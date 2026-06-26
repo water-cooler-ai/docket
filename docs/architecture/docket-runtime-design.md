@@ -239,8 +239,8 @@ Sources:
 12. Support local and remote executors through a stable adapter contract.
 13. Expose telemetry and streaming events without making PubSub the source of
     truth.
-14. Let applications own graph/run persistence and supply authorization,
-    checkpoint, and execution adapters.
+14. Let applications own authorization, graph/run persistence, checkpoint
+    handling, and execution adapters.
 15. Let simple DAG workflows remain simple.
 
 ## 5. Non-Goals
@@ -374,7 +374,7 @@ Runtime-internal graph modules:
 
 ```text
 Docket.Graph.Runtime
-Docket.Graph.Runtime.NodeDef
+Docket.Graph.Runtime.CompiledNode
 Docket.Graph.Runtime.ChannelDef
 ```
 
@@ -454,22 +454,25 @@ but it does not require the host application to project graph fields into
 first-class database columns. A host may add projection columns, hashes, or
 expression indexes if it needs operational queries.
 
-### 8.1 Runtime Node Definition
+### 8.1 Compiled Runtime Node
 
 ```elixir
-defmodule Docket.Graph.Runtime.NodeDef do
+defmodule Docket.Graph.Runtime.CompiledNode do
   defstruct [
     :id,
     :module,
     :function,
     :executor,
+    :guard,
     :timeout,
     :retry,
     :cache,
     :on_error,
+    config: %{},
     subscribe: [],
     read: [],
     write: [],
+    system_writes: [],
     metadata: %{}
   ]
 end
@@ -480,13 +483,16 @@ Fields:
 - `id`: stable runtime node identity derived from the public graph node.
 - `module` / `function`: local implementation, if any.
 - `executor`: local, remote, task queue, MCP, HTTP, or custom adapter.
+- `guard`: compiled guard expression evaluated against committed channel state.
 - `subscribe`: channels whose version changes activate the node.
 - `read`: additional channels visible to the node without activating it.
 - `write`: channels the node may update.
+- `system_writes`: compiler-generated activation writes emitted by the runner.
 - `timeout`: node execution timeout.
 - `retry`: retry policy.
 - `cache`: optional deterministic memoization policy.
 - `on_error`: fail run, write error channel, retry, skip, or route.
+- `config`: node-facing configuration copied into `Docket.Node.Input`.
 - `metadata`: application-owned data plus public ID mapping.
 
 ### 8.2 Runtime Channel Definition
@@ -801,6 +807,7 @@ The Runner dispatches each selected node with a consistent snapshot.
   values: readable_channel_values,
   versions: readable_channel_versions,
   context: application_context,
+  config: node_config,
   attempt: attempt,
   idempotency_key: key
 }
@@ -988,20 +995,35 @@ node :reviewer,
   ])
 ```
 
-Guard primitives:
+Design-space guard primitives:
 
 - `changed(channel)`
 - `version_at_least(channel, version)`
+- `path(channel, path)`
 - `exists(channel)`
 - `equals(channel, value)`
-- `matches(channel, predicate)`
 - `all([...])`
 - `any([...])`
 - `not(predicate)`
 - custom application guard
 
-Guards must be deterministic and side-effect free. Guards can read channel
-state, not external services.
+v1 guard constructors:
+
+```elixir
+Docket.Guard.changed(channel)
+Docket.Guard.version_at_least(channel, version)
+Docket.Guard.path(channel, path)
+Docket.Guard.exists(ref)
+Docket.Guard.equals(ref, value)
+Docket.Guard.all(expressions)
+Docket.Guard.any(expressions)
+Docket.Guard.not(expression)
+```
+
+Guards are serializable data expressions. They must be deterministic and side
+effect free. Guards can read committed channel state, channel versions, and the
+previous step's changed channel set, not external services. v1 does not support
+custom application guards or arbitrary predicate matches.
 
 ## 14. External Effects
 
@@ -1119,11 +1141,33 @@ defmodule MyApp.DocketCheckpoint do
 end
 ```
 
-For durable usage, a state-changing API should not report success until the
-required checkpoint callback returns `:ok`. Apps that want observational hooks
-instead of durability may configure a best-effort checkpoint policy, but the
-golden path is to save `checkpoint.run` and pass that run document back to
-Docket after a crash.
+For durable usage, checkpoint delivery has two modes:
+
+- `:sync`: the Runner waits for the checkpoint callback to return `:ok` before
+  committing the staged transition or reporting success to a related public API.
+- `:async`: the Runner commits the in-memory transition, submits checkpoint
+  delivery in the background, and continues execution.
+
+Required lifecycle and public API gate checkpoints should use `:sync`. Ordinary
+step/event checkpoints can use `:async` so projections, event history, and
+outbox delivery do not block graph execution. Apps that want stronger crash
+recovery between ordinary supersteps may configure additional checkpoint types
+as `:sync`.
+
+The golden path is still to save `checkpoint.run` and pass that run document
+back to Docket after a crash. With async step checkpoints, the durable run may
+lag behind the active in-memory Runner until the host accepts those checkpoint
+deliveries.
+
+Run creation follows the same rule. `Docket.run/3` must build the initial
+`Docket.Run` document and emit a required `:run_started` checkpoint before any
+node execution, event publication, interrupt, timer, or later step checkpoint can
+occur. If the initial checkpoint fails, execution has not started and callers
+receive a checkpoint error.
+
+Checkpoint handlers should create or replace records by `Docket.Run.id`. They
+must not require a run row to exist before the first checkpoint, and they should
+be safe to receive the same checkpoint more than once.
 
 ### 15.3 Run Document Shape
 
@@ -1214,13 +1258,16 @@ end
 
 Events are emitted with checkpoints. Apps that need replay, time travel,
 debugging, or audit history may persist `checkpoint.events`. Apps that only need
-crash resume may persist only the latest `checkpoint.run`.
+crash resume may persist only the latest `checkpoint.run`. Async
+`checkpoint.events` delivery is observational; failure to persist an async event
+envelope must not mutate or roll back the active in-memory Runner.
 
 ### 15.5 Checkpoint Shape
 
 ```elixir
 %Docket.Checkpoint{
   type: :step_committed,
+  delivery: :async,
   seq: checkpoint_seq,
   run: %Docket.Run{},
   events: [%Docket.Event{}],
@@ -1379,8 +1426,6 @@ defmodule MyApp.Docket do
   use Docket,
     checkpoint: MyApp.DocketCheckpoint,
     executor: MyApp.GraphExecutor,
-    authorizer: MyApp.GraphAuthorizer,
-    codec: MyApp.GraphCodec,
     limits: [
       max_supersteps: 100,
       max_concurrent_nodes: 8,
@@ -1607,8 +1652,9 @@ The public API should follow common Elixir library shape:
 - core infrastructure adapters configured once at runtime startup
 - a small test helper API for pushing test runs and asserting committed events
 
-The child spec and test helper APIs should be documented before implementation,
-but they do not need detailed design in this draft.
+The child spec and test helper APIs should be documented before implementation.
+See `docs/architecture/docket-graph-execution-contract-design.md` for the
+companion execution contract.
 
 ### 24.1 Graph Construction
 
@@ -1647,19 +1693,14 @@ graph = MyApp.Graphs.fetch_docket_graph!("essay-review", version: 1)
     context: %{tenant_id: tenant_id}
   )
 
-{:ok, result} = Docket.await(MyApp.Docket, run.id)
+{:ok, current_run} = MyApp.Docket.get_run(run.id)
 ```
 
-### 24.4 Stream
+`get_run/2` reads the current in-memory run snapshot for an active run. It does
+not read host storage and does not emit a checkpoint. It is observational; the
+latest accepted checkpoint remains the durable source of truth.
 
-```elixir
-Docket.stream(MyApp.Docket, run_id)
-|> Enum.each(fn event ->
-  IO.inspect(event)
-end)
-```
-
-### 24.5 Resume
+### 24.4 Resume
 
 ```elixir
 run = MyApp.Runs.fetch_docket_run!(run_id)
@@ -1670,6 +1711,72 @@ graph = MyApp.Graphs.fetch_docket_graph!(run.graph_id, run.graph_version)
 Docket.resolve_interrupt(MyApp.Docket, run.id, interrupt_id, %{"approved" => true})
 ```
 
+### 24.5 Test Helpers And Inline Runner
+
+See `docs/architecture/docket-v1-test-suite-design.md` for the full v1 test
+suite plan, including construction, compiler, inline execution, supervised
+runner, fixture, helper, and ETS-backed test adapter coverage.
+
+Most Docket runtime tests should not need to exercise supervision, GenServer
+mailboxes, or BEAM scheduling. Docket should expose an inline test runner that
+executes graph transitions in the calling test process while using the same core
+runtime logic as the supervised Runner.
+
+Proposed test API:
+
+```elixir
+Docket.Test.run_inline(graph, input, opts \\ [])
+Docket.Test.step_inline(state_or_run, opts \\ [])
+```
+
+`run_inline/3` should:
+
+- verify and compile the supplied `Docket.Graph`
+- create the initial `Docket.Run`
+- synchronously emit the required `:run_started` checkpoint to the configured
+  test checkpoint sink
+- execute graph transitions in the calling process until the run reaches
+  `:done`, `:failed`, `:waiting`, or a configured max step limit
+- return only after sync checkpoints caused by those transitions have been
+  accepted or failed
+- drain async checkpoints by default before returning, unless the test opts into
+  production-like async delivery behavior
+
+Recommended return shape:
+
+```elixir
+{:ok, Docket.Run.t(), [Docket.Checkpoint.t()]}
+| {:error, Docket.Error.t(), [Docket.Checkpoint.t()]}
+```
+
+`step_inline/2` should drive exactly one committed superstep and return only
+after that step's sync checkpoint requirements have been accepted or failed.
+If the step emits an async checkpoint, the helper should drain it by default for
+assertions or let tests opt into non-drained async delivery.
+
+The inline runner is not a second interpreter. It must call the same plan,
+execution, update, validation, reducer, and checkpoint-building code as the
+supervised Runner. The difference is only the shell:
+
+```text
+supervised Runner:
+  GenServer process owns state and receives calls/messages
+
+inline test runner:
+  calling test process owns state for the duration of the helper
+```
+
+Tests that only care about graph semantics, checkpoint ordering, reducers,
+guards, interrupts, and failure policy should use the inline runner. Tests that
+care about supervision, process lifecycle, crash recovery, late completions,
+remote executors, timers, or async awaits should use focused supervised or
+adapter-specific tests.
+
+No Docket test should require `Process.sleep/1` to wait for ordinary graph
+progress. Test helpers should expose explicit synchronization points, and every
+helper should return only after relevant sync checkpoints have succeeded or
+failed. Async checkpoint delivery should be drainable explicitly.
+
 ## 25. Executor Adapter
 
 Executors let the core runtime run node work locally, remotely, or through an
@@ -1679,7 +1786,7 @@ application-specific system.
 defmodule Docket.Executor do
   @callback execute(
               task :: Docket.Run.TaskState.t(),
-              node :: Docket.Graph.Runtime.NodeDef.t(),
+              node :: Docket.Graph.Runtime.CompiledNode.t(),
               input :: Docket.Node.Input.t(),
               opts :: keyword()
             ) ::
@@ -1713,8 +1820,9 @@ runtime verification, and generated document IDs when callers omit `id:`.
 The companion design in
 `docs/architecture/docket-graph-construction-design.md` proposes the
 canonical `Docket.Graph` API, app-owned document persistence, realtime edit
-operations, React Flow projection, diagnostics, and lowering rules from public
-fields, nodes, and edges into internal runtime channels and subscriptions.
+operations, diagnostics, and lowering rules from public fields, nodes, and
+edges into internal runtime channels and subscriptions. UI projection is
+host-owned.
 
 ### 26.1 Sequential Workflow Compiler
 

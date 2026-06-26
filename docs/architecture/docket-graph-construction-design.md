@@ -3,7 +3,10 @@
 Status: draft
 Date: 2026-06-25
 
-Related document: `docs/architecture/docket-runtime-design.md`
+Related documents:
+
+- `docs/architecture/docket-runtime-design.md`
+- `docs/architecture/docket-v1-test-suite-design.md`
 
 ## 1. Executive Summary
 
@@ -17,7 +20,7 @@ Docket.Run is the canonical, user-facing run snapshot document.
 Docket.Graph.Runtime is the internal executable runtime graph.
 ```
 
-Applications, workflow compilers, React Flow editors, and product UIs work with
+Applications, workflow compilers, graph editors, and product UIs work with
 `Docket.Graph`. It contains fields, nodes, edges, guards, outputs, policies,
 layout, metadata, and advisory diagnostics.
 
@@ -70,7 +73,7 @@ Docket.Graph.Runtime
   Internal executable graph materialization.
   Derived from Docket.Graph.
   Consumed by the Runner.
-  Contains channels, NodeDef records, generated barriers, and lowering maps.
+  Contains channels, CompiledNode records, generated barriers, and lowering maps.
 
 Run State
   Mutable execution state for one run.
@@ -90,8 +93,8 @@ is not the storage format and not the user-facing API. The host stores
 2. Keep graph storage app-owned; Docket accepts and returns graph documents.
 3. Keep `Docket.Graph.Runtime` internal and derived.
 4. Support realtime graph construction through simple graph update functions.
-5. Support React Flow and similar UI projections without making UI layout part
-   of runtime semantics.
+5. Support app-side graph editors without making UI layout part of runtime
+   semantics.
 6. Allow incomplete drafts and advisory diagnostics while users edit.
 7. Use compiler verification and compilation as the blocking gate for
    publish/run.
@@ -104,10 +107,11 @@ is not the storage format and not the user-facing API. The host stores
 
 1. Do not introduce a separate `StateGraph`, `Builder`, `NodeSpec`, or
    `EdgeSpec` schema that mirrors `Docket.Graph`.
-2. Do not ask UI code to construct runtime `ChannelDef` or `NodeDef` values.
+2. Do not ask UI code to construct runtime `ChannelDef` or `CompiledNode`
+   values.
 3. Do not mutate a published graph version in place.
 4. Do not require every UI edit to produce a valid executable graph.
-5. Do not make React Flow JSON the canonical graph model.
+5. Do not make any UI canvas JSON the canonical graph model.
 6. Do not make graph layout affect runtime execution.
 7. Do not require a Docket graph storage behaviour.
 8. Do not make hashes or compile receipts part of the core public model.
@@ -123,7 +127,6 @@ Docket.Graph.Edge
 Docket.Graph.Field
 Docket.Graph.Output
 Docket.Graph.Layout
-Docket.Graph.Projection
 Docket.Graph.Diagnostics
 Docket.Graph.Compiler
 Docket.Schema
@@ -131,11 +134,25 @@ Docket.Reducer
 Docket.Guard
 ```
 
+`Docket.Guard` is the public constructor module for durable guard expressions
+used by graph nodes and edges:
+
+```elixir
+Docket.Guard.changed(channel)
+Docket.Guard.version_at_least(channel, version)
+Docket.Guard.path(channel, path)
+Docket.Guard.exists(ref)
+Docket.Guard.equals(ref, value)
+Docket.Guard.all(expressions)
+Docket.Guard.any(expressions)
+Docket.Guard.not(expression)
+```
+
 Recommended internal/runtime modules:
 
 ```text
 Docket.Graph.Runtime
-Docket.Graph.Runtime.NodeDef
+Docket.Graph.Runtime.CompiledNode
 Docket.Graph.Runtime.ChannelDef
 Docket.Graph.Runtime.Lowering
 Docket.Runner
@@ -145,7 +162,7 @@ The naming boundary is:
 
 - `Docket.Graph.Node` is an editable public graph node.
 - `Docket.Node` is the executable node behaviour implemented by user code.
-- `Docket.Graph.Runtime.NodeDef` is an internal lowered node definition.
+- `Docket.Graph.Runtime.CompiledNode` is an internal lowered node definition.
 
 ## 6. Docket.Graph
 
@@ -212,7 +229,7 @@ graph =
   |> Docket.Graph.output(:draft)
 ```
 
-## 7. Public Nodes And Runtime NodeDefs
+## 7. Public Nodes And Compiled Runtime Nodes
 
 The word "node" appears in three places. They are related but not identical.
 
@@ -227,7 +244,7 @@ Docket.Node
   Receives Docket.Node.Input and returns Docket.Node.Output, interrupt, await,
   or error.
 
-Docket.Graph.Runtime.NodeDef
+Docket.Graph.Runtime.CompiledNode
   Internal runtime definition consumed by the Runner.
   Names runtime channels, subscriptions, guards, executor settings, and
   generated system writes.
@@ -248,7 +265,7 @@ Example public node:
 Example runtime node definition:
 
 ```elixir
-%Docket.Graph.Runtime.NodeDef{
+%Docket.Graph.Runtime.CompiledNode{
   id: "writer",
   module: Essay.Writer,
   function: :call,
@@ -265,9 +282,9 @@ Example runtime node definition:
 ```
 
 The public node says "writer reads topic and writes draft." The runtime
-`NodeDef` says "writer subscribes to this activation channel, reads this input
-channel, may write this state channel, and emits this generated edge channel on
-success."
+`CompiledNode` says "writer subscribes to this activation channel, reads this
+input channel, may write this state channel, and emits this generated edge
+channel on success."
 
 ## 8. Compile, Verify, And Materialize
 
@@ -313,7 +330,7 @@ edge -> generated edge channel plus subscriptions
 join -> generated barrier channel
 branch -> guarded edges or generated branch channel/node
 output -> output channel projection
-Docket.Graph.Node -> Docket.Graph.Runtime.NodeDef
+Docket.Graph.Node -> Docket.Graph.Runtime.CompiledNode
 ```
 
 The compile path may return an explain report for debugging, but the runtime
@@ -521,12 +538,12 @@ graph =
   end)
 ```
 
-React Flow can call these helpers directly from UI events:
+Graph editor handlers can translate user actions into ordinary graph updates:
 
 ```text
-drag node onto canvas -> put_node(graph, node_id, attrs)
+add node -> put_node(graph, node_id, attrs)
 move node -> update_node(graph, node_id, %{layout: new_layout})
-connect handles -> put_edge(graph, edge_id, attrs)
+connect nodes -> put_edge(graph, edge_id, attrs)
 edit edge condition -> update_edge(graph, edge_id, %{guard: guard})
 delete edge -> delete_edge(graph, edge_id)
 ```
@@ -648,56 +665,19 @@ Rules:
 - The required Docket contract is only canonical documents in, canonical
   documents out.
 
-## 13. React Flow Projection
+## 13. UI Projection Boundary
 
-React Flow should consume a UI projection of `Docket.Graph`, not runtime graph
-internals.
+The host application owns UI-specific projection. Docket should expose the
+canonical `Docket.Graph` document, graph editing helpers, diagnostics, compiler
+reports, checkpoints, and runtime events. The app can project those values into
+its graph editor or inspector shape.
 
-Recommended projection:
-
-```elixir
-%Docket.Graph.Projection.ReactFlow{
-  nodes: [
-    %{
-      id: "writer",
-      type: "workflowNode",
-      position: %{x: 120, y: 80},
-      data: %{
-        label: "Writer",
-        implementation: %{type: :registered, id: "essay_writer"},
-        reads: ["topic"],
-        writes: ["draft"],
-        diagnostics: []
-      }
-    }
-  ],
-  edges: [
-    %{
-      id: "edge_writer_reviewer",
-      source: "writer",
-      target: "reviewer",
-      sourceHandle: "success",
-      targetHandle: "in",
-      data: %{guard: nil, diagnostics: []}
-    }
-  ],
-  viewport: %{x: 0, y: 0, zoom: 1.0}
-}
-```
-
-Projection API:
-
-```elixir
-Docket.Graph.Projection.to_react_flow(graph, opts \\ [])
-Docket.Graph.Projection.from_react_flow(payload, opts \\ [])
-```
-
-React Flow events should call ordinary graph update helpers:
+Editor events should call ordinary graph update helpers:
 
 ```text
-onNodesChange position update -> update_node(graph, node_id, %{layout: ...})
-onConnect -> put_edge(graph, edge_id, %{from: ..., to: ...})
-onEdgesDelete -> delete_edge(graph, edge_id)
+node position update -> update_node(graph, node_id, %{layout: ...})
+connect nodes -> put_edge(graph, edge_id, %{from: ..., to: ...})
+delete edge -> delete_edge(graph, edge_id)
 node property edit -> update_node(graph, node_id, attrs)
 field panel edit -> put_field/update_field/delete_field
 guard editor save -> update_edge(graph, edge_id, %{guard: guard})
@@ -705,7 +685,7 @@ guard editor save -> update_edge(graph, edge_id, %{guard: guard})
 
 The host app should persist the canonical `Docket.Graph` or its own
 product-specific workflow record that can produce a `Docket.Graph`. It should
-not persist React Flow JSON as the canonical workflow document.
+not persist UI canvas JSON as the canonical workflow document.
 
 ## 14. Runtime Introspection And Realtime Overlays
 
@@ -713,16 +693,16 @@ Runtime introspection has two layers:
 
 ```text
 static graph view:
-  Docket.Graph -> React Flow projection
+  Docket.Graph -> host-owned UI projection
 
 live run overlay:
   Run events/checkpoints/channel versions -> overlay data keyed by public IDs
 ```
 
 The inspector can load the canonical graph version used by a run, project it to
-React Flow, then stream committed run events and apply overlay updates.
+the app's UI shape, then stream committed run events and apply overlay updates.
 
-Runtime events refer to runtime channels and `NodeDef` IDs. The runtime lowering
+Runtime events refer to runtime channels and `CompiledNode` IDs. The runtime lowering
 map maps those IDs back to public node, edge, and field IDs for UI overlays.
 That lowering map can be returned by `Docket.Graph.Compiler.explain/2`,
 included in debug events, or held inside the live Runner.
@@ -734,7 +714,7 @@ workflow mode:
   show Docket.Graph nodes, edges, fields, and user-facing statuses
 
 runtime debug mode:
-  reveal generated channels, barriers, subscriptions, and NodeDef details
+  reveal generated channels, barriers, subscriptions, and CompiledNode details
 ```
 
 This avoids forcing normal users to understand generated edge channels while
@@ -786,10 +766,10 @@ Runtime:
 ChannelDef "edge:writer:reviewer"
   type: Ephemeral
 
-NodeDef "writer"
+CompiledNode "writer"
   system_writes: ["edge:writer:reviewer"]
 
-NodeDef "reviewer"
+CompiledNode "reviewer"
   subscribe: ["edge:writer:reviewer"]
 ```
 
@@ -845,7 +825,7 @@ Runtime:
 edge:reviewer:deploy
 ```
 
-The target `NodeDef` subscribes to the generated edge channel and carries the
+The target `CompiledNode` subscribes to the generated edge channel and carries the
 compiled guard expression.
 
 ## 16. Diagnostics And Runtime Verification
@@ -976,7 +956,7 @@ end
 ```text
 1. User opens workflow editor.
 2. Host loads latest published Docket.Graph or existing draft Docket.Graph.
-3. Host projects Docket.Graph to React Flow.
+3. Host projects Docket.Graph to its graph editor UI shape.
 4. User drags a node onto the canvas.
 5. UI sends the node ID and node shape.
 6. Server calls `put_node/3` on the graph.
@@ -997,7 +977,7 @@ end
 2. Server loads the latest Docket.Run document.
 3. Server fetches the canonical Docket.Graph document using run.graph_id and
    run.graph_version.
-4. Server projects Docket.Graph to React Flow.
+4. Server projects Docket.Graph to its run inspector UI shape.
 5. Server streams committed run events.
 6. Server maps runtime channel/node IDs to public IDs using lowering metadata.
 7. UI overlays active/completed/failed/waiting status on public nodes and edges.
@@ -1072,21 +1052,18 @@ Recommended MVP:
 6. Single `Docket.Graph.Compiler` module with `verify/2`, `explain/2`, and
    `compile/2`.
 7. Internal `Docket.Graph.Runtime` materialization returned by `compile/2`.
-8. React Flow projection helpers.
-9. Runtime overlay mapping from events/channels back to public IDs.
-10. Sequential workflow compatibility compiler through `Docket.Graph`.
+8. Runtime overlay mapping from events/channels back to public IDs.
+9. Sequential workflow compatibility compiler through `Docket.Graph`.
 
 ## 23. Open Questions
 
 1. Should `Docket.Graph.Compiler.verify/2` be public, or should publish/start
-   APIs hide verification entirely?
+   APIs hide verification entirely? Public for testing purposes probably.
 2. Should branch/join sugar be preserved as first-class graph elements, or
-   normalized to edges plus metadata?
-3. What is the minimum React Flow projection Docket should own versus leaving
-   all UI-specific projection to WaterCooler?
-4. Should collaborative editing revisions be entirely host-owned?
-5. Should `Docket.Graph.Runtime` live under `Docket.Graph.Runtime` or be named
-   `Docket.RuntimeGraph` for extra internal separation?
+   normalized to edges plus metadata? That depends, what would the lift be and what are they in LangGraph?
+3. Should collaborative editing revisions be entirely host-owned? out of scope for v1
+4. Should `Docket.Graph.Runtime` live under `Docket.Graph.Runtime` or be named
+   `Docket.RuntimeGraph` for extra internal separation? yes rename it to runtimegraph so it's more clear what it is.
 
 ## 24. Strong Recommendations
 
@@ -1101,8 +1078,8 @@ Recommended MVP:
    appending a new version after edits.
 7. Make build-time and realtime graph construction use the same graph update
    helpers.
-8. Make React Flow a projection of `Docket.Graph`, not the canonical workflow
+8. Keep UI projection host-owned; `Docket.Graph` is the canonical workflow
    document.
 9. Show generated channels only in runtime debug mode.
-10. Build compiler verify, compile, explain, and project-to-React-Flow early
-    because they will reveal API mistakes quickly.
+10. Build compiler verify, compile, and explain early because they will reveal
+    API mistakes quickly.
