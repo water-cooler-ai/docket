@@ -17,7 +17,7 @@ The key naming decision is:
 ```text
 Docket.Graph is the canonical, user-facing graph.
 Docket.Run is the canonical, user-facing run snapshot document.
-Docket.Graph.Runtime is the internal executable runtime graph.
+Docket.RuntimeGraph is the internal executable runtime graph.
 ```
 
 Applications, workflow compilers, graph editors, and product UIs work with
@@ -25,7 +25,7 @@ Applications, workflow compilers, graph editors, and product UIs work with
 layout, metadata, and advisory diagnostics.
 
 The Runner does not execute `Docket.Graph` directly. When a run starts, Docket
-materializes the canonical graph into an internal `Docket.Graph.Runtime` value
+materializes the canonical graph into an internal `Docket.RuntimeGraph` value
 with channels, subscriptions, reducers, generated edge channels, barriers, and
 runtime node definitions.
 
@@ -43,12 +43,12 @@ publish/verify:
 
 run:
   host loads Docket.Graph document
-  -> Docket.run/3 or MyApp.Docket.run/3
+  -> Docket.run/4 or MyApp.Docket.run/3
   -> internal runtime compile
   -> Docket.Checkpoint emits Docket.Run document
 ```
 
-`Docket.Graph.Runtime` is a derived implementation detail. Its shape can change
+`Docket.RuntimeGraph` is a derived implementation detail. Its shape can change
 as the runtime improves without changing the public graph model.
 
 ## 2. Core Model
@@ -69,7 +69,7 @@ Docket.Run
   Saved by the host application.
   Passed back to Docket to resume or retry a run.
 
-Docket.Graph.Runtime
+Docket.RuntimeGraph
   Internal executable graph materialization.
   Derived from Docket.Graph.
   Consumed by the Runner.
@@ -84,14 +84,15 @@ Run State
 
 The public construction layer is centered on `Docket.Graph`. The runtime graph
 is not the storage format and not the user-facing API. The host stores
-`Docket.Graph` and `Docket.Run` documents, not `Docket.Graph.Runtime` or
-`Docket.Run.State` internals.
+`Docket.Graph` and `Docket.Run` documents. A `Docket.Run` includes structured
+Docket-owned `%Docket.Run.State{}` resume data, but hosts persist and pass that
+state back without interpreting its internals.
 
 ## 3. Design Goals
 
 1. Make `Docket.Graph` the canonical graph used by applications.
 2. Keep graph storage app-owned; Docket accepts and returns graph documents.
-3. Keep `Docket.Graph.Runtime` internal and derived.
+3. Keep `Docket.RuntimeGraph` internal and derived.
 4. Support realtime graph construction through simple graph update functions.
 5. Support app-side graph editors without making UI layout part of runtime
    semantics.
@@ -151,10 +152,10 @@ Docket.Guard.not(expression)
 Recommended internal/runtime modules:
 
 ```text
-Docket.Graph.Runtime
-Docket.Graph.Runtime.CompiledNode
-Docket.Graph.Runtime.ChannelDef
-Docket.Graph.Runtime.Lowering
+Docket.RuntimeGraph
+Docket.RuntimeGraph.CompiledNode
+Docket.RuntimeGraph.ChannelDef
+Docket.RuntimeGraph.Lowering
 Docket.Runner
 ```
 
@@ -162,7 +163,7 @@ The naming boundary is:
 
 - `Docket.Graph.Node` is an editable public graph node.
 - `Docket.Node` is the executable node behaviour implemented by user code.
-- `Docket.Graph.Runtime.CompiledNode` is an internal lowered node definition.
+- `Docket.RuntimeGraph.CompiledNode` is an internal lowered node definition.
 
 ## 6. Docket.Graph
 
@@ -215,19 +216,87 @@ This is not a temporary builder. The functional API returns updated
 ```elixir
 graph =
   Docket.Graph.new(id: "essay-review", name: "Essay Review")
-  |> Docket.Graph.input(:topic, schema: Docket.Schema.string())
-  |> Docket.Graph.field(:draft,
+  |> Docket.Graph.input("topic", schema: Docket.Schema.string())
+  |> Docket.Graph.field("draft",
     schema: Docket.Schema.string(),
     reducer: Docket.Reducer.last_value()
   )
-  |> Docket.Graph.node(:writer, Essay.Writer,
-    reads: [:topic],
-    writes: [:draft]
+  |> Docket.Graph.node("writer", Essay.Writer,
+    reads: ["topic"],
+    writes: ["draft"]
   )
-  |> Docket.Graph.edge(:start, :writer)
-  |> Docket.Graph.edge(:writer, :finish)
-  |> Docket.Graph.output(:draft)
+  |> Docket.Graph.edge("$start", "writer")
+  |> Docket.Graph.edge("writer", "$finish")
+  |> Docket.Graph.output("draft")
 ```
+
+### 6.1 ID Rules
+
+All IDs stored in `Docket.Graph` are binaries in v1.
+
+This includes graph IDs, input IDs, field IDs, output IDs, node IDs, edge IDs,
+join IDs, branch IDs, and any graph references that point at those records.
+Graph editing helpers accept binary IDs and reject atom IDs, charlists, numbers,
+or other terms as hard argument errors. Docket must not create atoms from graph
+IDs or from user-supplied strings.
+
+Canonical v1 public IDs are non-empty binaries that match:
+
+```text
+~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
+```
+
+The only reserved graph endpoint IDs outside that pattern are the pseudo-node
+IDs `"$start"` and `"$finish"`. They may be used as edge endpoints, but they
+cannot be used as user node IDs or any other public graph record ID.
+
+If an ID is omitted, Docket generates a binary ID using the configured ID
+generator. Default generated public ID prefixes are:
+
+```text
+graph_<token>
+input_<token>
+field_<token>
+output_<token>
+node_<token>
+edge_<token>
+join_<token>
+branch_<token>
+```
+
+Tests may inject deterministic ID generation, such as `edge_000001`, but the
+canonical stored value is still a binary.
+
+Runtime-generated IDs are also binaries, but they are internal and namespaced by
+runtime kind:
+
+```text
+input:<input_id>
+state:<field_id>
+output:<output_id>
+edge:<edge_id>
+barrier:<join_id>
+```
+
+Branches do not create `branch:<branch_id>` runtime channels in v1. A branch is
+public grouping sugar over guarded edge records, and each branch arm activates
+through the same `edge:<edge_id>` channel format as any other edge. The branch
+ID remains useful for editing, diagnostics, reports, and lowering metadata.
+
+Every `edge:<edge_id>` runtime channel is backed by a canonical edge record with
+`id`, `from`, and `to`. Helpers such as fan-out, joins, and branches may create
+or group those edge records, but the compiler still lowers activation through
+edge record IDs rather than endpoint-derived channel names.
+
+Compiler collision rules:
+
+- duplicate public IDs are rejected across all public graph record collections
+- input IDs and field IDs share the node read/write namespace and may not collide
+- user node IDs may not be `"$start"` or `"$finish"`
+- runtime-generated channel IDs may not collide with any other generated runtime
+  channel ID
+- diagnostics for ID errors use the public graph path and public ID whenever
+  possible
 
 ## 7. Public Nodes And Compiled Runtime Nodes
 
@@ -244,7 +313,7 @@ Docket.Node
   Receives Docket.Node.Input and returns Docket.Node.Output, interrupt, await,
   or error.
 
-Docket.Graph.Runtime.CompiledNode
+Docket.RuntimeGraph.CompiledNode
   Internal runtime definition consumed by the Runner.
   Names runtime channels, subscriptions, guards, executor settings, and
   generated system writes.
@@ -265,15 +334,15 @@ Example public node:
 Example runtime node definition:
 
 ```elixir
-%Docket.Graph.Runtime.CompiledNode{
+%Docket.RuntimeGraph.CompiledNode{
   id: "writer",
   module: Essay.Writer,
   function: :call,
-  subscribe: ["edge:$start:writer"],
+  subscribe: ["edge:edge_start_writer"],
   read: ["input:topic"],
   write: ["state:draft"],
   system_writes: [
-    %{channel: "edge:writer:$finish", on: :success}
+    %{channel: "edge:edge_writer_finish", on: :success}
   ],
   metadata: %{
     public_node_id: "writer"
@@ -293,11 +362,16 @@ explanation, and runtime materialization.
 
 `compile/2` is the only compiler function that returns a compiled runtime
 artifact. It materializes `Docket.Graph` into an internal
-`Docket.Graph.Runtime` value.
+`Docket.RuntimeGraph` value.
 
 `verify/2` and `explain/2` use the same compiler rules, but they do not return a
 runtime graph. They only prove that compilation would succeed or return the
 diagnostics/report needed for publishing, previews, and debugging.
+
+`verify/2` is a public API. Publish and start helpers may call it internally,
+but tests, host publishing flows, workflow compilers, and editor previews need a
+stable way to ask whether a canonical graph is runnable without starting a run
+or exposing runtime internals.
 
 Applications do not normally store the runtime graph. They may verify that a
 graph is runnable before publishing it:
@@ -328,9 +402,9 @@ input field -> input channel
 state field -> state channel
 edge -> generated edge channel plus subscriptions
 join -> generated barrier channel
-branch -> guarded edges or generated branch channel/node
+branch -> guarded edge records plus generated edge channels
 output -> output channel projection
-Docket.Graph.Node -> Docket.Graph.Runtime.CompiledNode
+Docket.Graph.Node -> Docket.RuntimeGraph.CompiledNode
 ```
 
 The compile path may return an explain report for debugging, but the runtime
@@ -356,14 +430,14 @@ Build-time, pipe-oriented construction:
 ```elixir
 graph =
   Docket.Graph.new(id: "essay-review", name: "Essay Review")
-  |> Docket.Graph.input(:topic, schema: Docket.Schema.string())
-  |> Docket.Graph.field(:draft, schema: Docket.Schema.string())
-  |> Docket.Graph.node(:writer, Essay.Writer,
-    reads: [:topic],
-    writes: [:draft]
+  |> Docket.Graph.input("topic", schema: Docket.Schema.string())
+  |> Docket.Graph.field("draft", schema: Docket.Schema.string())
+  |> Docket.Graph.node("writer", Essay.Writer,
+    reads: ["topic"],
+    writes: ["draft"]
   )
-  |> Docket.Graph.edge(:start, :writer)
-  |> Docket.Graph.edge(:writer, :finish)
+  |> Docket.Graph.edge("$start", "writer")
+  |> Docket.Graph.edge("writer", "$finish")
 
 warnings = graph.diagnostics
 ```
@@ -410,7 +484,7 @@ field to the graph:
 ```elixir
 graph =
   graph
-  |> Docket.Graph.input(:topic,
+  |> Docket.Graph.input("topic",
     schema: Docket.Schema.string(),
     required: true
   )
@@ -422,9 +496,9 @@ into an input channel. Nodes can read it by listing the input ID in `reads`.
 ```elixir
 graph =
   graph
-  |> Docket.Graph.node(:writer, Essay.Writer,
-    reads: [:topic],
-    writes: [:draft]
+  |> Docket.Graph.node("writer", Essay.Writer,
+    reads: ["topic"],
+    writes: ["draft"]
   )
 ```
 
@@ -432,7 +506,7 @@ In the canonical graph model, inputs are fields, not nodes. The executable entry
 into the graph is still represented by start edges such as:
 
 ```elixir
-Docket.Graph.edge(graph, :start, :writer)
+Docket.Graph.edge(graph, "$start", "writer")
 ```
 
 Recommended API:
@@ -484,7 +558,7 @@ Docket.Graph.Compiler.compile(graph, opts \\ [])
 `compile/2` should return:
 
 ```elixir
-{:ok, Docket.Graph.Runtime.t(), Docket.Graph.Compiler.Report.t()}
+{:ok, Docket.RuntimeGraph.t(), Docket.Graph.Compiler.Report.t()}
 | {:error, Docket.Graph.Diagnostics.t()}
 ```
 
@@ -655,7 +729,7 @@ Typical host records may include:
 Rules:
 
 - `Docket.Graph.new/1` accepts `id:`. If omitted, Docket generates `graph.id`.
-- `Docket.run/3` and `MyApp.Docket.run/3` accept `id:`. If omitted, Docket
+- `Docket.run/4` and `MyApp.Docket.run/3` accept `id:`. If omitted, Docket
   generates `run.id`.
 - Apps may use Docket document IDs as primary keys or store them alongside their
   own internal IDs.
@@ -727,7 +801,7 @@ still giving engineers a precise runtime inspection view.
 Public graph:
 
 ```elixir
-input :topic, schema: string()
+input "topic", schema: string()
 ```
 
 Runtime:
@@ -742,7 +816,7 @@ ChannelDef "input:topic"
 Public graph:
 
 ```elixir
-field :draft, schema: string(), reducer: last_value()
+field "draft", schema: string(), reducer: last_value()
 ```
 
 Runtime:
@@ -757,20 +831,20 @@ ChannelDef "state:draft"
 Public graph:
 
 ```elixir
-edge :writer, :reviewer
+edge "writer", "reviewer", id: "edge_writer_reviewer"
 ```
 
 Runtime:
 
 ```text
-ChannelDef "edge:writer:reviewer"
+ChannelDef "edge:edge_writer_reviewer"
   type: Ephemeral
 
 CompiledNode "writer"
-  system_writes: ["edge:writer:reviewer"]
+  system_writes: ["edge:edge_writer_reviewer"]
 
 CompiledNode "reviewer"
-  subscribe: ["edge:writer:reviewer"]
+  subscribe: ["edge:edge_writer_reviewer"]
 ```
 
 User node code does not manually write edge signal channels. The Runner emits
@@ -781,52 +855,102 @@ compiler-generated system writes after successful node completion.
 Public graph:
 
 ```elixir
-edge :researcher, [:summarizer, :tester]
+edge "researcher", "summarizer", id: "edge_researcher_summarizer"
+edge "researcher", "tester", id: "edge_researcher_tester"
 ```
 
 Runtime:
 
 ```text
-edge:researcher:summarizer
-edge:researcher:tester
+edge:edge_researcher_summarizer
+edge:edge_researcher_tester
 ```
+
+Fan-out helpers may accept multiple targets, but the canonical graph still stores
+one edge record per target so every runtime activation channel has a stable
+`edge:<edge_id>` identity.
 
 ### 15.5 Fan-In
 
 Public graph:
 
 ```elixir
-join [:researcher, :tester], :reviewer
+join ["researcher", "tester"], "reviewer", id: "join_review_ready"
 ```
 
 Runtime:
 
 ```text
-edge:researcher:reviewer
-edge:tester:reviewer
-barrier:researcher+tester:reviewer
+edge:edge_researcher_reviewer
+edge:edge_tester_reviewer
+barrier:join_review_ready
 ```
 
-The canonical graph may preserve this as one join edge/group. Runtime lowering
-may use multiple edge channels plus a barrier channel.
+The canonical graph should preserve this as one join record/group so editors,
+diagnostics, compiler reports, and workflow compilers can keep the user's
+intent. Runtime lowering should normalize it into generated edge activation
+channels plus a barrier channel. The join's member edge records carry `from`
+and `to` endpoints, while their runtime channels use `edge:<edge_id>`.
 
 ### 15.6 Conditional Edges
 
 Public graph:
 
 ```elixir
-edge :reviewer, :deploy,
-  guard: equals(path(:review, [:status]), :approved)
+edge "reviewer", "deploy",
+  id: "edge_review_approved",
+  guard: equals(path("review", ["status"]), "approved")
 ```
 
 Runtime:
 
 ```text
-edge:reviewer:deploy
+edge:edge_review_approved
 ```
 
 The target `CompiledNode` subscribes to the generated edge channel and carries the
 compiled guard expression.
+
+### 15.7 Branches
+
+Public graph:
+
+```elixir
+branch "reviewer", %{
+  "approved" => [
+    to: "deploy",
+    edge_id: "edge_review_approved",
+    guard: equals(path("review", ["status"]), "approved")
+  ],
+  "rejected" => [
+    to: "revise",
+    edge_id: "edge_review_rejected",
+    guard: equals(path("review", ["status"]), "rejected")
+  ]
+}
+```
+
+Runtime:
+
+```text
+edge:edge_review_approved
+edge:edge_review_rejected
+```
+
+The canonical graph should preserve branch groups as first-class editing and
+inspection sugar. Lowering should normalize branches to guarded edge records and
+generated `edge:<edge_id>` activation channels. The Runner does not need to know
+whether an activation came from a user-authored edge or branch sugar; the
+lowering map keeps the public branch/edge IDs available for diagnostics and
+runtime overlays. v1 does not generate separate branch activation channels.
+
+This is a moderate compiler/reporting lift, not a Runner lift. The canonical
+struct already has `joins` and `branches`; the extra work is defining their
+record shape, lowering them into ordinary runtime channels, and adding tests for
+public-to-runtime mapping. If v1 needs to shrink scope, keep the public
+`branch/3` helper but implement it as grouped guarded edges in `Docket.Graph`
+metadata, then promote the group to a dedicated branch record later without
+changing runtime execution.
 
 ## 16. Diagnostics And Runtime Verification
 
@@ -907,9 +1031,9 @@ Host run records:
   project, user, session, message, or job relationships
 ```
 
-Host storage does not need to know about `Docket.Graph.Runtime` or
-`Docket.Run.State`. Runtime materialization happens when Docket verifies a graph,
-starts a run, resumes a run, or retries a run.
+Host storage does not need to know about `Docket.RuntimeGraph` or interpret
+`Docket.Run.State` internals. Runtime materialization happens when Docket
+verifies a graph, starts a run, resumes a run, or retries a run.
 
 ## 18. WaterCooler Workflow Compiler
 
@@ -993,6 +1117,21 @@ Compilation validates the graph and lowers it to a Pregel-style runtime graph
 with channels, triggers, and writers. The direct Pregel API can also be used by
 hand, but ordinary users generally work through `StateGraph`.
 
+LangGraph's builder keeps these concepts separate before compile:
+
+```text
+edges -> normal fixed transitions
+waiting_edges -> fan-in joins that wait for multiple starts
+branches -> conditional routing specs keyed by source node and branch name
+```
+
+Compilation then attaches normal edges, waiting edges, and branches to the
+runtime graph. At runtime, the compiled Pregel graph exposes channels such as
+state channels, start/activation channels, branch-specific channels, and
+barrier-like channels for waits. Docket should follow that separation of public
+intent from runtime lowering without copying LangGraph's exact API; in Docket v1,
+branch activation is represented by guarded `edge:<edge_id>` channels.
+
 The useful lowering pattern is:
 
 ```text
@@ -1009,7 +1148,7 @@ editing model:
 ```text
 Docket.Graph is canonical and editable.
 Docket.Run is canonical and restorable.
-Docket.Graph.Runtime is internal and derived.
+Docket.RuntimeGraph is internal and derived.
 Host applications store Docket documents, not runtime graph internals.
 ```
 
@@ -1038,37 +1177,44 @@ Sources:
 - https://docs.langchain.com/oss/python/langgraph/pregel
 - https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/graph/state.py
 
-## 22. MVP Scope
+## 22. Resolved v1 Graph Construction Scope
 
-Recommended MVP:
+Resolved v1 graph construction scope:
 
 1. `Docket.Graph` as the canonical public graph document.
 2. One functional graph editing API for both build-time pipes and realtime UI
    edits.
-3. Graph helpers for fields, inputs, nodes, edges, joins, outputs, policies,
-   metadata, and layout.
+3. Graph helpers for fields, inputs, nodes, edges, joins, branches, outputs,
+   policies, metadata, and layout.
 4. App-owned graph persistence with optional `id:` generation.
 5. Advisory graph diagnostics and blocking compiler verification.
 6. Single `Docket.Graph.Compiler` module with `verify/2`, `explain/2`, and
    `compile/2`.
-7. Internal `Docket.Graph.Runtime` materialization returned by `compile/2`.
+7. Internal `Docket.RuntimeGraph` materialization returned by `compile/2`.
 8. Runtime overlay mapping from events/channels back to public IDs.
-9. Sequential workflow compatibility compiler through `Docket.Graph`.
+9. WaterCooler/sequential workflow compatibility compiler remains post-v1. It
+   should compile through `Docket.Graph` when added, but it is not part of the v1
+   implementation gate.
 
-## 23. Open Questions
+## 23. Resolved Decisions
 
-1. Should `Docket.Graph.Compiler.verify/2` be public, or should publish/start
-   APIs hide verification entirely? Public for testing purposes probably.
-2. Should branch/join sugar be preserved as first-class graph elements, or
-   normalized to edges plus metadata? That depends, what would the lift be and what are they in LangGraph?
-3. Should collaborative editing revisions be entirely host-owned? out of scope for v1
-4. Should `Docket.Graph.Runtime` live under `Docket.Graph.Runtime` or be named
-   `Docket.RuntimeGraph` for extra internal separation? yes rename it to runtimegraph so it's more clear what it is.
+1. `Docket.Graph.Compiler.verify/2` is public. It is useful for tests, editor
+   previews, workflow compiler tests, and host-owned publish flows. Start/publish
+   helpers may still call it internally.
+2. Branch and join sugar are preserved as first-class canonical graph concepts
+   for editing, diagnostics, compiler reports, and UI overlays. The compiler
+   normalizes them into runtime activation channels, guards, and barriers, so the
+   Runner only consumes `Docket.RuntimeGraph`.
+3. Collaborative editing revisions are out of scope for v1 and remain
+   host-owned.
+4. The internal executable graph is named `Docket.RuntimeGraph`, with
+   `Docket.RuntimeGraph.CompiledNode`, `Docket.RuntimeGraph.ChannelDef`, and
+   `Docket.RuntimeGraph.Lowering` underneath it.
 
 ## 24. Strong Recommendations
 
 1. Treat `Docket.Graph` as the canonical public graph.
-2. Treat `Docket.Graph.Runtime` as internal derived runtime materialization.
+2. Treat `Docket.RuntimeGraph` as internal derived runtime materialization.
 3. Keep graph persistence app-owned; Docket should accept graph documents as
    values.
 4. Treat `Docket.Run` as the canonical public resume document emitted by

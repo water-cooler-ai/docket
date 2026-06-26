@@ -1,0 +1,20 @@
+# The directory Mix writes compiled artifacts to.
+/_build/
+
+# If you run "mix test --cover", coverage assets end up here.
+/cover/
+
+# The directory Mix downloads dependencies sources to.
+/deps/
+
+# Where third-party dependencies like ExDoc output generated docs.
+/doc/
+
+# Ignore package archives.
+/*.ez
+
+# Ignore package tarball.
+docket-*.tar
+
+# Temporary files, for example, from tests.
+/tmp/

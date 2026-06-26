@@ -54,7 +54,7 @@ v1 tests follow these rules:
 LangGraph's test suite is useful as a pattern: it compiles small graphs, asserts
 graph projections, then runs the compiled graph to prove the builder/runtime
 link works. Docket should make that bridge more explicit because
-`Docket.Graph` and `Docket.Graph.Runtime` are intentionally separate.
+`Docket.Graph` and `Docket.RuntimeGraph` are intentionally separate.
 
 ## 3. Test Layers
 
@@ -82,7 +82,7 @@ document can be built, edited, inspected, and saved by a host application.
 
 ### 3.2 Compiler Tests
 
-Compiler tests cover `Docket.Graph -> Docket.Graph.Runtime`.
+Compiler tests cover `Docket.Graph -> Docket.RuntimeGraph`.
 
 They verify:
 
@@ -90,7 +90,7 @@ They verify:
 - inputs lower to input channels
 - state fields lower to state channels with the intended reducer
 - outputs lower to output projections
-- public nodes lower to `Docket.Graph.Runtime.CompiledNode` values
+- public nodes lower to `Docket.RuntimeGraph.CompiledNode` values
 - node `reads` lower to readable runtime channels
 - node `writes` lower to runtime write permissions
 - simple edges lower to generated ephemeral activation channels
@@ -98,6 +98,7 @@ They verify:
 - target nodes subscribe to generated activation channels
 - fan-out creates one generated activation channel per target
 - joins lower to the required barrier representation
+- branches lower to grouped guarded edges and generated activation channels
 - guarded edges compile durable `Docket.Guard` expressions
 - compiler reports expose public-to-runtime and runtime-to-public lowering maps
 - diagnostics use public IDs and public graph paths whenever possible
@@ -118,6 +119,14 @@ They follow this shape:
 ```text
 Docket.Graph fixture
   -> Docket.Graph.Compiler.compile/2
+  -> Docket.Test.run_inline/3
+  -> assertions on Docket.Run, checkpoints, events, and outputs
+```
+
+The integration suite should also include direct compiled-runtime entry tests:
+
+```text
+Docket.RuntimeGraph fixture
   -> Docket.Test.run_inline/3
   -> assertions on Docket.Run, checkpoints, events, and outputs
 ```
@@ -173,8 +182,8 @@ They verify:
 - stale task completions are ignored
 - timeouts become node attempt failures
 - checkpoint callback failures block sync checkpoint commits
-- async checkpoint delivery failures are observable if async checkpoints remain
-  in v1
+- async checkpoint delivery failures are observable without blocking the active
+  Runner
 
 Supervised tests may use real processes, monitors, unique registries, and
 supervisors. They still must not use external services.
@@ -285,7 +294,9 @@ Initial assertions:
 
 - `Docket.Test.run_inline/3` runs `minimal_linear/0` in the calling test process
 - accepted checkpoints are returned to the test
-- `:run_started` is emitted before any node execution
+- inline execution initializes through `Docket.Runner.Core.init/3`
+- `Core.init/3` infers blank run state without an extra caller-supplied flag
+- `:run_initialized` is emitted before any node execution
 - `:run_completed` is emitted only after terminal detection
 - the checkpoint sink receives the same checkpoints returned by the inline
   helper
@@ -331,8 +342,8 @@ test/docket/graph/compiler/
 
 test/docket/channel/
   last_value_test.exs
-  aggregate_test.exs
   ephemeral_test.exs
+  barrier_test.exs
   reducer_validation_test.exs
 
 test/docket/runner/
@@ -503,7 +514,7 @@ write to Repo, disk, or external services.
 `Docket.Test` is the public test-facing execution helper.
 
 ```elixir
-Docket.Test.run_inline(graph, input, opts \\ [])
+Docket.Test.run_inline(graph_or_runtime_graph, input, opts \\ [])
 Docket.Test.step_inline(run_or_state, opts \\ [])
 ```
 
@@ -516,9 +527,17 @@ Return shape:
 
 `run_inline/3` should:
 
-- compile or accept a compiled runtime graph according to the final API
+- accept either a canonical `Docket.Graph` or a precompiled
+  `Docket.RuntimeGraph`
+- compile `Docket.Graph` inputs through the same compiler path used by the
+  supervised Runner
+- run precompiled `Docket.RuntimeGraph` inputs directly while preserving the
+  same core execution semantics
 - create the initial run snapshot
-- emit the required `:run_started` checkpoint
+- initialize execution through `Docket.Runner.Core.init/3`, matching the
+  supervised Runner launch path
+- rely on `Core.init/3` to infer blank run state and emit the required
+  `:run_initialized` checkpoint
 - execute in the calling test process until terminal, failed, waiting, or step
   limit
 - call the configured checkpoint sink
@@ -681,22 +700,22 @@ the layer where it belongs and one integration test proving the layers connect.
 | Diagnostics | advisory warnings | blocking errors | typed failures | public errors |
 | Checkpoints | n/a | checkpoint metadata map | order and failure | callback path |
 | Interrupts | node capability | resume channel wiring | wait/resume | public resolution |
-| Resume | graph version metadata | graph/run match | hydrate run | crash recovery |
+| Resume | graph version metadata | graph/run match | `Core.init/3` infers saved state | crash recovery |
 | Layout | graph metadata | ignored by lowering | no effect | no effect |
 
 ## 12. Open Decisions
 
 The v1 implementation still needs to settle these testing details:
 
-- whether `Docket.Test.run_inline/3` accepts only `Docket.Graph` or also accepts
-  a precompiled `Docket.Graph.Runtime`
-- whether compiler reports are public structs or opaque maps with documented
-  accessors
 - whether checkpoint IDs are deterministic under injected ID generation
-- whether async checkpoint delivery remains in v1 and, if so, which tests are
-  default versus tagged
 - whether published graph immutability is enforced by Docket structs or remains
   host-owned convention with Docket helper support
+
+Resolved testing detail:
+
+- async checkpoint delivery remains in v1; default tests should cover accepted
+  async step checkpoints and observable async delivery failures without requiring
+  sleeps or external services
 
 Those decisions should be made before the end-of-v1 suite is considered
 complete.
