@@ -1,13 +1,18 @@
 # Docket: v1 Test Suite Design
 
-Status: draft
+Status: reference draft
 Date: 2026-06-26
 
 Related documents:
 
+- `docs/architecture/docket-v1-implementation-path.md`
 - `docs/architecture/docket-runtime-design.md`
 - `docs/architecture/docket-graph-construction-design.md`
 - `docs/architecture/docket-graph-execution-contract-design.md`
+
+Implementation note: use `docket-v1-implementation-path.md` as the active v1
+build sequence. This document owns the detailed test layers, fixtures, and
+coverage matrix.
 
 ## 1. Purpose
 
@@ -20,8 +25,8 @@ that:
 - users can build and edit canonical `Docket.Graph` documents
 - the compiler verifies and lowers those documents into executable runtime
   graphs
-- the inline runner can execute graph semantics in the calling test process
-- the supervised Runner uses the same execution core as the inline runner
+- the inline runtime can execute graph semantics in the calling test process
+- the supervised Runtime uses the same execution loop as the inline runtime
 - checkpoints and execution state can be tested with in-memory and ETS-backed
   test adapters
 
@@ -45,7 +50,7 @@ v1 tests follow these rules:
 - Construction helpers allow incomplete drafts. Compiler tests decide what is
   runnable.
 - Public tests assert public structs, diagnostics, checkpoints, runs, compiler
-  reports, and lowering maps. They do not assert private Runner process state.
+  reports, and lowering maps. They do not assert private Runtime process state.
 - Runtime algorithm tests may assert internal data only in internal test files.
   Public contract tests should stay stable across implementation refactors.
 - Fixtures are ordinary Elixir modules and graph values, not external files,
@@ -54,7 +59,7 @@ v1 tests follow these rules:
 LangGraph's test suite is useful as a pattern: it compiles small graphs, asserts
 graph projections, then runs the compiled graph to prove the builder/runtime
 link works. Docket should make that bridge more explicit because
-`Docket.Graph` and `Docket.RuntimeGraph` are intentionally separate.
+`Docket.Graph` and `Docket.Runtime.Graph` are intentionally separate.
 
 ## 3. Test Layers
 
@@ -68,12 +73,13 @@ They verify:
 
 - `Docket.Graph.new/1` creates a canonical draft graph with stable IDs
 - `input/3`, `field/3`, `output/3`, `node/4`, `edge/4`, `join/4`, `branch/3`,
-  `policy/3`, and metadata/layout helpers update the graph document
+  `policy/3`, and metadata helpers update the graph document
 - `put_*`, `update_*`, and `delete_*` helpers preserve stable IDs where
   appropriate
 - incomplete drafts are representable and carry advisory diagnostics
 - published graph documents are not mutated in ordinary editing flows
-- layout and UI metadata are preserved but do not affect runtime semantics
+- UI layout and editor projection state are host-owned and not part of Docket
+  graph documents
 - malformed arguments that cannot be represented as graph data return hard
   errors or raise according to the public API contract
 
@@ -82,7 +88,7 @@ document can be built, edited, inspected, and saved by a host application.
 
 ### 3.2 Compiler Tests
 
-Compiler tests cover `Docket.Graph -> Docket.RuntimeGraph`.
+Compiler tests cover `Docket.Graph -> Docket.Runtime.Graph`.
 
 They verify:
 
@@ -90,9 +96,14 @@ They verify:
 - inputs lower to input channels
 - state fields lower to state channels with the intended reducer
 - outputs lower to output projections
-- public nodes lower to `Docket.RuntimeGraph.CompiledNode` values
+- public nodes lower to `Docket.Runtime.Graph.Node` values
 - node `reads` lower to readable runtime channels
 - node `writes` lower to runtime write permissions
+- node config validates against the node behaviour's config schema
+- dynamic node ports are derived from normalized config
+- input/output port bindings lower to runtime channel bindings
+- binding validation checks compatibility between graph field schemas and node
+  port schemas
 - simple edges lower to generated ephemeral activation channels
 - source nodes receive generated system writes for outgoing edge channels
 - target nodes subscribe to generated activation channels
@@ -108,7 +119,7 @@ They verify:
   and cycles without an explicit v1 limit or halt condition
 
 Compiler tests are the bridge suite. They should assert exact lowering shape
-where Docket needs a stable internal contract between builder and runner.
+where Docket needs a stable internal contract between builder and runtime.
 
 ### 3.3 Compiler Integration Tests
 
@@ -126,7 +137,7 @@ Docket.Graph fixture
 The integration suite should also include direct compiled-runtime entry tests:
 
 ```text
-Docket.RuntimeGraph fixture
+Docket.Runtime.Graph fixture
   -> Docket.Test.run_inline/3
   -> assertions on Docket.Run, checkpoints, events, and outputs
 ```
@@ -166,24 +177,24 @@ They verify:
 Inline tests should be the default for ordinary execution behavior. They are
 fast, deterministic, and do not depend on BEAM scheduling.
 
-### 3.5 Supervised Runner Tests
+### 3.5 Supervised Runtime Tests
 
 Supervised tests cover process behavior that inline tests cannot.
 
 They verify:
 
-- `Docket.run/4` starts or locates a Runner through the registry/supervisor
-- only one active Runner owns a run ID
-- `get_run/3` reads only active Runner state
-- finished or evicted runs return `{:error, :not_found}` when no Runner owns
+- `Docket.run/4` starts or locates a Runtime through the registry/supervisor
+- only one active Runtime owns a run ID
+- `get_run/3` reads only active Runtime state
+- finished or evicted runs return `{:error, :not_found}` when no Runtime owns
   them
-- Runner crashes can resume from the latest ETS-backed checkpoint
+- Runtime crashes can resume from the latest ETS-backed checkpoint
 - task executor completions are correlated by task ID, attempt, and input hash
 - stale task completions are ignored
 - timeouts become node attempt failures
 - checkpoint callback failures block sync checkpoint commits
 - async checkpoint delivery failures are observable without blocking the active
-  Runner
+  Runtime
 
 Supervised tests may use real processes, monitors, unique registries, and
 supervisors. They still must not use external services.
@@ -255,7 +266,7 @@ Initial assertions:
 - a fresh graph has an ID, schema version, empty collections, and diagnostics
 - adding input, field, node, edge, output updates the graph document
 - incomplete graphs are valid draft data but not runnable
-- layout metadata can be changed without changing semantic graph fields
+- graph construction tests do not require or inspect UI layout metadata
 - deleting a node removes or diagnoses affected edges according to the chosen
   public contract
 
@@ -275,8 +286,8 @@ Initial assertions:
 - `unknown_read/0` fails with a diagnostic path to the public node read
 - `unknown_write/0` fails with a diagnostic path to the public node write
 - simple edges produce generated activation channels
-- source compiled nodes have system writes for outgoing edges
-- target compiled nodes subscribe to incoming generated edge channels
+- source runtime graph nodes have system writes for outgoing edges
+- target runtime graph nodes subscribe to incoming generated edge channels
 - compiler reports map public node, edge, input, field, and output IDs to
   runtime IDs
 
@@ -285,17 +296,18 @@ Initial assertions:
 Create:
 
 ```text
-test/docket/test/inline_runner_test.exs
-test/docket/runner/inline_execution_test.exs
-test/docket/runner/checkpoint_order_test.exs
+test/docket/test/inline_runtime_test.exs
+test/docket/runtime/inline_execution_test.exs
+test/docket/runtime/checkpoint_order_test.exs
 ```
 
 Initial assertions:
 
 - `Docket.Test.run_inline/3` runs `minimal_linear/0` in the calling test process
 - accepted checkpoints are returned to the test
-- inline execution initializes through `Docket.Runner.Core.init/3`
-- `Core.init/3` infers blank run state without an extra caller-supplied flag
+- inline execution initializes through `Docket.Runtime.Loop.init/3`
+- `Loop.init/3` infers fresh versus saved execution from the supplied run
+  without an extra caller-supplied flag
 - `:run_initialized` is emitted before any node execution
 - `:run_completed` is emitted only after terminal detection
 - the checkpoint sink receives the same checkpoints returned by the inline
@@ -315,7 +327,7 @@ Initial assertions:
 
 - each test creates a private ETS table or a private owner key
 - accepted checkpoints can be inserted, listed, and fetched by run ID
-- latest run snapshot is read from the latest checkpoint
+- latest run document is read from the latest checkpoint
 - no test starts Ecto or a Repo
 - ETS data is cleaned up by `on_exit/1`
 
@@ -346,7 +358,7 @@ test/docket/channel/
   barrier_test.exs
   reducer_validation_test.exs
 
-test/docket/runner/
+test/docket/runtime/
   inline_execution_test.exs
   superstep_test.exs
   barrier_visibility_test.exs
@@ -360,13 +372,13 @@ test/docket/runner/
 
 test/docket/supervised/
   runtime_start_test.exs
-  runner_registry_test.exs
-  runner_lifecycle_test.exs
+  runtime_registry_test.exs
+  runtime_lifecycle_test.exs
   task_executor_test.exs
   crash_recovery_test.exs
 
 test/docket/test/
-  inline_runner_test.exs
+  inline_runtime_test.exs
   fixtures_test.exs
   memory_checkpoint_sink_test.exs
   ets_checkpoint_sink_test.exs
@@ -467,11 +479,6 @@ decide -> finish when count >= limit
 
 Proves cycles, guards, and max-superstep protection.
 
-`layout_only_change/0`
-
-Same semantic graph as `minimal_linear/0`, but with changed layout metadata.
-Proves layout does not affect compiler lowering.
-
 ### 6.2 Node Fixtures
 
 Test nodes should be ordinary modules under `test/support/fixtures`.
@@ -515,7 +522,7 @@ write to Repo, disk, or external services.
 
 ```elixir
 Docket.Test.run_inline(graph_or_runtime_graph, input, opts \\ [])
-Docket.Test.step_inline(run_or_state, opts \\ [])
+Docket.Test.step_inline(run, opts \\ [])
 ```
 
 Return shape:
@@ -528,15 +535,15 @@ Return shape:
 `run_inline/3` should:
 
 - accept either a canonical `Docket.Graph` or a precompiled
-  `Docket.RuntimeGraph`
+  `Docket.Runtime.Graph`
 - compile `Docket.Graph` inputs through the same compiler path used by the
-  supervised Runner
-- run precompiled `Docket.RuntimeGraph` inputs directly while preserving the
-  same core execution semantics
-- create the initial run snapshot
-- initialize execution through `Docket.Runner.Core.init/3`, matching the
-  supervised Runner launch path
-- rely on `Core.init/3` to infer blank run state and emit the required
+  supervised Runtime
+- run precompiled `Docket.Runtime.Graph` inputs directly while preserving the
+  same loop execution semantics
+- create the initial run document
+- initialize execution through `Docket.Runtime.Loop.init/3`, matching the
+  supervised Runtime launch path
+- rely on `Loop.init/3` to infer fresh execution and emit the required
   `:run_initialized` checkpoint
 - execute in the calling test process until terminal, failed, waiting, or step
   limit
@@ -549,8 +556,8 @@ Return shape:
 - return after the checkpoint for that step is accepted
 - return the updated public run and accepted checkpoint list
 
-The inline helper must call the same compiler, core, algorithm, reducer,
-validation, and checkpoint-building code as the supervised Runner.
+The inline helper must call the same compiler, loop, algorithm, reducer,
+validation, and checkpoint-building code as the supervised Runtime.
 
 ### 7.2 Test-Only Convenience Helpers
 
@@ -590,7 +597,7 @@ ETS is the default persistence tool for execution-state tests.
 Use ETS for:
 
 - checkpoint sink storage
-- latest run snapshots derived from checkpoints
+- latest run documents derived from checkpoints
 - supervised recovery tests
 - idempotency and duplicate checkpoint tests
 - small host-like lookup helpers used only in tests
@@ -660,7 +667,7 @@ Default v1 tests must not start or require:
 - browser automation
 
 If future adapter packages need database contract tests, those tests should live
-outside the core default suite or be explicitly tagged. The core Docket v1 suite
+outside the loop default suite or be explicitly tagged. The loop Docket v1 suite
 should remain runnable on a clean machine with only Elixir dependencies fetched
 by the project.
 
@@ -678,7 +685,7 @@ The sequence should be:
    edge, output projection.
 6. Expand inline runtime semantics: barriers, reducers, checkpoint ordering,
    interrupts, retry, failure, resume.
-7. Add supervised Runner tests only after the inline semantics are stable.
+7. Add supervised Runtime tests only after the inline semantics are stable.
 8. Add crash recovery with ETS-backed checkpoint state.
 9. Add regression fixtures for bugs found during v1 implementation.
 10. Keep `mix test` dependency-free throughout.
@@ -692,16 +699,15 @@ the layer where it belongs and one integration test proving the layers connect.
 | --- | --- | --- | --- | --- |
 | Inputs and fields | graph document | channels and schemas | initial values | start API |
 | Outputs | graph document | output projection | returned run/output | public wrappers |
-| Nodes | public node records | compiled nodes | node input/output | executor dispatch |
-| Simple edges | edge records | activation channels | sequential activation | runner tick |
+| Nodes | public node records | runtime graph nodes | node input/output | executor dispatch |
+| Simple edges | edge records | activation channels | sequential activation | runtime tick |
 | Fan-out | edge records | generated channels | parallel step | task executor |
 | Join | join record | barrier lowering | waits for all sources | task completion order |
-| Guards | guard expression | guard validation | committed-state reads | runner scheduling |
+| Guards | guard expression | guard validation | committed-state reads | runtime scheduling |
 | Diagnostics | advisory warnings | blocking errors | typed failures | public errors |
 | Checkpoints | n/a | checkpoint metadata map | order and failure | callback path |
 | Interrupts | node capability | resume channel wiring | wait/resume | public resolution |
-| Resume | graph version metadata | graph/run match | `Core.init/3` infers saved state | crash recovery |
-| Layout | graph metadata | ignored by lowering | no effect | no effect |
+| Resume | graph version metadata | graph/run match | `Loop.init/3` infers saved state | crash recovery |
 
 ## 12. Open Decisions
 

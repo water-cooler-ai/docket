@@ -1,7 +1,11 @@
 # Docket: Elixir Durable Graph Runtime Library Design
 
-Status: draft
+Status: reference draft
 Date: 2026-06-25
+
+Implementation note: use `docs/architecture/docket-v1-implementation-path.md`
+as the active v1 build sequence. This document is background and rationale for
+the runtime model.
 
 ## 1. Executive Summary
 
@@ -14,7 +18,7 @@ consumer, but the abstraction should be useful to any Elixir system that needs
 to run cyclic, parallel, stateful graphs with checkpoints, streaming updates,
 human interrupts, remote execution, and replay.
 
-The core idea is:
+The central idea is:
 
 ```text
 One process owns one active graph run.
@@ -32,8 +36,8 @@ remote execution, supervision, and fault containment.
 The recommended architecture is:
 
 ```text
-Pregel-style execution core
-  + Beam-style graph/channel/runner abstractions
+Pregel-style execution loop
+  + Beam-style graph/channel/runtime abstractions
   + Temporal-style event history and replay discipline
   + Flink-style checkpoint barrier thinking
   + Timely-style logical timestamps and progress tracking
@@ -102,21 +106,21 @@ Useful ideas for this library:
 - Built-in channel families include last value, topics, and aggregates.
 - Cycles are first-class.
 - Interrupts, checkpoint callbacks, streams, and retry policies belong around
-  the core runtime.
+  the runtime loop.
 
 Source: https://docs.langchain.com/oss/python/langgraph/pregel
 
 ### 3.3 Apache Beam
 
 Apache Beam defines pipelines as graphs of PTransforms over PCollections. The
-same abstractions cover bounded and unbounded data. Beam also has a runner model,
+same abstractions cover bounded and unbounded data. Beam also has a runtime model,
 windowing, triggers, state, timers, side inputs, multiple outputs, and splittable
 work.
 
 Useful ideas for this library:
 
 - A graph definition should be portable across execution backends.
-- A runner should execute a graph without changing graph semantics.
+- A runtime should execute a graph without changing graph semantics.
 - Data collections/channels should declare boundedness, accumulation, and
   windowing semantics.
 - User functions should satisfy serialization, idempotence, and replay-friendly
@@ -191,7 +195,7 @@ Sources:
 
 Airflow models workflows as DAGs with tasks, dependencies, schedules, retries,
 branching, and task instances. This is useful for scheduled batch orchestration,
-but less suitable as the core model for agentic loops because cycles and
+but less suitable as the execution model for agentic loops because cycles and
 long-lived state are not natural in a DAG.
 
 Useful ideas for this library:
@@ -258,23 +262,23 @@ Sources:
 10. Do not start with full Beam-style windows, watermarks, and splittable DoFns.
     Design for them, implement the minimal useful subset first.
 
-## 6. Core Mental Model
+## 6. Runtime Mental Model
 
 ```text
 Graph definition:
   Canonical Docket.Graph document describing fields, nodes, edges, reducers,
-  policies, and layout. Published versions are host-owned and immutable.
+  and policies. Published versions are host-owned and immutable.
 
 Graph edit/build:
   Application or product code creates and updates canonical Docket.Graph values
   through Docket's graph API.
 
 Run document:
-  Canonical Docket.Run snapshot document emitted at checkpoints.
+  Canonical Docket.Run state document emitted at checkpoints.
   The host application saves it and passes it back to Docket for resume/retry.
 
 Runtime graph:
-  Internal Docket.RuntimeGraph materialized from Docket.Graph for one Runner.
+  Internal Docket.Runtime.Graph materialized from Docket.Graph for one run.
 
 Graph run:
   One execution of a graph definition with input, internal run state, events,
@@ -358,8 +362,9 @@ Docket.Graph
 Docket.Node
 Docket.Channel
 Docket.Run
-Docket.Runner
-Docket.RunnerSupervisor
+Docket.Runtime
+Docket.Runtime.Registry
+Docket.Runtime.Supervisor
 Docket.Checkpoint
 Docket.Executor
 Docket.Event
@@ -368,22 +373,23 @@ Docket.Graph.Compiler
 ```
 
 Post-v1 modules can add first-class telemetry, streaming, timers, and related
-inspection surfaces without changing the v1 execution core.
+inspection surfaces without changing the v1 execution loop.
 
 Runtime-internal graph modules:
 
 ```text
-Docket.RuntimeGraph
-Docket.RuntimeGraph.CompiledNode
-Docket.RuntimeGraph.ChannelDef
+Docket.Runtime.Graph
+Docket.Runtime.Graph.Node
+Docket.Runtime.Graph.Channel
+Docket.Runtime.Graph.Lowering
 ```
 
-`Docket.RuntimeGraph` is top-level by design: it is the executable
-materialization of a public graph, not a nested public graph document type.
+`Docket.Runtime.Graph` lives under `Docket.Runtime` by design: it is the
+executable materialization of a public graph, not a public graph document type.
 
 Docket owns graph construction and graph execution. Application code interfaces
-with canonical `Docket.Graph` values. The low-level Runner consumes internal
-`Docket.RuntimeGraph` values materialized from those canonical graphs.
+with canonical `Docket.Graph` values. The supervised Runtime consumes internal
+`Docket.Runtime.Graph` values materialized from those canonical graphs.
 `Docket.Graph.Compiler` is the single compiler module; `compile/2` returns the
 runtime graph, while verification and explanation functions only prove or
 describe compilability.
@@ -395,7 +401,7 @@ product UIs, produced by workflow compilers, and stored by host applications.
 Published graph versions should be immutable and append-only from the host
 application's perspective.
 
-Docket lowers the canonical graph into `Docket.RuntimeGraph` when it needs to
+Docket lowers the canonical graph into `Docket.Runtime.Graph` when it needs to
 verify a publish or start a run. The host application should not assemble
 runtime graph internals or persist ad hoc runtime structure outside Docket.
 
@@ -413,7 +419,6 @@ defmodule Docket.Graph do
     edges: %{},
     joins: %{},
     branches: %{},
-    layout: %{},
     metadata: %{},
     policies: %{}
   ]
@@ -423,7 +428,7 @@ end
 The runtime materialization is internal:
 
 ```elixir
-defmodule Docket.RuntimeGraph do
+defmodule Docket.Runtime.Graph do
   defstruct [
     :id,
     :version,
@@ -457,10 +462,10 @@ but it does not require the host application to project graph fields into
 first-class database columns. A host may add projection columns, hashes, or
 expression indexes if it needs operational queries.
 
-### 8.1 Compiled Runtime Node
+### 8.1 Runtime Graph Node
 
 ```elixir
-defmodule Docket.RuntimeGraph.CompiledNode do
+defmodule Docket.Runtime.Graph.Node do
   defstruct [
     :id,
     :module,
@@ -472,6 +477,9 @@ defmodule Docket.RuntimeGraph.CompiledNode do
     :cache,
     :on_error,
     config: %{},
+    ports: nil,
+    input_bindings: %{},
+    output_bindings: %{},
     subscribe: [],
     read: [],
     write: [],
@@ -487,21 +495,25 @@ Fields:
 - `module` / `function`: local implementation, if any.
 - `executor`: local, remote, task queue, MCP, HTTP, or custom adapter.
 - `guard`: compiled guard expression evaluated against committed channel state.
+- `ports`: normalized node input/output port schemas after config defaults.
+- `input_bindings`: input port IDs mapped to readable runtime channels.
+- `output_bindings`: output port IDs mapped to writable runtime channels.
 - `subscribe`: channels whose version changes activate the node.
 - `read`: additional channels visible to the node without activating it.
 - `write`: channels the node may update.
-- `system_writes`: compiler-generated activation writes emitted by the runner.
+- `system_writes`: compiler-generated activation writes emitted by the runtime.
 - `timeout`: node execution timeout.
 - `retry`: retry policy.
 - `cache`: optional deterministic memoization policy.
 - `on_error`: fail run, write error channel, retry, skip, or route.
-- `config`: node-facing configuration copied into `Docket.Node.Input`.
+- `config`: normalized node-facing configuration copied into
+  `Docket.Node.Input`.
 - `metadata`: application-owned data plus public ID mapping.
 
-### 8.2 Runtime Channel Definition
+### 8.2 Runtime Graph Channel
 
 ```elixir
-defmodule Docket.RuntimeGraph.ChannelDef do
+defmodule Docket.Runtime.Graph.Channel do
   defstruct [
     :id,
     :type,
@@ -638,44 +650,34 @@ For v1, Docket does not generate branch-specific runtime channels such as
 
 ## 9. Active Run State
 
-One active run is owned by one Runner process.
+One active run is owned by one Runtime process.
 
-The Runner keeps both the immutable graph definition and mutable run state in
-memory while it is active:
+The Runtime keeps the materialized runtime graph and the current `Docket.Run` in
+memory while it is active. There is no second durable runtime-state model. The
+run is the execution state document.
 
-```elixir
-defmodule Docket.Runner.State do
-  defstruct [
-    :graph,
-    :run
-  ]
-end
-```
+`Docket.Runtime.Graph` is derived from the canonical `Docket.Graph` document
+passed to `run`, `resume`, or `retry`. `Docket.Run` is the durable document that
+is advanced through checkpoint emissions. A new public `run` call first builds a
+fresh `Docket.Run` from input; resume passes the durable run loaded by the host.
+`Docket.Runtime.Loop.init/3` inspects the supplied run to decide whether to
+initialize a fresh run or continue a saved run.
 
-`graph` is the internal `Docket.RuntimeGraph` materialized from the canonical
-`Docket.Graph` document passed to `run`, `resume`, or `retry`. `run` is the
-structured Docket-owned `%Docket.Run.State{}` stored in a public `Docket.Run`
-document, then advanced through checkpoint emissions. A new public `run` call
-first builds a `Docket.Run` with blank Docket-owned state from input; resume
-passes the durable run loaded by the host. `Docket.Runner.Core.init/3` inspects
-that run state to decide whether to initialize from blank state or hydrate from
-existing state.
-
-`Docket.Run.State` is opaque by ownership and typespec, not by shape. It should
-be a real struct with nested structs for channel, task, interrupt, and timer
-state. Host applications persist and pass it back, but they do not construct,
-pattern match, mutate, or depend on its fields.
+`Docket.Run` should be a real struct with nested structs for channel, task,
+interrupt, and timer records where useful. Host applications persist and pass it
+back, but they do not construct, pattern match, mutate, or depend on
+Docket-owned execution internals.
 
 ```elixir
-defmodule Docket.Run.State do
-  @opaque t :: %__MODULE__{}
-
+defmodule Docket.Run do
   defstruct [
-    :run_id,
+    :id,
     :graph_id,
     :graph_version,
     :status,
-    :superstep,
+    :step,
+    :input,
+    :output,
     :started_at,
     :updated_at,
     :finished_at,
@@ -695,20 +697,19 @@ end
 ```
 
 If a host stores runs in a format that cannot persist Elixir structs directly,
-Docket should provide explicit codecs rather than making `Docket.Run.state` a
-dynamic map:
+Docket should provide explicit codecs rather than making hosts treat the run as
+a public map contract:
 
 ```elixir
-Docket.Run.State.dump(%Docket.Run.State{}) ::
+Docket.Run.dump(%Docket.Run{}) ::
   {:ok, map()} | {:error, term()}
 
-Docket.Run.State.load(map() | %Docket.Run.State{}) ::
-  {:ok, %Docket.Run.State{}} | {:error, term()}
+Docket.Run.load(map() | %Docket.Run{}) ::
+  {:ok, %Docket.Run{}} | {:error, term()}
 ```
 
 The dumped representation may be a map at the storage boundary. The public
-runtime API and in-memory `Docket.Run.state` remain structured
-`%Docket.Run.State{}` values.
+runtime API and in-memory state remain structured `%Docket.Run{}` values.
 
 ### 9.1 Channel State
 
@@ -790,13 +791,13 @@ Default v1 topology:
 
 ```text
 Application supervisor
-  Docket.RunnerRegistry
-  Docket.RunnerSupervisor
+  Docket.Runtime.Registry
+  Docket.Runtime.Supervisor
   Docket.ExecutorSupervisor
 
-Runner process per active run
+Runtime process per active run
   owns immutable runtime graph materialized from the supplied Docket.Graph
-  owns Run.State
+  keeps the current Docket.Run in memory
   owns step planning
   owns update barriers
   emits Docket.Checkpoint documents
@@ -804,10 +805,10 @@ Runner process per active run
 
 Executor tasks or pools
   run node code
-  report results back to Runner
+  report results back to Runtime
 ```
 
-The Runner is the only process allowed to mutate a run.
+The Runtime is the only process allowed to mutate a run.
 
 PIDs do not leave the library API. Callers use `run_id`, `graph_id`, and
 application scopes.
@@ -869,15 +870,15 @@ writes produced by tasks in the same superstep.
 
 ### 11.2 Execution
 
-The Runner dispatches each selected node with a consistent snapshot.
+The Runtime dispatches each selected node with a consistent snapshot.
 
 ```elixir
 %Docket.Node.Input{
   run_id: run_id,
   node_id: node_id,
   superstep: step,
-  values: readable_channel_values,
-  versions: readable_channel_versions,
+  inputs: resolved_port_values,
+  source_versions: source_channel_versions_by_port,
   context: application_context,
   config: node_config,
   attempt: attempt,
@@ -889,9 +890,9 @@ The node returns:
 
 ```elixir
 {:ok, %Docket.Node.Output{
-  writes: [
-    %Docket.Write{channel: "plan", value: %{...}}
-  ],
+  outputs: %{
+    "plan" => %{...}
+  },
   commands: [
     %Docket.Command{type: :schedule_timer, payload: %{...}}
   ],
@@ -1128,10 +1129,10 @@ On replay:
 ## 15. Persistence Model
 
 Docket should support durable applications without owning their storage schema.
-The core persistence model is document-shaped:
+The persistence model is document-shaped:
 
 - `Docket.Graph` is the graph definition document.
-- `Docket.Run` is the restorable run snapshot document.
+- `Docket.Run` is the restorable run state document.
 - `Docket.Checkpoint` is the callback payload emitted when the run reaches a
   committed runtime moment.
 
@@ -1215,10 +1216,10 @@ end
 
 For durable usage, checkpoint delivery has two modes:
 
-- `:sync`: `Docket.Runner.Core` waits for the checkpoint callback to return
+- `:sync`: `Docket.Runtime.Loop` waits for the checkpoint callback to return
   `:ok` before committing the transition or reporting success to a related
   public API.
-- `:async`: `Docket.Runner.Core` commits the in-memory transition, submits
+- `:async`: `Docket.Runtime.Loop` commits the in-memory transition, submits
   checkpoint delivery in the background, and continues execution.
 
 Required lifecycle and public API gate checkpoints should use `:sync`. Ordinary
@@ -1229,24 +1230,24 @@ as `:sync`.
 
 The golden path is still to save `checkpoint.run` and pass that run document
 back to Docket after a crash. With async step checkpoints, the durable run may
-lag behind the active in-memory Runner until the host accepts those checkpoint
+lag behind the active in-memory Runtime until the host accepts those checkpoint
 deliveries.
 
-Run initialization follows the same rule. `Docket.run/4` builds the initial
-`Docket.Run` document with blank Docket-owned state and launches the Runner with
-that run. `Docket.resume/4` launches the Runner with a durable `Docket.Run`
-supplied by the host. Both paths call `Docket.Runner.Core.init/3`, and the core
-infers the path from the run state rather than an explicit mode.
+Run initialization follows the same rule. `Docket.run/4` builds a fresh
+`Docket.Run` document from input and launches the Runtime with that run.
+`Docket.resume/4` launches the Runtime with a durable `Docket.Run` supplied by
+the host. Both paths call `Docket.Runtime.Loop.init/3`, and the loop infers the
+path from the supplied run document rather than an explicit mode.
 
-For any non-terminal run it is going to execute, `Core.init/3` produces an
-initialized public run snapshot and emits a required `:run_initialized`
+For any non-terminal run it is going to execute, `Loop.init/3` produces an
+initialized public run document and emits a required `:run_initialized`
 checkpoint before any node execution, event publication, interrupt, timer, or
 later step checkpoint can occur. The checkpoint handler upserts by
 `Docket.Run.id`: a new run creates the host row, and a resumed run updates the
 existing host row. If the initialization checkpoint fails, execution has not
 started and callers receive a checkpoint error.
 
-Starting a Runner process is not graph progress by itself. `Docket.Run.status`
+Starting a Runtime process is not graph progress by itself. `Docket.Run.status`
 describes graph execution state, not process liveness, so resume must not
 blindly flip a waiting, running, done, failed, or cancelled run to `:running`.
 If a supplied run is already terminal, initialization should return the terminal
@@ -1270,7 +1271,15 @@ be safe to receive the same checkpoint more than once.
   step: 12,
   input: input,
   output: nil,
-  state: %Docket.Run.State{},
+  channels: %{},
+  channel_versions: %{},
+  changed_channels: MapSet.new(),
+  active_tasks: %{},
+  pending_writes: [],
+  interrupts: %{},
+  timers: %{},
+  checkpoint_seq: 0,
+  event_seq: 0,
   metadata: metadata,
   started_at: started_at,
   updated_at: updated_at,
@@ -1279,11 +1288,12 @@ be safe to receive the same checkpoint more than once.
 ```
 
 Apps may inspect top-level fields such as `id`, `graph_id`, `graph_version`,
-`status`, `step`, `input`, `output`, and timestamps. `state` is structured
-Docket-owned resume data. Apps should persist it but not interpret, pattern
-match, mutate, or rebuild it. Code that needs an external storage format should
-use `Docket.Run.State.dump/1` and `Docket.Run.State.load/1` rather than treating
-the state as a public map contract.
+`status`, `step`, `input`, `output`, and timestamps. The run also contains
+Docket-owned execution data such as channels, tasks, interrupts, timers, and
+checkpoint counters. Apps should persist the run but not interpret, pattern
+match, mutate, or rebuild Docket-owned execution internals. Code that needs an
+external storage format should use `Docket.Run.dump/1` and `Docket.Run.load/1`
+rather than treating the run as a public map contract.
 
 The crucial persist/resume path should stay simple:
 
@@ -1351,7 +1361,7 @@ Events are emitted with checkpoints. Apps that need replay, time travel,
 debugging, or audit history may persist `checkpoint.events`. Apps that only need
 crash resume may persist only the latest `checkpoint.run`. Async
 `checkpoint.events` delivery is observational; failure to persist an async event
-envelope must not mutate or roll back the active in-memory Runner.
+envelope must not mutate or roll back the active in-memory Runtime.
 
 ### 15.5 Checkpoint Shape
 
@@ -1367,7 +1377,7 @@ envelope must not mutate or roll back the active in-memory Runner.
 }
 ```
 
-The checkpoint is not an internal runner dump. It is the public notification
+The checkpoint is not an internal runtime dump. It is the public notification
 that a runtime moment committed, and it carries the latest restorable
 `Docket.Run` document.
 
@@ -1430,13 +1440,13 @@ canonical graph it started with:
 - graph ID
 - graph version
 
-On runner start, the host passes a canonical `Docket.Graph` document to Docket.
+On runtime start, the host passes a canonical `Docket.Graph` document to Docket.
 On resume, retry, replay, and time travel, the host passes both the graph
 document and the `Docket.Run` document or historical checkpoint/event document
 it wants Docket to hydrate from. Docket then materializes the internal
-`Docket.RuntimeGraph` value and initializes core state through
-`Docket.Runner.Core.init/3`. A live Runner keeps that materialized runtime graph
-in memory. It does not recompile the graph on every superstep.
+`Docket.Runtime.Graph` value and initializes or continues the run through
+`Docket.Runtime.Loop.init/3`. A live Runtime keeps that materialized runtime
+graph in memory. It does not recompile the graph on every superstep.
 
 The canonical graph document stores the metadata needed to understand how it was
 produced and how it should be interpreted:
@@ -1445,7 +1455,7 @@ produced and how it should be interpreted:
 - origin identifier and version, when available
 - public field, node, edge, and output definitions
 - node implementation references
-- policies and layout metadata
+- policies and runtime-relevant metadata
 
 Graph metadata is not run state. The runtime can inspect graph metadata before
 executing. Host applications may project selected metadata into database columns
@@ -1535,12 +1545,12 @@ children = [
 ]
 ```
 
-Core adapters are runtime configuration. Individual graph runs may pass input,
-context, limits, or policy overrides, but they should not need to repeat the
-checkpoint handler or executor unless the host intentionally runs multiple named
-Docket runtimes.
+Configured adapters are runtime configuration. Individual graph runs may pass
+input, context, limits, or policy overrides, but they should not need to repeat
+the checkpoint handler or executor unless the host intentionally runs multiple
+named Docket runtimes.
 
-The core library must not create atoms from untrusted strings. All graph record
+The library must not create atoms from untrusted strings. All graph record
 IDs are binaries in v1, including graph, input, field, output, node, edge, join,
 and branch IDs. Runtime-generated channel IDs are also binaries. Existing atoms
 may still appear as ordinary Elixir enum/status/config values, but they are not
@@ -1554,6 +1564,13 @@ Graph compile validation should reject:
 - duplicate channel IDs
 - node subscriptions to missing channels
 - node writes to missing channels
+- invalid node config
+- invalid node port schemas
+- missing required input or output bindings
+- input bindings whose source channel schema is incompatible with the node input
+  port schema
+- output bindings whose target channel schema is incompatible with the node
+  output port schema
 - invalid output channels
 - invalid input channels
 - reducers that are not modules/functions accepted by policy
@@ -1566,6 +1583,9 @@ Runtime validation should reject:
 - writes to undeclared channels
 - writes whose update shape does not match channel schema
 - writes from nodes not authorized to write that channel
+- resolved node inputs that do not match node input port schemas
+- returned node outputs that do not match node output port schemas
+- returned outputs that have no compiled output binding
 - channel values larger than configured limits
 - too many writes in one superstep
 - supersteps beyond max limit
@@ -1626,14 +1646,14 @@ Retries must preserve task identity and attempt number.
 
 ### 20.3 Crash Recovery
 
-If the Runner crashes:
+If the Runtime crashes:
 
-1. Supervisor restarts or caller lazily starts Runner.
+1. Supervisor restarts or caller lazily starts Runtime.
 2. Host loads the latest saved `Docket.Run` document and matching
    `Docket.Graph` document.
 3. Host calls `Docket.resume/4` or `MyApp.Docket.resume/3`.
-4. Runner calls `Docket.Runner.Core.init/3` with the saved run.
-5. Runner reconciles active tasks.
+4. Runtime calls `Docket.Runtime.Loop.init/3` with the saved run.
+5. Runtime reconciles active tasks.
 6. Completed effects are reused from event history if the host saved it.
 7. Lost in-flight effects are retried or marked unknown according to executor
    policy.
@@ -1717,7 +1737,7 @@ Backpressure exists at several layers:
 - per-channel retention limits
 - global scheduler capacity
 
-The core Runner can dispatch to `Task.Supervisor` for v1. For high-throughput
+The Runtime can dispatch to `Task.Supervisor` for v1. For high-throughput
 or queue-backed workloads, an Executor adapter can use GenStage or Broadway.
 
 Scheduling policies:
@@ -1742,7 +1762,7 @@ The public API should follow common Elixir library shape:
 - named runtimes for applications that need more than one runtime instance
 - run operations addressed by runtime name and `run_id`, not PIDs
 - per-run options for input, context, limits, and policy overrides
-- core infrastructure adapters configured once at runtime startup
+- infrastructure adapters configured once at runtime startup
 - a small test helper API for pushing test runs and asserting committed events
 
 The child spec and test helper APIs should be documented before implementation.
@@ -1763,13 +1783,26 @@ defmodule Essay.Writer do
   @behaviour Docket.Node
 
   @impl true
-  def call(%Docket.Node.Input{values: %{topic: topic}} = input) do
+  def config_schema do
+    Docket.Schema.object(%{})
+  end
+
+  @impl true
+  def ports(_config) do
+    %Docket.Node.Ports{
+      inputs: %{"topic" => Docket.Schema.string(required: true)},
+      outputs: %{"draft" => Docket.Schema.string(required: true)}
+    }
+  end
+
+  @impl true
+  def call(%Docket.Node.Input{inputs: %{"topic" => topic}} = input) do
     {:ok,
      %Docket.Node.Output{
-       writes: [
-         Docket.Write.last_value("draft", "Essay about #{topic}")
-       ],
-       metadata: %{input_versions: input.versions}
+       outputs: %{
+         "draft" => "Essay about #{topic}"
+       },
+       metadata: %{source_versions: input.source_versions}
      }}
   end
 end
@@ -1789,7 +1822,7 @@ graph = MyApp.Graphs.fetch_docket_graph!("essay-review", version: 1)
 {:ok, current_run} = MyApp.Docket.get_run(run.id)
 ```
 
-`MyApp.Docket.get_run/2` reads the current in-memory run snapshot for an active run. It does
+`MyApp.Docket.get_run/2` reads the current in-memory run document for an active run. It does
 not read host storage and does not emit a checkpoint. It is observational; the
 latest accepted checkpoint remains the durable source of truth.
 
@@ -1804,32 +1837,32 @@ graph = MyApp.Graphs.fetch_docket_graph!(run.graph_id, run.graph_version)
 Docket.resolve_interrupt(MyApp.Docket, run.id, interrupt_id, %{"approved" => true})
 ```
 
-### 24.5 Test Helpers And Inline Runner
+### 24.5 Test Helpers And Inline Runtime
 
 See `docs/architecture/docket-v1-test-suite-design.md` for the full v1 test
 suite plan, including construction, compiler, inline execution, supervised
-runner, fixture, helper, and ETS-backed test adapter coverage.
+runtime, fixture, helper, and ETS-backed test adapter coverage.
 
 Most Docket runtime tests should not need to exercise supervision, GenServer
-mailboxes, or BEAM scheduling. Docket should expose an inline test runner that
-executes graph transitions in the calling test process while using the same core
-runtime logic as the supervised Runner.
+mailboxes, or BEAM scheduling. Docket should expose an inline test runtime that
+executes graph transitions in the calling test process while using the same loop
+runtime logic as the supervised Runtime.
 
 Proposed test API:
 
 ```elixir
 Docket.Test.run_inline(graph_or_runtime_graph, input, opts \\ [])
-Docket.Test.step_inline(state_or_run, opts \\ [])
+Docket.Test.step_inline(run, opts \\ [])
 ```
 
 `run_inline/3` should:
 
 - verify and compile a supplied `Docket.Graph`, or accept a precompiled
-  `Docket.RuntimeGraph`
+  `Docket.Runtime.Graph`
 - create the initial `Docket.Run`
-- initialize core execution through `Docket.Runner.Core.init/3`, letting the
-  core infer blank versus existing state from the run document
-- rely on `Core.init/3` to synchronously emit the required
+- initialize execution through `Docket.Runtime.Loop.init/3`, letting the loop
+  infer fresh versus saved execution from the run document
+- rely on `Loop.init/3` to synchronously emit the required
   `:run_initialized` checkpoint to the configured test checkpoint sink before
   any node execution it schedules
 - execute graph transitions in the calling process until the run reaches
@@ -1851,20 +1884,20 @@ after that step's sync checkpoint requirements have been accepted or failed.
 If the step emits an async checkpoint, the helper should drain it by default for
 assertions or let tests opt into non-drained async delivery.
 
-The inline runner is not a second interpreter. It must call the same plan,
+The inline runtime is not a second interpreter. It must call the same plan,
 execution, update, validation, reducer, and checkpoint-building code as the
-supervised Runner. The difference is only the shell:
+supervised Runtime. The difference is only the shell:
 
 ```text
-supervised Runner:
+supervised Runtime:
   GenServer process owns state and receives calls/messages
 
-inline test runner:
+inline test runtime:
   calling test process owns state for the duration of the helper
 ```
 
 Tests that only care about graph semantics, checkpoint ordering, reducers,
-guards, interrupts, and failure policy should use the inline runner. Tests that
+guards, interrupts, and failure policy should use the inline runtime. Tests that
 care about supervision, process lifecycle, crash recovery, late completions,
 remote executors, timers, or async awaits should use focused supervised or
 adapter-specific tests.
@@ -1876,14 +1909,14 @@ failed. Async checkpoint delivery should be drainable explicitly.
 
 ## 25. Executor Adapter
 
-Executors let the core runtime run node work locally, remotely, or through an
+Executors let the runtime run node work locally, remotely, or through an
 application-specific system.
 
 ```elixir
 defmodule Docket.Executor do
   @callback execute(
               task :: Docket.Run.TaskState.t(),
-              node :: Docket.RuntimeGraph.CompiledNode.t(),
+              node :: Docket.Runtime.Graph.Node.t(),
               input :: Docket.Node.Input.t(),
               opts :: keyword()
             ) ::
@@ -1908,7 +1941,7 @@ connected runtime without exposing the full graph.
 
 Docket's graph construction layer produces canonical `Docket.Graph` values.
 Application code, workflow compilers, and graph editors use that canonical graph
-shape. The Runner uses an internal `Docket.RuntimeGraph` value materialized
+shape. The Runtime uses an internal `Docket.Runtime.Graph` value materialized
 from the canonical graph when a run starts.
 
 Regardless of API shape, Docket owns graph normalization, advisory diagnostics,
@@ -2037,7 +2070,7 @@ Phase 1: Library skeleton
 
 - Create a standalone Mix package immediately, outside the WaterCooler app.
 - Implement graph document structs, channel behaviours, a checkpoint
-  handler/test collector, local executor, and a single Runner.
+  handler/test collector, local executor, and a single Runtime.
 - Add tests for Plan, Execution, Update semantics.
 
 Phase 2: Compatibility compiler
@@ -2126,7 +2159,7 @@ Problems:
 
 Recommendation:
 
-Support DAGs as a subset compiled to graph channels. Do not make DAGs the core
+Support DAGs as a subset compiled to graph channels. Do not make DAGs the loop
 runtime model.
 
 ### 28.3 Temporal-Style Code-First Workflow
@@ -2159,7 +2192,7 @@ Keep graph/channels as the primary model.
 Description:
 
 - PCollections and transforms are primary.
-- Runner decides execution backend.
+- Runtime decides execution backend.
 
 Benefits:
 
@@ -2175,7 +2208,7 @@ Problems:
 
 Recommendation:
 
-Borrow pipeline graph, runner abstraction, channel/window concepts, and user-code
+Borrow pipeline graph, runtime abstraction, channel/window concepts, and user-code
 requirements. Do not implement full Beam.
 
 ### 28.5 Flink-Style Stateful Stream Processor
@@ -2226,7 +2259,7 @@ frontiers and incremental recomputation later.
 
 Description:
 
-- Use GenStage/Broadway as the core runtime.
+- Use GenStage/Broadway as the primary runtime.
 
 Benefits:
 
@@ -2241,13 +2274,13 @@ Problems:
 
 Recommendation:
 
-Use GenStage/Broadway behind Executor adapters or schedulers, not as the core
+Use GenStage/Broadway behind Executor adapters or schedulers, not as the primary
 graph state model.
 
 ## 29. Resolved v1 Scope
 
 The v1 implementation should be the smallest durable graph runtime that proves
-the graph construction, compiler, runner, checkpoint, retry, and crash-recovery
+the graph construction, compiler, runtime, checkpoint, retry, and crash-recovery
 contracts.
 
 Included in v1:
@@ -2255,17 +2288,17 @@ Included in v1:
 1. Canonical `Docket.Graph` and `Docket.Run` public documents.
 2. Binary-only graph IDs and binary runtime-generated channel IDs.
 3. Functional graph editing helpers for inputs, fields, outputs, nodes, edges,
-   joins, branches, policies, metadata, and layout.
+   joins, branches, policies, and metadata.
 4. `Docket.Graph.Compiler.verify/2`, `explain/2`, and `compile/2`.
-5. Internal `Docket.RuntimeGraph` materialization for inputs, state fields,
-   outputs, compiled nodes, simple edges, fan-out, joins, branches, generated
+5. Internal `Docket.Runtime.Graph` materialization for inputs, state fields,
+   outputs, runtime graph nodes, simple edges, fan-out, joins, branches, generated
    activation channels, guards, and barrier channels.
 6. Built-in channel support required by that runtime path:
    - `LastValue`
    - `Ephemeral` edge activation channels
    - internal barrier channels for joins
-7. One Runner process per active run plus a shared execution core used by the
-   supervised Runner and `Docket.Test`.
+7. One Runtime process per active run plus a shared execution loop used by the
+   supervised Runtime and `Docket.Test`.
 8. Plan -> Execution -> Update supersteps with barrier visibility.
 9. `Docket.Executor.Local` and `Docket.Executor.Task`.
 10. `Docket.Checkpoint` callback behaviour with both `:sync` and `:async`
@@ -2300,8 +2333,8 @@ v1 acceptance tests:
 - Failed node prevents barrier commit by default.
 - Retry succeeds without duplicating committed writes.
 - Interrupt pauses and resumes through channel update.
-- Runner crash recovers from the latest saved checkpoint.
-- Resume never commits uncheckpointed writes from a crashed Runner.
+- Runtime crash recovers from the latest saved checkpoint.
+- Resume never commits uncheckpointed writes from a crashed Runtime.
 
 ## 30. Post-v1 Priorities
 
@@ -2315,7 +2348,7 @@ After the MVP, the top priority is Beam-style time and collection semantics:
 - accumulation and discarding modes
 - late data policy
 
-These are not MVP concerns, but the channel and runner model should avoid
+These are not MVP concerns, but the channel and runtime model should avoid
 closing the door on them.
 
 Other post-MVP areas:
@@ -2325,7 +2358,7 @@ Other post-MVP areas:
 - checkpoint compaction
 - incremental recomputation
 - distributed deployment through durable executors, not distributed Erlang as a
-  core requirement
+  requirement
 
 ## 31. Settled Decisions
 
@@ -2340,7 +2373,7 @@ Other post-MVP areas:
 6. Do not require reducers to be modules only. Durable graphs need serializable
    reducer references; direct functions are acceptable for in-memory/local-only
    graphs.
-7. Do not use distributed Erlang as a core runtime requirement.
+7. Do not use distributed Erlang as a runtime requirement.
 8. Use `Docket` as the package identity.
 
 ## 32. Strong Recommendations

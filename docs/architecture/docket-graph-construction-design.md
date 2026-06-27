@@ -1,12 +1,17 @@
 # Docket: Graph Construction Public API Design
 
-Status: draft
+Status: reference draft
 Date: 2026-06-25
 
 Related documents:
 
+- `docs/architecture/docket-v1-implementation-path.md`
 - `docs/architecture/docket-runtime-design.md`
 - `docs/architecture/docket-v1-test-suite-design.md`
+
+Implementation note: use `docket-v1-implementation-path.md` as the active v1
+build sequence. This document owns the detailed graph document and compiler
+construction decisions.
 
 ## 1. Executive Summary
 
@@ -16,16 +21,16 @@ The key naming decision is:
 
 ```text
 Docket.Graph is the canonical, user-facing graph.
-Docket.Run is the canonical, user-facing run snapshot document.
-Docket.RuntimeGraph is the internal executable runtime graph.
+Docket.Run is the canonical, user-facing run state document.
+Docket.Runtime.Graph is the internal executable runtime graph.
 ```
 
 Applications, workflow compilers, graph editors, and product UIs work with
 `Docket.Graph`. It contains fields, nodes, edges, guards, outputs, policies,
-layout, metadata, and advisory diagnostics.
+metadata, and advisory diagnostics.
 
-The Runner does not execute `Docket.Graph` directly. When a run starts, Docket
-materializes the canonical graph into an internal `Docket.RuntimeGraph` value
+The Runtime does not execute `Docket.Graph` directly. When a run starts, Docket
+materializes the canonical graph into an internal `Docket.Runtime.Graph` value
 with channels, subscriptions, reducers, generated edge channels, barriers, and
 runtime node definitions.
 
@@ -48,10 +53,10 @@ run:
   -> Docket.Checkpoint emits Docket.Run document
 ```
 
-`Docket.RuntimeGraph` is a derived implementation detail. Its shape can change
+`Docket.Runtime.Graph` is a derived implementation detail. Its shape can change
 as the runtime improves without changing the public graph model.
 
-## 2. Core Model
+## 2. Document Model
 
 There are four related but distinct things:
 
@@ -64,38 +69,38 @@ Docket.Graph
   Suitable for UI, workflow compilers, host-owned storage, and inspection.
 
 Docket.Run
-  User-facing durable run snapshot document.
+  User-facing durable run state document.
   Emitted through Docket.Checkpoint callbacks.
   Saved by the host application.
   Passed back to Docket to resume or retry a run.
 
-Docket.RuntimeGraph
+Docket.Runtime.Graph
   Internal executable graph materialization.
   Derived from Docket.Graph.
-  Consumed by the Runner.
-  Contains channels, CompiledNode records, generated barriers, and lowering maps.
+  Consumed by the Runtime.
+  Contains channels, runtime node records, generated barriers, and lowering maps.
 
 Run State
   Mutable execution state for one run.
-  Owned by one Runner process.
+  Owned by one Runtime process.
   Contains channel values, versions, active tasks, interrupts, timers, events,
   and checkpoints.
 ```
 
 The public construction layer is centered on `Docket.Graph`. The runtime graph
 is not the storage format and not the user-facing API. The host stores
-`Docket.Graph` and `Docket.Run` documents. A `Docket.Run` includes structured
-Docket-owned `%Docket.Run.State{}` resume data, but hosts persist and pass that
-state back without interpreting its internals.
+`Docket.Graph` and `Docket.Run` documents. A `Docket.Run` is the durable
+execution state document; hosts persist and pass it back without interpreting
+Docket-owned execution internals.
 
 ## 3. Design Goals
 
 1. Make `Docket.Graph` the canonical graph used by applications.
 2. Keep graph storage app-owned; Docket accepts and returns graph documents.
-3. Keep `Docket.RuntimeGraph` internal and derived.
+3. Keep `Docket.Runtime.Graph` internal and derived.
 4. Support realtime graph construction through simple graph update functions.
-5. Support app-side graph editors without making UI layout part of runtime
-   semantics.
+5. Support app-side graph editors through stable public IDs while keeping UI
+   layout outside Docket.
 6. Allow incomplete drafts and advisory diagnostics while users edit.
 7. Use compiler verification and compilation as the blocking gate for
    publish/run.
@@ -108,14 +113,15 @@ state back without interpreting its internals.
 
 1. Do not introduce a separate `StateGraph`, `Builder`, `NodeSpec`, or
    `EdgeSpec` schema that mirrors `Docket.Graph`.
-2. Do not ask UI code to construct runtime `ChannelDef` or `CompiledNode`
-   values.
+2. Do not ask UI code to construct `Docket.Runtime.Graph.Channel` or
+   `Docket.Runtime.Graph.Node` values.
 3. Do not mutate a published graph version in place.
 4. Do not require every UI edit to produce a valid executable graph.
 5. Do not make any UI canvas JSON the canonical graph model.
-6. Do not make graph layout affect runtime execution.
+6. Do not store UI layout, canvas state, viewport state, zoom, positions, or
+   editor projection data inside Docket graph documents.
 7. Do not require a Docket graph storage behaviour.
-8. Do not make hashes or compile receipts part of the core public model.
+8. Do not make hashes or compile receipts part of the loop public model.
 
 ## 5. Module Shape
 
@@ -127,9 +133,10 @@ Docket.Graph.Node
 Docket.Graph.Edge
 Docket.Graph.Field
 Docket.Graph.Output
-Docket.Graph.Layout
 Docket.Graph.Diagnostics
 Docket.Graph.Compiler
+Docket.Node
+Docket.Node.Ports
 Docket.Schema
 Docket.Reducer
 Docket.Guard
@@ -152,18 +159,21 @@ Docket.Guard.not(expression)
 Recommended internal/runtime modules:
 
 ```text
-Docket.RuntimeGraph
-Docket.RuntimeGraph.CompiledNode
-Docket.RuntimeGraph.ChannelDef
-Docket.RuntimeGraph.Lowering
-Docket.Runner
+Docket.Runtime.Graph
+Docket.Runtime.Graph.Node
+Docket.Runtime.Graph.Channel
+Docket.Runtime.Graph.Lowering
+Docket.Runtime
 ```
 
 The naming boundary is:
 
 - `Docket.Graph.Node` is an editable public graph node.
 - `Docket.Node` is the executable node behaviour implemented by user code.
-- `Docket.RuntimeGraph.CompiledNode` is an internal lowered node definition.
+- `Docket.Runtime.Graph.Node` is an internal lowered runtime node definition.
+
+When code must reference both public graph nodes and runtime graph nodes in the
+same scope, alias `Docket.Runtime.Graph.Node` as `RuntimeNode`.
 
 ## 6. Docket.Graph
 
@@ -181,7 +191,6 @@ It contains:
 - edges
 - joins and branch sugar, if preserved separately
 - graph-level policies
-- layout and UI metadata
 - application metadata
 - advisory diagnostics
 
@@ -203,7 +212,6 @@ defmodule Docket.Graph do
     joins: %{},
     branches: %{},
     policies: %{},
-    layout: %Docket.Graph.Layout{},
     metadata: %{},
     diagnostics: []
   ]
@@ -298,7 +306,7 @@ Compiler collision rules:
 - diagnostics for ID errors use the public graph path and public ID whenever
   possible
 
-## 7. Public Nodes And Compiled Runtime Nodes
+## 7. Public Nodes And Runtime Graph Nodes
 
 The word "node" appears in three places. They are related but not identical.
 
@@ -306,17 +314,17 @@ The word "node" appears in three places. They are related but not identical.
 Docket.Graph.Node
   Editable public node in the canonical graph.
   Used by UI, workflow compilers, diagnostics, host storage, and graph projection.
-  Names public fields and public edges.
+  Names public fields, public edges, node config, and port bindings.
 
 Docket.Node
   Behaviour implemented by executable node code.
-  Receives Docket.Node.Input and returns Docket.Node.Output, interrupt, await,
-  or error.
+  Declares config schema and generic ports. Receives Docket.Node.Input and
+  returns Docket.Node.Output, interrupt, await, or error.
 
-Docket.RuntimeGraph.CompiledNode
-  Internal runtime definition consumed by the Runner.
-  Names runtime channels, subscriptions, guards, executor settings, and
-  generated system writes.
+Docket.Runtime.Graph.Node
+  Internal runtime definition consumed by the Runtime.
+  Names runtime channels, resolved port bindings, subscriptions, guards,
+  executor settings, and generated system writes.
 ```
 
 Example public node:
@@ -327,6 +335,9 @@ Example public node:
   implementation: %{type: :module, module: Essay.Writer, function: :call},
   reads: ["topic"],
   writes: ["draft"],
+  input_bindings: %{"topic" => "topic"},
+  output_bindings: %{"draft" => "draft"},
+  config: %{},
   metadata: %{label: "Write Draft"}
 }
 ```
@@ -334,10 +345,12 @@ Example public node:
 Example runtime node definition:
 
 ```elixir
-%Docket.RuntimeGraph.CompiledNode{
+%Docket.Runtime.Graph.Node{
   id: "writer",
   module: Essay.Writer,
   function: :call,
+  input_bindings: %{"topic" => "input:topic"},
+  output_bindings: %{"draft" => "state:draft"},
   subscribe: ["edge:edge_start_writer"],
   read: ["input:topic"],
   write: ["state:draft"],
@@ -350,10 +363,161 @@ Example runtime node definition:
 }
 ```
 
-The public node says "writer reads topic and writes draft." The runtime
-`CompiledNode` says "writer subscribes to this activation channel, reads this
-input channel, may write this state channel, and emits this generated edge
-channel on success."
+The public node says "writer reads topic and writes draft." The runtime node
+says "writer subscribes to this activation channel, reads this input channel,
+may write this state channel, and emits this generated edge channel on
+success."
+
+### 7.1 Node Type Contracts, Ports, And Bindings
+
+Executable node modules should be introspectable. A node behaviour is not only a
+callback that can run; it is a node type that can tell graph editors and the
+compiler which config values it accepts and which generic input/output ports it
+exposes.
+
+Recommended public node behaviour shape:
+
+```elixir
+defmodule Docket.Node do
+  @callback config_schema() :: Docket.Schema.t()
+
+  @callback ports(config :: map()) :: Docket.Node.Ports.t()
+
+  @callback call(Docket.Node.Input.t()) ::
+              {:ok, Docket.Node.Output.t()}
+              | {:interrupt, Docket.Interrupt.t()}
+              | {:await, Docket.Await.t()}
+              | {:error, term()}
+end
+```
+
+`config_schema/0` returns the schema for node-instance configuration. The
+compiler validates user-provided config, applies defaults, and passes the
+normalized config into `ports/1`. `ports/1` may be dynamic. For example, an LLM
+node can derive required input ports from variables in a prompt template.
+
+```elixir
+defmodule Docket.Nodes.LLM do
+  @behaviour Docket.Node
+
+  def config_schema do
+    Docket.Schema.object(%{
+      model: Docket.Schema.string(required: true),
+      reasoning_effort: Docket.Schema.enum([:low, :medium, :high],
+        default: :medium
+      ),
+      prompt_template: Docket.Schema.string(required: true)
+    })
+  end
+
+  def ports(%{prompt_template: template}) do
+    inputs =
+      template
+      |> Docket.Template.variables()
+      |> Map.new(fn name ->
+        {name, Docket.Schema.string(required: true)}
+      end)
+
+    %Docket.Node.Ports{
+      inputs: inputs,
+      outputs: %{
+        "text" => Docket.Schema.string(required: true),
+        "usage" => Docket.Schema.map()
+      }
+    }
+  end
+end
+```
+
+A graph node instance stores the app user's wiring from generic port names to
+public graph field IDs:
+
+```elixir
+%Docket.Graph.Node{
+  id: "draft_reply",
+  implementation: %{type: :module, module: Docket.Nodes.LLM, function: :call},
+  config: %{
+    model: "gpt-4.1-mini",
+    reasoning_effort: :medium,
+    prompt_template: "Reply to {{message}} using {{context}}"
+  },
+  input_bindings: %{
+    "message" => "customer_message",
+    "context" => "account_context"
+  },
+  output_bindings: %{
+    "text" => "draft_response"
+  },
+  reads: ["customer_message", "account_context"],
+  writes: ["draft_response"]
+}
+```
+
+The user-authored behaviour receives port-native data:
+
+```elixir
+%Docket.Node.Input{
+  inputs: %{
+    "message" => "I need help with billing",
+    "context" => "Enterprise account"
+  },
+  config: %{model: "gpt-4.1-mini"}
+}
+```
+
+and returns port-native outputs:
+
+```elixir
+%Docket.Node.Output{
+  outputs: %{
+    "text" => "Thanks for reaching out..."
+  }
+}
+```
+
+The runtime maps output ports back to graph channels using the compiled
+`output_bindings`, validates values, then creates channel writes internally.
+
+### 7.2 Schema Boundaries For Channels And Ports
+
+`Docket.Schema` is the canonical typing language for both graph data and node
+type contracts.
+
+Use `Docket.Schema` for:
+
+- graph input fields
+- graph state fields
+- output projections through their source fields
+- runtime channel definitions derived from those fields
+- node config schemas
+- node input port schemas
+- node output port schemas
+
+Do not put independent schemas directly on `reads` or `writes`. `reads` and
+`writes` are permission and routing sets: they say which graph fields a node
+instance may read from or write to. The types live on the graph fields/channels
+and on the node ports.
+
+The compiler validates the boundary:
+
+- node config conforms to `config_schema/0`
+- `ports/1` returns valid `Docket.Schema` values
+- each required input port has an `input_binding`
+- each required output port has an `output_binding`
+- every binding points at an existing public field/channel
+- input bindings point only at fields named in `reads`
+- output bindings point only at fields named in `writes`
+- each source field schema is compatible with the target input port schema
+- each output port schema is compatible with the target field schema
+
+Runtime validation should still validate resolved input values before `call/1`
+and returned output values before reducers run. Compile-time compatibility
+protects graph shape; runtime validation protects actual data.
+
+`Docket.Schema` should be Docket's stable, serializable schema IR. It may compile
+to a validation library such as Peri, and it may export JSON Schema for UI forms
+or structured LLM outputs, but raw third-party schema terms should not be the
+durable graph document format.
 
 ## 8. Compile, Verify, And Materialize
 
@@ -362,7 +526,7 @@ explanation, and runtime materialization.
 
 `compile/2` is the only compiler function that returns a compiled runtime
 artifact. It materializes `Docket.Graph` into an internal
-`Docket.RuntimeGraph` value.
+`Docket.Runtime.Graph` value.
 
 `verify/2` and `explain/2` use the same compiler rules, but they do not return a
 runtime graph. They only prove that compilation would succeed or return the
@@ -386,7 +550,7 @@ case Docket.Graph.Compiler.verify(graph, opts) do
 end
 ```
 
-The Runner materializes at run start:
+The Runtime materializes at run start:
 
 ```elixir
 graph = MyApp.Graphs.fetch!("essay-review", version: 5)
@@ -404,7 +568,7 @@ edge -> generated edge channel plus subscriptions
 join -> generated barrier channel
 branch -> guarded edge records plus generated edge channels
 output -> output channel projection
-Docket.Graph.Node -> Docket.RuntimeGraph.CompiledNode
+Docket.Graph.Node -> Docket.Runtime.Graph.Node
 ```
 
 The compile path may return an explain report for debugging, but the runtime
@@ -447,8 +611,7 @@ Realtime, event-by-event editing:
 ```elixir
 graph =
   Docket.Graph.update_node(graph, "writer", %{
-    label: "Draft Writer",
-    layout: %{position: %{x: 180, y: 120}}
+    label: "Draft Writer"
   })
 
 warnings = graph.diagnostics
@@ -535,9 +698,6 @@ Docket.Graph.delete_edge(graph, id, opts \\ [])
 Docket.Graph.put_field(graph, id, attrs)
 Docket.Graph.update_field(graph, id, attrs_or_fun)
 Docket.Graph.delete_field(graph, id, opts \\ [])
-
-Docket.Graph.put_layout(graph, layout)
-Docket.Graph.update_layout(graph, attrs_or_fun)
 ```
 
 Compiler API:
@@ -558,7 +718,7 @@ Docket.Graph.Compiler.compile(graph, opts \\ [])
 `compile/2` should return:
 
 ```elixir
-{:ok, Docket.RuntimeGraph.t(), Docket.Graph.Compiler.Report.t()}
+{:ok, Docket.Runtime.Graph.t(), Docket.Graph.Compiler.Report.t()}
 | {:error, Docket.Graph.Diagnostics.t()}
 ```
 
@@ -582,8 +742,7 @@ graph =
     label: "Writer",
     implementation: %{type: :registered, id: "essay_writer"},
     reads: ["topic"],
-    writes: ["draft"],
-    layout: %{position: %{x: 120, y: 80}}
+    writes: ["draft"]
   })
 ```
 
@@ -616,7 +775,7 @@ Graph editor handlers can translate user actions into ordinary graph updates:
 
 ```text
 add node -> put_node(graph, node_id, attrs)
-move node -> update_node(graph, node_id, %{layout: new_layout})
+move node -> update host-owned UI projection keyed by node_id
 connect nodes -> put_edge(graph, edge_id, attrs)
 edit edge condition -> update_edge(graph, edge_id, %{guard: guard})
 delete edge -> delete_edge(graph, edge_id)
@@ -706,7 +865,7 @@ Docket.Graph
   Passed to Docket when starting, resuming, or retrying a run.
 
 Docket.Run
-  Canonical run snapshot document.
+  Canonical run state document.
   Emitted by Docket.Checkpoint callbacks.
   Saved by the host application.
   Passed back to Docket to resume or retry a run.
@@ -746,10 +905,12 @@ canonical `Docket.Graph` document, graph editing helpers, diagnostics, compiler
 reports, checkpoints, and runtime events. The app can project those values into
 its graph editor or inspector shape.
 
-Editor events should call ordinary graph update helpers:
+Editor events that change graph semantics should call ordinary graph update
+helpers. Editor-only events should update host-owned projection state keyed by
+public graph IDs:
 
 ```text
-node position update -> update_node(graph, node_id, %{layout: ...})
+node position update -> update host-owned UI projection keyed by node_id
 connect nodes -> put_edge(graph, edge_id, %{from: ..., to: ...})
 delete edge -> delete_edge(graph, edge_id)
 node property edit -> update_node(graph, node_id, attrs)
@@ -759,7 +920,8 @@ guard editor save -> update_edge(graph, edge_id, %{guard: guard})
 
 The host app should persist the canonical `Docket.Graph` or its own
 product-specific workflow record that can produce a `Docket.Graph`. It should
-not persist UI canvas JSON as the canonical workflow document.
+not persist UI canvas JSON as the canonical workflow document or store UI
+projection state inside Docket graph documents.
 
 ## 14. Runtime Introspection And Realtime Overlays
 
@@ -776,10 +938,10 @@ live run overlay:
 The inspector can load the canonical graph version used by a run, project it to
 the app's UI shape, then stream committed run events and apply overlay updates.
 
-Runtime events refer to runtime channels and `CompiledNode` IDs. The runtime lowering
-map maps those IDs back to public node, edge, and field IDs for UI overlays.
+Runtime events refer to runtime channels and runtime node IDs. The runtime
+lowering map maps those IDs back to public node, edge, and field IDs for UI overlays.
 That lowering map can be returned by `Docket.Graph.Compiler.explain/2`,
-included in debug events, or held inside the live Runner.
+included in debug events, or held inside the live Runtime.
 
 The UI can offer two modes:
 
@@ -788,7 +950,7 @@ workflow mode:
   show Docket.Graph nodes, edges, fields, and user-facing statuses
 
 runtime debug mode:
-  reveal generated channels, barriers, subscriptions, and CompiledNode details
+  reveal generated channels, barriers, subscriptions, and runtime node details
 ```
 
 This avoids forcing normal users to understand generated edge channels while
@@ -807,7 +969,7 @@ input "topic", schema: string()
 Runtime:
 
 ```text
-ChannelDef "input:topic"
+Runtime.Graph.Channel "input:topic"
   type: LastValue
 ```
 
@@ -822,7 +984,7 @@ field "draft", schema: string(), reducer: last_value()
 Runtime:
 
 ```text
-ChannelDef "state:draft"
+Runtime.Graph.Channel "state:draft"
   type: LastValue
 ```
 
@@ -837,17 +999,17 @@ edge "writer", "reviewer", id: "edge_writer_reviewer"
 Runtime:
 
 ```text
-ChannelDef "edge:edge_writer_reviewer"
+Runtime.Graph.Channel "edge:edge_writer_reviewer"
   type: Ephemeral
 
-CompiledNode "writer"
+Runtime.Graph.Node "writer"
   system_writes: ["edge:edge_writer_reviewer"]
 
-CompiledNode "reviewer"
+Runtime.Graph.Node "reviewer"
   subscribe: ["edge:edge_writer_reviewer"]
 ```
 
-User node code does not manually write edge signal channels. The Runner emits
+User node code does not manually write edge signal channels. The Runtime emits
 compiler-generated system writes after successful node completion.
 
 ### 15.4 Fan-Out
@@ -908,7 +1070,7 @@ Runtime:
 edge:edge_review_approved
 ```
 
-The target `CompiledNode` subscribes to the generated edge channel and carries the
+The target runtime node subscribes to the generated edge channel and carries the
 compiled guard expression.
 
 ### 15.7 Branches
@@ -939,12 +1101,12 @@ edge:edge_review_rejected
 
 The canonical graph should preserve branch groups as first-class editing and
 inspection sugar. Lowering should normalize branches to guarded edge records and
-generated `edge:<edge_id>` activation channels. The Runner does not need to know
+generated `edge:<edge_id>` activation channels. The Runtime does not need to know
 whether an activation came from a user-authored edge or branch sugar; the
 lowering map keeps the public branch/edge IDs available for diagnostics and
 runtime overlays. v1 does not generate separate branch activation channels.
 
-This is a moderate compiler/reporting lift, not a Runner lift. The canonical
+This is a moderate compiler/reporting lift, not a Runtime lift. The canonical
 struct already has `joins` and `branches`; the extra work is defining their
 record shape, lowering them into ordinary runtime channels, and adding tests for
 public-to-runtime mapping. If v1 needs to shrink scope, keep the public
@@ -1022,7 +1184,7 @@ Host graph records:
   editable Docket.Graph
   immutable published Docket.Graph versions
   collaboration metadata
-  UI layout
+  host-owned UI layout keyed by Docket graph IDs
   product ownership and permissions
 
 Host run records:
@@ -1031,8 +1193,8 @@ Host run records:
   project, user, session, message, or job relationships
 ```
 
-Host storage does not need to know about `Docket.RuntimeGraph` or interpret
-`Docket.Run.State` internals. Runtime materialization happens when Docket
+Host storage does not need to know about `Docket.Runtime.Graph` or interpret
+`Docket.Run` execution internals. Runtime materialization happens when Docket
 verifies a graph, starts a run, resumes a run, or retries a run.
 
 ## 18. WaterCooler Workflow Compiler
@@ -1047,7 +1209,7 @@ workflow definition -> Docket.Graph
 workflow step -> Docket.Graph.Node
 gate -> guarded edge, branch, or join
 step result -> graph field write
-workflow canvas layout -> graph layout metadata
+workflow canvas layout -> host-owned UI projection keyed by graph IDs
 published workflow version -> immutable Docket.Graph version
 current_step_id -> compatibility projection over run overlay/frontier
 RuntimeChannel execution -> Executor adapter
@@ -1064,7 +1226,6 @@ defmodule WaterCooler.Docket.WorkflowCompiler do
     |> add_nodes(workflow)
     |> add_edges_and_gates(workflow)
     |> add_outputs(workflow)
-    |> add_layout(workflow)
   end
 
   def verify(workflow, opts) do
@@ -1148,7 +1309,7 @@ editing model:
 ```text
 Docket.Graph is canonical and editable.
 Docket.Run is canonical and restorable.
-Docket.RuntimeGraph is internal and derived.
+Docket.Runtime.Graph is internal and derived.
 Host applications store Docket documents, not runtime graph internals.
 ```
 
@@ -1185,12 +1346,12 @@ Resolved v1 graph construction scope:
 2. One functional graph editing API for both build-time pipes and realtime UI
    edits.
 3. Graph helpers for fields, inputs, nodes, edges, joins, branches, outputs,
-   policies, metadata, and layout.
+   policies, and metadata.
 4. App-owned graph persistence with optional `id:` generation.
 5. Advisory graph diagnostics and blocking compiler verification.
 6. Single `Docket.Graph.Compiler` module with `verify/2`, `explain/2`, and
    `compile/2`.
-7. Internal `Docket.RuntimeGraph` materialization returned by `compile/2`.
+7. Internal `Docket.Runtime.Graph` materialization returned by `compile/2`.
 8. Runtime overlay mapping from events/channels back to public IDs.
 9. WaterCooler/sequential workflow compatibility compiler remains post-v1. It
    should compile through `Docket.Graph` when added, but it is not part of the v1
@@ -1204,17 +1365,17 @@ Resolved v1 graph construction scope:
 2. Branch and join sugar are preserved as first-class canonical graph concepts
    for editing, diagnostics, compiler reports, and UI overlays. The compiler
    normalizes them into runtime activation channels, guards, and barriers, so the
-   Runner only consumes `Docket.RuntimeGraph`.
+   Runtime only consumes `Docket.Runtime.Graph`.
 3. Collaborative editing revisions are out of scope for v1 and remain
    host-owned.
-4. The internal executable graph is named `Docket.RuntimeGraph`, with
-   `Docket.RuntimeGraph.CompiledNode`, `Docket.RuntimeGraph.ChannelDef`, and
-   `Docket.RuntimeGraph.Lowering` underneath it.
+4. The internal executable graph is named `Docket.Runtime.Graph`, with
+   `Docket.Runtime.Graph.Node`, `Docket.Runtime.Graph.Channel`, and
+   `Docket.Runtime.Graph.Lowering` underneath it.
 
 ## 24. Strong Recommendations
 
 1. Treat `Docket.Graph` as the canonical public graph.
-2. Treat `Docket.RuntimeGraph` as internal derived runtime materialization.
+2. Treat `Docket.Runtime.Graph` as internal derived runtime materialization.
 3. Keep graph persistence app-owned; Docket should accept graph documents as
    values.
 4. Treat `Docket.Run` as the canonical public resume document emitted by
@@ -1224,8 +1385,8 @@ Resolved v1 graph construction scope:
    appending a new version after edits.
 7. Make build-time and realtime graph construction use the same graph update
    helpers.
-8. Keep UI projection host-owned; `Docket.Graph` is the canonical workflow
-   document.
+8. Keep UI projection host-owned and outside Docket graph documents;
+   `Docket.Graph` is the canonical workflow document.
 9. Show generated channels only in runtime debug mode.
 10. Build compiler verify, compile, and explain early because they will reveal
     API mistakes quickly.
