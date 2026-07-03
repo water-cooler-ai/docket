@@ -16,6 +16,7 @@ defmodule Docket.Runtime.Graph.Channel do
     :value_schema,
     :reducer,
     :default,
+    required: false,
     sources: [],
     metadata: %{}
   ]
@@ -28,6 +29,7 @@ defmodule Docket.Runtime.Graph.Channel do
           value_schema: Docket.Schema.t() | nil,
           reducer: Docket.Reducer.t() | nil,
           default: term(),
+          required: boolean(),
           sources: [String.t()],
           metadata: map()
         }

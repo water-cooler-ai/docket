@@ -45,7 +45,8 @@ defmodule Docket.Graph.Compiler.Lowering do
            id: input_channel_id(id),
            type: :last_value,
            value_schema: field.schema,
-           default: field.default
+           default: field.default,
+           required: field.required
          }}
       end
 

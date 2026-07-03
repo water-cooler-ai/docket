@@ -133,7 +133,10 @@ defmodule Docket.Test.Fixtures.Graphs do
   def cycle_counter do
     Graph.new!(id: "cycle-counter")
     |> Graph.put_field!("count", schema: Schema.float(), default: 0.0)
-    |> Graph.put_node!("increment", implementation: Nodes.Echo)
+    |> Graph.put_node!("increment",
+      implementation: Nodes.Increment,
+      config: %{field: "count"}
+    )
     |> Graph.put_node!("decide", implementation: Nodes.Echo)
     |> Graph.put_edge!("edge_start_increment", from: "$start", to: "increment")
     |> Graph.put_edge!("edge_increment_decide", from: "increment", to: "decide")
@@ -148,6 +151,107 @@ defmodule Docket.Test.Fixtures.Graphs do
       guard: Guard.equals(Guard.path("count", []), 10.0)
     )
     |> Graph.policy!("max_supersteps", 50)
+  end
+
+  @doc """
+  start -> gate; gate interrupts until "decision" is resolved, then writes
+  "applied" and finishes.
+
+  Proves interrupt creation, resume-channel writes, and re-execution.
+  """
+  def interrupt_review do
+    Graph.new!(id: "interrupt-review")
+    |> Graph.put_field!("decision", schema: Schema.string())
+    |> Graph.put_field!("applied", schema: Schema.string())
+    |> Graph.put_node!("gate",
+      implementation: Nodes.InterruptOnce,
+      config: %{resume_field: "decision", write_field: "applied"}
+    )
+    |> Graph.put_edge!("edge_start_gate", from: "$start", to: "gate")
+    |> Graph.put_edge!("edge_gate_finish", from: "gate", to: "$finish")
+  end
+
+  @doc """
+  start -> flaky -> finish; flaky fails twice and succeeds on attempt three.
+
+  Proves retry attempts and continuation after success.
+  """
+  def retry_then_continue do
+    Graph.new!(id: "retry-then-continue")
+    |> Graph.put_field!("out", schema: Schema.string())
+    |> Graph.put_node!("flaky",
+      implementation: Nodes.FlakyThenSucceeds,
+      config: %{failures: 2.0, field: "out", value: "done"},
+      policies: %{"retry" => %{"max_attempts" => 3, "backoff_ms" => 0}}
+    )
+    |> Graph.put_edge!("edge_start_flaky", from: "$start", to: "flaky")
+    |> Graph.put_edge!("edge_flaky_finish", from: "flaky", to: "$finish")
+    |> Graph.put_output!("out", [])
+  end
+
+  @doc """
+  start fans out to ok_node and failing_node; their join must never run.
+
+  Proves v1 permanent failure commits no writes from the failed superstep.
+  """
+  def parallel_failure do
+    Graph.new!(id: "parallel-failure")
+    |> Graph.put_field!("ok_out", schema: Schema.string())
+    |> Graph.put_node!("ok_node",
+      implementation: Nodes.WriteStatic,
+      config: %{field: "ok_out", value: "committed"}
+    )
+    |> Graph.put_node!("failing_node", implementation: Nodes.AlwaysFails)
+    |> Graph.put_node!("should_not_run", implementation: Nodes.Echo)
+    |> Graph.put_edge!("edge_start_ok", from: "$start", to: "ok_node")
+    |> Graph.put_edge!("edge_start_failing", from: "$start", to: "failing_node")
+    |> Graph.put_edge!("edge_join", from: ["ok_node", "failing_node"], to: "should_not_run")
+    |> Graph.put_edge!("edge_join_finish", from: "should_not_run", to: "$finish")
+  end
+
+  @doc """
+  start fans out to writer (writes "x") and reader (copies "x" to "y") in
+  the same superstep.
+
+  Proves barrier visibility: the reader sees the committed default, not the
+  writer's same-superstep write.
+  """
+  def same_step_isolation do
+    Graph.new!(id: "same-step-isolation")
+    |> Graph.put_field!("x", schema: Schema.string(), default: "old")
+    |> Graph.put_field!("y", schema: Schema.string())
+    |> Graph.put_node!("writer",
+      implementation: Nodes.WriteStatic,
+      config: %{field: "x", value: "new"}
+    )
+    |> Graph.put_node!("reader",
+      implementation: Nodes.CopyInput,
+      config: %{from: "x", to: "y"}
+    )
+    |> Graph.put_edge!("edge_start_writer", from: "$start", to: "writer")
+    |> Graph.put_edge!("edge_start_reader", from: "$start", to: "reader")
+  end
+
+  @doc """
+  Two nodes write the same last_value field in one superstep.
+
+  Proves deterministic same-step conflict resolution: the last write in
+  sorted node-ID order wins.
+  """
+  def write_conflict do
+    Graph.new!(id: "write-conflict")
+    |> Graph.put_field!("out", schema: Schema.string())
+    |> Graph.put_node!("a_writer",
+      implementation: Nodes.WriteStatic,
+      config: %{field: "out", value: "from_a"}
+    )
+    |> Graph.put_node!("b_writer",
+      implementation: Nodes.WriteStatic,
+      config: %{field: "out", value: "from_b"}
+    )
+    |> Graph.put_edge!("edge_start_a", from: "$start", to: "a_writer")
+    |> Graph.put_edge!("edge_start_b", from: "$start", to: "b_writer")
+    |> Graph.put_output!("out", [])
   end
 
   @doc """

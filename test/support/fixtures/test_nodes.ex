@@ -137,4 +137,145 @@ defmodule Docket.Test.Fixtures.Nodes do
     # Loads fine but exports neither config_schema/0 nor call/3.
     def unrelated, do: :ok
   end
+
+  defmodule Increment do
+    @moduledoc false
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{"field" => Docket.Schema.string(required: true)})
+    end
+
+    @impl true
+    def call(state, config, _context) do
+      {:ok, %{config["field"] => (Map.get(state, config["field"]) || 0) + 1}}
+    end
+  end
+
+  defmodule InterruptOnce do
+    @moduledoc false
+    # Interrupts while the resume field is unwritten; on re-execution after
+    # resolution it copies the resolved value into the write field.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{
+        "resume_field" => Docket.Schema.string(required: true),
+        "write_field" => Docket.Schema.string(required: true)
+      })
+    end
+
+    @impl true
+    def call(state, config, _context) do
+      case Map.fetch(state, config["resume_field"]) do
+        :error ->
+          {:interrupt,
+           %Docket.Interrupt{
+             prompt: "value for #{config["resume_field"]}?",
+             schema: Docket.Schema.string(),
+             resume_channel: config["resume_field"]
+           }}
+
+        {:ok, value} ->
+          {:ok, %{config["write_field"] => value}}
+      end
+    end
+  end
+
+  defmodule FlakyThenSucceeds do
+    @moduledoc false
+    # Fails deterministically while context.attempt <= config failures, then
+    # writes the configured value. Schema has no integer type; "failures" is
+    # a float compared against the integer attempt counter.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{
+        "failures" => Docket.Schema.float(required: true),
+        "field" => Docket.Schema.string(required: true),
+        "value" => Docket.Schema.string(required: true)
+      })
+    end
+
+    @impl true
+    def call(_state, config, context) do
+      if context.attempt <= trunc(config["failures"]) do
+        {:error, {:flaky, context.attempt}}
+      else
+        {:ok, %{config["field"] => config["value"]}}
+      end
+    end
+  end
+
+  defmodule AlwaysFails do
+    @moduledoc false
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: Docket.Schema.object(%{})
+
+    @impl true
+    def call(_state, _config, _context), do: {:error, :always_fails}
+  end
+
+  defmodule Raises do
+    @moduledoc false
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: Docket.Schema.object(%{})
+
+    @impl true
+    def call(_state, _config, _context), do: raise("node exploded")
+  end
+
+  defmodule Throws do
+    @moduledoc false
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: Docket.Schema.object(%{})
+
+    @impl true
+    def call(_state, _config, _context), do: throw(:ball)
+  end
+
+  defmodule Awaits do
+    @moduledoc false
+    # {:await, _} is a reserved post-v1 return shape.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: Docket.Schema.object(%{})
+
+    @impl true
+    def call(_state, _config, _context), do: {:await, :external}
+  end
+
+  defmodule AtomWriter do
+    @moduledoc false
+    # Returns atom-keyed/atom-valued content; the update barrier coerces it
+    # to durable string form exactly as a checkpointed run would persist it.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: Docket.Schema.object(%{})
+
+    @impl true
+    def call(_state, _config, _context), do: {:ok, %{out: %{status: :ok}}}
+  end
+
+  defmodule BadReturn do
+    @moduledoc false
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: Docket.Schema.object(%{})
+
+    @impl true
+    def call(_state, _config, _context), do: :oops
+  end
 end
