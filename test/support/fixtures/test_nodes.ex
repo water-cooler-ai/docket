@@ -69,6 +69,47 @@ defmodule Docket.Test.Fixtures.Nodes do
     def call(_state, _config, _context), do: {:ok, %{}}
   end
 
+  defmodule AtomKeyedConfigSchema do
+    @moduledoc false
+    # Schema.object accepts atom field keys; the compiler must canonicalize
+    # them to strings so they line up with canonicalized node config.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{
+        tone: Docket.Schema.string(required: true),
+        temperature: Docket.Schema.float(default: 0.5)
+      })
+    end
+
+    @impl true
+    def call(_state, _config, _context), do: {:ok, %{}}
+  end
+
+  defmodule StatefulConfigSchema do
+    @moduledoc false
+    # Returns a valid schema on the first call in a process and raises on
+    # every later call. Proves the compiler fetches config schemas exactly
+    # once per compile and surfaces later failures as diagnostics.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      calls = Process.get({__MODULE__, :calls}, 0)
+      Process.put({__MODULE__, :calls}, calls + 1)
+
+      if calls == 0 do
+        Docket.Schema.object(%{})
+      else
+        raise "config_schema/0 was invoked more than once"
+      end
+    end
+
+    @impl true
+    def call(_state, _config, _context), do: {:ok, %{}}
+  end
+
   defmodule RaisingConfigSchema do
     @moduledoc false
     @behaviour Docket.Node

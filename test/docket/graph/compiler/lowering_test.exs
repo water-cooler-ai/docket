@@ -91,6 +91,23 @@ defmodule Docket.Graph.Compiler.LoweringTest do
              }
     end
 
+    test "atom-keyed config schemas apply defaults under canonical string keys" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_node!("styled",
+          implementation: Nodes.AtomKeyedConfigSchema,
+          config: %{tone: "warm"}
+        )
+        |> Graph.put_edge!("edge_copy_styled", from: "copy", to: "styled")
+
+      runtime_graph = compile!(graph)
+
+      assert runtime_graph.nodes["node:styled"].config == %{
+               "tone" => "warm",
+               "temperature" => 0.5
+             }
+    end
+
     test "config defaults and canonicalization are not written back into the public graph" do
       graph =
         Graphs.minimal_linear()
@@ -255,6 +272,26 @@ defmodule Docket.Graph.Compiler.LoweringTest do
       runtime_graph = compile!(graph, max_supersteps: 25)
 
       assert runtime_graph.policies["max_supersteps"] == 25
+    end
+
+    test "an explicit nil policy is replaced by the opts runtime default" do
+      graph =
+        Graphs.cycle_counter()
+        |> Map.update!(:policies, &Map.put(&1, "max_supersteps", nil))
+
+      runtime_graph = compile!(graph, max_supersteps: 25)
+
+      assert runtime_graph.policies["max_supersteps"] == 25
+    end
+
+    test "an explicit nil policy normalizes away when no default is given" do
+      graph =
+        Graphs.minimal_linear()
+        |> Map.update!(:policies, &Map.put(&1, "max_supersteps", nil))
+
+      runtime_graph = compile!(graph)
+
+      refute Map.has_key?(runtime_graph.policies, "max_supersteps")
     end
   end
 end

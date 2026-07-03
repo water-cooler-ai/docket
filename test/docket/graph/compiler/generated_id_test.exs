@@ -52,6 +52,34 @@ defmodule Docket.Graph.Compiler.GeneratedIdTest do
     assert_diagnostic(diagnostics, :missing_runtime_channel, runtime_id: "edge:edge_ghost")
   end
 
+  test "self-validation detects outgoing edges with no descriptor" do
+    runtime_graph = compile!(Graphs.minimal_linear())
+
+    doctored =
+      update_in(
+        runtime_graph.nodes["node:copy"].outgoing_edges,
+        &["edge_ghost" | &1]
+      )
+
+    diagnostics = RuntimeValidation.run(doctored, Graphs.minimal_linear())
+
+    assert_diagnostic(diagnostics, :lowering_invariant_failed, public_id: "edge_ghost")
+  end
+
+  test "self-validation detects outgoing edges whose channel is missing" do
+    runtime_graph = compile!(Graphs.minimal_linear())
+
+    doctored =
+      update_in(
+        runtime_graph.channels,
+        &Map.delete(&1, "edge:edge_copy_finish")
+      )
+
+    diagnostics = RuntimeValidation.run(doctored, Graphs.minimal_linear())
+
+    assert_diagnostic(diagnostics, :lowering_invariant_failed, public_id: "edge_copy_finish")
+  end
+
   test "self-validation detects runtime nodes with no public counterpart" do
     runtime_graph = compile!(Graphs.minimal_linear())
     ghost = %{runtime_graph.nodes["node:copy"] | id: "node:ghost", public_id: "ghost"}

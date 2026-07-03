@@ -8,15 +8,16 @@ defmodule Docket.Graph.Compiler.Lowering do
   # opts, keeping compilation deterministic.
 
   alias Docket.Graph
-  alias Docket.Graph.Compiler.Validation
+  alias Docket.Graph.Compiler.{NodeContracts, Policies}
   alias Docket.Graph.Edge
   alias Docket.Reducer
   alias Docket.Runtime
 
   @hash_prefix_length 12
 
-  @spec run(Graph.t(), keyword()) :: Runtime.Graph.t()
-  def run(%Graph{} = graph, opts) do
+  @spec run(Graph.t(), %{optional(String.t()) => NodeContracts.fetch_result()}, keyword()) ::
+          Runtime.Graph.t()
+  def run(%Graph{} = graph, config_schemas, opts) do
     graph_hash = Graph.hash(graph)
 
     %Runtime.Graph{
@@ -24,7 +25,7 @@ defmodule Docket.Graph.Compiler.Lowering do
       graph_id: graph.id,
       graph_hash: graph_hash,
       channels: channels(graph),
-      nodes: nodes(graph),
+      nodes: nodes(graph, config_schemas),
       edges: edge_descriptors(graph),
       outputs: output_projections(graph),
       policies: normalize_policies(graph, opts),
@@ -79,7 +80,7 @@ defmodule Docket.Graph.Compiler.Lowering do
   # Nodes
   # ---------------------------------------------------------------------------
 
-  defp nodes(graph) do
+  defp nodes(graph, config_schemas) do
     for {id, node} <- graph.nodes, into: %{} do
       %{module: module, function: function} = node.implementation
 
@@ -89,7 +90,7 @@ defmodule Docket.Graph.Compiler.Lowering do
          public_id: id,
          module: module,
          function: function,
-         config: config_with_defaults(module, node.config),
+         config: config_with_defaults(config_schemas, id, node.config),
          subscribe: subscriptions(graph, id),
          outgoing_edges: outgoing_edges(graph, id),
          policies: node.policies,
@@ -99,17 +100,23 @@ defmodule Docket.Graph.Compiler.Lowering do
   end
 
   # Config schema defaults are applied here during lowering; they are never
-  # written back into the public graph document.
-  defp config_with_defaults(module, config) do
-    {:ok, schema} = Validation.fetch_config_schema(module)
+  # written back into the public graph document. The schema comes from the
+  # per-compile fetch shared with validation, so user config_schema/0 code is
+  # never re-entered here.
+  defp config_with_defaults(config_schemas, public_id, config) do
+    case Map.get(config_schemas, public_id) do
+      {:ok, schema} ->
+        Enum.reduce(schema.fields, config, fn {key, field_schema}, acc ->
+          if field_schema.default == Docket.Schema.no_default() do
+            acc
+          else
+            Map.put_new(acc, key, field_schema.default)
+          end
+        end)
 
-    Enum.reduce(schema.fields, config, fn {key, field_schema}, acc ->
-      if field_schema.default == Docket.Schema.no_default() do
-        acc
-      else
-        Map.put_new(acc, key, field_schema.default)
-      end
-    end)
+      _missing_or_invalid ->
+        config
+    end
   end
 
   defp subscriptions(graph, node_id) do
@@ -175,13 +182,14 @@ defmodule Docket.Graph.Compiler.Lowering do
   # Policies and lowering metadata
   # ---------------------------------------------------------------------------
 
+  # Lowering only runs on graphs that passed validation, so the policy is
+  # either valid or unset here; an explicit nil policy normalizes away and
+  # the opts runtime default fills the gap when present.
   defp normalize_policies(graph, opts) do
-    case Keyword.get(opts, :max_supersteps) do
-      limit when is_integer(limit) and limit > 0 ->
-        Map.put_new(graph.policies, "max_supersteps", limit)
-
-      _no_default ->
-        graph.policies
+    case Policies.max_supersteps(graph, opts) do
+      {:ok, nil} -> Map.delete(graph.policies, Policies.max_supersteps_key())
+      {:ok, limit} -> Map.put(graph.policies, Policies.max_supersteps_key(), limit)
+      {:invalid, _value} -> graph.policies
     end
   end
 

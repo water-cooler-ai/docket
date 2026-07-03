@@ -58,14 +58,20 @@ defmodule Docket.Graph.Compiler.RuntimeValidation do
   defp check_outgoing_edges(runtime_graph) do
     for {runtime_id, node} <- sorted(runtime_graph.nodes),
         edge_id <- node.outgoing_edges,
-        descriptor = Map.get(runtime_graph.edges, edge_id),
-        descriptor == nil or not Map.has_key?(runtime_graph.channels, descriptor.channel_id) do
+        dangling_outgoing_edge?(runtime_graph, edge_id) do
       error(
         :lowering_invariant_failed,
         "runtime node #{inspect(runtime_id)} references outgoing edge #{inspect(edge_id)} with no runtime channel",
         runtime_id: runtime_id,
         public_id: edge_id
       )
+    end
+  end
+
+  defp dangling_outgoing_edge?(runtime_graph, edge_id) do
+    case Map.get(runtime_graph.edges, edge_id) do
+      nil -> true
+      descriptor -> not Map.has_key?(runtime_graph.channels, descriptor.channel_id)
     end
   end
 

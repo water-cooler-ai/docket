@@ -1,7 +1,7 @@
 defmodule Docket.Graph.Compiler.ValidationTest do
   use Docket.Test.Case, async: true
 
-  alias Docket.Graph.{Edge, Field, Node, Output}
+  alias Docket.Graph.{Edge, Field, Node}
   alias Docket.{Guard, Reducer, Schema}
 
   # Compiler validation must not trust edit-time normalization: hosts can load
@@ -143,6 +143,14 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       assert graph.outputs["result"].schema == nil
       assert {:ok, _verified} = Graph.verify(graph)
     end
+
+    test "returns diagnostics for output records that are not structs" do
+      graph = Graphs.minimal_linear()
+
+      %{graph | outputs: Map.put(graph.outputs, "junk", %{})}
+      |> verify_error!()
+      |> assert_diagnostic(:unknown_output_source, path: [:outputs, "junk"], public_id: "junk")
+    end
   end
 
   describe "node validation (9.5)" do
@@ -228,6 +236,46 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       |> Graph.put_edge!("edge_copy_styled", from: "copy", to: "styled")
       |> verify_error!()
       |> assert_diagnostic(:invalid_node_config, path: [:nodes, "styled", :config])
+    end
+
+    test "atom-keyed config schemas validate against canonicalized config" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_node!("styled",
+          implementation: Nodes.AtomKeyedConfigSchema,
+          config: %{tone: "warm"}
+        )
+        |> Graph.put_edge!("edge_copy_styled", from: "copy", to: "styled")
+
+      assert {:ok, verified} = Graph.verify(graph)
+      refute_error_diagnostics(verified.diagnostics)
+    end
+
+    test "config schemas are fetched once per compile and later failures are diagnostics" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_node!("stateful", implementation: Nodes.StatefulConfigSchema, config: %{})
+        |> Graph.put_edge!("edge_copy_stateful", from: "copy", to: "stateful")
+
+      # First compile invokes config_schema/0 exactly once (a second
+      # invocation would raise inside this process).
+      assert %Docket.Runtime.Graph{} = compile!(graph)
+
+      # The next compile hits the raising call; that must surface as a
+      # diagnostic, never as a crash.
+      assert {:error, failed} = Compiler.compile(graph)
+      assert_diagnostic(failed, :invalid_node_config_schema, public_id: "stateful")
+    end
+
+    test "returns diagnostics for node records that are not structs" do
+      graph = Graphs.minimal_linear()
+
+      %{graph | nodes: Map.put(graph.nodes, "junk", %{"not" => "a node"})}
+      |> verify_error!()
+      |> assert_diagnostic(:missing_node_implementation,
+        path: [:nodes, "junk"],
+        public_id: "junk"
+      )
     end
   end
 
@@ -434,6 +482,38 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       assert {:ok, _verified} = Graph.verify(graph, max_supersteps: 25)
     end
 
+    test "an explicit nil policy counts as unset and honors the opts default" do
+      graph =
+        Graphs.cycle_counter()
+        |> Map.update!(:policies, &Map.put(&1, "max_supersteps", nil))
+
+      assert {:ok, _verified} = Graph.verify(graph, max_supersteps: 25)
+      assert {:error, _failed} = Graph.verify(graph)
+    end
+
+    test "rejects invalid max_supersteps policies even on acyclic graphs" do
+      Graphs.minimal_linear()
+      |> Map.update!(:policies, &Map.put(&1, "max_supersteps", "banana"))
+      |> verify_error!()
+      |> assert_diagnostic(:invalid_policy, path: [:policies, "max_supersteps"])
+    end
+
+    test "an invalid policy does not additionally report an unbounded cycle" do
+      diagnostics =
+        Graphs.cycle_counter()
+        |> Map.update!(:policies, &Map.put(&1, "max_supersteps", "banana"))
+        |> verify_error!()
+
+      assert_diagnostic(diagnostics, :invalid_policy, path: [:policies, "max_supersteps"])
+      refute Enum.any?(diagnostics, &(&1.code == :unbounded_cycle))
+    end
+
+    test "raises on malformed max_supersteps compile opts" do
+      assert_raise ArgumentError, fn ->
+        Graph.verify(Graphs.minimal_linear(), max_supersteps: "banana")
+      end
+    end
+
     test "warns on bounded cycles with no guarded edge" do
       {:ok, verified} =
         Graphs.cycle_counter()
@@ -482,6 +562,22 @@ defmodule Docket.Graph.Compiler.ValidationTest do
     test "verification failure attaches at least one error diagnostic" do
       diagnostics = verify_error!(Graphs.invalid_unknown_target())
       assert Enum.any?(diagnostics, &(&1.severity == :error))
+    end
+
+    test "an ingest failure does not produce false config diagnostics" do
+      # The tuple in graph metadata blocks canonicalization, so validation
+      # falls back to the raw in-memory graph — where node config still has
+      # atom keys. That must not surface as :invalid_node_config: the config
+      # matches its schema once canonicalized, and steering the user to "fix"
+      # it would be wrong.
+      graph = Graphs.minimal_linear()
+
+      diagnostics =
+        %{graph | metadata: Map.put(graph.metadata, "opts", {1, 2})}
+        |> verify_error!()
+
+      assert_diagnostic(diagnostics, :non_durable_graph_value)
+      refute Enum.any?(diagnostics, &(&1.code == :invalid_node_config))
     end
   end
 end

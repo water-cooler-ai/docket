@@ -9,6 +9,7 @@ defmodule Docket.Graph.Compiler.Validation do
   # diagnostics; passes skip individual records they cannot interpret.
 
   alias Docket.Graph
+  alias Docket.Graph.Compiler.{NodeContracts, Policies}
   alias Docket.Graph.{Edge, Field}
   alias Docket.{Guard, Reducer, Schema}
 
@@ -21,22 +22,20 @@ defmodule Docket.Graph.Compiler.Validation do
   @supported_guard_ops [:all, :any, :changed, :equals, :exists, :not, :path, :version_at_least]
   @schema_types [:string, :float, :map, :object, :enum]
 
-  @spec run(Graph.t(), keyword()) :: [Docket.Graph.Diagnostic.t()]
-  def run(%Graph{} = graph, opts) do
-    Enum.flat_map(
-      [
-        &validate_document/2,
-        &validate_fields/2,
-        &validate_outputs/2,
-        &validate_nodes/2,
-        &validate_edges/2,
-        &validate_branches/2,
-        &validate_guards/2,
-        &validate_topology/2,
-        &analyze_cycles/2
-      ],
-      fn pass -> pass.(graph, opts) end
-    )
+  @spec run(Graph.t(), %{optional(String.t()) => NodeContracts.fetch_result()}, keyword()) ::
+          [Docket.Graph.Diagnostic.t()]
+  def run(%Graph{} = graph, config_schemas, opts) do
+    List.flatten([
+      validate_document(graph, opts),
+      validate_fields(graph, opts),
+      validate_outputs(graph, opts),
+      validate_nodes(graph, config_schemas),
+      validate_edges(graph, opts),
+      validate_branches(graph, opts),
+      validate_guards(graph, opts),
+      validate_topology(graph, opts),
+      analyze_cycles(graph, opts)
+    ])
   end
 
   # ---------------------------------------------------------------------------
@@ -45,13 +44,32 @@ defmodule Docket.Graph.Compiler.Validation do
 
   # Durability is not checked here: compiler ingest canonicalizes the graph
   # through the wire format and reports serialization failures itself.
-  defp validate_document(graph, _opts) do
+  defp validate_document(graph, opts) do
     List.flatten([
       check_schema_version(graph),
       check_graph_id(graph),
       check_record_ids(graph),
-      check_field_collisions(graph)
+      check_field_collisions(graph),
+      check_policies(graph, opts)
     ])
+  end
+
+  # Validated regardless of topology so an invalid limit never ships into the
+  # runtime graph (lowering would otherwise carry it verbatim).
+  defp check_policies(graph, opts) do
+    case Policies.max_supersteps(graph, opts) do
+      {:ok, _limit} ->
+        []
+
+      {:invalid, value} ->
+        [
+          error(
+            :invalid_policy,
+            "graph policy \"max_supersteps\" must be a positive integer, got #{inspect(value)}",
+            path: [:policies, Policies.max_supersteps_key()]
+          )
+        ]
+    end
   end
 
   defp check_schema_version(%Graph{schema_version: @supported_schema_version}), do: []
@@ -228,7 +246,7 @@ defmodule Docket.Graph.Compiler.Validation do
     end
   end
 
-  defp validate_output(graph, id, output) do
+  defp validate_output(graph, id, %Graph.Output{} = output) do
     case resolve_field(graph, output.source) do
       nil ->
         [
@@ -243,6 +261,17 @@ defmodule Docket.Graph.Compiler.Validation do
       source_field ->
         check_output_schema(id, output.schema, source_field.schema)
     end
+  end
+
+  defp validate_output(_graph, id, other) do
+    [
+      error(
+        :unknown_output_source,
+        "output #{inspect(id)} is not an output record, got #{inspect(other)}",
+        path: [:outputs, id],
+        public_id: id
+      )
+    ]
   end
 
   defp check_output_schema(_id, nil, _source_schema), do: []
@@ -293,13 +322,14 @@ defmodule Docket.Graph.Compiler.Validation do
   # 9.5 Nodes
   # ---------------------------------------------------------------------------
 
-  defp validate_nodes(graph, _opts) do
-    for {id, node} <- sorted(graph.nodes), diagnostic <- validate_node(id, node) do
+  defp validate_nodes(graph, config_schemas) do
+    for {id, node} <- sorted(graph.nodes),
+        diagnostic <- validate_node(id, node, config_schemas) do
       diagnostic
     end
   end
 
-  defp validate_node(id, node) do
+  defp validate_node(id, %Graph.Node{} = node, config_schemas) do
     case node.implementation do
       nil ->
         [
@@ -310,7 +340,7 @@ defmodule Docket.Graph.Compiler.Validation do
         ]
 
       %{type: :module, module: module, function: :call} when is_atom(module) ->
-        validate_node_module(id, node, module)
+        validate_node_module(id, node, module, config_schemas)
 
       %{type: :module} = implementation ->
         [
@@ -334,7 +364,18 @@ defmodule Docket.Graph.Compiler.Validation do
     end
   end
 
-  defp validate_node_module(id, node, module) do
+  defp validate_node(id, other, _config_schemas) do
+    [
+      error(
+        :missing_node_implementation,
+        "node #{inspect(id)} is not a node record, got #{inspect(other)}",
+        path: [:nodes, id],
+        public_id: id
+      )
+    ]
+  end
+
+  defp validate_node_module(id, node, module, config_schemas) do
     cond do
       not module_loaded?(module) ->
         [
@@ -357,14 +398,18 @@ defmodule Docket.Graph.Compiler.Validation do
         ]
 
       true ->
-        validate_node_config(id, node, module)
+        validate_node_config(id, node, module, config_schemas)
     end
   end
 
-  defp validate_node_config(id, node, module) do
-    case fetch_config_schema(module) do
+  defp validate_node_config(id, node, module, config_schemas) do
+    case Map.get(config_schemas, id) do
       {:ok, schema} ->
-        case Schema.validate(schema, node.config) do
+        # The config is canonicalized here rather than trusting ingest: in
+        # fallback mode (a graph that failed serialization elsewhere) the
+        # in-memory config may still be atom-keyed, and validating it raw
+        # would produce false diagnostics against the string-keyed schema.
+        case Schema.validate(schema, canonicalize_open(node.config)) do
           :ok ->
             []
 
@@ -390,23 +435,29 @@ defmodule Docket.Graph.Compiler.Validation do
             metadata: metadata
           )
         ]
+
+      nil ->
+        []
     end
   end
 
-  @doc false
-  # Also used by lowering to apply config defaults. Only called for modules
-  # that already passed validation there.
-  @spec fetch_config_schema(module()) :: {:ok, Schema.t()} | {:error, map()}
-  def fetch_config_schema(module) do
-    case module.config_schema() do
-      %Schema{type: type} = schema when type in @schema_types -> {:ok, schema}
-      other -> {:error, %{returned: inspect(other)}}
-    end
-  rescue
-    exception -> {:error, %{error: Exception.message(exception)}}
-  catch
-    kind, reason -> {:error, %{error: "#{kind}: #{inspect(reason)}"}}
+  # Canonicalizes open content the way the wire format would (atoms become
+  # strings, map keys stringify) without failing on non-durable terms; those
+  # are already reported by ingest.
+  defp canonicalize_open(value) when is_map(value) and not is_struct(value) do
+    Map.new(value, fn {key, child} -> {canonicalize_key(key), canonicalize_open(child)} end)
   end
+
+  defp canonicalize_open(value) when is_list(value), do: Enum.map(value, &canonicalize_open/1)
+
+  defp canonicalize_open(value) when is_atom(value) and value not in [nil, true, false] do
+    Atom.to_string(value)
+  end
+
+  defp canonicalize_open(value), do: value
+
+  defp canonicalize_key(key) when is_atom(key), do: Atom.to_string(key)
+  defp canonicalize_key(key), do: key
 
   defp module_loaded?(module) do
     case Code.ensure_loaded(module) do
@@ -587,6 +638,7 @@ defmodule Docket.Graph.Compiler.Validation do
 
   defp validate_branches(graph, _opts) do
     for {node_id, node} <- sorted(graph.nodes),
+        is_struct(node, Graph.Node),
         is_map(node.branches),
         diagnostic <- validate_node_branches(graph, node_id, node.branches) do
       diagnostic
@@ -910,23 +962,30 @@ defmodule Docket.Graph.Compiler.Validation do
   # ---------------------------------------------------------------------------
 
   defp analyze_cycles(graph, opts) do
-    cycles = cyclic_components(graph)
+    case cyclic_components(graph) do
+      [] -> []
+      cycles -> cycle_diagnostics(graph, opts, cycles)
+    end
+  end
 
-    cond do
-      cycles == [] ->
+  defp cycle_diagnostics(graph, opts, cycles) do
+    case Policies.max_supersteps(graph, opts) do
+      # An invalid policy already carries its own :invalid_policy error;
+      # piling :unbounded_cycle on top would steer the user two ways at once.
+      {:invalid, _value} ->
         []
 
-      max_supersteps(graph, opts) == nil ->
+      {:ok, nil} ->
         for component <- cycles do
           error(
             :unbounded_cycle,
             "graph contains a cycle through #{inspect(component)} with no max_supersteps limit; set the \"max_supersteps\" graph policy or a runtime default",
-            path: [:policies, "max_supersteps"],
+            path: [:policies, Policies.max_supersteps_key()],
             metadata: %{nodes: component}
           )
         end
 
-      true ->
+      {:ok, _limit} ->
         for component <- cycles, not component_guarded?(graph, component) do
           warning(
             :unguarded_cycle,
@@ -935,13 +994,6 @@ defmodule Docket.Graph.Compiler.Validation do
             metadata: %{nodes: component}
           )
         end
-    end
-  end
-
-  defp max_supersteps(graph, opts) do
-    case Map.get(graph.policies, "max_supersteps", Keyword.get(opts, :max_supersteps)) do
-      limit when is_integer(limit) and limit > 0 -> limit
-      _other -> nil
     end
   end
 

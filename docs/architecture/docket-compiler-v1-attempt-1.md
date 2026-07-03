@@ -54,9 +54,15 @@ compiler is implemented to make them pass.
     functions other than `:call`.
 12. **Node config defaults** from `config_schema/0` are applied into the
     runtime node's `config` during lowering and are never written back to the
-    public graph.
+    public graph. Config schemas are fetched from node modules **exactly once
+    per compile** (`Compiler.NodeContracts`); validation and lowering share
+    the same fetch result, so stateful or nondeterministic `config_schema/0`
+    callbacks cannot desynchronize passes or crash lowering. Object field
+    keys in fetched schemas are canonicalized to strings on fetch, matching
+    canonical node config (`Schema.object/2` accepts atom keys).
 13. **Determinism**: every map iteration is sorted by public ID; diagnostics
-    are emitted in fixed phase order and sorted by path within a phase; the
+    are emitted in fixed phase order, iterating collections in a fixed order
+    and ID-sorted within each collection (not globally path-sorted); the
     runtime graph ID is derived from the graph ID and content hash
     (`<graph_id>@<first 12 hash chars>`), so identical graphs compile to
     identical runtime graphs.
@@ -69,13 +75,30 @@ compiler is implemented to make them pass.
     graph. A graph that cannot cross the boundary falls back to raw
     validation for granular, path-bearing diagnostics next to the ingest
     error (`:non_durable_graph_value` for non-durable content; the
-    serializer's own code otherwise). Graphs claiming an unsupported
+    serializer's own code otherwise). In fallback mode, node config is
+    canonicalized locally before validation so a serialization failure
+    elsewhere in the document cannot produce false `:invalid_node_config`
+    diagnostics against atom-keyed-but-correct configs; other structural
+    fallback checks assume binary IDs. Graphs claiming an unsupported
     `schema_version` are never canonicalized, because the v1 wire format
     stamps version 1 on dump.
 15. **verify/compile share the full pipeline** including lowering and runtime
     graph self-validation; `verify/2` throws the runtime graph away and
     returns the graph with fresh diagnostics. Stale diagnostics on the input
     graph are always ignored and never echoed back.
+16. **`"max_supersteps"` is validated whenever present** (positive integer),
+    regardless of topology, so an invalid limit never ships into the runtime
+    graph (`:invalid_policy` error). An explicit nil policy counts as unset:
+    it falls back to the `opts[:max_supersteps]` runtime default and
+    normalizes away during lowering. A malformed `:max_supersteps` compile
+    opt is programmer misuse and raises `ArgumentError`.
+17. **Node policy key validation is deferred** (deviation from design §9.5:
+    "node policies are validated for known keys and durable values").
+    Durability is enforced at the serialization boundary, but the v1 runtime
+    does not consume node policies yet, so there is no known-key list to
+    validate against; node policies pass through to the runtime node
+    verbatim. Revisit when the runtime defines its v1 node policy surface
+    (timeout/retry/on_error).
 
 ## 2. Module Layout
 
@@ -87,6 +110,8 @@ lib/docket/runtime/graph/lowering.ex       Docket.Runtime.Graph.Lowering
 
 lib/docket/graph/compiler.ex               public verify/compile facade
 lib/docket/graph/compiler/diagnostics.ex   diagnostic builders
+lib/docket/graph/compiler/node_contracts.ex  once-per-compile config schema fetch
+lib/docket/graph/compiler/policies.ex      shared graph policy resolution
 lib/docket/graph/compiler/validation.ex    phases 9.2 - 9.10
 lib/docket/graph/compiler/lowering.ex      phase 9.11
 lib/docket/graph/compiler/runtime_validation.ex  phase 9.12
@@ -108,18 +133,24 @@ Diagnostic codes added beyond the design's example families:
 - `:unguarded_branch_edge` (warning) - grouped edge without a guard
 - `:unguarded_cycle` (warning) - bounded cycle with no guarded edge
   (decision 7)
+- `:invalid_policy` - a present graph policy with an invalid value
+  (decision 16)
 
 ## 3. Pipeline
 
 ```text
 verify/compile
-  -> Context.new(graph, opts)        ignore stale diagnostics, index IDs
-  -> Validation.run(context)         9.2 document, 9.3 fields, 9.4 outputs,
-                                     9.5 nodes, 9.6 edges, 9.7 branches,
-                                     9.8 guards, 9.9 topology, 9.10 cycles
+  -> ingest                          canonicalize via dump/load! (decision 14),
+                                     ignore stale diagnostics
+  -> NodeContracts.config_schemas    fetch config schemas once (decision 12)
+  -> Validation.run(graph, schemas, opts)
+                                     9.2 document + policies, 9.3 fields,
+                                     9.4 outputs, 9.5 nodes, 9.6 edges,
+                                     9.7 branches, 9.8 guards, 9.9 topology,
+                                     9.10 cycles
   -> if blocking errors: {:error, graph + diagnostics}
-  -> Lowering.run(context)           9.11
-  -> RuntimeValidation.run(context)  9.12
+  -> Lowering.run(graph, schemas, opts)   9.11
+  -> RuntimeValidation.run(runtime_graph, graph)  9.12
   -> verify:  {:ok|:error, graph + diagnostics}
      compile: {:ok, runtime_graph} | {:error, graph + diagnostics}
 ```

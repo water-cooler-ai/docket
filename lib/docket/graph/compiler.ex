@@ -20,7 +20,15 @@ defmodule Docket.Graph.Compiler do
   """
 
   alias Docket.Graph
-  alias Docket.Graph.Compiler.{Diagnostics, Lowering, RuntimeValidation, Validation}
+
+  alias Docket.Graph.Compiler.{
+    Diagnostics,
+    Lowering,
+    NodeContracts,
+    RuntimeValidation,
+    Validation
+  }
+
   alias Docket.Graph.Serializer
   alias Docket.Runtime
 
@@ -56,12 +64,17 @@ defmodule Docket.Graph.Compiler do
 
   defp run_pipeline(graph, opts) do
     {canonical, ingest_diagnostics} = ingest(graph)
-    diagnostics = ingest_diagnostics ++ Validation.run(canonical, opts)
+
+    # Config schemas are fetched exactly once per compile; validation and
+    # lowering must see the same result even when config_schema/0 callbacks
+    # are stateful, and lowering must never re-enter user code.
+    config_schemas = NodeContracts.config_schemas(canonical)
+    diagnostics = ingest_diagnostics ++ Validation.run(canonical, config_schemas, opts)
 
     if Diagnostics.blocking?(diagnostics) do
       {:error, diagnostics}
     else
-      runtime_graph = Lowering.run(canonical, opts)
+      runtime_graph = Lowering.run(canonical, config_schemas, opts)
       diagnostics = diagnostics ++ RuntimeValidation.run(runtime_graph, canonical)
 
       if Diagnostics.blocking?(diagnostics) do
@@ -121,6 +134,16 @@ defmodule Docket.Graph.Compiler do
             "unsupported compiler profile #{inspect(profile)}; expected one of #{inspect(@profiles)}"
     end
 
-    opts
+    case Keyword.get(opts, :max_supersteps) do
+      nil ->
+        opts
+
+      limit when is_integer(limit) and limit > 0 ->
+        opts
+
+      other ->
+        raise ArgumentError,
+              ":max_supersteps must be a positive integer, got #{inspect(other)}"
+    end
   end
 end
