@@ -49,7 +49,8 @@ Implemented today:
 - `Docket.Graph` is the canonical editable graph document.
 - `Docket.Graph.Node`, `Edge`, `Field`, `Output`, and `Diagnostic` exist.
 - Graph editing helpers clear stale diagnostics.
-- `Docket.Graph.hash/2` computes a canonical SHA-256 hash excluding diagnostics.
+- `Docket.Graph.hash/2` computes a SHA-256 hash over the canonical JSON
+  encoding of `Docket.Graph.to_map/1`, excluding diagnostics.
 - `Docket.Graph.verify/2` delegates to `Docket.Graph.Compiler.verify/2`.
 - `Docket.Graph.Compiler.verify/2` and `compile/2` exist but return a stub
   `:compiler_not_implemented` diagnostic.

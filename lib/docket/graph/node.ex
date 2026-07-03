@@ -24,9 +24,9 @@ defmodule Docket.Graph.Node do
             required(:module) => module(),
             optional(:function) => atom()
           }
-          | %{required(:type) => atom(), optional(atom()) => term()}
+          | %{required(:type) => atom(), optional(String.t()) => term()}
           | nil
-  @type branch_group :: [String.t()] | %{optional(String.t()) => term()} | keyword()
+  @type branch_group :: [String.t()] | %{optional(String.t()) => term()}
 
   @type t :: %__MODULE__{
           id: String.t() | nil,

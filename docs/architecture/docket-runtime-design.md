@@ -682,18 +682,21 @@ end
 
 If a host stores runs in a format that cannot persist Elixir structs directly,
 Docket should provide explicit codecs rather than making hosts treat the run as
-a public map contract:
+a public map contract. The codec names mirror the graph document codec
+(`Docket.Graph.to_map/2` / `Docket.Graph.from_map/2`) so each Docket document
+type has exactly one serialization entry/exit pair:
 
 ```elixir
-Docket.Run.dump(%Docket.Run{}) ::
-  {:ok, map()} | {:error, term()}
+Docket.Run.to_map(%Docket.Run{}) :: map()
 
-Docket.Run.load(map() | %Docket.Run{}) ::
+Docket.Run.from_map(map()) ::
   {:ok, %Docket.Run{}} | {:error, term()}
+
+Docket.Run.from_map!(map()) :: %Docket.Run{}
 ```
 
-The dumped representation may be a map at the storage boundary. The public
-runtime API and in-memory state remain structured `%Docket.Run{}` values.
+The wire representation is a map at the storage boundary. The public runtime
+API and in-memory state remain structured `%Docket.Run{}` values.
 
 ### 9.1 Channel State
 
@@ -1284,8 +1287,8 @@ Apps may inspect top-level fields such as `id`, `graph_id`, `graph_hash`,
 Docket-owned execution data such as channels, tasks, interrupts, timers, and
 checkpoint counters. Apps should persist the run but not interpret, pattern
 match, mutate, or rebuild Docket-owned execution internals. Code that needs an
-external storage format should use `Docket.Run.dump/1` and `Docket.Run.load/1`
-rather than treating the run as a public map contract.
+external storage format should use `Docket.Run.to_map/1` and
+`Docket.Run.from_map/1` rather than treating the run as a public map contract.
 
 The crucial persist/resume path should stay simple:
 
