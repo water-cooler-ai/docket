@@ -19,20 +19,27 @@ defmodule Docket.Graph.Serializer do
   # - `canonical_json_encode/1` renders the wire map to a deterministic,
   #   compact JSON binary used as the input to the graph hash.
   #
-  # The module also owns the durable value normalization used at edit time. The
-  # editing API normalizes "open" content (metadata, policies, config,
-  # constraints, defaults, enum values, guard args, branch groups, and
-  # non-reserved implementation entries) so the in-memory struct is always in
-  # canonical durable form. This makes the round-trip law
-  # `from_map!(to_map(graph)) == graph` hold on struct equality.
+  # Durability is handled only here, at the serialization boundary. Graphs
+  # are free-form in memory: the editing API stores content exactly as given
+  # and performs no validation or transformation (the one exception is the
+  # module / {module, function} implementation construction shorthand).
   #
-  # Durable values are: binaries, integers, floats, booleans, `nil`, lists of
-  # durable values, and string-keyed maps of durable values. Atoms are
-  # converted to strings via `Atom.to_string/1` for both keys and values. Map
-  # keys starting with "$" are reserved for wire-format tags (for example the
-  # "$guard" wrapper for guard expressions nested in plain argument positions).
-  # Anything else - tuples (including keyword lists), pids, refs, functions,
-  # `MapSet`s, and structs of any kind - is rejected as non-durable.
+  # dump/2 canonicalizes open content with Jason-style coercion: atoms become
+  # strings (both map keys and values), silently. Terms with no JSON
+  # representation - tuples (including keyword lists), pids, refs, functions,
+  # `MapSet`s, and structs - are rejected with `:non_durable_value`. The wire
+  # document therefore always contains only binaries, numbers, booleans,
+  # `nil`, lists, and string-keyed maps.
+  #
+  # Because dump/2 re-canonicalizes on every call, the hash is stable across
+  # storage round trips for every dumpable graph:
+  # `hash(from_map!(to_map(graph))) == hash(graph)`. Struct equality
+  # `from_map!(to_map(graph)) == graph` holds for graphs whose open content is
+  # already canonical (string keys/values); a graph built with atom content
+  # reloads in canonical string form, exactly as a Jason/JSONB round trip
+  # would return it. Map keys starting with "$" are reserved for wire-format
+  # tags (for example the "$guard" wrapper for guard expressions nested in
+  # plain argument positions).
 
   alias Docket.Graph
   alias Docket.Graph.{Edge, Error, Field, Node, Output}
@@ -101,16 +108,16 @@ defmodule Docket.Graph.Serializer do
   # Wire format (dump / load) - exposed as Docket.Graph.to_map/from_map
   # ---------------------------------------------------------------------------
 
-  # Dumps a graph to the plain, JSON-safe v1 wire map. Raises
-  # `Docket.Graph.Error` when the graph contains non-durable content. Graphs
-  # built through the `Docket.Graph` editing API are always dumpable because
-  # edits normalize durable values.
+  # Dumps a graph to the plain, JSON-safe v1 wire map, canonicalizing open
+  # content (atoms become strings) and raising `Docket.Graph.Error` for terms
+  # with no JSON representation. This is the boundary where durability is
+  # handled.
   @doc false
   @spec dump(Graph.t(), keyword()) :: map()
   def dump(%Graph{} = graph, _opts \\ []) do
     %{"schema_version" => @schema_version, "id" => graph.id}
-    |> put_present("name", graph.name)
-    |> put_present("description", graph.description)
+    |> put_present_string("name", graph.name)
+    |> put_present_string("description", graph.description)
     |> put_collection("inputs", graph.inputs, &dump_field/1)
     |> put_collection("fields", graph.fields, &dump_field/1)
     |> put_collection("outputs", graph.outputs, &dump_output/1)
@@ -173,31 +180,31 @@ defmodule Docket.Graph.Serializer do
   # ---------------------------------------------------------------------------
 
   defp dump_field(%Field{} = field) do
-    kind = Map.fetch!(@field_kinds_out, field.kind)
+    kind = lookup!(@field_kinds_out, field.kind, :invalid_field, "field kind")
 
     %{"kind" => kind}
-    |> put_present("label", field.label)
-    |> put_present("description", field.description)
+    |> put_present_string("label", field.label)
+    |> put_present_string("description", field.description)
     |> put_present("schema", dump_schema(field.schema))
     |> put_present("reducer", dump_reducer(field.reducer))
     |> put_true("required", field.required)
-    |> put_present("default", field.default)
+    |> put_present("default", durable!(field.default))
     |> put_open_map("metadata", field.metadata)
   end
 
   defp dump_output(%Output{} = output) do
     %{}
-    |> put_present("source", output.source)
-    |> put_present("label", output.label)
-    |> put_present("description", output.description)
+    |> put_present_string("source", output.source)
+    |> put_present_string("label", output.label)
+    |> put_present_string("description", output.description)
     |> put_present("schema", dump_schema(output.schema))
     |> put_open_map("metadata", output.metadata)
   end
 
   defp dump_node(%Node{} = node) do
     %{}
-    |> put_present("label", node.label)
-    |> put_present("description", node.description)
+    |> put_present_string("label", node.label)
+    |> put_present_string("description", node.description)
     |> put_present("implementation", dump_implementation(node.implementation))
     |> put_open_map("branches", dump_branches(node.branches))
     |> put_open_map("config", node.config)
@@ -207,12 +214,12 @@ defmodule Docket.Graph.Serializer do
 
   defp dump_edge(%Edge{} = edge) do
     %{}
-    |> put_present("from", edge.from)
-    |> put_present("to", edge.to)
-    |> put_present("label", edge.label)
-    |> put_present("description", edge.description)
-    |> put_present("source_handle", edge.source_handle)
-    |> put_present("target_handle", edge.target_handle)
+    |> put_present_endpoint("from", edge.from)
+    |> put_present_endpoint("to", edge.to)
+    |> put_present_string("label", edge.label)
+    |> put_present_string("description", edge.description)
+    |> put_present_string("source_handle", edge.source_handle)
+    |> put_present_string("target_handle", edge.target_handle)
     |> put_present("guard", dump_guard(edge.guard))
     |> put_open_map("metadata", edge.metadata)
   end
@@ -220,38 +227,61 @@ defmodule Docket.Graph.Serializer do
   defp dump_schema(nil), do: nil
 
   defp dump_schema(%Schema{} = schema) do
-    type = Map.fetch!(@schema_types_out, schema.type)
+    type = lookup!(@schema_types_out, schema.type, :invalid_schema, "schema type")
 
     %{"type" => type}
     |> put_present("fields", dump_schema_fields(schema.fields))
     |> put_present("item", dump_schema(schema.item))
-    |> put_present("values", schema.values)
+    |> put_present("values", dump_schema_values(schema.values))
     |> put_true("required", schema.required)
     |> put_schema_default(schema.default)
     |> put_open_map("constraints", schema.constraints)
     |> put_open_map("metadata", schema.metadata)
   end
 
+  defp dump_schema(other) do
+    invalid!(:invalid_schema, "schema must be a Docket.Schema or nil, got #{inspect(other)}")
+  end
+
   defp dump_schema_fields(fields) when map_size(fields) == 0, do: nil
 
-  defp dump_schema_fields(fields) do
-    Map.new(fields, fn {name, schema} -> {to_string(name), dump_schema(schema)} end)
+  defp dump_schema_fields(fields) when is_map(fields) do
+    Map.new(fields, fn {name, schema} -> {durable_key!(name), dump_schema(schema)} end)
+  end
+
+  defp dump_schema_fields(other) do
+    invalid!(:invalid_schema, "schema fields must be a map, got #{inspect(other)}")
+  end
+
+  defp dump_schema_values([]), do: nil
+  defp dump_schema_values(values) when is_list(values), do: Enum.map(values, &durable!/1)
+
+  defp dump_schema_values(other) do
+    invalid!(:invalid_schema, "schema values must be a list, got #{inspect(other)}")
   end
 
   defp dump_reducer(nil), do: nil
 
   defp dump_reducer(%Reducer{} = reducer) do
-    type = Map.fetch!(@reducer_types_out, reducer.type)
+    type = lookup!(@reducer_types_out, reducer.type, :invalid_reducer, "reducer type")
 
     %{"type" => type}
     |> put_open_map("opts", reducer.opts)
   end
 
+  defp dump_reducer(other) do
+    invalid!(:invalid_reducer, "reducer must be a Docket.Reducer or nil, got #{inspect(other)}")
+  end
+
   defp dump_guard(nil), do: nil
 
-  defp dump_guard(%Guard{op: op, args: args}) do
-    op_string = Map.fetch!(@guard_ops_out, op)
+  defp dump_guard(%Guard{op: op, args: args}) when is_list(args) do
+    op_string = lookup!(@guard_ops_out, op, :invalid_guard, "guard op")
     %{"op" => op_string, "args" => dump_guard_args(op, args)}
+  end
+
+  defp dump_guard(other) do
+    invalid!(:invalid_guard, "guard must be a Docket.Guard or nil, got #{inspect(other)}")
   end
 
   defp dump_guard_args(op, args) when op in @guard_recursive_ops do
@@ -279,13 +309,25 @@ defmodule Docket.Graph.Serializer do
   defp dump_implementation(nil), do: nil
 
   defp dump_implementation(%{type: :module} = impl) do
-    %{"type" => "module", "module" => Atom.to_string(impl.module)}
-    |> then(fn map ->
-      case Map.get(impl, :function) do
-        nil -> map
-        function -> Map.put(map, "function", Atom.to_string(function))
-      end
-    end)
+    case Map.keys(impl) -- [:type, :module, :function] do
+      [] ->
+        :ok
+
+      extra ->
+        invalid!(
+          :invalid_implementation,
+          "module implementations support only :type, :module, and :function, got extra keys #{inspect(extra)}"
+        )
+    end
+
+    module = fetch_module!(impl)
+    base = %{"type" => "module", "module" => Atom.to_string(module)}
+
+    case Map.get(impl, :function) do
+      nil -> base
+      function when is_atom(function) -> Map.put(base, "function", Atom.to_string(function))
+      other -> non_durable!(other, "implementation function must be an atom")
+    end
   end
 
   defp dump_implementation(%{type: type} = impl) when is_atom(type) do
@@ -298,10 +340,21 @@ defmodule Docket.Graph.Serializer do
     end)
   end
 
-  defp dump_branches(branches) when map_size(branches) == 0, do: %{}
+  defp dump_implementation(other) do
+    invalid!(
+      :invalid_implementation,
+      "implementation must be a map with an atom :type, or nil, got #{inspect(other)}"
+    )
+  end
 
-  defp dump_branches(branches) do
-    Map.new(branches, fn {name, group} -> {to_string(name), dump_branch_group(group)} end)
+  defp dump_branches(branches) when is_map(branches) and map_size(branches) == 0, do: %{}
+
+  defp dump_branches(branches) when is_map(branches) and not is_struct(branches) do
+    Map.new(branches, fn {name, group} -> {durable_key!(name), dump_branch_group(group)} end)
+  end
+
+  defp dump_branches(other) do
+    non_durable!(other, "branches must be a map")
   end
 
   defp dump_branch_group(group) when is_list(group), do: Enum.map(group, &durable!/1)
@@ -559,12 +612,15 @@ defmodule Docket.Graph.Serializer do
     end
   end
 
-  defp load_custom_implementation!(map, type_string, _id) do
+  defp load_custom_implementation!(map, type_string, id) do
     type = to_existing_atom!(type_string, :unknown_implementation_type, "implementation type")
+    location = "node #{inspect(id)} implementation"
 
     map
     |> Map.delete("type")
-    |> Map.new(fn {key, value} -> {durable_key!(key), durable!(value)} end)
+    |> Map.new(fn {key, value} ->
+      {load_durable_key!(key, location), load_durable_value!(value, location)}
+    end)
     |> Map.put(:type, type)
   end
 
@@ -585,11 +641,12 @@ defmodule Docket.Graph.Serializer do
     )
   end
 
-  defp load_branch_group!(group, _id, _name) when is_list(group), do: group
+  defp load_branch_group!(group, id, name) when is_list(group) do
+    load_durable_value!(group, "node #{inspect(id)} branch #{inspect(name)}")
+  end
 
   defp load_branch_group!(group, id, name) when is_map(group) and not is_struct(group) do
-    assert_string_keys!(group, "node #{inspect(id)} branch #{inspect(name)}")
-    group
+    load_durable_value!(group, "node #{inspect(id)} branch #{inspect(name)}")
   end
 
   defp load_branch_group!(other, id, name) do
@@ -634,11 +691,45 @@ defmodule Docket.Graph.Serializer do
   defp put_present(map, _key, nil), do: map
   defp put_present(map, key, value), do: Map.put(map, key, value)
 
+  defp put_present_string(map, _key, nil), do: map
+  defp put_present_string(map, key, value) when is_binary(value), do: Map.put(map, key, value)
+
+  defp put_present_string(_map, key, other) do
+    invalid!(:invalid_attrs, "#{key} must be a string or nil, got #{inspect(other)}")
+  end
+
+  defp put_present_endpoint(map, _key, nil), do: map
+
+  defp put_present_endpoint(map, key, value) when is_binary(value), do: Map.put(map, key, value)
+
+  defp put_present_endpoint(map, key, list) when is_list(list) do
+    Enum.each(list, fn
+      value when is_binary(value) -> :ok
+      other -> invalid!(:invalid_attrs, "#{key} entries must be strings, got #{inspect(other)}")
+    end)
+
+    Map.put(map, key, list)
+  end
+
+  defp put_present_endpoint(_map, key, other) do
+    invalid!(:invalid_attrs, "#{key} must be a string or list of strings, got #{inspect(other)}")
+  end
+
   defp put_true(map, _key, false), do: map
   defp put_true(map, key, true), do: Map.put(map, key, true)
 
+  defp put_true(_map, key, other) do
+    invalid!(:invalid_attrs, "#{key} must be a boolean, got #{inspect(other)}")
+  end
+
   defp put_open_map(map, _key, value) when value == %{}, do: map
-  defp put_open_map(map, key, value) when is_map(value), do: Map.put(map, key, durable!(value))
+
+  defp put_open_map(map, key, value) when is_map(value) and not is_struct(value),
+    do: Map.put(map, key, durable!(value))
+
+  defp put_open_map(_map, key, other) do
+    non_durable!(other, "#{key} must be a string-keyed map")
+  end
 
   defp put_schema_default(map, default) do
     if default == Schema.no_default() do
@@ -867,76 +958,13 @@ defmodule Docket.Graph.Serializer do
   end
 
   # ---------------------------------------------------------------------------
-  # Durable value normalization (edit time)
+  # Construction sugar
   # ---------------------------------------------------------------------------
-
-  @doc """
-  Normalizes an open durable value into canonical form.
-
-  Atoms become strings, map keys (binaries or atoms) become strings, and lists
-  and maps recurse. Non-durable terms raise `Docket.Graph.Error`.
-  """
-  @spec normalize_value(term()) :: term()
-  def normalize_value(value), do: durable!(value)
-
-  @doc """
-  Normalizes an open map key. Binaries pass through; atoms become strings.
-  """
-  @spec normalize_key(term()) :: String.t()
-  def normalize_key(key), do: durable_key!(key)
-
-  @doc false
-  @spec normalize_field(Field.t()) :: Field.t()
-  def normalize_field(%Field{} = field) do
-    %Field{
-      field
-      | schema: normalize_schema(field.schema),
-        reducer: normalize_reducer(field.reducer),
-        default: normalize_default(field.default),
-        metadata: normalize_open_map(field.metadata)
-    }
-  end
-
-  @doc false
-  @spec normalize_node(Node.t()) :: Node.t()
-  def normalize_node(%Node{} = node) do
-    %Node{
-      node
-      | implementation: normalize_implementation(node.implementation),
-        branches: normalize_branches(node.branches),
-        config: normalize_open_map(node.config),
-        policies: normalize_open_map(node.policies),
-        metadata: normalize_open_map(node.metadata)
-    }
-  end
-
-  @doc false
-  @spec normalize_edge(Edge.t()) :: Edge.t()
-  def normalize_edge(%Edge{} = edge) do
-    %Edge{
-      edge
-      | guard: normalize_guard(edge.guard),
-        metadata: normalize_open_map(edge.metadata)
-    }
-  end
-
-  @doc false
-  @spec normalize_output(Output.t()) :: Output.t()
-  def normalize_output(%Output{} = output) do
-    %Output{
-      output
-      | schema: normalize_schema(output.schema),
-        metadata: normalize_open_map(output.metadata)
-    }
-  end
-
-  @doc false
-  @spec normalize_open_map(term()) :: map()
-  def normalize_open_map(map) when is_map(map) and not is_struct(map), do: durable!(map)
-
-  def normalize_open_map(other) do
-    non_durable!(other, "expected a map")
-  end
+  # Editing helpers do not validate durable content; graphs are free-form in
+  # memory (Ecto-style) and content is canonicalized where the document
+  # crosses the serialization boundary: dump/2 and hash/2. The only edit-time
+  # rewrite is `normalize_implementation/1`, which expands the
+  # module / {module, function} construction shorthand.
 
   @doc false
   @spec normalize_implementation(term()) :: map() | nil
@@ -951,28 +979,13 @@ defmodule Docket.Graph.Serializer do
   end
 
   def normalize_implementation(%{type: :module} = impl) do
-    normalized = %{type: :module, module: fetch_module!(impl)}
-
     case Map.get(impl, :function) do
-      nil -> Map.put(normalized, :function, :call)
-      function when is_atom(function) -> Map.put(normalized, :function, function)
-      other -> non_durable!(other, "implementation function must be an atom")
+      nil -> Map.put(impl, :function, :call)
+      _function -> impl
     end
   end
 
-  def normalize_implementation(%{type: type} = impl) when is_atom(type) do
-    base = %{type: type}
-
-    impl
-    |> Map.delete(:type)
-    |> Enum.reduce(base, fn {key, value}, acc ->
-      Map.put(acc, durable_key!(key), durable!(value))
-    end)
-  end
-
-  def normalize_implementation(%{} = impl) do
-    non_durable!(impl, "implementation map must have an atom :type")
-  end
+  def normalize_implementation(%{} = impl), do: impl
 
   def normalize_implementation(other) do
     invalid!(
@@ -985,117 +998,6 @@ defmodule Docket.Graph.Serializer do
 
   defp fetch_module!(impl) do
     non_durable!(impl, "module implementation must have an atom :module")
-  end
-
-  @doc false
-  @spec normalize_schema(term()) :: Schema.t() | nil
-  def normalize_schema(nil), do: nil
-
-  def normalize_schema(%Schema{} = schema) do
-    unless Map.has_key?(@schema_types_out, schema.type) do
-      invalid!(:invalid_schema, "unknown schema type #{inspect(schema.type)}", %{
-        type: schema.type
-      })
-    end
-
-    %Schema{
-      schema
-      | fields: normalize_schema_fields(schema.fields),
-        item: normalize_schema(schema.item),
-        values: normalize_list(schema.values),
-        default: normalize_default(schema.default),
-        constraints: normalize_open_map(schema.constraints),
-        metadata: normalize_open_map(schema.metadata)
-    }
-  end
-
-  def normalize_schema(other) do
-    invalid!(:invalid_schema, "schema must be a Docket.Schema or nil, got #{inspect(other)}")
-  end
-
-  defp normalize_schema_fields(fields) when is_map(fields) do
-    Map.new(fields, fn {name, schema} -> {durable_key!(name), normalize_schema(schema)} end)
-  end
-
-  @doc false
-  @spec normalize_reducer(term()) :: Reducer.t() | nil
-  def normalize_reducer(nil), do: nil
-
-  def normalize_reducer(%Reducer{} = reducer) do
-    unless Map.has_key?(@reducer_types_out, reducer.type) do
-      invalid!(:invalid_reducer, "unknown reducer type #{inspect(reducer.type)}", %{
-        type: reducer.type
-      })
-    end
-
-    %Reducer{reducer | opts: normalize_open_map(reducer.opts)}
-  end
-
-  def normalize_reducer(other) do
-    invalid!(:invalid_reducer, "reducer must be a Docket.Reducer or nil, got #{inspect(other)}")
-  end
-
-  @doc false
-  @spec normalize_guard(term()) :: Guard.t() | nil
-  def normalize_guard(nil), do: nil
-
-  def normalize_guard(%Guard{op: op, args: args}) do
-    unless Map.has_key?(@guard_ops_out, op) do
-      invalid!(:invalid_guard, "unknown guard op #{inspect(op)}", %{op: op})
-    end
-
-    %Guard{op: op, args: normalize_guard_args(op, args)}
-  end
-
-  def normalize_guard(other) do
-    invalid!(:invalid_guard, "guard must be a Docket.Guard or nil, got #{inspect(other)}")
-  end
-
-  defp normalize_guard_args(op, args) when op in @guard_recursive_ops do
-    Enum.map(args, fn
-      %Guard{} = arg -> normalize_guard(arg)
-      other -> non_durable!(other, "guard #{op} arguments must be Docket.Guard structs")
-    end)
-  end
-
-  # Plain argument positions may reference nested guard expressions, e.g.
-  # equals(path(...), value).
-  defp normalize_guard_args(_op, args) when is_list(args) do
-    Enum.map(args, fn
-      %Guard{} = arg -> normalize_guard(arg)
-      other -> durable!(other)
-    end)
-  end
-
-  defp normalize_guard_args(_op, args) do
-    invalid!(:invalid_guard, "guard args must be a list, got #{inspect(args)}")
-  end
-
-  defp normalize_branches(branches) when is_map(branches) and not is_struct(branches) do
-    Map.new(branches, fn {name, group} -> {durable_key!(name), normalize_branch_group(group)} end)
-  end
-
-  defp normalize_branches(other) do
-    non_durable!(other, "branches must be a map")
-  end
-
-  defp normalize_branch_group(group) when is_list(group), do: normalize_list(group)
-
-  defp normalize_branch_group(group) when is_map(group) and not is_struct(group),
-    do: durable!(group)
-
-  defp normalize_branch_group(group) do
-    non_durable!(group, "branch group must be a list of edge IDs or a string-keyed map")
-  end
-
-  defp normalize_list(list) when is_list(list), do: Enum.map(list, &durable!/1)
-
-  defp normalize_default(default) do
-    if default == Schema.no_default() do
-      default
-    else
-      durable!(default)
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -1134,7 +1036,7 @@ defmodule Docket.Graph.Serializer do
   defp durable_key!(key) when is_atom(key), do: durable_key!(Atom.to_string(key))
 
   defp durable_key!(key) do
-    non_durable!(key, "map keys must be binaries or atoms")
+    non_durable!(key, "map keys must be strings or atoms")
   end
 
   defp durable_hint(value) when is_list(value), do: "lists must contain only durable values"

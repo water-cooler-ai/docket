@@ -21,6 +21,7 @@ defmodule Docket.Graph.Compiler do
 
   alias Docket.Graph
   alias Docket.Graph.Compiler.{Diagnostics, Lowering, RuntimeValidation, Validation}
+  alias Docket.Graph.Serializer
   alias Docket.Runtime
 
   @type opts :: keyword()
@@ -54,13 +55,14 @@ defmodule Docket.Graph.Compiler do
   end
 
   defp run_pipeline(graph, opts) do
-    diagnostics = Validation.run(graph, opts)
+    {canonical, ingest_diagnostics} = ingest(graph)
+    diagnostics = ingest_diagnostics ++ Validation.run(canonical, opts)
 
     if Diagnostics.blocking?(diagnostics) do
       {:error, diagnostics}
     else
-      runtime_graph = Lowering.run(graph, opts)
-      diagnostics = diagnostics ++ RuntimeValidation.run(runtime_graph, graph)
+      runtime_graph = Lowering.run(canonical, opts)
+      diagnostics = diagnostics ++ RuntimeValidation.run(runtime_graph, canonical)
 
       if Diagnostics.blocking?(diagnostics) do
         {:error, diagnostics}
@@ -68,6 +70,47 @@ defmodule Docket.Graph.Compiler do
         {:ok, runtime_graph, diagnostics}
       end
     end
+  end
+
+  # Graphs are free-form in memory; the compiler is a serialization boundary.
+  # Ingest canonicalizes the document through the wire format (atom keys and
+  # values in open content become strings, exactly as storage would see them)
+  # and validates/lowers the canonical form. Graphs that cannot cross the
+  # boundary keep their in-memory shape so the validation passes can still
+  # produce granular, path-bearing diagnostics next to the ingest error.
+  #
+  # The v1 wire format only represents schema_version 1 (dump stamps it), so
+  # a graph claiming any other version is never canonicalized; validation
+  # rejects it against the in-memory document instead.
+  defp ingest(%Graph{schema_version: version} = graph) when version != 1 do
+    {graph, []}
+  end
+
+  defp ingest(graph) do
+    {Serializer.load!(Serializer.dump(graph, []), []), []}
+  rescue
+    exception in Docket.Graph.Error ->
+      {graph, [ingest_diagnostic(exception)]}
+
+    exception ->
+      {graph,
+       [
+         Diagnostics.error(
+           :non_durable_graph_value,
+           "graph cannot be canonically serialized",
+           metadata: %{error: inspect(exception)}
+         )
+       ]}
+  end
+
+  defp ingest_diagnostic(%Docket.Graph.Error{} = error) do
+    code =
+      case error.code do
+        :non_durable_value -> :non_durable_graph_value
+        code -> code
+      end
+
+    Diagnostics.error(code, error.message, metadata: %{details: error.details})
   end
 
   defp validate_opts!(opts) do

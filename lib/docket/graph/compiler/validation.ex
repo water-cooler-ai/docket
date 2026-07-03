@@ -9,7 +9,7 @@ defmodule Docket.Graph.Compiler.Validation do
   # diagnostics; passes skip individual records they cannot interpret.
 
   alias Docket.Graph
-  alias Docket.Graph.{Edge, Field, Serializer}
+  alias Docket.Graph.{Edge, Field}
   alias Docket.{Guard, Reducer, Schema}
 
   import Docket.Graph.Compiler.Diagnostics, only: [error: 3, warning: 3]
@@ -43,13 +43,14 @@ defmodule Docket.Graph.Compiler.Validation do
   # 9.2 Public document
   # ---------------------------------------------------------------------------
 
+  # Durability is not checked here: compiler ingest canonicalizes the graph
+  # through the wire format and reports serialization failures itself.
   defp validate_document(graph, _opts) do
     List.flatten([
       check_schema_version(graph),
       check_graph_id(graph),
       check_record_ids(graph),
-      check_field_collisions(graph),
-      check_durability(graph)
+      check_field_collisions(graph)
     ])
   end
 
@@ -124,27 +125,6 @@ defmodule Docket.Graph.Compiler.Validation do
         public_id: id
       )
     end
-  end
-
-  defp check_durability(graph) do
-    Serializer.dump(graph, [])
-    []
-  rescue
-    exception in Docket.Graph.Error ->
-      [
-        error(
-          :non_durable_graph_value,
-          "graph contains non-durable content: #{exception.message}",
-          metadata: %{code: exception.code, details: exception.details}
-        )
-      ]
-
-    exception ->
-      [
-        error(:non_durable_graph_value, "graph cannot be canonically serialized",
-          metadata: %{error: inspect(exception)}
-        )
-      ]
   end
 
   # ---------------------------------------------------------------------------

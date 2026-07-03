@@ -40,7 +40,7 @@ defmodule Docket.GraphTest do
     assert %Docket.Graph.Node{implementation: %{module: Writer, function: :call}} =
              graph.nodes["writer"]
 
-    assert graph.nodes["writer"].config == %{"tone" => "clear"}
+    assert graph.nodes["writer"].config == %{tone: "clear"}
 
     assert %Docket.Graph.Edge{from: "$start", to: "writer"} = graph.edges["edge_start_writer"]
     assert %Docket.Graph.Output{source: "draft"} = graph.outputs["draft"]
@@ -62,7 +62,7 @@ defmodule Docket.GraphTest do
     {:ok, graph} = Docket.Graph.delete_edge(graph, "edge_start_draft")
 
     assert graph.inputs["message"].kind == :input
-    assert graph.nodes["draft"].config == %{"model" => "accurate"}
+    assert graph.nodes["draft"].config == %{model: "accurate"}
     refute Map.has_key?(graph.edges, "edge_start_draft")
     assert graph.diagnostics == []
   end
@@ -161,24 +161,22 @@ defmodule Docket.GraphTest do
     assert Docket.Graph.hash(renamed_graph) != hash
   end
 
-  test "keeps guard, schema, and reducer values serializable" do
-    guard =
-      Docket.Guard.not(Docket.Guard.equals(Docket.Guard.path("review", ["status"]), "approved"))
+  test "keeps atoms in memory and canonicalizes them to strings at the boundary" do
+    atom_schema = Docket.Schema.enum([:low, :medium, :high], default: :medium)
 
-    assert %Docket.Guard{op: :not} = guard
-
-    # enum values are normalized to durable strings when attached to a field.
-    schema = Docket.Schema.enum([:low, :medium, :high], default: :medium)
-    assert %Docket.Schema{type: :enum, values: [:low, :medium, :high]} = schema
-
-    stored =
+    graph =
       Docket.Graph.new!(id: "sev")
-      |> Docket.Graph.put_field!("severity", schema: schema)
+      |> Docket.Graph.put_field!("severity", schema: atom_schema)
 
-    assert stored.fields["severity"].schema.values == ["low", "medium", "high"]
-    assert stored.fields["severity"].schema.default == "medium"
+    assert graph.fields["severity"].schema.values == [:low, :medium, :high]
 
-    assert %Docket.Reducer{type: :last_value} = Docket.Reducer.last_value()
+    assert %{"values" => ["low", "medium", "high"], "default" => "medium"} =
+             Docket.Graph.to_map(graph)["fields"]["severity"]["schema"]
+
+    reloaded = Docket.Graph.from_map!(Docket.Graph.to_map(graph))
+
+    assert reloaded.fields["severity"].schema.values == ["low", "medium", "high"]
+    assert Docket.Graph.hash(reloaded) == Docket.Graph.hash(graph)
   end
 
   defp rich_graph do
@@ -189,7 +187,7 @@ defmodule Docket.GraphTest do
       })
 
     profile = Docket.Schema.object(%{"address" => address})
-    severity = Docket.Schema.enum([:low, :high], default: :low)
+    severity = Docket.Schema.enum(["low", "high"], default: "low")
     explicit_nil = Docket.Schema.string(default: nil)
 
     guard =
@@ -204,25 +202,25 @@ defmodule Docket.GraphTest do
       id: "rich",
       name: "Rich",
       description: "A rich graph",
-      metadata: %{owner: "team"},
-      policies: %{retries: 3}
+      metadata: %{"owner" => "team"},
+      policies: %{"retries" => 3}
     )
     |> Docket.Graph.put_input!("topic", schema: Docket.Schema.string(), required: true)
     |> Docket.Graph.put_input!("profile", schema: profile)
     |> Docket.Graph.put_field!("draft",
       schema: Docket.Schema.string(),
-      reducer: Docket.Reducer.last_value(strategy: :keep),
-      metadata: %{ui: "hidden"}
+      reducer: Docket.Reducer.last_value(%{"strategy" => "keep"}),
+      metadata: %{"ui" => "hidden"}
     )
     |> Docket.Graph.put_field!("severity", schema: severity)
     |> Docket.Graph.put_field!("note", schema: explicit_nil)
     |> Docket.Graph.put_node!("writer",
       label: "Writer",
       implementation: {Writer, :call},
-      config: %{tone: "clear"}
+      config: %{"tone" => "clear"}
     )
     |> Docket.Graph.put_node!("router",
-      implementation: %{type: :llm, model: "fast", temperature: 0.5},
+      implementation: %{"model" => "fast", "temperature" => 0.5, type: :llm},
       branches: %{"decision" => ["edge_yes", "edge_no"]}
     )
     |> Docket.Graph.put_edge!("edge_start_writer", from: "$start", to: "writer")
@@ -239,6 +237,49 @@ defmodule Docket.GraphTest do
     assert Docket.Graph.to_map(Docket.Graph.from_map!(map)) == map
     assert map["schema_version"] == 1
     refute Map.has_key?(map, "diagnostics")
+  end
+
+  test "wraps guards nested in plain argument positions with a $guard tag" do
+    guard = Docket.Guard.equals(Docket.Guard.path("review", ["status"]), "approved")
+
+    graph =
+      Docket.Graph.new!(id: "guarded")
+      |> Docket.Graph.put_edge!("e", from: "$start", to: "$finish", guard: guard)
+
+    map = Docket.Graph.to_map(graph)
+
+    assert %{
+             "op" => "equals",
+             "args" => [
+               %{"$guard" => %{"op" => "path", "args" => ["review", ["status"]]}},
+               "approved"
+             ]
+           } = map["edges"]["e"]["guard"]
+
+    assert Docket.Graph.from_map!(map) == graph
+
+    # A plain map value in a guard argument stays a plain map on load.
+    plain = put_in(map, ["edges", "e", "guard", "args"], [%{"status" => "x"}, "approved"])
+
+    assert %Docket.Guard{op: :equals, args: [%{"status" => "x"}, "approved"]} =
+             Docket.Graph.from_map!(plain).edges["e"].guard
+  end
+
+  test "reserves $-prefixed keys in durable content" do
+    graph =
+      Docket.Graph.new!(id: "reserved")
+      |> Docket.Graph.put_node!("n", config: %{"$tag" => 1})
+
+    error = assert_raise Docket.Graph.Error, fn -> Docket.Graph.to_map(graph) end
+    assert error.code == :non_durable_value
+
+    doc = %{
+      "schema_version" => 1,
+      "id" => "reserved",
+      "metadata" => %{"$tag" => 1}
+    }
+
+    assert {:error, %Docket.Graph.Error{code: :invalid_document}} = Docket.Graph.from_map(doc)
   end
 
   test "sentinel and explicit-nil schema defaults round-trip distinctly" do
@@ -283,34 +324,52 @@ defmodule Docket.GraphTest do
     assert Docket.Graph.hash(reschemad) != hash
   end
 
-  test "normalizes atom keys and values in open content at edit time" do
+  test "accepts free-form content in memory and coerces atoms at to_map" do
     graph =
-      Docket.Graph.new!(id: "norm")
-      |> Docket.Graph.metadata!(:owner, :team_a)
-      |> Docket.Graph.policy!(:mode, :strict)
+      Docket.Graph.new!(id: "free")
+      |> Docket.Graph.metadata!("owner", :team_a)
       |> Docket.Graph.put_node!("n", config: %{model: :fast, tags: [:a, :b]})
 
-    assert graph.metadata == %{"owner" => "team_a"}
-    assert graph.policies == %{"mode" => "strict"}
-    assert graph.nodes["n"].config == %{"model" => "fast", "tags" => ["a", "b"]}
+    assert graph.metadata == %{"owner" => :team_a}
+    assert graph.nodes["n"].config == %{model: :fast, tags: [:a, :b]}
+
+    map = Docket.Graph.to_map(graph)
+
+    assert map["metadata"] == %{"owner" => "team_a"}
+    assert map["nodes"]["n"]["config"] == %{"model" => "fast", "tags" => ["a", "b"]}
+
+    # The hash is computed from the canonical document, so it is identical
+    # before and after a storage round trip.
+    assert Docket.Graph.hash(Docket.Graph.from_map!(map)) == Docket.Graph.hash(graph)
+    assert Docket.Graph.to_map(Docket.Graph.from_map!(map)) == map
   end
 
-  test "rejects non-durable values in open content" do
-    graph = Docket.Graph.new!(id: "nd")
+  test "to_map rejects malformed record content with tagged errors" do
+    base = Docket.Graph.new!(id: "nd")
 
-    assert {:error, %Docket.Graph.Error{code: :non_durable_value}} =
-             Docket.Graph.metadata(graph, "opts", key: "value")
+    non_durable = [
+      Docket.Graph.metadata!(base, "opts", key: "value"),
+      Docket.Graph.put_node!(base, "n", config: %{coords: {1, 2}})
+    ]
 
-    assert {:error, %Docket.Graph.Error{code: :non_durable_value}} =
-             Docket.Graph.put_node(graph, "n", config: %{coords: {1, 2}})
-
-    assert_raise Docket.Graph.Error, fn ->
-      Docket.Graph.metadata!(graph, "opts", key: "value")
+    for graph <- non_durable do
+      error = assert_raise Docket.Graph.Error, fn -> Docket.Graph.to_map(graph) end
+      assert error.code == :non_durable_value
     end
 
-    assert_raise Docket.Graph.Error, fn ->
-      Docket.Graph.put_node!(graph, "n", config: %{coords: {1, 2}})
-    end
+    bad_schema = Docket.Graph.put_field!(base, "f", schema: %Docket.Schema{type: :weird})
+    error = assert_raise Docket.Graph.Error, fn -> Docket.Graph.to_map(bad_schema) end
+    assert error.code == :invalid_schema
+
+    bad_guard =
+      Docket.Graph.put_edge!(base, "e",
+        from: "$start",
+        to: "$finish",
+        guard: %Docket.Guard{op: :weird}
+      )
+
+    error = assert_raise Docket.Graph.Error, fn -> Docket.Graph.to_map(bad_guard) end
+    assert error.code == :invalid_guard
   end
 
   test "from_map rejects malformed documents" do

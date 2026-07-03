@@ -88,8 +88,8 @@ defmodule Docket.Graph do
       name: Keyword.get(opts, :name),
       description: Keyword.get(opts, :description),
       schema_version: Keyword.get(opts, :schema_version, @schema_version),
-      metadata: Serializer.normalize_open_map(Keyword.get(opts, :metadata, %{})),
-      policies: Serializer.normalize_open_map(Keyword.get(opts, :policies, %{}))
+      metadata: Keyword.get(opts, :metadata, %{}),
+      policies: Keyword.get(opts, :policies, %{})
     }
 
     finalize_edit(graph, opts)
@@ -198,7 +198,7 @@ defmodule Docket.Graph do
       |> Map.put(:id, id)
       |> Map.put_new(:source, id)
 
-    output = Output |> struct(attrs) |> Serializer.normalize_output()
+    output = struct(Output, attrs)
 
     graph
     |> put_in([Access.key!(:outputs), id], output)
@@ -220,16 +220,15 @@ defmodule Docket.Graph do
   @doc """
   Stores a graph-level policy value, raising on malformed arguments.
 
-  The key must be a binary or atom (atoms are normalized to strings) and the
-  value must be a durable value.
+  Content is stored as given. When the graph crosses the serialization
+  boundary (`to_map/2`, `hash/2`), atom keys and values are canonicalized to
+  strings and terms with no JSON representation are rejected. Keys starting
+  with `"$"` are reserved for the wire format.
   """
-  @spec policy!(t(), binary() | atom(), term(), keyword()) :: t()
+  @spec policy!(t(), binary(), term(), keyword()) :: t()
   def policy!(graph, key, value, opts \\ [])
 
   def policy!(%__MODULE__{} = graph, key, value, opts) do
-    key = Serializer.normalize_key(key)
-    value = Serializer.normalize_value(value)
-
     graph
     |> Map.put(:policies, Map.put(graph.policies, key, value))
     |> finalize_edit(opts)
@@ -250,16 +249,15 @@ defmodule Docket.Graph do
   @doc """
   Stores graph-level application metadata, raising on malformed arguments.
 
-  The key must be a binary or atom (atoms are normalized to strings) and the
-  value must be a durable value.
+  Content is stored as given. When the graph crosses the serialization
+  boundary (`to_map/2`, `hash/2`), atom keys and values are canonicalized to
+  strings and terms with no JSON representation are rejected. Keys starting
+  with `"$"` are reserved for the wire format.
   """
-  @spec metadata!(t(), binary() | atom(), term(), keyword()) :: t()
+  @spec metadata!(t(), binary(), term(), keyword()) :: t()
   def metadata!(graph, key, value, opts \\ [])
 
   def metadata!(%__MODULE__{} = graph, key, value, opts) do
-    key = Serializer.normalize_key(key)
-    value = Serializer.normalize_value(value)
-
     graph
     |> Map.put(:metadata, Map.put(graph.metadata, key, value))
     |> finalize_edit(opts)
@@ -281,9 +279,20 @@ defmodule Docket.Graph do
   Dumps the graph to a plain, JSON-safe map (the v1 wire format).
 
   Keys are strings and values are durable JSON-safe terms. Compiler diagnostics
-  are transient and are never serialized. Raises `Docket.Graph.Error` when the
-  graph contains non-durable content; graphs built through this editing API are
-  always dumpable because edits normalize durable values.
+  are transient and are never serialized.
+
+  Graphs are free-form in memory; this is the boundary where content is
+  canonicalized. Open content (metadata, policies, config, defaults, enum
+  values, guard arguments, branch groups) is coerced the way `Jason` would
+  encode it: atom keys and atom values become strings, silently. Terms with no
+  JSON representation - tuples, keyword lists, pids, refs, functions, structs -
+  raise `Docket.Graph.Error` (`:non_durable_value` and friends).
+
+  The graph hash is computed from this document, so it is stable across
+  storage round trips: `hash(from_map!(to_map(graph))) == hash(graph)` for any
+  dumpable graph. Graphs whose open content is already canonical (string keys
+  and values) also round-trip on struct equality:
+  `from_map!(to_map(graph)) == graph`.
   """
   @spec to_map(t(), keyword()) :: map()
   def to_map(%__MODULE__{} = graph, opts \\ []) do
@@ -685,7 +694,7 @@ defmodule Docket.Graph do
 
   defp field_from_attrs(attrs, id \\ nil)
 
-  defp field_from_attrs(%Field{} = field, _id), do: Serializer.normalize_field(field)
+  defp field_from_attrs(%Field{} = field, _id), do: field
 
   defp field_from_attrs(attrs, id) do
     attrs
@@ -693,27 +702,27 @@ defmodule Docket.Graph do
     |> Map.put_new(:id, id)
     |> Map.put_new(:kind, :state)
     |> then(&struct(Field, &1))
-    |> Serializer.normalize_field()
   end
 
-  defp node_from_attrs(%Node{} = node, _id), do: Serializer.normalize_node(node)
+  defp node_from_attrs(%Node{} = node, _id) do
+    Map.update!(node, :implementation, &Serializer.normalize_implementation/1)
+  end
 
   defp node_from_attrs(attrs, id) do
     attrs
     |> attrs_to_map()
     |> Map.put_new(:id, id)
     |> then(&struct(Node, &1))
-    |> Serializer.normalize_node()
+    |> Map.update!(:implementation, &Serializer.normalize_implementation/1)
   end
 
-  defp edge_from_attrs(%Edge{} = edge, _id), do: Serializer.normalize_edge(edge)
+  defp edge_from_attrs(%Edge{} = edge, _id), do: edge
 
   defp edge_from_attrs(attrs, id) do
     attrs
     |> attrs_to_map()
     |> Map.put_new(:id, id)
     |> then(&struct(Edge, &1))
-    |> Serializer.normalize_edge()
   end
 
   defp apply_update(existing, fun, normalizer) when is_function(fun, 1) do

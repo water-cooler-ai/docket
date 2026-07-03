@@ -89,8 +89,7 @@ defmodule MyApp.DocketCheckpoint do
   def handle(%Docket.Checkpoint{run: run} = checkpoint, _context) do
     metadata = run.metadata || %{}
 
-    with {:ok, dumped_run} <- Docket.Run.dump(run),
-         {:ok, user_id} <- fetch_metadata(metadata, :user_id),
+    with {:ok, user_id} <- fetch_metadata(metadata, :user_id),
          {:ok, account_id} <- fetch_metadata(metadata, :account_id),
          {:ok, workflow_id} <- fetch_metadata(metadata, :workflow_id) do
       attrs = %{
@@ -99,7 +98,7 @@ defmodule MyApp.DocketCheckpoint do
         account_id: account_id,
         workflow_id: workflow_id,
         status: run.status,
-        docket_run: dumped_run,
+        docket_run: Docket.Run.to_map(run),
         latest_checkpoint_seq: checkpoint.seq,
         latest_checkpoint_type: checkpoint.type
       }
@@ -206,7 +205,7 @@ public `Docket.Run`, and passes both the graph and run back to Docket:
 ```elixir
 defmodule MyApp.Workflows do
   def resume_run!(%WorkflowRun{} = workflow_run) do
-    {:ok, run} = Docket.Run.load(workflow_run.docket_run)
+    run = Docket.Run.from_map!(workflow_run.docket_run)
     graph = load_published_graph!(workflow_run.workflow_id, run.graph_hash)
 
     MyApp.Docket.resume(graph, run)

@@ -91,7 +91,7 @@ defmodule Docket.Graph.Compiler.LoweringTest do
              }
     end
 
-    test "config defaults are not written back into the public graph" do
+    test "config defaults and canonicalization are not written back into the public graph" do
       graph =
         Graphs.minimal_linear()
         |> Graph.put_node!("styled", implementation: Nodes.WithDefaults, config: %{tone: "warm"})
@@ -99,7 +99,9 @@ defmodule Docket.Graph.Compiler.LoweringTest do
 
       compile!(graph)
 
-      assert graph.nodes["styled"].config == %{"tone" => "warm"}
+      # The public document keeps its free-form in-memory shape; string keys
+      # and defaults only appear in the derived runtime graph.
+      assert graph.nodes["styled"].config == %{tone: "warm"}
     end
 
     test "targets subscribe to their incoming activation channels" do
@@ -164,6 +166,24 @@ defmodule Docket.Graph.Compiler.LoweringTest do
       descriptor = runtime_graph.edges["edge_premium"]
 
       assert %Docket.Guard{op: :equals} = descriptor.guard
+    end
+
+    test "guard literals canonicalize with the rest of the graph" do
+      guard = Docket.Guard.equals(Docket.Guard.path("user", ["tier"]), :premium)
+
+      graph =
+        Graphs.guarded_edge()
+        |> Graph.update_edge!("edge_premium", guard: guard)
+
+      runtime_graph = compile!(graph)
+
+      # Atom literals become strings at the compile boundary, matching what
+      # a stored-and-reloaded graph would produce; the public graph keeps
+      # the atom.
+      assert %Docket.Guard{op: :equals, args: [%Docket.Guard{op: :path}, "premium"]} =
+               runtime_graph.edges["edge_premium"].guard
+
+      assert %Docket.Guard{args: [_path, :premium]} = graph.edges["edge_premium"].guard
     end
 
     test "multi-source edges lower to barrier descriptors" do

@@ -60,10 +60,18 @@ compiler is implemented to make them pass.
     runtime graph ID is derived from the graph ID and content hash
     (`<graph_id>@<first 12 hash chars>`), so identical graphs compile to
     identical runtime graphs.
-14. **Durability check**: phase 9.2 proves the graph is durable by attempting
-    the canonical `Serializer.dump/2`; failure surfaces as
-    `:non_durable_graph_value` instead of an exception. The graph hash is only
-    computed (and attached) when the dump succeeds.
+14. **Ingest canonicalizes through the wire format**: graphs are free-form in
+    memory (serialization happens at compile/hash/storage time, not per
+    edit), so compiler ingest round-trips the document through
+    `Serializer.dump/2` + `load!/2` and validates/lowers the canonical form
+    (atom keys and values in open content become strings, exactly as storage
+    would see them). Canonicalization is never written back to the public
+    graph. A graph that cannot cross the boundary falls back to raw
+    validation for granular, path-bearing diagnostics next to the ingest
+    error (`:non_durable_graph_value` for non-durable content; the
+    serializer's own code otherwise). Graphs claiming an unsupported
+    `schema_version` are never canonicalized, because the v1 wire format
+    stamps version 1 on dump.
 15. **verify/compile share the full pipeline** including lowering and runtime
     graph self-validation; `verify/2` throws the runtime graph away and
     returns the graph with fresh diagnostics. Stale diagnostics on the input
