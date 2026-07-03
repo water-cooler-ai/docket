@@ -110,21 +110,14 @@ atoms.
 
 ### Compiler Boundary
 
-The compiler boundary exists but is not implemented beyond the public function
-shape.
+The compiler boundary is implemented; see "Compiler (Attempt 1)" below.
 
 Implemented functions:
 
 - `Docket.Graph.Compiler.verify/2`
 - `Docket.Graph.Compiler.compile/2`
 
-Current behavior:
-
-- `verify/2` returns `{:error, graph_with_diagnostics}` with a placeholder
-  compiler diagnostic.
-- `compile/2` returns `{:error, graph_with_diagnostics}`.
-- There is no compiler report struct.
-- There is no `explain/2` function.
+There is no compiler report struct and no `explain/2` function.
 
 ### Node Contracts
 
@@ -197,20 +190,38 @@ Current coverage checks:
 - graph verification attaching compiler diagnostics
 - edit helpers clearing stale diagnostics
 
+### Compiler (Attempt 1)
+
+The compiler slice from `docket-compiler-design.md` is implemented; decisions
+specific to this attempt are recorded in `docket-compiler-v1-attempt-1.md`.
+
+- `Docket.Graph.Compiler.verify/2` and `compile/2` run the real pipeline:
+  document, field/schema/reducer, output, node, edge, branch, guard,
+  topology, and cycle validation, then lowering and runtime graph
+  self-validation. Both share the same rules; diagnostics are always fresh.
+- `Docket.Runtime.Graph`, `Docket.Runtime.Graph.Node`,
+  `Docket.Runtime.Graph.Channel`, and `Docket.Runtime.Graph.Lowering` exist
+  as derived internal structs with no execution behavior.
+- Lowering generates `input:`/`state:`/`edge:` channels, `node:` runtime
+  nodes with subscriptions and outgoing edges, `output:` projections,
+  barrier channels for multi-source edges, guard descriptors on runtime
+  edges, and required lowering metadata in both directions. Branch groups
+  lower to metadata only.
+- `Docket.Schema.validate/2` provides the minimal v1 validation engine used
+  for field defaults and node config.
+- Compilation is deterministic; compiling the same graph twice yields
+  identical runtime graphs regardless of map insertion order.
+- Test support landed under `test/support`: node fixtures, graph fixtures
+  (`minimal_linear/0` through `cycle_counter/0` plus invalid variants), and
+  a `Docket.Test.Case` with `assert_diagnostic/3` helpers.
+
 ## Not Yet Implemented
 
-- real compiler validation
-- runtime graph lowering
-- schema compatibility checks
-- node config validation
-- reachability checks
-- cycle and max-step validation
-- multi-source edge barrier lowering
-- node-local branch group validation and lowering
 - `Docket.Run`
 - checkpoint contracts
 - runtime loop
-- inline test runtime
+- inline test runtime (`Docket.Test.run_inline/3`)
+- compile-and-run integration tests (blocked on the inline runtime)
 - public run/resume APIs
 - supervised runtime process tree
 
@@ -220,5 +231,5 @@ Latest local check:
 
 ```text
 mix test
-21 tests, 0 failures
+140 tests, 0 failures
 ```

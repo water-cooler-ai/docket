@@ -922,10 +922,23 @@ Resolved v1 contract:
   attempt counter only advances inside a barrier that commits, so a
   never-committed superstep runs again with the same keys and cooperating
   integrations deduplicate the external effects.
+- Invariant to protect in `Docket.Runtime.Algorithm`: attempt counters (and
+  any other value that feeds idempotency keys) must never be advanced in
+  mutable/in-memory state before the barrier that records the advance commits.
+  Planning a superstep derives keys from the previous committed `Docket.Run`
+  only. If an attempt counter is ever bumped before commit, crash-resume
+  re-execution silently produces fresh idempotency keys and external effects
+  duplicate. This invariant has a dedicated inline-execution test gate:
+  re-planning a superstep after a failed checkpoint must produce
+  byte-identical idempotency keys.
 - Post-v1 design space: persist successful sibling-node writes attached to the
   previous checkpoint (LangGraph's `put_writes` pending-writes pattern) so a
-  re-executed superstep does not redo nodes that already succeeded. v1
-  re-executes the whole superstep.
+  re-executed superstep does not redo nodes that already succeeded. This
+  matters for Water Cooler because re-running an already-succeeded LLM node is
+  the expensive redo (latency, tokens, and provider cost), but pending writes
+  complicate the checkpoint contract with a second write path, so it is
+  deliberately deferred. v1 re-executes the whole superstep and relies on
+  idempotency keys for external-effect dedupe.
 
 ## 15. Interrupt Contract
 

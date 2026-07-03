@@ -466,12 +466,12 @@ defmodule Docket.GraphTest do
   end
 
   test "verifies through the public graph API" do
-    graph = Docket.Graph.new!(id: "stubbed") |> Docket.Graph.put_output!("result", [])
+    graph = Docket.Graph.new!(id: "dangling") |> Docket.Graph.put_output!("result", [])
 
     assert {:error, verified} = Docket.Graph.verify(graph)
 
-    assert %Docket.Graph{id: "stubbed"} = verified
-    assert Enum.any?(verified.diagnostics, &(&1.code == :compiler_not_implemented))
+    assert %Docket.Graph{id: "dangling"} = verified
+    assert Enum.any?(verified.diagnostics, &(&1.code == :unknown_output_source))
   end
 
   test "graph edits clear stale diagnostics until the graph is verified again" do
@@ -480,7 +480,7 @@ defmodule Docket.GraphTest do
       |> Docket.Graph.put_output!("result", [])
 
     assert {:error, graph} = Docket.Graph.verify(graph)
-    assert Enum.any?(graph.diagnostics, &(&1.code == :compiler_not_implemented))
+    assert Enum.any?(graph.diagnostics, &(&1.code == :unknown_output_source))
 
     {:ok, graph} = Docket.Graph.put_output(graph, "result", [])
 

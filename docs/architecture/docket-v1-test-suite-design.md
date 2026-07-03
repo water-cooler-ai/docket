@@ -165,6 +165,9 @@ They verify:
   same superstep
 - reducer application and write ordering
 - checkpoint ordering and checkpoint failure behavior
+- idempotency key stability across checkpoint failure: re-planning a superstep
+  after a failed checkpoint produces byte-identical idempotency keys, proving
+  attempt counters only advance inside committed barriers
 - retry policy and max-attempt behavior
 - interrupts, interrupt checkpoints, and resume-channel writes
 - terminal detection
