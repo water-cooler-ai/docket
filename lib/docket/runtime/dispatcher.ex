@@ -77,7 +77,16 @@ defmodule Docket.Runtime.Dispatcher do
       application: config.context
     }
 
-    config.executor.execute(task, node, activation.snapshot, activation.config, context, [])
+    executor_opts = Keyword.put(config.executor_opts, :timeout_ms, activation.timeout_ms)
+
+    config.executor.execute(
+      task,
+      node,
+      activation.snapshot,
+      activation.config,
+      context,
+      executor_opts
+    )
   rescue
     exception -> {:raised, exception, __STACKTRACE__}
   catch

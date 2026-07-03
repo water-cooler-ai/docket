@@ -35,7 +35,7 @@ defmodule Docket.Test do
       | {:error, Docket.Error.t(), [Docket.Checkpoint.t()]}
   """
 
-  alias Docket.{Error, Graph, Run}
+  alias Docket.{Error, Run}
   alias Docket.Runtime.{Config, Dispatcher, Loop}
 
   @doc """
@@ -47,7 +47,7 @@ defmodule Docket.Test do
     opts = normalize_opts(opts)
 
     with {:ok, rtg} <- ensure_compiled(graph_or_runtime_graph, opts) do
-      run = initial_run(rtg, input, opts)
+      run = Loop.build_initial_run(rtg, input, opts)
       start(rtg, run, opts)
     else
       {:error, %Error{} = error} -> {:error, error, []}
@@ -205,29 +205,8 @@ defmodule Docket.Test do
     Keyword.put_new(opts, :checkpoint, Docket.Test.Checkpoint.Accept)
   end
 
-  defp ensure_compiled(%Graph{} = graph, opts) do
-    compile_opts = [profile: :run] ++ Keyword.take(opts, [:max_supersteps])
-
-    case Docket.Graph.Compiler.compile(graph, compile_opts) do
-      {:ok, rtg} ->
-        {:ok, rtg}
-
-      {:error, %Graph{} = failed} ->
-        {:error,
-         Error.new(:invalid_graph, "graph #{inspect(graph.id)} failed verification",
-           details: %{diagnostics: failed.diagnostics}
-         )}
-    end
-  end
-
-  defp ensure_compiled(%Docket.Runtime.Graph{} = rtg, _opts), do: {:ok, rtg}
-
-  defp ensure_compiled(other, _opts) do
-    {:error,
-     Error.new(
-       :invalid_graph,
-       "expected a Docket.Graph or Docket.Runtime.Graph, got #{inspect(other)}"
-     )}
+  defp ensure_compiled(graph_or_runtime_graph, opts) do
+    Docket.ensure_compiled(graph_or_runtime_graph, opts)
   end
 
   defp graph_from_opts(opts) do
@@ -245,18 +224,5 @@ defmodule Docket.Test do
       {graph, _} ->
         ensure_compiled(graph, opts)
     end
-  end
-
-  defp initial_run(rtg, input, opts) do
-    config = Config.resolve(opts)
-
-    %Run{
-      id: Keyword.get(opts, :run_id) || config.id_generator.(:run),
-      graph_id: rtg.graph_id,
-      graph_hash: rtg.graph_hash,
-      status: :created,
-      input: input || %{},
-      metadata: Keyword.get(opts, :metadata, %{})
-    }
   end
 end

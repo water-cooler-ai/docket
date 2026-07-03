@@ -541,7 +541,9 @@ attempt defines it:
 - `on_error` routing is post-v1; the key is reserved and rejected if present.
 
 Once confirmed, compiler validation for these keys is a small follow-up in
-`Validation` (phase 9.5), closing the deferred decision.
+`Validation` (phase 9.5), closing the deferred decision. (Landed with the
+supervised slice: `Policies.node_policies/1` is shared by compiler
+validation and plan-time validation.)
 
 ## 11. Interrupts
 
@@ -628,9 +630,9 @@ them exactly.
   in a checkpoint.
 - **C4 — Node policy surface**: as in section 10 (`"timeout_ms"`,
   `"retry" => %{"max_attempts", "backoff_ms"}`, `"on_error"` reserved and
-  rejected). Compiler validation of these keys is a pending follow-up in
-  `Validation` phase 9.5 (runtime validates them at plan time meanwhile and
-  fails the run with `:invalid_policy`).
+  rejected). Compiler validation of these keys landed with the supervised
+  slice (`Validation` phase 9.5); plan-time validation remains as defense
+  for hand-built runtime graphs and fails the run with `:invalid_policy`.
 - **C5 — Sibling writes at an interrupt barrier**: they commit; the barrier
   emits one sync `:interrupt_requested` checkpoint carrying the commit.
 - **C6 — pending_nodes**: added as committed `Docket.Run` state.

@@ -21,6 +21,23 @@ defmodule Docket.Runtime.Loop do
   alias Docket.Run.{ChannelState, InterruptState}
   alias Docket.Runtime.{Algorithm, Config}
 
+  @doc false
+  # Builds the fresh `:created` run document consumed by `init/3`. Shared by
+  # `Docket.run/4` and `Docket.Test.run_inline/3` so both entry points create
+  # byte-identical initial runs.
+  def build_initial_run(rtg, input, opts) do
+    config = Config.resolve(opts)
+
+    %Run{
+      id: Keyword.get(opts, :run_id) || config.id_generator.(:run),
+      graph_id: rtg.graph_id,
+      graph_hash: rtg.graph_hash,
+      status: :created,
+      input: input || %{},
+      metadata: Keyword.get(opts, :metadata, %{})
+    }
+  end
+
   # ---------------------------------------------------------------------------
   # init/3
   # ---------------------------------------------------------------------------
@@ -391,7 +408,9 @@ defmodule Docket.Runtime.Loop do
     if Map.has_key?(rtg.lowering.public_to_runtime.fields, interrupt.resume_channel || "") do
       []
     else
-      ["interrupt resume_channel #{inspect(interrupt.resume_channel)} is not a declared state field"]
+      [
+        "interrupt resume_channel #{inspect(interrupt.resume_channel)} is not a declared state field"
+      ]
     end
   end
 

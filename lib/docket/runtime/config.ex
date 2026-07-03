@@ -11,6 +11,7 @@ defmodule Docket.Runtime.Config do
             optional(Docket.Checkpoint.type()) => Docket.Checkpoint.delivery()
           },
           executor: module(),
+          executor_opts: keyword(),
           clock: (-> DateTime.t()),
           id_generator: (atom() -> String.t()),
           sleeper: (non_neg_integer() -> :ok),
@@ -28,6 +29,7 @@ defmodule Docket.Runtime.Config do
       checkpoint: checkpoint,
       checkpoint_overrides: Keyword.get(opts, :checkpoint_overrides, %{}),
       executor: Keyword.get(opts, :executor, Docket.Executor.Local),
+      executor_opts: Keyword.get(opts, :executor_opts, []),
       clock: Keyword.get(opts, :clock, &DateTime.utc_now/0),
       id_generator: Keyword.get(opts, :id_generator, &default_id/1),
       sleeper: Keyword.get(opts, :sleeper, &sleep/1),

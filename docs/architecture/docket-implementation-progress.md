@@ -217,13 +217,6 @@ specific to this attempt are recorded in `docket-compiler-v1-attempt-1.md`.
 
 ## Not Yet Implemented
 
-- `Docket.Runtime` GenServer shell, registry, and supervisor
-- public `Docket.run/4`, `resume/4`, `get_run/3`, `resolve_interrupt/5` and
-  `use Docket` host wrappers
-- `Docket.Executor.Task` and supervised lifecycle/crash-recovery tests
-- ETS checkpoint sink test support
-- compiler validation of the v1 node policy keys (runtime validates them at
-  plan time meanwhile)
 - `Docket.Event` codecs (events are in-memory structs delivered with
   checkpoints; hosts that persist them own the encoding for now)
 
@@ -292,11 +285,78 @@ graph fixtures `interrupt_review/0`, `retry_then_continue/0`,
 `Docket.Runtime.Graph.Channel` gained a `required` flag lowered from input
 `Field.required` so run initialization can enforce required inputs.
 
+## Runtime (Attempt 1) — Supervised Slice
+
+Run-path slices 8-11 of the implementation path are implemented on top of
+the shared loop: the supervised GenServer shell, registry/supervisor,
+public run APIs, task executor, ETS sink test support, and crash-recovery
+coverage.
+
+Implemented public modules:
+
+- `Docket` public facade: `run/4`, `resume/4`, `get_run/3`,
+  `resolve_interrupt/5`, `child_spec/1`, and the `use Docket` host module
+  generator (`run/3`, `resume/3`, `get_run/2`, `resolve_interrupt/4`
+  wrappers plus `child_spec/1`/`start_link/1`)
+- `Docket.Runtime.Supervisor` — one named runtime instance: unique
+  registry, `Task.Supervisor`, and a `DynamicSupervisor` for per-run
+  Runtime processes (`:one_for_all`); startup options become the instance's
+  default run options (stored as registry metadata), merged under per-call
+  options
+- `Docket.Runtime` — `restart: :temporary` GenServer shell for one active
+  run driving the same `Loop` transitions on self-scheduled ticks. Emits
+  the sync `:run_initialized` checkpoint inside `init/1` and reports the
+  initialized run to the caller before start returns, so `Docket.run/4` is
+  a true start barrier. Async checkpoint effects are submitted to the
+  instance task supervisor and tracked; failures are logged without
+  blocking the run. The process exits normally once the run is terminal and
+  deliveries have settled, after which `get_run/3` returns `:not_found`.
+- `Docket.Executor.Task` — process-isolated node execution with
+  `timeout_ms` enforcement (supervised `async_nolink` under the instance
+  task supervisor; unsupervised monitored process without one). Timeouts
+  and task crashes normalize to retryable attempt failures.
+
+Semantics proven by supervised tests (`test/docket/supervised/`):
+
+- `run/4` start barrier ordering, `use Docket` wrappers, invalid input and
+  failed `:run_initialized` checkpoints leaving no runtime registered
+- one active Runtime per run ID (`:already_active` on duplicate run/resume),
+  `get_run/3` reading only active Runtime memory, `:not_found` for unknown
+  and finished runs, normal exit + deregistration after terminal
+- interrupts parking the run as `:waiting` and resolving through the public
+  API; stale/unknown messages ignored; async delivery failures observable
+  (logged + rejected checkpoint) without blocking the run
+- task executor: timeout -> non-permanent node attempt failure -> retry
+  dispatches a fresh attempt; exhausted timeouts fail the run; node crashes
+  isolated from the runtime tree; inline (unsupervised) Executor.Task path
+- crash recovery: killed waiting and mid-superstep runtimes resume from the
+  latest ETS-backed checkpoint (including a `to_map`/`from_map` round trip),
+  re-executing the uncommitted superstep with the same attempt counter;
+  terminal runs never restart; mismatched graph hashes rejected
+
+Test support added: `Docket.Test.Checkpoint.EtsSink` (anonymous
+`:ordered_set` tables keyed `{run_id, seq}`, `latest_run/2`,
+`list_checkpoints/2`, `delete_run/2`, idempotent by seq, optional test-pid
+notify), `Docket.Test.Checkpoint.Recording` (sends every checkpoint to the
+test process, optional forced failures per type), the
+`SleepsUntilReleased` node fixture (message-released, no wall-clock
+sleeps), and the `blocking/1` graph fixture with attachable node policies.
+
+### Compiler Node Policy Validation (Phase 9.5)
+
+The deferred compiler validation of the v1 node policy surface is closed:
+`Docket.Graph.Compiler.Policies.node_policies/1` owns the rules
+(`"timeout_ms"`, `"retry" => %{"max_attempts", "backoff_ms"}`, reserved
+`"on_error"`; other keys stay open content) and is shared by compiler
+validation (one `:invalid_policy` diagnostic per offending key at
+`[:nodes, id, :policies, key]`) and `Docket.Runtime.Algorithm` plan-time
+validation, which remains as defense for hand-built runtime graphs.
+
 ## Current Test Status
 
 Latest local check:
 
 ```text
 mix test
-213 tests, 0 failures
+256 tests, 0 failures
 ```

@@ -172,6 +172,27 @@ defmodule Docket.Test.Fixtures.Graphs do
   end
 
   @doc """
+  start -> blocker -> finish; blocker announces itself to the test
+  coordinator and blocks until released.
+
+  Proves task-executor timeouts, in-flight crash recovery, and deterministic
+  release without wall-clock sleeps. `policies` lets tests attach
+  "timeout_ms"/"retry" node policies.
+  """
+  def blocking(policies \\ %{}) do
+    Graph.new!(id: "blocking")
+    |> Graph.put_field!("out", schema: Schema.string())
+    |> Graph.put_node!("blocker",
+      implementation: Nodes.SleepsUntilReleased,
+      config: %{field: "out", value: "released"},
+      policies: policies
+    )
+    |> Graph.put_edge!("edge_start_blocker", from: "$start", to: "blocker")
+    |> Graph.put_edge!("edge_blocker_finish", from: "blocker", to: "$finish")
+    |> Graph.put_output!("out", [])
+  end
+
+  @doc """
   start -> flaky -> finish; flaky fails twice and succeeds on attempt three.
 
   Proves retry attempts and continuation after success.
