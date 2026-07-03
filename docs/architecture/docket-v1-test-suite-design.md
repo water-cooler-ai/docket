@@ -49,8 +49,8 @@ v1 tests follow these rules:
   messages, monitors, barriers, controlled executors, or inline execution.
 - Construction helpers allow incomplete drafts. Compiler tests decide what is
   runnable.
-- Public tests assert public structs, diagnostics, checkpoints, runs, compiler
-  reports, and lowering maps. They do not assert private Runtime process state.
+- Public tests assert public structs, graph-attached diagnostics, checkpoints,
+  runs, and lowering maps. They do not assert private Runtime process state.
 - Runtime algorithm tests may assert internal data only in internal test files.
   Public contract tests should stay stable across implementation refactors.
 - Fixtures are ordinary Elixir modules and graph values, not external files,
@@ -72,11 +72,12 @@ Construction tests cover the public editable graph document.
 They verify:
 
 - `Docket.Graph.new/1` creates a canonical draft graph with stable IDs
-- `input/3`, `field/3`, `output/3`, `node/4`, `edge/4`, `join/4`, `branch/3`,
-  `policy/3`, and metadata helpers update the graph document
-- `put_*`, `update_*`, and `delete_*` helpers preserve stable IDs where
-  appropriate
-- incomplete drafts are representable and carry advisory diagnostics
+- `put_input/4`, `put_field/4`, `put_output/4`, `put_node/4`, `put_edge/4`,
+  `policy/4`, and metadata helpers update the graph document
+- multi-source edges represent fan-in joins
+- node-local branch groups preserve guarded outgoing edge groupings
+- `update_*` and `delete_*` helpers preserve stable IDs where appropriate
+- incomplete drafts are representable without diagnostics until verification
 - published graph documents are not mutated in ordinary editing flows
 - UI layout and editor projection state are host-owned and not part of Docket
   graph documents
@@ -92,31 +93,28 @@ Compiler tests cover `Docket.Graph -> Docket.Runtime.Graph`.
 
 They verify:
 
-- `verify/2`, `explain/2`, and `compile/2` share the same validation rules
+- `Docket.Graph.verify/2`, `Docket.Graph.Compiler.verify/2`, and
+  `Docket.Graph.Compiler.compile/2` share the same validation rules
 - inputs lower to input channels
 - state fields lower to state channels with the intended reducer
 - outputs lower to output projections
 - public nodes lower to `Docket.Runtime.Graph.Node` values
-- node `reads` lower to readable runtime channels
-- node `writes` lower to runtime write permissions
 - node config validates against the node behaviour's config schema
-- dynamic node ports are derived from normalized config
-- input/output port bindings lower to runtime channel bindings
-- binding validation checks compatibility between graph field schemas and node
-  port schemas
+- configured state field references validate against graph input/state fields
 - simple edges lower to generated ephemeral activation channels
-- source nodes receive generated system writes for outgoing edge channels
+- source runtime graph nodes reference outgoing edges for trigger evaluation
 - target nodes subscribe to generated activation channels
 - fan-out creates one generated activation channel per target
-- joins lower to the required barrier representation
-- branches lower to grouped guarded edges and generated activation channels
+- multi-source edges lower to the required barrier/all representation
+- node branch groups lower through grouped guarded edges and generated activation
+  channels
 - guarded edges compile durable `Docket.Guard` expressions
-- compiler reports expose public-to-runtime and runtime-to-public lowering maps
+- compiler lowering metadata exposes public-to-runtime and runtime-to-public maps
 - diagnostics use public IDs and public graph paths whenever possible
 - generated channel IDs cannot collide with user-declared IDs
 - compile rejects unknown fields, unknown nodes, invalid guards, impossible
-  joins, invalid reducers, unsafe node implementations, unauthorized writes,
-  and cycles without an explicit v1 limit or halt condition
+  multi-source edge barriers, invalid reducers, unsafe node implementations,
+  invalid node config, and cycles without an explicit v1 limit or halt condition
 
 Compiler tests are the bridge suite. They should assert exact lowering shape
 where Docket needs a stable internal contract between builder and runtime.
@@ -149,11 +147,12 @@ Examples:
 
 - a simple edge activates the target node exactly once
 - fan-out activates both targets from one source
-- join waits until all upstream nodes have committed
-- a guarded edge activates only when the guard sees committed state
+- multi-source edge waits until all upstream nodes have committed
+- a guarded edge activates only when source completion produces a candidate and
+  the guard sees committed state plus changed fields
 - generated edge channels are not writable by user node output
 - output projections return the public output shape
-- public IDs in events map back through the compiler lowering report
+- public IDs in events map back through compiler lowering metadata
 
 ### 3.4 Inline Execution Tests
 
@@ -241,11 +240,11 @@ test/support/deterministic_clock.ex
 Baseline helpers:
 
 - `Docket.Test.Fixtures.Graphs.minimal_linear/0`
-- `Docket.Test.Fixtures.Graphs.unknown_read/0`
-- `Docket.Test.Fixtures.Graphs.unknown_write/0`
+- `Docket.Test.Fixtures.Graphs.unknown_config_field/0`
+- `Docket.Test.Fixtures.Graphs.unknown_update_field/0`
 - `Docket.Test.Fixtures.Graphs.simple_edge/0`
 - `Docket.Test.Fixtures.Graphs.fanout/0`
-- `Docket.Test.Fixtures.Graphs.join/0`
+- `Docket.Test.Fixtures.Graphs.multi_source_edge/0`
 - `Docket.Test.Fixtures.Graphs.guarded_edge/0`
 - `Docket.Test.Checkpoint.MemorySink`
 - `Docket.Test.Checkpoint.EtsSink`
@@ -263,12 +262,12 @@ test/docket/graph/diagnostics_test.exs
 
 Initial assertions:
 
-- a fresh graph has an ID, schema version, empty collections, and diagnostics
+- a fresh graph has an ID, schema version, empty collections, and empty diagnostics
 - adding input, field, node, edge, output updates the graph document
 - incomplete graphs are valid draft data but not runnable
 - graph construction tests do not require or inspect UI layout metadata
-- deleting a node removes or diagnoses affected edges according to the chosen
-  public contract
+- deleting a node updates only the graph document according to the chosen public
+  contract
 
 ### 4.3 Baseline Compiler Tests
 
@@ -277,19 +276,19 @@ Create:
 ```text
 test/docket/graph/compiler/validation_test.exs
 test/docket/graph/compiler/lowering_test.exs
-test/docket/graph/compiler/report_test.exs
+test/docket/graph/compiler/lowering_metadata_test.exs
 ```
 
 Initial assertions:
 
 - `minimal_linear/0` compiles
-- `unknown_read/0` fails with a diagnostic path to the public node read
-- `unknown_write/0` fails with a diagnostic path to the public node write
+- `unknown_config_field/0` fails with a diagnostic path to the public node config
+- `unknown_update_field/0` fails with a diagnostic path to the returned update
 - simple edges produce generated activation channels
-- source runtime graph nodes have system writes for outgoing edges
+- source runtime graph nodes expose outgoing edge references
 - target runtime graph nodes subscribe to incoming generated edge channels
-- compiler reports map public node, edge, input, field, and output IDs to
-  runtime IDs
+- compiler lowering metadata maps public node, edge, input, field, and output
+  IDs to runtime IDs
 
 ### 4.4 Baseline Inline Execution Tests
 
@@ -347,8 +346,7 @@ test/docket/graph/
 test/docket/graph/compiler/
   validation_test.exs
   lowering_test.exs
-  report_test.exs
-  explain_test.exs
+  lowering_metadata_test.exs
   generated_id_test.exs
   compile_and_run_test.exs
 
@@ -422,16 +420,16 @@ source -> right
 
 Proves fan-out lowering and same-superstep parallel activations.
 
-`join/0`
+`multi_source_edge/0`
 
 ```text
 start -> source
 source -> left
 source -> right
-join [left, right] -> combine
+edge [left, right] -> combine
 ```
 
-Proves barrier lowering and join execution.
+Proves barrier lowering and multi-source edge execution.
 
 `guarded_edge/0`
 
@@ -456,7 +454,7 @@ Proves interrupt creation, resume-channel writes, and resume execution.
 ```text
 start -> ok_node
 start -> failing_node
-join [ok_node, failing_node] -> should_not_run
+edge [ok_node, failing_node] -> should_not_run
 ```
 
 Proves v1 permanent failure commits no writes from the failed superstep.
@@ -570,7 +568,7 @@ compile_and_run!(graph, input, opts \\ [])
 checkpoint_types(checkpoints)
 latest_checkpoint(checkpoints)
 assert_diagnostic(diagnostics, code, path)
-assert_lowered_edge(report, public_edge_id, opts)
+assert_lowered_edge(lowering, public_edge_id, opts)
 ```
 
 These helpers belong under `test/support`; they are not public Docket API.
@@ -588,7 +586,8 @@ Tests should be able to inject:
 - max supersteps
 
 Default tests should avoid asserting opaque generated IDs. Where IDs matter,
-use deterministic ID options or assert through compiler reports and public IDs.
+use deterministic ID options or assert through compiler lowering metadata and
+public IDs.
 
 ## 8. ETS Guidance
 
@@ -677,12 +676,12 @@ The sequence should be:
 
 1. Add support helpers, deterministic IDs, deterministic clock, memory sink, and
    ETS sink.
-2. Add construction tests for canonical `Docket.Graph` updates and advisory
-   diagnostics.
+2. Add construction tests for canonical `Docket.Graph` updates and explicit
+   verification diagnostics.
 3. Add compiler validation and lowering tests before runtime execution grows.
 4. Add `Docket.Test.run_inline/3` and a minimal compile-and-run test.
-5. Expand compiler integration fixtures: simple edge, fan-out, join, guarded
-   edge, output projection.
+5. Expand compiler integration fixtures: simple edge, fan-out, multi-source
+   edge, guarded edge branch group, output projection.
 6. Expand inline runtime semantics: barriers, reducers, checkpoint ordering,
    interrupts, retry, failure, resume.
 7. Add supervised Runtime tests only after the inline semantics are stable.
@@ -702,12 +701,12 @@ the layer where it belongs and one integration test proving the layers connect.
 | Nodes | public node records | runtime graph nodes | node input/output | executor dispatch |
 | Simple edges | edge records | activation channels | sequential activation | runtime tick |
 | Fan-out | edge records | generated channels | parallel step | task executor |
-| Join | join record | barrier lowering | waits for all sources | task completion order |
+| Multi-source edge | edge record | barrier/all lowering | waits for all sources | task completion order |
 | Guards | guard expression | guard validation | committed-state reads | runtime scheduling |
-| Diagnostics | advisory warnings | blocking errors | typed failures | public errors |
+| Diagnostics | empty until verify | blocking errors | typed failures | public errors |
 | Checkpoints | n/a | checkpoint metadata map | order and failure | callback path |
 | Interrupts | node capability | resume channel wiring | wait/resume | public resolution |
-| Resume | graph version metadata | graph/run match | `Loop.init/3` infers saved state | crash recovery |
+| Resume | computed graph hash | graph/run match | `Loop.init/3` infers saved state | crash recovery |
 
 ## 12. Open Decisions
 

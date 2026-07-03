@@ -201,17 +201,19 @@ mailbox, no checkpoint side effects, and no direct executor calls.
 Docket.Runtime.Algorithm.plan(graph, run, opts)
 Docket.Runtime.Algorithm.prepare_activations(graph, run, plan, opts)
 Docket.Runtime.Algorithm.evaluate_guard(expr, context)
-Docket.Runtime.Algorithm.validate_output(graph, activation, output, opts)
-Docket.Runtime.Algorithm.collect_writes(graph, activations, task_results, opts)
-Docket.Runtime.Algorithm.apply_writes(graph, run, writes, opts)
+Docket.Runtime.Algorithm.validate_state_update(graph, activation, update, opts)
+Docket.Runtime.Algorithm.collect_state_writes(graph, activations, task_results, opts)
+Docket.Runtime.Algorithm.apply_state_writes(graph, run, writes, opts)
+Docket.Runtime.Algorithm.evaluate_edge_triggers(graph, run, completed_nodes, opts)
 Docket.Runtime.Algorithm.detect_terminal(graph, run, opts)
 Docket.Runtime.Algorithm.build_checkpoint(graph, run, events, opts)
 ```
 
-`Docket.Runtime.Dispatcher`, if introduced, is also internal. It prepares
-`Docket.Node.Input`, calls the configured executor for each activation, handles
-local task timeout mechanics, and returns normalized task results to the loop.
-It does not evaluate guards, apply reducers, or commit checkpoints.
+`Docket.Runtime.Dispatcher`, if introduced, is also internal. It prepares the
+state snapshot, node config, and runtime context, calls the configured executor
+for each activation, handles local task timeout mechanics, and returns
+normalized task results to the loop. It does not evaluate guards, apply reducers,
+or commit checkpoints.
 
 ```elixir
 Docket.Runtime.Dispatcher.dispatch(activations, graph, run, opts)
@@ -232,7 +234,7 @@ decide where it belongs.
 | `Docket.Runtime` | GenServer shell for one active run; mailbox ownership; lifecycle calls; tick scheduling; current `Docket.Run`; compiled runtime graph; runtime config; tracking in-flight dispatcher refs and async checkpoint completion messages. | Guard evaluation, reducer logic, write validation, graph lowering, public graph storage, checkpoint callback execution, or direct durable persistence. |
 | `Docket.Runtime.Loop` | Processless transition functions over `Docket.Runtime.Graph` and `Docket.Run`; initialization from a supplied run; planning transitions; applying normalized task results; interrupt resolution; checkpoint emission/barrier semantics; returning updated runs. | GenServer callbacks, process registry, direct executor calls, telemetry/PubSub publication, or direct host storage outside the configured checkpoint callback. |
 | `Docket.Runtime.Algorithm` | Deterministic graph execution helpers: plan, prepare activations, evaluate guards, validate outputs, collect writes, apply reducers, detect termination, and build checkpoint data. | Mutable process state, wall-clock reads except injected timestamps, random values, external services, executor calls, checkpoint side effects, or host callbacks. |
-| `Docket.Runtime.Dispatcher` | Internal task dispatch mechanics; building `Docket.Node.Input`; calling the configured `Docket.Executor`; local/task timeout handling; normalizing node returns, raises, exits, and throws into task results. | Planning, guard evaluation, reducer application, checkpoint commit, retry policy decisions beyond attempt mechanics, or public adapter configuration. |
+| `Docket.Runtime.Dispatcher` | Internal task dispatch mechanics; building the node state snapshot/config/context; calling the configured `Docket.Executor`; local/task timeout handling; normalizing node returns, raises, exits, and throws into task results. | Planning, guard evaluation, reducer application, checkpoint commit, retry policy decisions beyond attempt mechanics, or public adapter configuration. |
 | `Docket.Executor` implementations | The adapter boundary for executing one runtime graph node activation locally, in a task, or later through queue/remote systems. | Mutating `Docket.Run`, applying writes, emitting checkpoints, deciding graph termination, or reading uncommitted superstep writes. |
 | `Docket.Test` | Test-facing inline runtime facade; drives the same loop transitions in the calling process; returns public runs and accepted checkpoints for assertions. | A second execution interpreter, direct mutation of loop internals as public API, GenServer lifecycle semantics, or behavior that supervised Runtime cannot share. |
 
@@ -390,23 +392,23 @@ Known contract:
 
 - The host loads the durable `Docket.Run` document.
 - The host loads the matching `Docket.Graph` document using `run.graph_id` and
-  `run.graph_version`.
+  `run.graph_hash`.
 - `Docket.resume/4` materializes `Docket.Runtime.Graph`.
 - `Docket.resume/4` uses the same Runtime launch path as `run/4`, passing the
   durable run document instead of building a new one from input.
 - The Runtime calls `Docket.Runtime.Loop.init/3`; the loop sees a saved
   `Docket.Run` and continues from it.
-- Active runs stay on their original graph version.
+- Active runs stay on their original graph content hash.
 
 Resolved v1 contract:
 
 - `resume/4` requires `graph.id == run.graph_id` and
-  `graph.version == run.graph_version`.
+  `Docket.Graph.hash(graph) == run.graph_hash`.
 - A mismatch returns
   `{:error, %Docket.Error{type: :graph_mismatch, reason: reason}}`.
-- If the old graph version is unavailable, the host cannot resume that run and
+- If the old graph content is unavailable, the host cannot resume that run and
   should return/fold that into
-  `{:error, %Docket.Error{type: :graph_version_unavailable}}`.
+  `{:error, %Docket.Error{type: :graph_unavailable}}`.
 - `resume/4` skips only the input-to-run prelude: it does not create a new
   `Docket.Run`, but it still passes through the same `Loop.init/3` durable
   barrier. The checkpoint handler upserts the run by ID, updating an existing
@@ -427,15 +429,15 @@ Each superstep has three phases.
 
 ```text
 Plan
-  choose candidate nodes from changed channels, guards, interrupts, timers, and
+  choose active nodes from edge activations, interrupts, timers, and
   concurrency policy
 
 Execution
   execute selected nodes against a consistent input snapshot
 
 Update
-  validate writes, apply channel reducers, build events, emit checkpoint, and
-  publish observational events
+  validate state updates, apply reducers, evaluate outgoing edge triggers,
+  build events, emit checkpoint, and publish observational events
 ```
 
 Visual flow:
@@ -453,11 +455,11 @@ flowchart TD
 
   subgraph loop["Docket.Runtime.Loop superstep"]
     plan["plan/3"]
-    algorithm["Docket.Runtime.Algorithm<br/>select activations from changed channels, guards, timers, interrupts"]
+    algorithm["Docket.Runtime.Algorithm<br/>select activations from edge signals, timers, interrupts"]
     decision{"Plan result"}
     dispatch["Docket.Runtime.Dispatcher<br/>execute selected node activations"]
     results["Normalized task results<br/>writes, interrupts, awaits, errors"]
-    update["apply_results/4<br/>validate writes and apply reducers at barrier"]
+    update["apply_results/4<br/>validate updates, reduce state, trigger edges"]
     events["Build Docket.Event list"]
     checkpoint["Build Docket.Checkpoint<br/>with next Docket.Run"]
     unchanged["Return current Docket.Run<br/>no step checkpoint"]
@@ -487,7 +489,9 @@ Known rules:
 - Plan only sees the last completed channel state.
 - Writes from one node in a superstep are invisible to other nodes in that same
   superstep.
-- Channel updates from Update activate nodes in the next superstep.
+- Edge activations emitted from Update activate nodes in the next superstep.
+- State changes from Update are visible to edge guards, but do not directly
+  activate arbitrary nodes without a source-completion edge candidate.
 - Failed nodes prevent barrier commit by default.
 - Termination occurs when there are no active nodes and no pending external
   work.
@@ -505,6 +509,16 @@ Resolved v1 contract:
   interrupt, failure, and externally resolved state changes do emit checkpoints.
 - `max_supersteps` is a runtime limit. Exceeding it fails the run with a typed
   limit error before dispatching the next superstep.
+- Multi-source edge barriers follow LangGraph `NamedBarrierValue` semantics.
+  Each source-node completion is recorded in the barrier's seen set. The
+  barrier fires when every source has completed at least once since the barrier
+  last fired. Firing resets the seen set, so the barrier can fire again in
+  cycles.
+- Source completions are sticky across supersteps: the sources of a
+  multi-source edge do not need to complete in the same superstep, and
+  duplicate completions recorded before firing are idempotent.
+- Barrier seen-state is committed `Docket.Run` state, so it is checkpointed and
+  survives resume.
 
 ### 9.1 Worked Example: Local Executor And Guarded Edge
 
@@ -543,25 +557,25 @@ tick 0 / plan
   activate FetchUser
 
 execute with Local executor
-  Local calls FetchUser.call(input) directly
+  Local calls FetchUser.call(state, config, context) directly
   FetchUser queries Repo
-  returns writes: user, a_status
+  returns updates: user, a_status
 
 update
   validate writes
   reduce user
   reduce a_status
+  evaluate FetchUser outgoing edges against committed state and changed fields
   changed channels = ["state:user", "state:a_status", "edge:edge_fetch_user_premium_step"]
   emit :step_committed checkpoint
 
 tick 1 / plan
   premium_step edge is activated
-  guard reads user.premium_user == true
   activate PremiumStep
 
 execute with Local executor
-  Local calls PremiumStep.call(input)
-  returns b_status
+  Local calls PremiumStep.call(state, config, context)
+  returns update: b_status
 
 update
   reduce b_status
@@ -579,29 +593,32 @@ This example clarifies:
 - the initialized run document must be checkpointed before `FetchUser` can run.
 - `Docket.Executor.Local` can execute node code synchronously in the Runtime's
   current execution path.
-- Edge activation and guard evaluation are related but distinct. The edge signal
-  can activate `PremiumStep` as a candidate, while the guard decides whether the
-  candidate actually runs.
-- The guard sees only committed channel state from the previous update barrier.
+- Edge activation and guard evaluation happen together at the update barrier.
+  Successful source-node completion creates outgoing edge candidates; guards
+  decide which candidates become activation signals for the next superstep.
+- The guard sees the newly committed state and the changed field set from that
+  update barrier.
 - Terminal detection happens on the next plan after `PremiumStep` commits
   `b_status`, not inside the same update.
 
 Resolved decisions from this example:
 
-- Every public edge lowers to an ephemeral activation channel and a
-  compiler-generated system write on successful source-node completion.
-  `FetchUser` never manually writes `edge:edge_fetch_user_premium_step`.
-- Branch and join sugar are canonical graph concepts, but v1 keeps the runtime
-  lowering simple: generated edge activation channels, compiled guards, and
-  barrier channels. The Runtime consumes the lowered `Docket.Runtime.Graph`, not
-  branch/join records directly.
+- Every public edge lowers to an ephemeral activation channel. The Runtime emits
+  that activation after successful source-node completion, successful barrier
+  commit, and guard approval when the edge has a guard. `FetchUser` never
+  manually writes `edge:edge_fetch_user_premium_step`.
+- Public fan-in and branch intent stays on ordinary graph records: multi-source
+  edges and node-local branch groups over outgoing guarded edges. v1 keeps the
+  runtime lowering simple: generated edge activation channels, compiled guards,
+  and barrier semantics. The Runtime consumes the lowered `Docket.Runtime.Graph`,
+  not public graph records directly.
 - Guards that inspect nested values use durable data paths such as
   `path("user", ["premium_user"])`.
-- Guard-false candidates are skipped for that plan. v1 does not need a durable
+- Guard-false candidates emit no activation signal. v1 does not need a durable
   skipped event unless debug tracing is enabled.
-- Node-facing config and resolved input port values are included in
-  `Docket.Node.Input`. Internal compiled runtime details are passed to the
-  executor, not to node code.
+- Node-facing config, the committed state snapshot, and runtime context are
+  passed as separate arguments to node code. Internal compiled runtime details
+  are passed to the executor, not to node code.
 - `{:error, reason}` from a local node records a node failure, commits no writes
   from the superstep, and eventually emits a failed-run checkpoint if retries are
   exhausted.
@@ -613,24 +630,24 @@ Resolved decisions from this example:
 Known node callback shape:
 
 ```elixir
-@callback call(Docket.Node.Input.t()) ::
-            {:ok, Docket.Node.Output.t()}
+@callback call(state :: map(), config :: map(), context :: map()) ::
+            {:ok, state_update :: map()}
             | {:interrupt, Docket.Interrupt.t()}
             | {:await, Docket.Await.t()}
             | {:error, term()}
 ```
 
-Known input shape:
+Known call shape:
 
 ```elixir
-%Docket.Node.Input{
+state = committed_state_snapshot
+config = node_config
+context = %{
   run_id: run_id,
   node_id: node_id,
   superstep: step,
-  inputs: resolved_port_values,
-  source_versions: source_channel_versions_by_port,
-  context: application_context,
-  config: node_config,
+  source_versions: state_channel_versions,
+  application: application_context,
   attempt: attempt,
   idempotency_key: key
 }
@@ -639,11 +656,7 @@ Known input shape:
 Known output shape:
 
 ```elixir
-%Docket.Node.Output{
-  outputs: resolved_port_outputs,
-  commands: [Docket.Command.t()],
-  metadata: map()
-}
+{:ok, %{"field_name" => value}}
 ```
 
 Resolved v1 contract:
@@ -655,35 +668,28 @@ Resolved v1 contract:
   `Docket.Runtime.Graph.Node`.
 - When code must reference both public graph nodes and runtime graph nodes in the
   same scope, alias `Docket.Runtime.Graph.Node` as `RuntimeNode`.
-- `Docket.Node.Input.node_id` is the public graph node ID.
-- `Docket.Node.Input.inputs` is keyed by generic node input port ID, not by
-  graph channel ID.
-- `Docket.Node.Output.outputs` is keyed by generic node output port ID, not by
-  graph channel ID.
+- `context.node_id` is the public graph node ID.
+- `state` is keyed by graph input/field ID, not by generic node port ID.
+- the returned update map is keyed by graph field ID.
 - The executor receives the runtime graph node and can inspect runtime IDs,
-  generated channels, subscriptions, input/output bindings, write permissions,
-  timeout, retry, and metadata.
-- v1 node callbacks use `call/1`. Runtime structs may keep a function field for
+  generated channels, subscriptions, timeout, retry, and metadata.
+- v1 node callbacks use `call/3`. Runtime structs may keep a function field for
   later, but v1 should compile-time/runtime reject unsupported function names.
-- `commands` remain on `Docket.Node.Output` as a reserved extension point, but
-  v1 rejects non-empty commands with `:unsupported_command`.
-- The runtime maps output ports to graph channels through the runtime node's
-  `output_bindings`, then creates channel writes internally.
-- Output validation rejects undeclared output ports, missing required outputs,
-  unauthorized output bindings, invalid output values, excess writes, and
-  oversized channel values before reducers run.
+- command-style returns remain a reserved extension point, but v1 rejects them
+  with `:unsupported_command`.
+- The runtime treats returned updates as graph field writes.
+- Output validation rejects unknown update fields, invalid output values, excess
+  updates, and oversized channel values before reducers run.
 
 Node type contracts are schema-bearing:
 
 ```elixir
 @callback config_schema() :: Docket.Schema.t()
-@callback ports(config :: map()) :: Docket.Node.Ports.t()
 ```
 
-The compiler validates config against `config_schema/0`, passes normalized config
-to `ports/1`, validates port bindings, and checks compatibility between graph
-field schemas and node port schemas. Runtime dispatch validates actual resolved
-inputs before `call/1` and returned outputs before applying reducers.
+The compiler validates config against `config_schema/0`. Runtime dispatch passes
+the committed state snapshot to `call/3` and validates returned updates before
+applying reducers.
 
 ## 11. Executor Contract
 
@@ -693,10 +699,12 @@ Known executor callback:
 @callback execute(
             task :: Docket.Run.TaskState.t(),
             node :: Docket.Runtime.Graph.Node.t(),
-            input :: Docket.Node.Input.t(),
+            state :: map(),
+            config :: map(),
+            context :: map(),
             opts :: keyword()
           ) ::
-            {:ok, Docket.Node.Output.t()}
+            {:ok, state_update :: map()}
             | {:interrupt, Docket.Interrupt.t()}
             | {:await, Docket.Await.t()}
             | {:error, term()}
@@ -738,10 +746,10 @@ Resolved v1 contract:
 
 Known guard rules:
 
-- Guards filter node activations.
+- Guards filter edge activation candidates.
 - Guards are deterministic.
 - Guards are side-effect free.
-- Guards can read channel state.
+- Guards can read committed state and the changed field set.
 - Guards cannot call external services.
 
 Design-space guard primitives:
@@ -762,8 +770,23 @@ Resolved v1 contract:
 - v1 supports `changed/1`, `version_at_least/2`, `exists/1`, `equals/2`,
   `all/1`, `any/1`, `not/1`, and `path/2`.
 - v1 does not support custom application guards.
+- Guards are evaluated only for outgoing edge candidates produced by successful
+  source-node completion or satisfied multi-source barriers.
+- Change tracking is write-based, not value-diff-based, matching LangGraph
+  channel versioning (`LastValue.update` bumps the channel version on every
+  write with no equality check; subscribers trigger on version counters). A
+  field is "changed" in a barrier when a committed write targeted it in that
+  barrier, even if the written value equals the previous value.
+- `changed/1` is true iff the referenced channel is in the changed set of the
+  update barrier that produced the edge candidate. `version_at_least/2`
+  compares monotonic per-channel version counters that advance once per
+  committed write barrier.
 - Paths read committed channel values only. Missing map keys/list indexes make
-  `exists/1` false and make `equals/2` false rather than raising.
+  `exists/1` false and make `equals/2` false rather than raising. The same
+  applies to channels that have never been written: `exists/1`, `equals/2`, and
+  `changed/1` are false. This is a deliberate deviation from LangGraph, which
+  raises `EmptyChannelError` on empty channel reads; Docket guards are lax so
+  model-generated partial state cannot crash guard evaluation.
 - Invalid guard expressions are compile errors. Runtime guard evaluation errors
   fail the run with `:guard_evaluation_failed`.
 
@@ -781,9 +804,9 @@ Docket.Guard.not(expression)
 ```
 
 Each constructor returns a serializable guard expression. The compiler validates
-the expression shape, channel references, literal values, and path segments
-before a graph can run. Runtime evaluation receives only committed channel
-values, channel versions, and the previous step's changed channel set.
+the expression shape, field references, literal values, and path segments before
+a graph can run. Runtime evaluation receives only newly committed state values,
+channel versions, and the update barrier's changed field set.
 
 ## 13. Checkpoint Contract
 
@@ -842,9 +865,20 @@ Resolved v1 contract:
 - The recommended durable host pattern is to persist the run and append/enqueue
   checkpoint events in one host transaction or outbox write. That outbox can
   provide backpressure and allow projections to catch up later.
+- Checkpoints are only constructed and delivered between superstep phases: no
+  executor work is in flight when a checkpoint callback runs. The v1
+  barrier-synchronous superstep makes this structural (Plan, then dispatch and
+  await all selected executions, then apply updates in memory, then
+  checkpoint). This matches the LangGraph loop ordering, where `checkpointer.put`
+  runs only after all tasks for the step have completed and writes are applied.
 - v1 does not automatically retry failed sync checkpoint callbacks. The current
   operation returns a typed checkpoint error and no later runtime progress is
   acknowledged.
+- On sync checkpoint failure the Runtime discards the uncommitted in-memory
+  transition, keeps the previous committed `Docket.Run`, reports the typed
+  checkpoint error, and stops. It does not attempt a `:run_failed` checkpoint
+  through the same failing sink. The host's durable state remains the last
+  successful checkpoint, and resume re-executes the uncommitted superstep.
 - Async checkpoint callback failures are reported through debug or
   test-observable surfaces in v1 and may be retried by the host's outbox or
   callback implementation, but they do not block the active Runtime. First-class
@@ -882,6 +916,16 @@ Resolved v1 contract:
   `:run_failed` checkpoint with node failure events.
 - v1 local/task in-flight work that was not checkpointed is retried or fails
   according to retry policy after resume.
+- Recovery after a crash or sync checkpoint failure re-executes the entire
+  uncommitted superstep. Idempotency keys are stable across that re-execution
+  because superstep numbers and attempt counters are committed run state: an
+  attempt counter only advances inside a barrier that commits, so a
+  never-committed superstep runs again with the same keys and cooperating
+  integrations deduplicate the external effects.
+- Post-v1 design space: persist successful sibling-node writes attached to the
+  previous checkpoint (LangGraph's `put_writes` pending-writes pattern) so a
+  re-executed superstep does not redo nodes that already succeeded. v1
+  re-executes the whole superstep.
 
 ## 15. Interrupt Contract
 
@@ -915,6 +959,9 @@ Resolved v1 contract:
 - Unknown or closed interrupts return `{:error, :not_found}`.
 - Authorization remains host-owned and should happen before calling
   `resolve_interrupt/5`.
+- Interrupt timeouts and deadlines are post-v1. A v1 interrupt waits
+  indefinitely until the host resolves it; hosts that need expiry enforce it
+  themselves and resolve or fail the run through public APIs.
 
 ## 16. Testing Contract
 

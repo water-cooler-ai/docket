@@ -19,16 +19,21 @@ first thing to read when deciding what to implement next.
 1. `docs/architecture/docket-v1-implementation-path.md`
    - The lean v1 spine.
    - Defines the build path, run path, implementation slices, and test gates.
-2. `docs/architecture/docket-graph-construction-design.md`
+2. `docs/architecture/docket-implementation-progress.md`
+   - Tracks what has actually landed in code for the MVP so far.
+3. `docs/architecture/docket-compiler-design.md`
+   - Compiler verification, diagnostics, runtime graph lowering, LangGraph
+     audit notes, and compiler test strategy.
+4. `docs/architecture/docket-graph-construction-design.md`
    - Public `Docket.Graph` document, graph editing API, compiler boundary, ID
      rules, lowering rules, and host storage boundary.
-3. `docs/architecture/docket-graph-execution-contract-design.md`
+5. `docs/architecture/docket-graph-execution-contract-design.md`
    - Runtime, execution loop, public run APIs, checkpoints, executors, guards,
      failures, interrupts, and inline test runtime contract.
-4. `docs/architecture/docket-v1-test-suite-design.md`
+6. `docs/architecture/docket-v1-test-suite-design.md`
    - Test layers, fixtures, in-memory/ETS checkpoint helpers, and v1 coverage
      progression.
-5. `docs/architecture/docket-runtime-design.md`
+7. `docs/architecture/docket-runtime-design.md`
    - Longer research and architecture background. Use it for rationale and
      future design space, not as the day-to-day implementation checklist.
 
@@ -37,7 +42,9 @@ first thing to read when deciding what to implement next.
 Durable public documents:
 
 - `Docket.Graph`: the graph definition document that host applications build,
-  edit, verify, publish, store, and later pass to Docket.
+  edit, verify, publish, store, and later pass to Docket. Public topology is
+  represented by edge records; fan-in joins are multi-source edges, and branch
+  groups live on source nodes.
 - `Docket.Run`: the durable execution state document that Docket emits through
   checkpoints and host applications persist for reads, resume, audit, and
   recovery.

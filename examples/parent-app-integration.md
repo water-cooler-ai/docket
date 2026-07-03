@@ -206,9 +206,8 @@ public `Docket.Run`, and passes both the graph and run back to Docket:
 ```elixir
 defmodule MyApp.Workflows do
   def resume_run!(%WorkflowRun{} = workflow_run) do
-    graph = load_published_graph!(workflow_run.workflow_id)
-
     {:ok, run} = Docket.Run.load(workflow_run.docket_run)
+    graph = load_published_graph!(workflow_run.workflow_id, run.graph_hash)
 
     MyApp.Docket.resume(graph, run)
   end

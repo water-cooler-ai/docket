@@ -398,7 +398,7 @@ describe compilability.
 
 `Docket.Graph` is the canonical user-facing graph document. It is edited by
 product UIs, produced by workflow compilers, and stored by host applications.
-Published graph versions should be immutable and append-only from the host
+Published graph artifacts should be immutable and append-only from the host
 application's perspective.
 
 Docket lowers the canonical graph into `Docket.Runtime.Graph` when it needs to
@@ -410,15 +410,12 @@ defmodule Docket.Graph do
   defstruct [
     :id,
     :name,
-    :version,
     :schema_version,
     fields: %{},
     inputs: %{},
     outputs: %{},
     nodes: %{},
     edges: %{},
-    joins: %{},
-    branches: %{},
     metadata: %{},
     policies: %{}
   ]
@@ -431,7 +428,6 @@ The runtime materialization is internal:
 defmodule Docket.Runtime.Graph do
   defstruct [
     :id,
-    :version,
     :schema_version,
     :input_channels,
     :output_channels,
@@ -451,8 +447,7 @@ run state:
 %{
   origin: %{
     type: "workflow",
-    id: "workflow_123",
-    version: 7
+    id: "workflow_123"
   }
 }
 ```
@@ -471,19 +466,13 @@ defmodule Docket.Runtime.Graph.Node do
     :module,
     :function,
     :executor,
-    :guard,
     :timeout,
     :retry,
     :cache,
     :on_error,
     config: %{},
-    ports: nil,
-    input_bindings: %{},
-    output_bindings: %{},
     subscribe: [],
-    read: [],
-    write: [],
-    system_writes: [],
+    outgoing_edges: [],
     metadata: %{}
   ]
 end
@@ -494,20 +483,13 @@ Fields:
 - `id`: stable runtime node identity derived from the public graph node.
 - `module` / `function`: local implementation, if any.
 - `executor`: local, remote, task queue, MCP, HTTP, or custom adapter.
-- `guard`: compiled guard expression evaluated against committed channel state.
-- `ports`: normalized node input/output port schemas after config defaults.
-- `input_bindings`: input port IDs mapped to readable runtime channels.
-- `output_bindings`: output port IDs mapped to writable runtime channels.
 - `subscribe`: channels whose version changes activate the node.
-- `read`: additional channels visible to the node without activating it.
-- `write`: channels the node may update.
-- `system_writes`: compiler-generated activation writes emitted by the runtime.
+- `outgoing_edges`: runtime edge records evaluated after successful completion.
 - `timeout`: node execution timeout.
 - `retry`: retry policy.
 - `cache`: optional deterministic memoization policy.
 - `on_error`: fail run, write error channel, retry, skip, or route.
-- `config`: normalized node-facing configuration copied into
-  `Docket.Node.Input`.
+- `config`: normalized node-facing configuration passed to `Docket.Node.call/3`.
 - `metadata`: application-owned data plus public ID mapping.
 
 ### 8.2 Runtime Graph Channel
@@ -580,15 +562,17 @@ A -> if condition then B else C
 A -> A
 ```
 
-Underneath, Docket lowers edges into channels, subscriptions, guards, and
-barriers.
+Underneath, Docket lowers edges into activation channels, subscriptions, guards,
+and barriers.
 
 At runtime, the important relation is:
 
 ```text
-node writes channel
-channel version changes
-subscribed nodes become candidates
+source node completes successfully
+update barrier commits state updates
+Runtime evaluates outgoing edges against committed state and changed fields
+triggered edge activation channels change
+subscribed target nodes become active in the next superstep
 ```
 
 Classic directed edges:
@@ -601,7 +585,7 @@ lower to:
 
 ```text
 edge record "edge_a_b" carries from: "A", to: "B"
-A writes channel "edge:edge_a_b"
+Runtime emits channel "edge:edge_a_b" after A succeeds and the step commits
 B subscribes to channel "edge:edge_a_b"
 ```
 
@@ -636,17 +620,17 @@ lower to:
 ```text
 edge record "edge_a_b_approved" carries from: "A", to: "B", guard: approved
 edge record "edge_a_c_rejected" carries from: "A", to: "C", guard: rejected
-A emits "edge:edge_a_b_approved" and "edge:edge_a_c_rejected" on success
-B subscribes to "edge:edge_a_b_approved" and runs only when its guard is true
-C subscribes to "edge:edge_a_c_rejected" and runs only when its guard is true
+A succeeds, creating outgoing edge candidates
+Runtime evaluates each guard against committed state and changed fields
+guard-true edges emit "edge:<edge_id>" activation channels
+B and C subscribe to their edge activation channels
 ```
 
 This keeps the public graph clear while preserving a uniform runtime: all
 activation ultimately flows through channel updates.
 
-Branch helpers are public grouping sugar over the same guarded edge records.
-For v1, Docket does not generate branch-specific runtime channels such as
-`branch:<branch_id>`.
+Node-local branch groups are public grouping metadata over the same guarded edge
+records. For v1, Docket does not generate branch-specific runtime channels.
 
 ## 9. Active Run State
 
@@ -673,7 +657,7 @@ defmodule Docket.Run do
   defstruct [
     :id,
     :graph_id,
-    :graph_version,
+    :graph_hash,
     :status,
     :step,
     :input,
@@ -823,7 +807,7 @@ Inputs:
 
 - graph definition
 - current run state
-- changed channels from the previous completed update
+- edge activation channels from the previous completed update
 - outstanding interrupts/timers
 - max step policy
 - concurrency policy
@@ -840,10 +824,7 @@ def plan(graph, run) do
   candidates =
     graph.nodes
     |> Enum.filter(fn {_id, node} ->
-      subscribes_to_changed_channel?(node, run.changed_channels)
-    end)
-    |> Enum.filter(fn {_id, node} ->
-      guards_satisfied?(node, run.channels)
+      subscribes_to_edge_activation?(node, run.changed_channels)
     end)
     |> Enum.reject(fn {id, _node} ->
       blocked_by_interrupt_or_active_task?(run, id)
@@ -867,20 +848,23 @@ end
 
 Important rule: Plan only sees the last completed channel state. It does not see
 writes produced by tasks in the same superstep.
+Plan does not evaluate ordinary edge guards; guarded edges were already filtered
+when the previous update barrier committed. State changes alone do not activate
+nodes unless an outgoing edge from a successfully completed source node triggers.
 
 ### 11.2 Execution
 
 The Runtime dispatches each selected node with a consistent snapshot.
 
 ```elixir
-%Docket.Node.Input{
+state = committed_state_snapshot
+config = node_config
+context = %{
   run_id: run_id,
   node_id: node_id,
   superstep: step,
-  inputs: resolved_port_values,
-  source_versions: source_channel_versions_by_port,
-  context: application_context,
-  config: node_config,
+  source_versions: state_channel_versions,
+  application: application_context,
   attempt: attempt,
   idempotency_key: key
 }
@@ -889,15 +873,7 @@ The Runtime dispatches each selected node with a consistent snapshot.
 The node returns:
 
 ```elixir
-{:ok, %Docket.Node.Output{
-  outputs: %{
-    "plan" => %{...}
-  },
-  commands: [
-    %Docket.Command{type: :schedule_timer, payload: %{...}}
-  ],
-  metadata: %{}
-}}
+{:ok, %{"plan" => %{...}}}
 ```
 
 or:
@@ -912,22 +888,32 @@ Execution may run nodes concurrently, but updates remain buffered.
 
 ### 11.3 Update
 
-The update barrier applies writes after all selected nodes complete or after the
-step fails according to policy.
+The update barrier applies state updates after all selected nodes complete or
+after the step fails according to policy.
 
 Pseudo-code:
 
 ```elixir
 def update(graph, run, task_outputs) do
-  writes = collect_writes(task_outputs)
-  validate_writes!(graph, writes)
+  state_writes = collect_state_updates(task_outputs)
+  validate_state_updates!(graph, state_writes)
 
-  {channels, changed} =
-    writes
+  {channels, changed_fields} =
+    state_writes
     |> Enum.group_by(& &1.channel)
     |> Enum.reduce({run.channels, MapSet.new()}, fn {channel_id, updates}, acc ->
       apply_channel_updates(graph, acc, channel_id, updates)
     end)
+
+  triggered_edges =
+    graph
+    |> outgoing_edges_for_successful_nodes(task_outputs)
+    |> evaluate_edge_triggers(channels, changed_fields)
+
+  {channels, changed_edge_channels} =
+    emit_edge_activations(channels, triggered_edges)
+
+  changed = MapSet.union(changed_fields, changed_edge_channels)
 
   run =
     %{run |
@@ -939,7 +925,7 @@ def update(graph, run, task_outputs) do
       updated_at: now()
     }
 
-  events = build_events(run, task_outputs, writes)
+  events = build_events(run, task_outputs, state_writes, triggered_edges)
   checkpoint = build_checkpoint(graph, run, events)
   emit_checkpoint!(checkpoint)
   publish_committed_events!(events)
@@ -950,6 +936,11 @@ end
 
 Important rule: channel updates from this phase activate nodes in the next
 superstep, not the current superstep.
+An unguarded outgoing edge triggers after successful source-node completion and
+barrier commit. A guarded outgoing edge triggers only when its source completion
+candidate passes against the newly committed state and changed fields. A
+multi-source edge triggers only when its source-completion barrier is satisfied,
+and then applies the same guard rule if it has a guard.
 
 ## 12. Channel Semantics
 
@@ -1056,15 +1047,15 @@ Records external commands to be performed by the host application or executor.
 
 ## 13. Activation and Guards
 
-A node can be activated by subscription and filtered by guards.
+Nodes are activated by edge activation subscriptions. Guards belong to edges and
+filter edge candidates during the update barrier, after source nodes complete
+and after state updates commit.
 
 ```elixir
-node :reviewer,
-  subscribe: ["research:done", "tests:done"],
-  read: ["research:summary", "tests:summary"],
+edge "reviewer", "deploy",
   guard: all([
-    changed("research:done"),
-    changed("tests:done")
+    changed("review"),
+    equals(path("review", ["status"]), "approved")
   ])
 ```
 
@@ -1094,9 +1085,10 @@ Docket.Guard.not(expression)
 ```
 
 Guards are serializable data expressions. They must be deterministic and side
-effect free. Guards can read committed channel state, channel versions, and the
-previous step's changed channel set, not external services. v1 does not support
-custom application guards or arbitrary predicate matches.
+effect free. Guards can read the newly committed state, channel versions, and
+the changed field set from the update barrier that produced the edge candidate.
+They do not call external services, and v1 does not support custom application
+guards or arbitrary predicate matches.
 
 ## 14. External Effects
 
@@ -1164,8 +1156,8 @@ starting a run. If `id:` is omitted, Docket generates an ID and stores it on the
 document:
 
 ```elixir
-graph = Docket.Graph.new(id: workflow_id, name: "Essay Review")
-graph = Docket.Graph.new(name: "Essay Review")
+{:ok, graph} = Docket.Graph.new(id: workflow_id, name: "Essay Review")
+{:ok, graph} = Docket.Graph.new(name: "Essay Review")
 
 {:ok, run} = MyApp.Docket.run(graph, input, id: app_run_id)
 {:ok, run} = MyApp.Docket.run(graph, input)
@@ -1266,7 +1258,7 @@ be safe to receive the same checkpoint more than once.
 %Docket.Run{
   id: run_id,
   graph_id: graph.id,
-  graph_version: graph.version,
+  graph_hash: Docket.Graph.hash(graph),
   status: :running,
   step: 12,
   input: input,
@@ -1287,7 +1279,7 @@ be safe to receive the same checkpoint more than once.
 }
 ```
 
-Apps may inspect top-level fields such as `id`, `graph_id`, `graph_version`,
+Apps may inspect top-level fields such as `id`, `graph_id`, `graph_hash`,
 `status`, `step`, `input`, `output`, and timestamps. The run also contains
 Docket-owned execution data such as channels, tasks, interrupts, timers, and
 checkpoint counters. Apps should persist the run but not interpret, pattern
@@ -1308,7 +1300,7 @@ After a crash:
 
 ```elixir
 run = MyApp.Runs.fetch_docket_run!(run_id)
-graph = MyApp.Graphs.fetch_docket_graph!(run.graph_id, run.graph_version)
+graph = MyApp.Graphs.fetch_docket_graph!(run.graph_id, run.graph_hash)
 
 {:ok, run} = MyApp.Docket.resume(graph, run)
 ```
@@ -1438,21 +1430,23 @@ Each run document stores the graph identity needed to resolve the exact
 canonical graph it started with:
 
 - graph ID
-- graph version
+- SHA-256 graph content hash
 
 On runtime start, the host passes a canonical `Docket.Graph` document to Docket.
-On resume, retry, replay, and time travel, the host passes both the graph
-document and the `Docket.Run` document or historical checkpoint/event document
-it wants Docket to hydrate from. Docket then materializes the internal
-`Docket.Runtime.Graph` value and initializes or continues the run through
-`Docket.Runtime.Loop.init/3`. A live Runtime keeps that materialized runtime
-graph in memory. It does not recompile the graph on every superstep.
+Docket hashes that graph and stores the digest on `Docket.Run.graph_hash`. On
+resume, retry, replay, and time travel, the host passes both the graph document
+and the `Docket.Run` document or historical checkpoint/event document it wants
+Docket to hydrate from. Docket hashes the supplied graph, compares it with
+`run.graph_hash`, then materializes the internal `Docket.Runtime.Graph` value
+and initializes or continues the run through `Docket.Runtime.Loop.init/3`. A live
+Runtime keeps that materialized runtime graph in memory. It does not recompile
+the graph on every superstep.
 
 The canonical graph document stores the metadata needed to understand how it was
 produced and how it should be interpreted:
 
 - document schema version
-- origin identifier and version, when available
+- public graph ID
 - public field, node, edge, and output definitions
 - node implementation references
 - policies and runtime-relevant metadata
@@ -1462,22 +1456,22 @@ executing. Host applications may project selected metadata into database columns
 for search or operations, but the durable graph contract is the immutable
 canonical graph document.
 
-If a graph definition changes, new runs use the new version. Active runs stay on
-the exact version they started with.
+If a graph definition changes, new runs capture the new graph content hash.
+Active runs stay on the exact graph content hash they started with.
 
 The library does not support run migrations in this design. There is no API for
-moving a run to another graph version, no channel transformation contract, and
-no attempt to move active runs between graph versions.
+moving a run to another graph hash, no channel transformation contract, and no
+attempt to move active runs between graph definitions.
 
-The host application should retain recent graph versions. A practical default is
-to keep roughly the latest 10 versions per graph, with host-configurable
+The host application should retain recent host graph artifacts. A practical
+default is to keep roughly the latest 10 artifacts per graph, with host-configurable
 retention.
 
-If an old version required by an active run is no longer available, the library
+If old graph content required by an active run is no longer available, the library
 should return a typed error such as:
 
 ```elixir
-{:error, {:graph_version_unavailable, graph_id, version}}
+{:error, {:graph_unavailable, graph_id, graph_hash}}
 ```
 
 The application using the library decides how to handle that condition:
@@ -1550,11 +1544,11 @@ input, context, limits, or policy overrides, but they should not need to repeat
 the checkpoint handler or executor unless the host intentionally runs multiple
 named Docket runtimes.
 
-The library must not create atoms from untrusted strings. All graph record
-IDs are binaries in v1, including graph, input, field, output, node, edge, join,
-and branch IDs. Runtime-generated channel IDs are also binaries. Existing atoms
-may still appear as ordinary Elixir enum/status/config values, but they are not
-accepted as graph IDs.
+The library must not create atoms from untrusted strings. All graph record IDs
+are binaries in v1, including graph, input, field, output, node, and edge IDs.
+Branch group names are binaries scoped to their source node. Runtime-generated
+channel IDs are also binaries. Existing atoms may still appear as ordinary
+Elixir enum/status/config values, but they are not accepted as graph IDs.
 
 ## 19. Validation and Safety
 
@@ -1563,14 +1557,8 @@ Graph compile validation should reject:
 - duplicate node IDs
 - duplicate channel IDs
 - node subscriptions to missing channels
-- node writes to missing channels
 - invalid node config
-- invalid node port schemas
-- missing required input or output bindings
-- input bindings whose source channel schema is incompatible with the node input
-  port schema
-- output bindings whose target channel schema is incompatible with the node
-  output port schema
+- configured state field references that point at missing channels
 - invalid output channels
 - invalid input channels
 - reducers that are not modules/functions accepted by policy
@@ -1582,10 +1570,8 @@ Runtime validation should reject:
 
 - writes to undeclared channels
 - writes whose update shape does not match channel schema
-- writes from nodes not authorized to write that channel
-- resolved node inputs that do not match node input port schemas
-- returned node outputs that do not match node output port schemas
-- returned outputs that have no compiled output binding
+- returned update fields that do not exist in graph state
+- returned update values that do not match state field schemas
 - channel values larger than configured limits
 - too many writes in one superstep
 - supersteps beyond max limit
@@ -1788,22 +1774,8 @@ defmodule Essay.Writer do
   end
 
   @impl true
-  def ports(_config) do
-    %Docket.Node.Ports{
-      inputs: %{"topic" => Docket.Schema.string(required: true)},
-      outputs: %{"draft" => Docket.Schema.string(required: true)}
-    }
-  end
-
-  @impl true
-  def call(%Docket.Node.Input{inputs: %{"topic" => topic}} = input) do
-    {:ok,
-     %Docket.Node.Output{
-       outputs: %{
-         "draft" => "Essay about #{topic}"
-       },
-       metadata: %{source_versions: input.source_versions}
-     }}
+  def call(state, _config, _context) do
+    {:ok, %{"draft" => "Essay about #{state["topic"]}"}}
   end
 end
 ```
@@ -1830,7 +1802,7 @@ latest accepted checkpoint remains the durable source of truth.
 
 ```elixir
 run = MyApp.Runs.fetch_docket_run!(run_id)
-graph = MyApp.Graphs.fetch_docket_graph!(run.graph_id, run.graph_version)
+graph = MyApp.Graphs.fetch_docket_graph!(run.graph_id, run.graph_hash)
 
 {:ok, run} = MyApp.Docket.resume(graph, run)
 
@@ -1917,10 +1889,12 @@ defmodule Docket.Executor do
   @callback execute(
               task :: Docket.Run.TaskState.t(),
               node :: Docket.Runtime.Graph.Node.t(),
-              input :: Docket.Node.Input.t(),
+              state :: map(),
+              config :: map(),
+              context :: map(),
               opts :: keyword()
             ) ::
-              {:ok, Docket.Node.Output.t()}
+              {:ok, state_update :: map()}
               | {:interrupt, Docket.Interrupt.t()}
               | {:await, Docket.Await.t()}
               | {:error, term()}
@@ -1944,7 +1918,7 @@ Application code, workflow compilers, and graph editors use that canonical graph
 shape. The Runtime uses an internal `Docket.Runtime.Graph` value materialized
 from the canonical graph when a run starts.
 
-Regardless of API shape, Docket owns graph normalization, advisory diagnostics,
+Regardless of API shape, Docket owns graph normalization, compiler diagnostics,
 runtime verification, and generated document IDs when callers omit `id:`.
 
 The companion design in
@@ -1985,8 +1959,9 @@ A gate:
 if review.status == "approved" then deploy else revise
 ```
 
-compiles to a branch group containing guarded edge records. Each branch arm has a
-stable edge ID and lowers to an `edge:<edge_id>` activation channel.
+compiles to node-local branch metadata grouping guarded edge records. Each
+branch arm has a stable edge ID and lowers to an `edge:<edge_id>` activation
+channel.
 
 A future runtime could add an explicit branch node for debugging or dynamic
 routing, but v1 keeps branch execution in the same channel family as every other
@@ -2288,15 +2263,17 @@ Included in v1:
 1. Canonical `Docket.Graph` and `Docket.Run` public documents.
 2. Binary-only graph IDs and binary runtime-generated channel IDs.
 3. Functional graph editing helpers for inputs, fields, outputs, nodes, edges,
-   joins, branches, policies, and metadata.
-4. `Docket.Graph.Compiler.verify/2`, `explain/2`, and `compile/2`.
+   policies, and metadata.
+4. `Docket.Graph.verify/2`, `Docket.Graph.Compiler.verify/2`, and
+   `Docket.Graph.Compiler.compile/2`.
 5. Internal `Docket.Runtime.Graph` materialization for inputs, state fields,
-   outputs, runtime graph nodes, simple edges, fan-out, joins, branches, generated
-   activation channels, guards, and barrier channels.
+   outputs, runtime graph nodes, simple edges, fan-out, multi-source edges,
+   node-local branch groups, generated activation channels, guards, and barrier
+   semantics.
 6. Built-in channel support required by that runtime path:
    - `LastValue`
    - `Ephemeral` edge activation channels
-   - internal barrier channels for joins
+   - barrier/all semantics for multi-source edges
 7. One Runtime process per active run plus a shared execution loop used by the
    supervised Runtime and `Docket.Test`.
 8. Plan -> Execution -> Update supersteps with barrier visibility.
@@ -2368,8 +2345,8 @@ Other post-MVP areas:
    modes for model-generated lists of objects and other hard-to-pin shapes.
 4. Store async node completions in the same event log as synchronous node
    completions.
-5. Keep active runs on their original graph version. The host application owns
-   retention and recovery when an old version is no longer available.
+5. Keep active runs on their original graph hash. The host application owns
+   retention and recovery when old graph content is no longer available.
 6. Do not require reducers to be modules only. Durable graphs need serializable
    reducer references; direct functions are acceptable for in-memory/local-only
    graphs.
