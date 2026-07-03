@@ -326,6 +326,15 @@ defmodule Docket.Runtime.Loop do
     end
   end
 
+  defp failure(result, reason) do
+    %{
+      node_id: result.node_id,
+      task_id: result.task_id,
+      attempt: result.attempt,
+      reason: reason
+    }
+  end
+
   defp partition_results(results) do
     Enum.reduce(results, {[], [], []}, fn result, {oks, interrupts, errors} ->
       case result.status do
@@ -336,14 +345,7 @@ defmodule Docket.Runtime.Loop do
           {oks, [result | interrupts], errors}
 
         :error ->
-          failure = %{
-            node_id: result.node_id,
-            task_id: result.task_id,
-            attempt: result.attempt,
-            reason: result.value
-          }
-
-          {oks, interrupts, [failure | errors]}
+          {oks, interrupts, [failure(result, result.value) | errors]}
       end
     end)
     |> then(fn {oks, interrupts, errors} ->
@@ -358,14 +360,7 @@ defmodule Docket.Runtime.Loop do
           {[{result, update} | writes], errors}
 
         {:error, reasons} ->
-          failure = %{
-            node_id: result.node_id,
-            task_id: result.task_id,
-            attempt: result.attempt,
-            reason: {:invalid_state_update, reasons}
-          }
-
-          {writes, [failure | errors]}
+          {writes, [failure(result, {:invalid_state_update, reasons}) | errors]}
       end
     end)
     |> then(fn {writes, errors} -> {Enum.reverse(writes), Enum.reverse(errors)} end)
@@ -375,46 +370,45 @@ defmodule Docket.Runtime.Loop do
     Enum.reduce(interrupt_results, {[], []}, fn result, {specs, errors} ->
       interrupt = result.value
 
-      reasons =
-        List.flatten([
-          if not Map.has_key?(
-               rtg.lowering.public_to_runtime.fields,
-               interrupt.resume_channel || ""
-             ) do
-            [
-              "interrupt resume_channel #{inspect(interrupt.resume_channel)} is not a declared state field"
-            ]
-          else
-            []
-          end,
-          case interrupt.schema do
-            nil -> []
-            %Schema{} -> []
-            other -> ["interrupt schema must be a Docket.Schema or nil, got #{inspect(other)}"]
-          end,
-          if interrupt.id != nil and Map.has_key?(run.interrupts, interrupt.id) do
-            ["interrupt id #{inspect(interrupt.id)} already exists on this run"]
-          else
-            []
-          end
-        ])
-
-      case reasons do
+      case interrupt_errors(rtg, run, interrupt) do
         [] ->
           {[{result, interrupt} | specs], errors}
 
         reasons ->
-          failure = %{
-            node_id: result.node_id,
-            task_id: result.task_id,
-            attempt: result.attempt,
-            reason: {:invalid_interrupt, reasons}
-          }
-
-          {specs, [failure | errors]}
+          {specs, [failure(result, {:invalid_interrupt, reasons}) | errors]}
       end
     end)
     |> then(fn {specs, errors} -> {Enum.reverse(specs), Enum.reverse(errors)} end)
+  end
+
+  defp interrupt_errors(rtg, run, interrupt) do
+    check_resume_channel(rtg, interrupt) ++
+      check_schema(interrupt) ++
+      check_id_unused(run, interrupt)
+  end
+
+  defp check_resume_channel(rtg, interrupt) do
+    if Map.has_key?(rtg.lowering.public_to_runtime.fields, interrupt.resume_channel || "") do
+      []
+    else
+      ["interrupt resume_channel #{inspect(interrupt.resume_channel)} is not a declared state field"]
+    end
+  end
+
+  defp check_schema(interrupt) do
+    case interrupt.schema do
+      nil -> []
+      %Schema{} -> []
+      other -> ["interrupt schema must be a Docket.Schema or nil, got #{inspect(other)}"]
+    end
+  end
+
+  defp check_id_unused(run, interrupt) do
+    if interrupt.id != nil and Map.has_key?(run.interrupts, interrupt.id) do
+      ["interrupt id #{inspect(interrupt.id)} already exists on this run"]
+    else
+      []
+    end
   end
 
   defp commit(rtg, run, config, results, validated_writes, interrupt_specs) do
@@ -668,10 +662,7 @@ defmodule Docket.Runtime.Loop do
         :ok
 
       {:error, reasons} ->
-        {:error,
-         Error.new(:invalid_input, "interrupt resolution value is invalid",
-           details: %{reasons: reasons}
-         )}
+        {:error, invalid_resolution(reasons)}
     end
   end
 
@@ -683,11 +674,14 @@ defmodule Docket.Runtime.Loop do
         {:ok, update}
 
       {:error, reasons} ->
-        {:error,
-         Error.new(:invalid_input, "interrupt resolution value is invalid",
-           details: %{reasons: reasons}
-         )}
+        {:error, invalid_resolution(reasons)}
     end
+  end
+
+  defp invalid_resolution(reasons) do
+    Error.new(:invalid_input, "interrupt resolution value is invalid",
+      details: %{reasons: reasons}
+    )
   end
 
   # ---------------------------------------------------------------------------
