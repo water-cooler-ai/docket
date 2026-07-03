@@ -224,9 +224,12 @@ defmodule Docket.Graph.Serializer do
     |> put_open_map("metadata", edge.metadata)
   end
 
-  defp dump_schema(nil), do: nil
+  # Public so the run serializer can dump interrupt schemas with the same
+  # rules; not a host-facing API.
+  @doc false
+  def dump_schema(nil), do: nil
 
-  defp dump_schema(%Schema{} = schema) do
+  def dump_schema(%Schema{} = schema) do
     type = lookup!(@schema_types_out, schema.type, :invalid_schema, "schema type")
 
     %{"type" => type}
@@ -239,7 +242,7 @@ defmodule Docket.Graph.Serializer do
     |> put_open_map("metadata", schema.metadata)
   end
 
-  defp dump_schema(other) do
+  def dump_schema(other) do
     invalid!(:invalid_schema, "schema must be a Docket.Schema or nil, got #{inspect(other)}")
   end
 
@@ -462,9 +465,11 @@ defmodule Docket.Graph.Serializer do
     }
   end
 
-  defp load_schema!(nil, _location), do: nil
+  # Public counterpart of dump_schema/1 for the run serializer.
+  @doc false
+  def load_schema!(nil, _location), do: nil
 
-  defp load_schema!(map, location) when is_map(map) and not is_struct(map) do
+  def load_schema!(map, location) when is_map(map) and not is_struct(map) do
     assert_string_keys!(map, "schema in #{location}")
     assert_known_keys!(map, @schema_keys, "schema in #{location}")
 
@@ -489,7 +494,7 @@ defmodule Docket.Graph.Serializer do
     }
   end
 
-  defp load_schema!(other, location) do
+  def load_schema!(other, location) do
     invalid!(:invalid_document, "schema in #{location} must be a map, got #{inspect(other)}")
   end
 

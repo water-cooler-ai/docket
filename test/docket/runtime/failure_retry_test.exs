@@ -1,0 +1,188 @@
+defmodule Docket.Runtime.FailureRetryTest do
+  use Docket.Test.Case, async: true
+
+  describe "failure policy" do
+    test "a permanent node failure commits no writes from the superstep" do
+      assert {:ok, run, checkpoints} =
+               Docket.Test.run_inline(Graphs.parallel_failure(), %{})
+
+      assert run.status == :failed
+      assert run.step == 0
+      assert field_value(run, "ok_out") == :unwritten
+      assert checkpoint_types(checkpoints) == [:run_initialized, :run_failed]
+
+      run_failed = List.last(checkpoints)
+      assert run_failed.delivery == :sync
+
+      failed_nodes =
+        for event <- run_failed.events,
+            event.type == :node_failed,
+            event.payload["permanent"],
+            do: event.node_id
+
+      assert failed_nodes == ["failing_node"]
+      refute Enum.any?(run_failed.events, &(&1.type == :node_completed))
+    end
+
+    test "raises and throws are normalized into node attempt failures" do
+      for implementation <- [Nodes.Raises, Nodes.Throws] do
+        graph =
+          Graph.new!(id: "crashing")
+          |> Graph.put_node!("boom", implementation: implementation)
+          |> Graph.put_edge!("edge_start_boom", from: "$start", to: "boom")
+          |> Graph.put_edge!("edge_boom_finish", from: "boom", to: "$finish")
+
+        assert {:ok, run, checkpoints} = Docket.Test.run_inline(graph, %{})
+        assert run.status == :failed
+        assert List.last(checkpoint_types(checkpoints)) == :run_failed
+      end
+    end
+
+    test "reserved return shapes fail permanently without retry" do
+      for {implementation, marker} <- [
+            {Nodes.Awaits, ":unsupported_await"},
+            {Nodes.BadReturn, ":invalid_node_return"}
+          ] do
+        graph =
+          Graph.new!(id: "reserved-return")
+          |> Graph.put_node!("node",
+            implementation: implementation,
+            policies: %{"retry" => %{"max_attempts" => 3}}
+          )
+          |> Graph.put_edge!("edge_start_node", from: "$start", to: "node")
+          |> Graph.put_edge!("edge_node_finish", from: "node", to: "$finish")
+
+        assert {:ok, run, checkpoints} = Docket.Test.run_inline(graph, %{})
+        assert run.status == :failed
+
+        run_failed = List.last(checkpoints)
+        permanent = Enum.filter(run_failed.events, &(&1.type == :node_failed))
+        # Deterministic failures are not retried even with retry budget left.
+        assert [event] = permanent
+        assert event.payload["attempt"] == 1
+        assert event.payload["reason"] =~ marker
+      end
+    end
+
+    test "writes to unknown or read-only fields fail the superstep" do
+      graph =
+        Graph.new!(id: "bad-write")
+        |> Graph.put_field!("out", schema: Docket.Schema.string())
+        |> Graph.put_node!("writer",
+          implementation: Nodes.WriteStatic,
+          config: %{field: "nope", value: "x"}
+        )
+        |> Graph.put_edge!("edge_start_writer", from: "$start", to: "writer")
+        |> Graph.put_edge!("edge_writer_finish", from: "writer", to: "$finish")
+
+      assert {:ok, run, checkpoints} = Docket.Test.run_inline(graph, %{})
+      assert run.status == :failed
+
+      run_failed = List.last(checkpoints)
+      assert Enum.any?(run_failed.events, &(&1.payload["reason"] =~ "unknown field"))
+    end
+
+    test "schema-invalid writes fail the superstep" do
+      graph =
+        Graph.new!(id: "schema-violation")
+        |> Graph.put_field!("out", schema: Docket.Schema.float())
+        |> Graph.put_node!("writer",
+          implementation: Nodes.WriteStatic,
+          config: %{field: "out", value: "not a number"}
+        )
+        |> Graph.put_edge!("edge_start_writer", from: "$start", to: "writer")
+        |> Graph.put_edge!("edge_writer_finish", from: "writer", to: "$finish")
+
+      assert {:ok, run, _} = Docket.Test.run_inline(graph, %{})
+      assert run.status == :failed
+      assert field_value(run, "out") == :unwritten
+    end
+  end
+
+  describe "retry policy" do
+    test "a flaky node succeeds within its retry budget" do
+      assert {:ok, run, checkpoints} =
+               Docket.Test.run_inline(Graphs.retry_then_continue(), %{})
+
+      assert run.status == :done
+      assert run.output == %{"out" => "done"}
+      assert checkpoint_types(checkpoints) == [:run_initialized, :step_committed, :run_completed]
+
+      step = Enum.at(checkpoints, 1)
+
+      retried =
+        for event <- step.events, event.type == :node_failed do
+          {event.payload["attempt"], event.payload["permanent"]}
+        end
+
+      assert retried == [{1, false}, {2, false}]
+
+      assert Enum.any?(
+               step.events,
+               &(&1.type == :node_completed and &1.payload["attempt"] == 3)
+             )
+    end
+
+    test "exhausting the retry budget makes the failure permanent" do
+      graph =
+        Graphs.retry_then_continue()
+        |> Graph.update_node!("flaky",
+          policies: %{"retry" => %{"max_attempts" => 2, "backoff_ms" => 0}}
+        )
+
+      assert {:ok, run, checkpoints} = Docket.Test.run_inline(graph, %{})
+      assert run.status == :failed
+
+      run_failed = List.last(checkpoints)
+
+      attempts =
+        for event <- run_failed.events, event.type == :node_failed do
+          {event.payload["attempt"], event.payload["permanent"]}
+        end
+
+      assert attempts == [{1, false}, {2, true}]
+    end
+
+    test "retry backoff uses the injected sleeper" do
+      test_pid = self()
+
+      sleeper = fn ms ->
+        send(test_pid, {:slept, ms})
+        :ok
+      end
+
+      graph =
+        Graphs.retry_then_continue()
+        |> Graph.update_node!("flaky",
+          policies: %{"retry" => %{"max_attempts" => 3, "backoff_ms" => 25}}
+        )
+
+      assert {:ok, %{status: :done}, _} = Docket.Test.run_inline(graph, %{}, sleeper: sleeper)
+
+      assert_received {:slept, 25}
+      assert_received {:slept, 25}
+      refute_received {:slept, _}
+    end
+
+    test "invalid node policies fail the run with a typed failure" do
+      graph =
+        Graphs.retry_then_continue()
+        |> Graph.update_node!("flaky", policies: %{"retry" => %{"max_attempts" => 0}})
+
+      assert {:ok, run, checkpoints} = Docket.Test.run_inline(graph, %{})
+
+      assert run.status == :failed
+      run_failed = List.last(checkpoints)
+      assert Enum.any?(run_failed.events, &(&1.payload["reason"] == "invalid_policy"))
+    end
+
+    test "the reserved on_error policy is rejected" do
+      graph =
+        Graphs.retry_then_continue()
+        |> Graph.update_node!("flaky", policies: %{"on_error" => "route"})
+
+      assert {:ok, run, _} = Docket.Test.run_inline(graph, %{})
+      assert run.status == :failed
+    end
+  end
+end

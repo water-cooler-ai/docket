@@ -1,7 +1,7 @@
 # Docket Implementation Progress
 
 Status: active progress note
-Date: 2026-06-27
+Date: 2026-07-03
 
 This document tracks what has actually landed in code for the v1 MVP. It is not
 the design source of truth; use `docket-v1-implementation-path.md` for the
@@ -217,13 +217,80 @@ specific to this attempt are recorded in `docket-compiler-v1-attempt-1.md`.
 
 ## Not Yet Implemented
 
-- `Docket.Run`
-- checkpoint contracts
-- runtime loop
-- inline test runtime (`Docket.Test.run_inline/3`)
-- compile-and-run integration tests (blocked on the inline runtime)
-- public run/resume APIs
-- supervised runtime process tree
+- `Docket.Runtime` GenServer shell, registry, and supervisor
+- public `Docket.run/4`, `resume/4`, `get_run/3`, `resolve_interrupt/5` and
+  `use Docket` host wrappers
+- `Docket.Executor.Task` and supervised lifecycle/crash-recovery tests
+- ETS checkpoint sink test support
+- compiler validation of the v1 node policy keys (runtime validates them at
+  plan time meanwhile)
+- `Docket.Event` codecs (events are in-memory structs delivered with
+  checkpoints; hosts that persist them own the encoding for now)
+
+## Runtime (Attempt 1) — Inline Slice
+
+The shared execution loop from `docket-runtime-v1-attempt-1.md` is
+implemented through the inline shell (run-path slices 1-7 of the
+implementation path). All section 15 clarifications in the attempt doc were
+confirmed; implementation deviations are recorded in its section 16.
+
+Implemented public modules:
+
+- `Docket.Run` with `Docket.Run.ChannelState`, `Docket.Run.TaskState`,
+  `Docket.Run.InterruptState`, and strict `to_map/2` / `from_map/2` /
+  `from_map!/2` codecs (`Docket.Run.Serializer` internally)
+- `Docket.Checkpoint` behaviour/struct with `Docket.Checkpoint.Context`,
+  sync/async delivery defaults, and `:sync`-forcing overrides
+- `Docket.Event`, `Docket.Error`, `Docket.Interrupt`
+- `Docket.Executor` behaviour and `Docket.Executor.Local`
+- `Docket.Test.run_inline/3`, `step_inline/2`, `resume_inline/3`,
+  `resolve_interrupt_inline/4`, and `Docket.Test.Checkpoint.Accept`
+
+Implemented internal modules:
+
+- `Docket.Runtime.Loop` — stateless transitions (`init/3`, `plan/3`,
+  `apply_results/4`, `resolve_interrupt/5`) owning checkpoint emission and
+  barrier semantics
+- `Docket.Runtime.Algorithm` — pure planning, activation preparation, guard
+  evaluation, write validation, reducer application, barrier seen-set
+  tracking, edge triggering, and output projection
+- `Docket.Runtime.Dispatcher` — executor dispatch, outcome normalization,
+  and the mechanical retry loop
+- `Docket.Runtime.Config` — option resolution with injectable clock, ID
+  generator, and retry sleeper
+- `Docket.Runtime.Activation`, `Docket.Runtime.TaskResult`, `Docket.Wire`
+
+Semantics proven by tests:
+
+- `:run_initialized` before any node execution; `Docket.run`-style start
+  barrier through `Loop.init/3` inferring fresh (`:created`) versus saved
+  runs
+- Plan -> Execution -> Update supersteps with barrier visibility; write-based
+  change tracking; deterministic same-step `last_value` conflict resolution
+- fan-out, sticky multi-source barriers with reset-on-fire, guarded edges
+  with lax reads, bounded cycles, and `max_supersteps` limit failures
+- default-strict failure policy (no writes commit), retry policy with
+  injectable backoff, deterministic non-retryable failures, and runtime
+  node-policy validation (`timeout_ms`, `retry`, reserved `on_error`)
+- interrupts: `:waiting` committed eagerly at the interrupt barrier, sibling
+  writes committed, resolution re-executing the interrupted node through
+  committed `pending_nodes`
+- checkpoint ordering, sync failure keeping the previous committed run,
+  async `:step_committed` failures not blocking the run, and byte-identical
+  idempotency keys when re-planning an uncommitted superstep
+- resume from persisted `Docket.Run` documents (including
+  `to_map`/`from_map` round trips) with graph hash matching and terminal
+  runs never restarting
+
+Test support added: `Docket.Test.Checkpoint.MemorySink` and `FailOn` sinks;
+executable node fixtures (`Increment`, `InterruptOnce`, `FlakyThenSucceeds`,
+`AlwaysFails`, `Raises`, `Throws`, `Awaits`, `AtomWriter`, `BadReturn`);
+graph fixtures `interrupt_review/0`, `retry_then_continue/0`,
+`parallel_failure/0`, `same_step_isolation/0`, `write_conflict/0`; and
+`cycle_counter/0` upgraded to an executable increment cycle.
+
+`Docket.Runtime.Graph.Channel` gained a `required` flag lowered from input
+`Field.required` so run initialization can enforce required inputs.
 
 ## Current Test Status
 
@@ -231,5 +298,5 @@ Latest local check:
 
 ```text
 mix test
-140 tests, 0 failures
+213 tests, 0 failures
 ```

@@ -36,6 +36,28 @@ defmodule Docket.Test.Case do
   end
 
   @doc """
+  Returns the checkpoint types in emission order.
+  """
+  def checkpoint_types(checkpoints), do: Enum.map(checkpoints, & &1.type)
+
+  @doc """
+  Returns the event types across all checkpoints in emission order.
+  """
+  def event_types(checkpoints) do
+    Enum.flat_map(checkpoints, fn checkpoint -> Enum.map(checkpoint.events, & &1.type) end)
+  end
+
+  @doc """
+  Returns the committed value of a public state field from a run.
+  """
+  def field_value(run, field_id) do
+    case Map.fetch(run.channels, "state:" <> field_id) do
+      {:ok, state} -> state.value
+      :error -> :unwritten
+    end
+  end
+
+  @doc """
   Verifies a graph that must fail, returning its diagnostics.
   """
   def verify_error!(graph, opts \\ []) do
