@@ -55,7 +55,13 @@ defmodule Docket.Graph.Serializer do
     "object" => :object,
     "enum" => :enum
   }
-  @schema_types_out %{string: "string", float: "float", map: "map", object: "object", enum: "enum"}
+  @schema_types_out %{
+    string: "string",
+    float: "float",
+    map: "map",
+    object: "object",
+    enum: "enum"
+  }
 
   @reducer_types %{"last_value" => :last_value}
   @reducer_types_out %{last_value: "last_value"}
@@ -408,7 +414,14 @@ defmodule Docket.Graph.Serializer do
   defp load_schema!(map, location) when is_map(map) and not is_struct(map) do
     assert_string_keys!(map, "schema in #{location}")
     assert_known_keys!(map, @schema_keys, "schema in #{location}")
-    type = lookup!(@schema_types, fetch_required!(map, "type", "schema"), :invalid_document, "schema type")
+
+    type =
+      lookup!(
+        @schema_types,
+        fetch_required!(map, "type", "schema"),
+        :invalid_document,
+        "schema type"
+      )
 
     %Schema{
       type: type,
@@ -417,7 +430,8 @@ defmodule Docket.Graph.Serializer do
       values: load_list!(Map.get(map, "values"), "schema values in #{location}"),
       required: load_bool_value!(Map.get(map, "required"), "schema required in #{location}"),
       default: load_schema_default(map, location),
-      constraints: load_open_map_value!(Map.get(map, "constraints"), "schema constraints in #{location}"),
+      constraints:
+        load_open_map_value!(Map.get(map, "constraints"), "schema constraints in #{location}"),
       metadata: load_open_map_value!(Map.get(map, "metadata"), "schema metadata in #{location}")
     }
   end
@@ -434,7 +448,10 @@ defmodule Docket.Graph.Serializer do
   end
 
   defp load_schema_fields!(other, location) do
-    invalid!(:invalid_document, "schema fields in #{location} must be a map, got #{inspect(other)}")
+    invalid!(
+      :invalid_document,
+      "schema fields in #{location} must be a map, got #{inspect(other)}"
+    )
   end
 
   defp load_schema_default(map, location) do
@@ -449,7 +466,14 @@ defmodule Docket.Graph.Serializer do
   defp load_reducer!(map, location) when is_map(map) and not is_struct(map) do
     assert_string_keys!(map, "reducer in #{location}")
     assert_known_keys!(map, @reducer_keys, "reducer in #{location}")
-    type = lookup!(@reducer_types, fetch_required!(map, "type", "reducer"), :invalid_document, "reducer type")
+
+    type =
+      lookup!(
+        @reducer_types,
+        fetch_required!(map, "type", "reducer"),
+        :invalid_document,
+        "reducer type"
+      )
 
     %Reducer{
       type: type,
@@ -470,7 +494,10 @@ defmodule Docket.Graph.Serializer do
     args = Map.get(map, "args", [])
 
     unless is_list(args) do
-      invalid!(:invalid_document, "guard args in #{location} must be a list, got #{inspect(args)}")
+      invalid!(
+        :invalid_document,
+        "guard args in #{location} must be a list, got #{inspect(args)}"
+      )
     end
 
     %Guard{op: op, args: load_guard_args!(op, args, location)}
@@ -522,7 +549,9 @@ defmodule Docket.Graph.Serializer do
 
     case Map.fetch(map, "function") do
       {:ok, function_string} ->
-        function = to_existing_atom!(function_string, :unknown_function, "implementation function")
+        function =
+          to_existing_atom!(function_string, :unknown_function, "implementation function")
+
         Map.put(base, :function, function)
 
       :error ->
@@ -550,7 +579,10 @@ defmodule Docket.Graph.Serializer do
   end
 
   defp load_branches!(other, id) do
-    invalid!(:invalid_document, "node #{inspect(id)} branches must be a map, got #{inspect(other)}")
+    invalid!(
+      :invalid_document,
+      "node #{inspect(id)} branches must be a map, got #{inspect(other)}"
+    )
   end
 
   defp load_branch_group!(group, _id, _name) when is_list(group), do: group
@@ -572,15 +604,21 @@ defmodule Docket.Graph.Serializer do
 
   defp load_endpoint!(list, location) when is_list(list) do
     Enum.each(list, fn
-      value when is_binary(value) -> :ok
-      other -> invalid!(:invalid_document, "#{location} entries must be strings, got #{inspect(other)}")
+      value when is_binary(value) ->
+        :ok
+
+      other ->
+        invalid!(:invalid_document, "#{location} entries must be strings, got #{inspect(other)}")
     end)
 
     list
   end
 
   defp load_endpoint!(other, location) do
-    invalid!(:invalid_document, "#{location} must be a string or list of strings, got #{inspect(other)}")
+    invalid!(
+      :invalid_document,
+      "#{location} must be a string or list of strings, got #{inspect(other)}"
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -626,7 +664,10 @@ defmodule Docket.Graph.Serializer do
           assert_public_id!(id, label)
 
           unless is_map(record) and not is_struct(record) do
-            invalid!(:invalid_document, "#{key} entry #{inspect(id)} must be a map, got #{inspect(record)}")
+            invalid!(
+              :invalid_document,
+              "#{key} entry #{inspect(id)} must be a map, got #{inspect(record)}"
+            )
           end
 
           {id, fun.(id, record)}
@@ -706,9 +747,14 @@ defmodule Docket.Graph.Serializer do
 
   defp load_optional_string!(map, key, location) do
     case Map.get(map, key) do
-      nil -> nil
-      value when is_binary(value) -> value
-      other -> invalid!(:invalid_document, "#{location} #{key} must be a string, got #{inspect(other)}")
+      nil ->
+        nil
+
+      value when is_binary(value) ->
+        value
+
+      other ->
+        invalid!(:invalid_document, "#{location} #{key} must be a string, got #{inspect(other)}")
     end
   end
 
@@ -725,8 +771,14 @@ defmodule Docket.Graph.Serializer do
 
   defp fetch_required!(map, key, location) do
     case Map.fetch(map, key) do
-      {:ok, value} -> value
-      :error -> invalid!(:invalid_document, "#{location} document is missing required key #{inspect(key)}")
+      {:ok, value} ->
+        value
+
+      :error ->
+        invalid!(
+          :invalid_document,
+          "#{location} document is missing required key #{inspect(key)}"
+        )
     end
   end
 
@@ -752,7 +804,10 @@ defmodule Docket.Graph.Serializer do
   end
 
   defp to_existing_atom!(other, code, label) do
-    invalid!(code, "#{label} must be a string, got #{inspect(other)}", %{label: label, value: other})
+    invalid!(code, "#{label} must be a string, got #{inspect(other)}", %{
+      label: label,
+      value: other
+    })
   end
 
   # ---------------------------------------------------------------------------
@@ -938,7 +993,9 @@ defmodule Docket.Graph.Serializer do
 
   def normalize_schema(%Schema{} = schema) do
     unless Map.has_key?(@schema_types_out, schema.type) do
-      invalid!(:invalid_schema, "unknown schema type #{inspect(schema.type)}", %{type: schema.type})
+      invalid!(:invalid_schema, "unknown schema type #{inspect(schema.type)}", %{
+        type: schema.type
+      })
     end
 
     %Schema{
@@ -966,7 +1023,9 @@ defmodule Docket.Graph.Serializer do
 
   def normalize_reducer(%Reducer{} = reducer) do
     unless Map.has_key?(@reducer_types_out, reducer.type) do
-      invalid!(:invalid_reducer, "unknown reducer type #{inspect(reducer.type)}", %{type: reducer.type})
+      invalid!(:invalid_reducer, "unknown reducer type #{inspect(reducer.type)}", %{
+        type: reducer.type
+      })
     end
 
     %Reducer{reducer | opts: normalize_open_map(reducer.opts)}
@@ -1022,7 +1081,8 @@ defmodule Docket.Graph.Serializer do
 
   defp normalize_branch_group(group) when is_list(group), do: normalize_list(group)
 
-  defp normalize_branch_group(group) when is_map(group) and not is_struct(group), do: durable!(group)
+  defp normalize_branch_group(group) when is_map(group) and not is_struct(group),
+    do: durable!(group)
 
   defp normalize_branch_group(group) do
     non_durable!(group, "branch group must be a list of edge IDs or a string-keyed map")
