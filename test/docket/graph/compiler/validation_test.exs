@@ -388,6 +388,18 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       |> assert_diagnostic(:duplicate_branch_edge, path: [:nodes, "reviewer", :branches])
     end
 
+    test "rejects the same edge listed twice within one branch group" do
+      Graphs.branch_group()
+      |> Graph.update_node!("reviewer",
+        branches: %{"decision" => ["edge_approved", "edge_approved", "edge_rejected"]}
+      )
+      |> verify_error!()
+      |> assert_diagnostic(:duplicate_branch_edge,
+        path: [:nodes, "reviewer", :branches],
+        public_id: "reviewer"
+      )
+    end
+
     test "warns on unguarded grouped edges instead of failing" do
       {:ok, verified} =
         Graphs.branch_group()
@@ -522,6 +534,62 @@ defmodule Docket.Graph.Compiler.ValidationTest do
         |> Graph.verify()
 
       assert_diagnostic(verified, :unguarded_cycle, severity: :warning)
+    end
+  end
+
+  describe "dead-end analysis (9.11)" do
+    test "warns on reachable nodes that cannot reach $finish" do
+      {:ok, verified} =
+        Graphs.minimal_linear()
+        |> Graph.put_node!("trap", implementation: Nodes.Echo)
+        |> Graph.put_edge!("edge_copy_trap", from: "copy", to: "trap")
+        |> Graph.verify()
+
+      assert_diagnostic(verified, :dead_end_node,
+        severity: :warning,
+        path: [:nodes, "trap"],
+        public_id: "trap"
+      )
+
+      # The node that still reaches $finish is not flagged.
+      refute Enum.any?(
+               verified.diagnostics,
+               &(&1.code == :dead_end_node and &1.public_id == "copy")
+             )
+    end
+
+    test "reports one terminal warning, not per-node dead ends, when no $finish edge exists" do
+      # fanout deliberately terminates nowhere; a single graph-level warning
+      # says the graph cannot finish rather than flagging every leaf.
+      {:ok, verified} = Graph.verify(Graphs.fanout())
+
+      assert_diagnostic(verified, :no_terminal_edge, severity: :warning, path: [:edges])
+      refute Enum.any?(verified.diagnostics, &(&1.code == :dead_end_node))
+    end
+
+    test "leaves a fully empty graph alone" do
+      {:ok, verified} = Graph.verify(Graph.new!(id: "empty"))
+
+      refute Enum.any?(verified.diagnostics, &(&1.code in [:no_terminal_edge, :dead_end_node]))
+    end
+
+    test "does not double-report unreachable nodes as dead ends" do
+      diagnostics =
+        Graphs.minimal_linear()
+        |> Graph.put_node!("stranded", implementation: Nodes.Echo)
+        |> verify_error!()
+
+      assert_diagnostic(diagnostics, :unreachable_node, public_id: "stranded")
+
+      refute Enum.any?(
+               diagnostics,
+               &(&1.code == :dead_end_node and &1.public_id == "stranded")
+             )
+    end
+
+    test "treats a node that only reaches $finish through a cycle as terminating" do
+      {:ok, verified} = Graph.verify(Graphs.cycle_counter())
+      refute Enum.any?(verified.diagnostics, &(&1.code == :dead_end_node))
     end
   end
 

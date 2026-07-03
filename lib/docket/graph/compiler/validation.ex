@@ -34,7 +34,8 @@ defmodule Docket.Graph.Compiler.Validation do
       validate_branches(graph, opts),
       validate_guards(graph, opts),
       validate_topology(graph, opts),
-      analyze_cycles(graph, opts)
+      analyze_cycles(graph, opts),
+      analyze_dead_ends(graph, opts)
     ])
   end
 
@@ -706,11 +707,14 @@ defmodule Docket.Graph.Compiler.Validation do
     ]
   end
 
+  # An edge may sit in at most one branch position. Occurrences are counted
+  # across all groups without a per-group uniq, so an edge repeated inside a
+  # single group is caught as well as one spanning two groups.
   defp check_duplicate_branch_edges(node_id, branches) do
     duplicated =
       branches
       |> Enum.flat_map(fn
-        {_group_name, edge_ids} when is_list(edge_ids) -> Enum.uniq(edge_ids)
+        {_group_name, edge_ids} when is_list(edge_ids) -> edge_ids
         _other -> []
       end)
       |> Enum.frequencies()
@@ -721,7 +725,7 @@ defmodule Docket.Graph.Compiler.Validation do
     for edge_id <- duplicated do
       error(
         :duplicate_branch_edge,
-        "node #{inspect(node_id)} groups edge #{inspect(edge_id)} in more than one branch",
+        "node #{inspect(node_id)} references edge #{inspect(edge_id)} more than once in its branch groups",
         path: [:nodes, node_id, :branches],
         public_id: node_id,
         metadata: %{edge_id: edge_id}
@@ -1127,6 +1131,105 @@ defmodule Docket.Graph.Compiler.Validation do
   defp pop_component([node | rest], node, acc), do: {[node | acc], rest}
 
   defp pop_component([head | rest], node, acc), do: pop_component(rest, node, [head | acc])
+
+  # ---------------------------------------------------------------------------
+  # 9.11 Termination (dead ends)
+  # ---------------------------------------------------------------------------
+
+  # The mirror of the topology pass. A graph with no edge to $finish can never
+  # terminate normally: one graph-level warning says so, rather than flagging
+  # every node as its own dead end. When a $finish edge exists, each node
+  # reachable from $start that still cannot reach $finish traps any run that
+  # enters it until the max_supersteps limit. Unreachable nodes are excluded —
+  # they already carry :unreachable_node, and steering the user two ways at
+  # once helps no one. A fully empty graph is left alone, matching topology.
+  defp analyze_dead_ends(graph, _opts) do
+    cond do
+      map_size(graph.nodes) == 0 ->
+        []
+
+      not declares_finish_edge?(graph) ->
+        [
+          warning(
+            :no_terminal_edge,
+            "graph has no edge to $finish; no run can terminate normally and every run halts at the max_supersteps limit",
+            path: [:edges]
+          )
+        ]
+
+      true ->
+        start_reachable = reachable_nodes(graph)
+        finish_reaching = nodes_reaching_finish(graph)
+
+        for node_id <- Enum.sort(Map.keys(graph.nodes)),
+            MapSet.member?(start_reachable, node_id),
+            not MapSet.member?(finish_reaching, node_id) do
+          warning(
+            :dead_end_node,
+            "node #{inspect(node_id)} is reachable from $start but cannot reach $finish; runs entering it can only halt at the max_supersteps limit",
+            path: [:nodes, node_id],
+            public_id: node_id
+          )
+        end
+    end
+  end
+
+  defp declares_finish_edge?(graph) do
+    Enum.any?(graph.edges, fn {_id, edge} -> match?(%Edge{to: @finish_id}, edge) end)
+  end
+
+  # Backward reachability from $finish over the forward node adjacency. A
+  # multi-source edge contributes each of its sources as able to reach the
+  # target, mirroring adjacency/1: an over-approximation that keeps dead-end
+  # warnings conservative (a barrier that still needs a sibling is not flagged).
+  defp nodes_reaching_finish(graph) do
+    expand_finish_reaching(direct_finishers(graph), finish_successors(graph))
+  end
+
+  defp expand_finish_reaching(reaching, successors) do
+    expanded =
+      Enum.reduce(successors, reaching, fn {node, targets}, acc ->
+        if Enum.any?(targets, &MapSet.member?(acc, &1)), do: MapSet.put(acc, node), else: acc
+      end)
+
+    if MapSet.equal?(expanded, reaching) do
+      reaching
+    else
+      expand_finish_reaching(expanded, successors)
+    end
+  end
+
+  defp finish_successors(graph) do
+    base = Map.new(graph.nodes, fn {id, _node} -> {id, []} end)
+
+    Enum.reduce(graph.edges, base, fn {_id, edge}, acc ->
+      with %Edge{from: from, to: to} <- edge,
+           true <- is_binary(to) and to != @finish_id and Map.has_key?(base, to) do
+        from
+        |> source_list()
+        |> Enum.filter(&(is_binary(&1) and Map.has_key?(base, &1)))
+        |> Enum.reduce(acc, fn source, inner -> Map.update!(inner, source, &[to | &1]) end)
+      else
+        _other -> acc
+      end
+    end)
+  end
+
+  defp direct_finishers(graph) do
+    Enum.reduce(graph.edges, MapSet.new(), fn
+      {_id, %Edge{from: from, to: @finish_id}}, acc ->
+        from
+        |> source_list()
+        |> Enum.filter(&is_binary/1)
+        |> Enum.reduce(acc, &MapSet.put(&2, &1))
+
+      {_id, _edge}, acc ->
+        acc
+    end)
+  end
+
+  defp source_list(from) when is_list(from), do: from
+  defp source_list(from), do: [from]
 
   # ---------------------------------------------------------------------------
   # Shared helpers
