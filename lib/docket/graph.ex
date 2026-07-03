@@ -18,13 +18,12 @@ defmodule Docket.Graph do
   records back through the same editing API.
   """
 
-  alias Docket.Graph.{Diagnostic, Edge, Error, Field, Node, Output}
+  alias Docket.Graph.{Diagnostic, Edge, Error, Field, Node, Output, Serializer}
 
   @id_pattern ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
   @start_id "$start"
   @finish_id "$finish"
   @schema_version 1
-  @hash_algorithm :sha256
 
   defstruct [
     :id,
@@ -213,15 +212,20 @@ defmodule Docket.Graph do
   @doc """
   Stores a graph-level policy value.
   """
-  @spec policy(t(), term(), term(), keyword()) :: edit_result()
+  @spec policy(t(), binary() | atom(), term(), keyword()) :: edit_result()
   def policy(graph, key, value, opts \\ []) do
     edit_result(fn -> policy!(graph, key, value, opts) end)
   end
 
   @doc """
   Stores a graph-level policy value, raising on malformed arguments.
+
+  Content is stored as given. When the graph crosses the serialization
+  boundary (`to_map/2`, `hash/2`), atom keys and values are canonicalized to
+  strings and terms with no JSON representation are rejected. Keys starting
+  with `"$"` are reserved for the wire format.
   """
-  @spec policy!(t(), term(), term(), keyword()) :: t()
+  @spec policy!(t(), binary(), term(), keyword()) :: t()
   def policy!(graph, key, value, opts \\ [])
 
   def policy!(%__MODULE__{} = graph, key, value, opts) do
@@ -237,15 +241,20 @@ defmodule Docket.Graph do
   @doc """
   Stores graph-level application metadata.
   """
-  @spec metadata(t(), term(), term(), keyword()) :: edit_result()
+  @spec metadata(t(), binary() | atom(), term(), keyword()) :: edit_result()
   def metadata(graph, key, value, opts \\ []) do
     edit_result(fn -> metadata!(graph, key, value, opts) end)
   end
 
   @doc """
   Stores graph-level application metadata, raising on malformed arguments.
+
+  Content is stored as given. When the graph crosses the serialization
+  boundary (`to_map/2`, `hash/2`), atom keys and values are canonicalized to
+  strings and terms with no JSON representation are rejected. Keys starting
+  with `"$"` are reserved for the wire format.
   """
-  @spec metadata!(t(), term(), term(), keyword()) :: t()
+  @spec metadata!(t(), binary(), term(), keyword()) :: t()
   def metadata!(graph, key, value, opts \\ [])
 
   def metadata!(%__MODULE__{} = graph, key, value, opts) do
@@ -267,20 +276,54 @@ defmodule Docket.Graph do
   end
 
   @doc """
+  Dumps the graph to a plain, JSON-safe map (the v1 wire format).
+
+  Keys are strings and values are durable JSON-safe terms. Compiler diagnostics
+  are transient and are never serialized.
+
+  Graphs are free-form in memory; this is the boundary where content is
+  canonicalized. Open content (metadata, policies, config, defaults, enum
+  values, guard arguments, branch groups) is coerced the way `Jason` would
+  encode it: atom keys and atom values become strings, silently. Terms with no
+  JSON representation - tuples, keyword lists, pids, refs, functions, structs -
+  raise `Docket.Graph.Error` (`:non_durable_value` and friends).
+
+  The graph hash is computed from this document, so it is stable across
+  storage round trips: `hash(from_map!(to_map(graph))) == hash(graph)` for any
+  dumpable graph. Graphs whose open content is already canonical (string keys
+  and values) also round-trip on struct equality:
+  `from_map!(to_map(graph)) == graph`.
+  """
+  @spec to_map(t(), keyword()) :: map()
+  def to_map(%__MODULE__{} = graph, opts \\ []) do
+    Serializer.dump(graph, opts)
+  end
+
+  @doc """
+  Loads a graph from a v1 wire map.
+  """
+  @spec from_map(map(), keyword()) :: edit_result()
+  def from_map(map, opts \\ []) do
+    edit_result(fn -> Serializer.load!(map, opts) end)
+  end
+
+  @doc """
+  Loads a graph from a v1 wire map, raising `Docket.Graph.Error` on invalid input.
+  """
+  @spec from_map!(map(), keyword()) :: t()
+  def from_map!(map, opts \\ []) do
+    Serializer.load!(map, opts)
+  end
+
+  @doc """
   Computes the SHA-256 graph hash used to bind runs to graph content.
 
-  The hash is computed from a canonical representation of graph content and
-  excludes host-owned versioning and compiler diagnostics.
+  The hash is a SHA-256 digest over the canonical JSON encoding of
+  `to_map/1`. It excludes host-owned versioning and compiler diagnostics.
   """
   @spec hash(t(), keyword()) :: String.t()
-  def hash(%__MODULE__{} = graph, _opts \\ []) do
-    graph
-    |> Map.from_struct()
-    |> Map.drop([:diagnostics])
-    |> canonicalize()
-    |> :erlang.term_to_binary()
-    |> then(&:crypto.hash(@hash_algorithm, &1))
-    |> Base.encode16(case: :lower)
+  def hash(%__MODULE__{} = graph, opts \\ []) do
+    Serializer.hash(graph, opts)
   end
 
   @doc """
@@ -661,14 +704,16 @@ defmodule Docket.Graph do
     |> then(&struct(Field, &1))
   end
 
-  defp node_from_attrs(%Node{} = node, _id), do: node
+  defp node_from_attrs(%Node{} = node, _id) do
+    Map.update!(node, :implementation, &Serializer.normalize_implementation/1)
+  end
 
   defp node_from_attrs(attrs, id) do
     attrs
     |> attrs_to_map()
     |> Map.put_new(:id, id)
-    |> normalize_node_implementation()
     |> then(&struct(Node, &1))
+    |> Map.update!(:implementation, &Serializer.normalize_implementation/1)
   end
 
   defp edge_from_attrs(%Edge{} = edge, _id), do: edge
@@ -678,31 +723,6 @@ defmodule Docket.Graph do
     |> attrs_to_map()
     |> Map.put_new(:id, id)
     |> then(&struct(Edge, &1))
-  end
-
-  defp normalize_node_implementation(%{implementation: implementation} = attrs) do
-    %{attrs | implementation: normalize_implementation(implementation)}
-  end
-
-  defp normalize_node_implementation(attrs), do: attrs
-
-  defp normalize_implementation(nil), do: nil
-
-  defp normalize_implementation(module) when is_atom(module) do
-    %{type: :module, module: module, function: :call}
-  end
-
-  defp normalize_implementation({module, function}) when is_atom(module) and is_atom(function) do
-    %{type: :module, module: module, function: function}
-  end
-
-  defp normalize_implementation(%{} = implementation), do: implementation
-
-  defp normalize_implementation(implementation) do
-    invalid!(
-      :invalid_implementation,
-      "implementation must be a module atom, {module, function}, map, or nil, got #{inspect(implementation)}"
-    )
   end
 
   defp apply_update(existing, fun, normalizer) when is_function(fun, 1) do
@@ -716,47 +736,6 @@ defmodule Docket.Graph do
     |> Map.from_struct()
     |> Map.merge(attrs_to_map(attrs))
     |> normalizer.()
-  end
-
-  defp canonicalize(%MapSet{} = set) do
-    set
-    |> MapSet.to_list()
-    |> Enum.map(&canonicalize/1)
-    |> Enum.sort_by(&:erlang.term_to_binary/1)
-    |> then(&{:map_set, &1})
-  end
-
-  defp canonicalize(%module{} = struct) do
-    {:struct, Atom.to_string(module), canonicalize(Map.from_struct(struct))}
-  end
-
-  defp canonicalize(map) when is_map(map) do
-    entries =
-      map
-      |> Enum.map(fn {key, value} -> {canonicalize(key), canonicalize(value)} end)
-      |> Enum.sort_by(fn {key, _value} -> :erlang.term_to_binary(key) end)
-
-    {:map, entries}
-  end
-
-  defp canonicalize(list) when is_list(list) do
-    {:list, Enum.map(list, &canonicalize/1)}
-  end
-
-  defp canonicalize(tuple) when is_tuple(tuple) do
-    tuple
-    |> Tuple.to_list()
-    |> Enum.map(&canonicalize/1)
-    |> then(&{:tuple, &1})
-  end
-
-  defp canonicalize(atom) when is_atom(atom), do: {:atom, Atom.to_string(atom)}
-  defp canonicalize(binary) when is_binary(binary), do: {:binary, binary}
-  defp canonicalize(integer) when is_integer(integer), do: {:integer, integer}
-  defp canonicalize(float) when is_float(float), do: {:float, float}
-
-  defp canonicalize(other) do
-    raise ArgumentError, "graph contains a non-durable value: #{inspect(other)}"
   end
 
   defp finalize_edit(%__MODULE__{} = graph, opts) do

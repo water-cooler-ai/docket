@@ -72,6 +72,9 @@ Implemented functions:
 - `Docket.Graph.metadata/4`
 - `Docket.Graph.metadata!/4`
 - `Docket.Graph.diagnostics/2`
+- `Docket.Graph.to_map/2`
+- `Docket.Graph.from_map/2`
+- `Docket.Graph.from_map!/2`
 - `Docket.Graph.hash/2`
 - `Docket.Graph.verify/2`
 
@@ -79,6 +82,31 @@ Non-bang graph edit functions return `{:ok, graph}` or
 `{:error, %Docket.Graph.Error{}}`. Bang edit functions return the graph or raise
 `Docket.Graph.Error`. Edits clear stale diagnostics, but they do not compile or
 diagnose the graph. Verification is explicit through `Docket.Graph.verify/2`.
+
+### Graph Serialization And Hashing
+
+`Docket.Graph.to_map/2` and `Docket.Graph.from_map/2` are the only public
+entry/exit points for serialized graph documents (the v1 JSON-safe wire
+format, implemented internally by `Docket.Graph.Serializer`).
+`Docket.Graph.hash/2` is a SHA-256 digest over the canonical JSON encoding of
+`to_map/1`, so hashes survive host storage round trips and library upgrades.
+
+Graphs are free-form in memory, Ecto-style: editing helpers store content
+exactly as given and perform no durability validation (the one edit-time
+rewrite is the module / `{module, function}` implementation construction
+shorthand). Canonicalization happens at the serialization boundary:
+`to_map/2` coerces open content the way a JSON encoder would (atom keys and
+values become strings, silently) and rejects terms with no JSON
+representation (tuples, keyword lists, pids, refs, functions, structs) with
+`:non_durable_value`. Hashes are computed from the canonical document, so
+`hash(from_map!(to_map(graph))) == hash(graph)` holds for every dumpable
+graph; graphs whose open content is already canonical also satisfy
+`from_map!(to_map(graph)) == graph` on struct equality. Guards nested in
+plain guard-argument positions are wrapped in a reserved `"$guard"` wire tag;
+`$`-prefixed map keys are reserved in durable content. `from_map/2` validates
+documents strictly (schema version, unknown keys, enum-like values,
+implementation atoms via `String.to_existing_atom/1`) and never creates
+atoms.
 
 ### Compiler Boundary
 
@@ -157,7 +185,15 @@ Current coverage checks:
 - realtime-style put/update/delete editing
 - guard/schema/reducer value construction
 - public ID argument errors
-- SHA-256 graph hashing over canonical graph content
+- to_map/from_map round-trip law on a rich graph
+- free-form in-memory content with atom-to-string coercion at to_map and
+  rejection of non-representable terms
+- nested guard `$guard` wire tagging and reserved `$` key rejection
+- schema no-default sentinel vs explicit-nil default round trip
+- strict from_map document validation (versions, unknown keys, unknown
+  enum-like values, unknown implementation modules)
+- SHA-256 graph hashing over the canonical JSON encoding of the wire
+  document, stable across to_map/from_map round trips
 - graph verification attaching compiler diagnostics
 - edit helpers clearing stale diagnostics
 
@@ -184,5 +220,5 @@ Latest local check:
 
 ```text
 mix test
-11 tests, 0 failures
+21 tests, 0 failures
 ```

@@ -34,6 +34,10 @@ defmodule Docket.Schema do
           metadata: map()
         }
 
+  @doc false
+  @spec no_default() :: :__docket_no_default__
+  def no_default, do: @no_default
+
   @spec string(keyword()) :: t()
   def string(opts \\ []), do: build(:string, opts)
 

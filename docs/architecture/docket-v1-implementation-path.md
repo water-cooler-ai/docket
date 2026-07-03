@@ -147,6 +147,9 @@ Docket.Graph.policy!(graph, key, value, opts \\ [])
 Docket.Graph.metadata(graph, key, value, opts \\ [])
 Docket.Graph.metadata!(graph, key, value, opts \\ [])
 Docket.Graph.diagnostics(graph, opts \\ [])
+Docket.Graph.to_map(graph, opts \\ [])
+Docket.Graph.from_map(map, opts \\ [])
+Docket.Graph.from_map!(map, opts \\ [])
 Docket.Graph.hash(graph, opts \\ [])
 Docket.Graph.verify(graph, opts \\ [])
 
@@ -348,8 +351,10 @@ The first implementation should keep these rules tight:
 - `get_run/3` reads only active Runtime memory and does not read host storage.
 - `resume/4` requires `graph.id == run.graph_id` and
   `Docket.Graph.hash(graph) == run.graph_hash`.
-- Graph hashes use SHA-256 over a canonical graph dump. Store the full hash;
-  short prefixes are only for display.
+- Graph hashes use SHA-256 over the canonical JSON encoding of
+  `Docket.Graph.to_map/1`, so the hash survives host storage round trips:
+  `hash(from_map!(to_map(graph))) == hash(graph)`. Store the full hash; short
+  prefixes are only for display.
 
 ### 5.4 Run Path Boundaries
 
