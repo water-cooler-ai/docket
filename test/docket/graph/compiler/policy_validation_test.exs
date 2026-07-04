@@ -3,8 +3,7 @@ defmodule Docket.Graph.Compiler.PolicyValidationTest do
 
   # Compiler validation of the v1 node policy surface defined by the runtime
   # ("timeout_ms", "retry" => %{"max_attempts", "backoff_ms"}, reserved
-  # "on_error"). Closes runtime attempt-1 clarification C4 / compiler phase
-  # 9.5: invalid policies are now compile errors instead of plan-time run
+  # "on_error"). Invalid policies are compile errors instead of plan-time run
   # failures.
 
   defp with_policies(policies) do

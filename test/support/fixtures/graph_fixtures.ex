@@ -2,9 +2,8 @@ defmodule Docket.Test.Fixtures.Graphs do
   @moduledoc """
   Small canonical graph fixtures named for the behavior they prove.
 
-  Fixtures follow the catalogs in `docket-v1-test-suite-design.md` section 6
-  and `docket-compiler-design.md` section 15.5. They are plain values; no
-  fixture requires processes or external services.
+  Fixtures are plain values; no fixture requires processes or external
+  services.
   """
 
   alias Docket.Test.Fixtures.Nodes

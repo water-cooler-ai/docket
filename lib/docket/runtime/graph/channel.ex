@@ -6,8 +6,9 @@ defmodule Docket.Runtime.Graph.Channel do
 
   - `:last_value` - input and state channels; stores the last committed value
   - `:ephemeral` - generated edge activation channels; visible for one step
-  - `:barrier` - multi-source edge activation channels; fires when every
-    source in `sources` has completed since the last firing
+  - `:barrier` - activation channels for edges declared with a list-form
+    `from`; fires when every source in `sources` has completed since the
+    last firing
   """
 
   defstruct [

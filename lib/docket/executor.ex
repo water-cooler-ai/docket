@@ -7,8 +7,11 @@ defmodule Docket.Executor do
   writes. The dispatcher normalizes raises, exits, and throws, so executors
   may let node exceptions propagate.
 
-  v1 ships `Docket.Executor.Local`. Queue, remote, and late-completion
-  protocols are post-v1.
+  v1 ships `Docket.Executor.Local` (in-process, no timeout enforcement) and
+  `Docket.Executor.Task` (process-isolated, enforces `timeout_ms`). Queue,
+  remote, and late-completion protocols are post-v1; the `{:await, term()}`
+  return is reserved for them and is treated as a permanent node failure in
+  v1.
   """
 
   @callback execute(

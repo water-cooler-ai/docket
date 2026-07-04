@@ -1,16 +1,12 @@
 # Docket Compiler Design
 
-Status: active spike design
+Status: reference design (implemented)
 Date: 2026-06-28
-Owner: Codex for this compiler spike
 
 Related documents:
 
-- `docs/architecture/docket-v1-implementation-path.md`
 - `docs/architecture/docket-graph-construction-design.md`
 - `docs/architecture/docket-graph-execution-contract-design.md`
-- `docs/architecture/docket-v1-test-suite-design.md`
-- `docs/architecture/docket-implementation-progress.md`
 
 ## 1. Purpose
 
@@ -41,96 +37,22 @@ state.
 
 ## 2. Current Repository State
 
-The current implementation has the public graph document and compiler boundary,
-but not the compiler itself.
+The compiler described by this document is implemented.
 
-Implemented today:
-
-- `Docket.Graph` is the canonical editable graph document.
-- `Docket.Graph.Node`, `Edge`, `Field`, `Output`, and `Diagnostic` exist.
-- Graph editing helpers clear stale diagnostics.
+- `Docket.Graph` is the canonical editable graph document, and graph editing
+  helpers clear stale diagnostics.
 - `Docket.Graph.hash/2` computes a SHA-256 hash over the canonical JSON
   encoding of `Docket.Graph.to_map/1`, excluding diagnostics.
 - `Docket.Graph.verify/2` delegates to `Docket.Graph.Compiler.verify/2`.
-- `Docket.Graph.Compiler.verify/2` and `compile/2` exist but return a stub
-  `:compiler_not_implemented` diagnostic.
+- `Docket.Graph.Compiler.verify/2` and `compile/2` run the real validation and
+  lowering passes under `lib/docket/graph/compiler/`.
+- `Docket.Runtime.Graph`, `Docket.Runtime.Graph.Node`,
+  `Docket.Runtime.Graph.Channel`, and `Docket.Runtime.Graph.Lowering` are the
+  internal runtime graph structs produced by `compile/2`.
 - `Docket.Schema`, `Docket.Reducer`, `Docket.Guard`, and `Docket.Node` exist as
   public value and behavior contracts.
 
-Not implemented today:
-
-- real compiler validation
-- runtime graph structs
-- runtime graph lowering
-- lowering metadata
-- node config validation
-- schema/reducer/guard validation
-- compile-and-run integration
-
-That means this document should be treated as the implementation target for the
-compiler slice, not a description of completed code.
-
-## 3. LangGraph Compile Audit
-
-LangGraph is the closest reference, but Docket should not clone its public API.
-
-Useful current LangGraph facts from primary sources:
-
-- `StateGraph` is explicitly a builder and cannot execute until `.compile()`
-  returns a `CompiledStateGraph`.
-- The compile step performs basic graph structure checks and binds runtime
-  options such as checkpointers and breakpoints.
-- `StateGraph.compile()` returns an executable object that implements invoke,
-  stream, async invoke, state update, state history, and graph inspection APIs.
-- The high-level graph API lowers into the Pregel runtime. Pregel combines
-  actors and channels, then executes in repeated Plan, Execution, and Update
-  phases.
-- Channel writes are invisible to actors until the next step.
-- Channels have explicit update semantics such as last value, topics, binary
-  operator aggregates, and delta channels.
-- LangGraph source separates graph intent before compile into ordinary edges,
-  waiting edges for fan-in, and branches for conditional routing.
-- The compiled Pregel instance exposes generated channels such as state
-  channels, activation channels, branch channels, and start channels.
-- LangGraph surfaces structural builder errors through exceptions, and runtime
-  errors through typed errors such as invalid updates and recursion limits.
-
-Sources reviewed:
-
-- https://docs.langchain.com/oss/python/langgraph/graph-api
-- https://docs.langchain.com/oss/python/langgraph/pregel
-- https://reference.langchain.com/python/langgraph/graphs/
-- https://reference.langchain.com/python/langgraph/errors/
-- https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/graph/state.py
-
-What Docket should borrow:
-
-- Compile is the hard gate between editable graph intent and executable runtime
-  materialization.
-- Runtime execution should consume channels, subscriptions, generated
-  activations, and reducers rather than public graph records directly.
-- Fan-in and branches should remain public authoring concepts that lower into
-  runtime channel/barrier machinery.
-- The compiler test suite should compile small graphs, inspect lowering, then
-  run the compiled graph through the same runtime loop used in production.
-- Generated runtime IDs must map back to public graph IDs for diagnostics and
-  live run overlays.
-
-What Docket should not borrow:
-
-- Do not make `Docket.Graph` a disposable builder. It is the canonical public
-  document that hosts store and version.
-- Do not bind checkpoint stores, caches, or executor instances into the compiled
-  graph as ordinary compile-time options. Docket runtime configuration belongs
-  at run/resume time or in generated host runtime modules.
-- Do not use arbitrary user functions for durable conditional routing. Docket v1
-  uses serializable `Docket.Guard` expressions.
-- Do not surface compiler failures primarily as exceptions. Docket should return
-  graph-attached diagnostics for representable graph invalidity.
-- Do not expose generated branch channels to normal users. They belong in
-  runtime debug views and lowering metadata.
-
-## 4. Design Position
+## 3. Design Position
 
 Docket has one public graph model:
 
@@ -179,7 +101,7 @@ The builder/design layer should stay simple: graph editing functions update
 data and clear stale diagnostics. The compiler decides whether that data can
 run.
 
-## 5. Compiler Goals
+## 4. Compiler Goals
 
 1. Preserve `Docket.Graph` as the canonical host-stored graph document.
 2. Allow incomplete drafts until explicit verification or compilation.
@@ -196,7 +118,7 @@ run.
 10. Keep room for future optimizations such as compiled graph caching without
     making caches part of the v1 public contract.
 
-## 6. Non-Goals
+## 5. Non-Goals
 
 1. Do not introduce a second public builder schema.
 2. Do not require UI code to construct runtime channels or runtime nodes.
@@ -208,7 +130,7 @@ run.
    compilation.
 8. Do not let compile perform node execution or external service calls.
 
-## 7. Public API Contract
+## 6. Public API Contract
 
 Keep the public compiler surface small:
 
@@ -242,7 +164,7 @@ runs validation first, and only lowers when blocking diagnostics are absent.
 a public compile report in v1. If implementation needs a richer internal result,
 keep it private to the compiler.
 
-## 8. Internal Pipeline
+## 7. Internal Pipeline
 
 The compiler should run a fixed pipeline. Each phase receives an immutable
 compiler context and appends diagnostics or derived facts.
@@ -281,9 +203,9 @@ Docket.Graph.Compiler.Diagnostics
 These modules are implementation suggestions, not public API. Keep only
 `Docket.Graph.Compiler` public.
 
-## 9. Phase Details
+## 8. Phase Details
 
-### 9.1 Ingest Graph
+### 8.1 Ingest Graph
 
 Inputs:
 
@@ -302,7 +224,7 @@ Responsibilities:
 The compiler should ignore existing diagnostics and produce a fresh diagnostic
 list for the returned graph.
 
-### 9.2 Validate Public Document
+### 8.2 Validate Public Document
 
 Validate graph-level shape:
 
@@ -320,7 +242,7 @@ malformed IDs when using the public API. The compiler still validates loaded
 graphs because hosts may deserialize old, manually edited, or externally
 generated data.
 
-### 9.3 Validate Fields, Schemas, And Reducers
+### 8.3 Validate Fields, Schemas, And Reducers
 
 Rules:
 
@@ -335,7 +257,7 @@ Rules:
 
 Compile does not validate a concrete run input payload. Runtime start does.
 
-### 9.4 Validate Outputs
+### 8.4 Validate Outputs
 
 Rules:
 
@@ -347,7 +269,7 @@ Rules:
 
 Outputs are projections over committed run state. They are not executable nodes.
 
-### 9.5 Validate Nodes
+### 8.5 Validate Nodes
 
 Rules:
 
@@ -370,7 +292,7 @@ surface a diagnostic on the node rather than crashing the compiler.
 Node implementation validation may be policy-sensitive later. For v1, keep the
 rules strict and local.
 
-### 9.6 Validate Edges
+### 8.6 Validate Edges
 
 Rules:
 
@@ -387,7 +309,7 @@ Rules:
 Start edges seed initial activation after run initialization. Finish edges mark
 terminal intent but do not replace normal "no active work" termination.
 
-### 9.7 Validate Branch Groups
+### 8.7 Validate Branch Groups
 
 Branch groups are node-local editing and inspection metadata over outgoing edge
 IDs.
@@ -405,7 +327,7 @@ Rules:
 The runtime does not need separate branch channels in v1. Branch groups lower
 through ordinary guarded edge activation channels and lowering metadata.
 
-### 9.8 Validate Guards
+### 8.8 Validate Guards
 
 Guards are durable data expressions.
 
@@ -423,7 +345,7 @@ Rules:
 Compile rejects invalid guard expressions. Runtime guard evaluation errors
 should be rare; if they happen, they fail the run as runtime errors.
 
-### 9.9 Validate Topology
+### 8.9 Validate Topology
 
 Rules:
 
@@ -439,7 +361,7 @@ Rules:
 This mirrors LangGraph's "no orphaned nodes" compile stance while preserving
 Docket's ability to store incomplete drafts before verification.
 
-### 9.10 Analyze Cycles
+### 8.10 Analyze Cycles
 
 Docket supports cycles. The compiler should not reject cycles by default.
 
@@ -454,7 +376,7 @@ Rules:
 Runtime remains the final safety net. If a cycle does not halt, the run fails
 with a max-supersteps error rather than running forever.
 
-### 9.11 Lower To Runtime Graph
+### 8.11 Lower To Runtime Graph
 
 Lowering turns public records into runtime primitives.
 
@@ -527,7 +449,7 @@ The runtime, not user node code, emits activation writes to generated edge
 channels after source completion, reducer commit, barrier satisfaction, and
 guard approval.
 
-### 9.12 Validate Runtime Graph
+### 8.12 Validate Runtime Graph
 
 After lowering, validate internal invariants:
 
@@ -545,7 +467,7 @@ If this phase fails, return diagnostics. Runtime graph invariant failures are
 compiler bugs or unsupported graph shapes, but they should still surface as
 diagnostics when possible.
 
-## 10. Runtime Graph Shape
+## 9. Runtime Graph Shape
 
 The exact structs can evolve, but the compiler should target this conceptual
 shape:
@@ -577,7 +499,7 @@ Docket.Runtime.Graph.Lowering
 `Docket.Runtime.Graph`; introduce a separate runtime edge struct only if it
 removes meaningful complexity.
 
-## 11. Lowering Metadata
+## 10. Lowering Metadata
 
 Lowering metadata is required, not optional.
 
@@ -632,7 +554,7 @@ output:<output_id>
 
 The public node ID remains what node callbacks receive in runtime context.
 
-## 12. Diagnostics And Error Surfacing
+## 11. Diagnostics And Error Surfacing
 
 Representable graph invalidity should surface as `Docket.Graph.Diagnostic`
 values, not exceptions.
@@ -689,20 +611,22 @@ Example:
 }
 ```
 
-Recommended initial diagnostic code families:
+Diagnostic code families (verify names against
+`lib/docket/graph/compiler/`):
 
-| Family      | Example codes                                                                                                                                        |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Graph shape | `:unsupported_schema_version`, `:non_durable_graph_value`                                                                                            |
-| IDs         | `:invalid_public_id`, `:duplicate_state_id`, `:reserved_id`                                                                                          |
-| Fields      | `:missing_field_schema`, `:invalid_schema`, `:invalid_reducer`                                                                                       |
-| Outputs     | `:unknown_output_source`, `:incompatible_output_schema`                                                                                              |
-| Nodes       | `:missing_node_implementation`, `:unsupported_node_implementation`, `:node_module_not_loaded`, `:invalid_node_config_schema`, `:invalid_node_config` |
-| Edges       | `:unknown_edge_source`, `:unknown_edge_target`, `:empty_edge_sources`, `:invalid_start_endpoint`, `:invalid_finish_endpoint`                         |
-| Branches    | `:unknown_branch_edge`, `:branch_edge_source_mismatch`, `:duplicate_branch_edge`                                                                     |
-| Guards      | `:invalid_guard`, `:unknown_guard_field`, `:invalid_guard_path`                                                                                      |
-| Topology    | `:no_entrypoint`, `:unreachable_node`, `:unbounded_cycle`                                                                                            |
-| Lowering    | `:runtime_id_collision`, `:missing_runtime_channel`, `:lowering_invariant_failed`                                                                    |
+| Family      | Codes                                                                                                                                                                             |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Graph shape | `:unsupported_schema_version`, `:non_durable_graph_value`                                                                                                                         |
+| IDs         | `:invalid_public_id`, `:duplicate_state_id`, `:reserved_id`                                                                                                                       |
+| Fields      | `:missing_field_schema`, `:invalid_schema`, `:invalid_reducer`, `:invalid_field_default`                                                                                          |
+| Outputs     | `:unknown_output_source`, `:incompatible_output_schema`                                                                                                                           |
+| Nodes       | `:missing_node_implementation`, `:invalid_node_implementation`, `:unsupported_node_implementation`, `:node_module_not_loaded`, `:invalid_node_config_schema`, `:invalid_node_config` |
+| Edges       | `:unknown_edge_source`, `:unknown_edge_target`, `:empty_edge_sources`, `:duplicate_edge_source`, `:invalid_start_endpoint`, `:invalid_finish_endpoint`                            |
+| Branches    | `:unknown_branch_edge`, `:branch_edge_source_mismatch`, `:duplicate_branch_edge`, `:unguarded_branch_edge` (warning)                                                              |
+| Guards      | `:invalid_guard`                                                                                                                                                                  |
+| Policies    | `:invalid_policy`                                                                                                                                                                 |
+| Topology    | `:no_entrypoint`, `:unreachable_node`, `:unbounded_cycle`, `:unguarded_cycle` (warning), `:dead_end_node` (warning), `:no_terminal_edge` (warning)                                |
+| Lowering    | `:runtime_id_collision`, `:missing_runtime_channel`, `:lowering_invariant_failed`                                                                                                 |
 
 Run APIs should normalize compiler errors into runtime-facing typed errors once
 `Docket.Error` exists:
@@ -718,7 +642,7 @@ Until `Docket.Error` exists, `Docket.run/4` can return the graph with attached
 diagnostics or a temporary typed tuple. The final v1 shape should not make
 callers scrape exception messages.
 
-## 13. Compiler And Runtime Boundary
+## 12. Compiler And Runtime Boundary
 
 Compile-time validation protects graph shape.
 
@@ -750,7 +674,7 @@ Runtime responsibilities:
 This split keeps compile deterministic and side-effect free while still
 protecting the runtime from bad data and bad node returns.
 
-## 14. Builder And Design Relationship
+## 13. Builder And Design Relationship
 
 The current builder/design is intentionally not a LangGraph-style mutable
 builder.
@@ -785,128 +709,18 @@ Workflow importers and compatibility compilers should compile into
 `Docket.Graph`, then call `Docket.Graph.verify/2`. They should not bypass the
 compiler by constructing runtime graph internals directly.
 
-## 15. Testing Strategy
+## 14. Testing Strategy
 
-Compiler tests should become the bridge between graph construction tests and
-runtime execution tests.
+Compiler tests are the bridge between graph construction tests and runtime
+execution tests. The suite exists under `test/docket/graph/compiler/` and
+covers validation diagnostics, policy validation, lowering, lowering metadata,
+generated IDs, and determinism; compile-and-run integration is exercised
+through the inline runtime tests.
 
-### 15.1 Validation Tests
+The standing rule remains: no compiler test may need Ecto, a database, Redis,
+Docker, network access, LLM credentials, browser automation, or a host app.
 
-Test files:
-
-```text
-test/docket/graph/compiler/validation_test.exs
-test/docket/graph/compiler/diagnostics_test.exs
-```
-
-Coverage:
-
-- no entrypoint
-- unknown edge source
-- unknown edge target
-- empty multi-source edge
-- duplicate source in multi-source edge
-- invalid start/finish endpoint use
-- missing node implementation
-- unsupported implementation type
-- unloaded module implementation
-- invalid config schema
-- invalid node config
-- unknown output source
-- invalid guard op
-- unknown guard field
-- branch references unknown edge
-- branch references edge from another node
-- unreachable node
-- unsupported graph schema version
-
-Every invalid fixture should assert:
-
-- return shape is `{:error, graph}`
-- at least one expected diagnostic code exists
-- diagnostic path points at the public graph path
-- diagnostic public ID is populated when possible
-
-### 15.2 Lowering Tests
-
-Test files:
-
-```text
-test/docket/graph/compiler/lowering_test.exs
-test/docket/graph/compiler/lowering_metadata_test.exs
-```
-
-Coverage:
-
-- input lowers to `input:<id>`
-- state field lowers to `state:<id>`
-- missing reducer defaults to last value
-- output projection lowers and inherits source schema
-- node lowers to runtime node with normalized config
-- start edge lowers to initial activation channel
-- simple edge lowers to target subscription
-- finish edge lowers to terminal activation intent
-- fan-out lowers one activation channel per edge
-- fan-in lowers barrier/all descriptor
-- guarded edge lowers guard descriptor
-- branch group lowers metadata only, not branch-specific execution channels
-- lowering maps every runtime ID back to public intent
-- generated runtime ID collisions are detected
-
-### 15.3 Compiler Integration Tests
-
-Test files:
-
-```text
-test/docket/graph/compiler/compile_and_run_test.exs
-```
-
-Coverage:
-
-- minimal linear graph compiles and runs inline
-- simple edge activates target once
-- fan-out activates both targets in the next superstep
-- fan-in waits until all sources commit
-- guarded edge activates only when guard is true
-- generated edge channels are not writable by user node output
-- output projections return the expected public output
-- runtime events can map runtime IDs back to public IDs
-
-These tests should wait for `Docket.Test.run_inline/3`, but lowering tests can
-land before the runtime loop exists.
-
-### 15.4 Determinism Tests
-
-Coverage:
-
-- compiling the same graph twice yields the same runtime IDs
-- diagnostic ordering is stable
-- graph hash is independent of diagnostics
-- map iteration order does not change compile output
-- compile does not mutate the input graph except returning fresh diagnostics
-  through the returned graph
-
-### 15.5 Regression Fixtures
-
-Build fixtures first and keep them small:
-
-```text
-minimal_linear/0
-simple_edge/0
-fanout/0
-multi_source_edge/0
-guarded_edge/0
-branch_group/0
-cycle_counter/0
-invalid_unknown_target/0
-invalid_config/0
-invalid_guard/0
-```
-
-No compiler test should need Ecto, a database, Redis, Docker, network access,
-LLM credentials, browser automation, or a host app.
-
-## 16. Implementation Sequence
+## 15. Implementation Sequence
 
 Recommended order:
 
@@ -927,7 +741,7 @@ Recommended order:
 
 Each step should have tests before expanding the next lowering feature.
 
-## 17. Open Decisions
+## 16. Open Decisions
 
 These should be resolved during implementation, but they should not block the
 initial compiler slice:
@@ -945,7 +759,7 @@ initial compiler slice:
    and warn on obviously unguarded cycles. A stricter future policy can reject
    them.
 
-## 18. Definition Of Done
+## 17. Definition Of Done
 
 The compiler design is implemented when:
 

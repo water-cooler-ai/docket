@@ -16,7 +16,7 @@ defmodule Docket.Run do
   ## Status
 
   - `:created` - built but never initialized; the fresh-run sentinel consumed
-    by `Docket.Runtime.Loop.init/3`. Never appears in a checkpoint.
+    by the runtime's init barrier. Never appears in a checkpoint.
   - `:running` - graph execution can proceed.
   - `:waiting` - open interrupts and nothing else can proceed.
   - `:done` / `:failed` / `:cancelled` - terminal.

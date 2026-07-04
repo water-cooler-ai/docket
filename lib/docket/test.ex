@@ -17,11 +17,13 @@ defmodule Docket.Test do
     `Docket.Test.Checkpoint.Accept`)
   - `:checkpoint_overrides` - map forcing checkpoint types to `:sync`
   - `:executor` - `Docket.Executor` module (default `Docket.Executor.Local`)
+  - `:executor_opts` - keyword list passed through to the executor
   - `:context` - application context passed to nodes and checkpoint handlers
   - `:clock`, `:id_generator`, `:sleeper` - determinism injection points
   - `:max_supersteps` - runtime default when the graph declares no policy
   - `:max_steps` - stop driving after this many committed supersteps
   - `:run_id` - explicit run ID for the fresh run document
+  - `:metadata` - application metadata map for the fresh run document
 
   Async checkpoints are drained synchronously in order before each helper
   returns, so ordinary semantic tests can assert a complete checkpoint
@@ -40,8 +42,9 @@ defmodule Docket.Test do
 
   @doc """
   Compiles (when given a `Docket.Graph`), builds a fresh run from `input`,
-  initializes through `Docket.Runtime.Loop.init/3`, and executes supersteps
-  until the run is terminal, waiting, or the step limit is reached.
+  initializes through the same durable barrier as `Docket.run/4`, and
+  executes supersteps until the run is terminal, waiting, or the step limit
+  is reached.
   """
   def run_inline(graph_or_runtime_graph, input, opts \\ []) do
     opts = normalize_opts(opts)
@@ -55,8 +58,8 @@ defmodule Docket.Test do
   end
 
   @doc """
-  Resumes a saved `Docket.Run` through the same `Loop.init/3` durable
-  barrier used by `run_inline/3`, then continues execution.
+  Resumes a saved `Docket.Run` through the same durable barrier used by
+  `run_inline/3`, then continues execution.
 
   Requires `graph.id == run.graph_id` and a matching graph hash. A terminal
   run is returned unchanged without restarting execution.

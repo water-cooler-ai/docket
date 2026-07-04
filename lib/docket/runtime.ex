@@ -4,7 +4,7 @@ defmodule Docket.Runtime do
 
   The Runtime is the only process allowed to mutate a run. It holds the
   compiled runtime graph and the current committed `Docket.Run` in memory,
-  drives `Docket.Runtime.Loop` transitions on self-scheduled ticks, and
+  drives shared runtime-loop transitions on self-scheduled ticks, and
   submits async checkpoint effects to the runtime instance's task
   supervisor. All graph semantics live in the shared loop; this module owns
   only mailbox, lifecycle, and delivery mechanics.

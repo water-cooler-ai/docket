@@ -5,13 +5,12 @@ Date: 2026-06-25
 
 Related documents:
 
-- `docs/architecture/docket-v1-implementation-path.md`
 - `docs/architecture/docket-runtime-design.md`
-- `docs/architecture/docket-v1-test-suite-design.md`
+- `docs/architecture/docket-compiler-design.md`
 
-Implementation note: use `docket-v1-implementation-path.md` as the active v1
-build sequence. This document owns the detailed graph document and compiler
-construction decisions.
+Implementation note: this document owns the detailed graph document and
+compiler construction decisions; concrete APIs are canonical in the module
+docs under `lib/docket/`.
 
 ## 1. Executive Summary
 
@@ -218,23 +217,10 @@ end
 ```
 
 This is not a temporary builder. The bang functional API returns updated
-`Docket.Graph` values for pipe-oriented construction:
-
-```elixir
-graph =
-  Docket.Graph.new!(id: "essay-review", name: "Essay Review")
-  |> Docket.Graph.put_input!("topic", schema: Docket.Schema.string())
-  |> Docket.Graph.put_field!("draft",
-    schema: Docket.Schema.string(),
-    reducer: Docket.Reducer.last_value()
-  )
-  |> Docket.Graph.put_node!("writer",
-    implementation: Essay.Writer
-  )
-  |> Docket.Graph.put_edge!("edge_start_writer", from: "$start", to: "writer")
-  |> Docket.Graph.put_edge!("edge_writer_finish", from: "writer", to: "$finish")
-  |> Docket.Graph.put_output!("draft", [])
-```
+`Docket.Graph` values for pipe-oriented construction. The editing API itself
+(`new`/`new!`, the `put_*`/`update_*`/`delete_*` helpers, and the accepted
+attribute shapes) is documented in the `Docket.Graph` module docs
+(`lib/docket/graph.ex`).
 
 ### 6.1 Computed Graph Hash
 
@@ -409,10 +395,12 @@ Example public node:
 ```elixir
 %Docket.Graph.Node{
   id: "writer",
+  label: "Write Draft",
   implementation: %{type: :module, module: Essay.Writer, function: :call},
   branches: %{},
   config: %{},
-  metadata: %{label: "Write Draft"}
+  policies: %{},
+  metadata: %{}
 }
 ```
 
@@ -442,7 +430,7 @@ Executable node modules should be introspectable enough for graph editors and
 the compiler to validate node-instance config. Data access is through the graph's
 shared state snapshot, not through a separate node-local binding layer.
 
-Recommended public node behaviour shape:
+Public node behaviour shape (see `lib/docket/node.ex`):
 
 ```elixir
 defmodule Docket.Node do
@@ -451,10 +439,13 @@ defmodule Docket.Node do
   @callback call(state :: map(), config :: map(), context :: map()) ::
               {:ok, state_update :: map()}
               | {:interrupt, Docket.Interrupt.t()}
-              | {:await, Docket.Await.t()}
+              | {:await, term()}
               | {:error, term()}
 end
 ```
+
+`{:await, term()}` is reserved for post-v1 late-completion protocols and is
+unsupported in v1: the dispatcher treats it as a permanent node failure.
 
 `config_schema/0` returns the schema for node-instance configuration. The
 compiler validates user-provided config and applies defaults. The normalized
@@ -712,47 +703,10 @@ into the graph is still represented by start edges such as:
 Docket.Graph.put_edge!(graph, "edge_start_writer", from: "$start", to: "writer")
 ```
 
-Recommended API:
-
-```elixir
-Docket.Graph.new(opts \\ [])
-Docket.Graph.new!(opts \\ [])
-Docket.Graph.put_input(graph, id, attrs, opts \\ [])
-Docket.Graph.put_input!(graph, id, attrs, opts \\ [])
-Docket.Graph.put_field(graph, id, attrs, opts \\ [])
-Docket.Graph.put_field!(graph, id, attrs, opts \\ [])
-Docket.Graph.put_output(graph, id, attrs, opts \\ [])
-Docket.Graph.put_output!(graph, id, attrs, opts \\ [])
-Docket.Graph.put_node(graph, id, attrs, opts \\ [])
-Docket.Graph.put_node!(graph, id, attrs, opts \\ [])
-Docket.Graph.put_edge(graph, id, attrs, opts \\ [])
-Docket.Graph.put_edge!(graph, id, attrs, opts \\ [])
-Docket.Graph.policy(graph, key, value, opts \\ [])
-Docket.Graph.policy!(graph, key, value, opts \\ [])
-Docket.Graph.metadata(graph, key, value, opts \\ [])
-Docket.Graph.metadata!(graph, key, value, opts \\ [])
-Docket.Graph.diagnostics(graph, opts \\ [])
-Docket.Graph.to_map(graph, opts \\ [])
-Docket.Graph.from_map(map, opts \\ [])
-Docket.Graph.from_map!(map, opts \\ [])
-Docket.Graph.hash(graph, opts \\ [])
-Docket.Graph.verify(graph, opts \\ [])
-
-Docket.Graph.update_node(graph, id, attrs_or_fun, opts \\ [])
-Docket.Graph.update_node!(graph, id, attrs_or_fun, opts \\ [])
-Docket.Graph.delete_node(graph, id, opts \\ [])
-Docket.Graph.delete_node!(graph, id, opts \\ [])
-
-Docket.Graph.update_edge(graph, id, attrs_or_fun, opts \\ [])
-Docket.Graph.update_edge!(graph, id, attrs_or_fun, opts \\ [])
-Docket.Graph.delete_edge(graph, id, opts \\ [])
-Docket.Graph.delete_edge!(graph, id, opts \\ [])
-
-Docket.Graph.update_field(graph, id, attrs_or_fun, opts \\ [])
-Docket.Graph.update_field!(graph, id, attrs_or_fun, opts \\ [])
-Docket.Graph.delete_field(graph, id, opts \\ [])
-Docket.Graph.delete_field!(graph, id, opts \\ [])
-```
+The full editing API (put/update/delete helpers for inputs, fields, outputs,
+nodes, and edges, plus policy/metadata helpers, `diagnostics/2`, `to_map/2`,
+`from_map/2`, `hash/2`, and `verify/2`) is documented in the `Docket.Graph`
+module docs (`lib/docket/graph.ex`).
 
 Compiler API:
 
@@ -787,40 +741,8 @@ Build-time construction has the same property while a compiler is midway
 through assembling a graph. A graph may be incomplete between function calls.
 
 The editing API should be simple functional updates against `Docket.Graph`.
-Callers pass an ID and the new shape, or an update function for that shape.
-
-```elixir
-{:ok, graph} =
-  Docket.Graph.put_node(graph, "writer", %{
-    label: "Writer",
-    implementation: %{type: :registered, id: "essay_writer"}
-  })
-```
-
-```elixir
-{:ok, graph} =
-  Docket.Graph.update_node(graph, "writer", %{
-    label: "Draft Writer",
-    config: %{prompt_template: "Write about {{topic}} using {{outline}}"}
-  })
-```
-
-```elixir
-{:ok, graph} =
-  Docket.Graph.put_edge(graph, "edge_writer_reviewer", %{
-    from: "writer",
-    to: "reviewer",
-    source_handle: "success",
-    target_handle: "in"
-  })
-```
-
-```elixir
-{:ok, graph} =
-  Docket.Graph.update_edge(graph, "edge_writer_reviewer", fn edge ->
-    %{edge | guard: Docket.Guard.exists("draft")}
-  end)
-```
+Callers pass an ID and the new shape, or an update function for that shape;
+the `Docket.Graph` module docs cover the accepted attribute shapes.
 
 Graph editor handlers can translate user actions into ordinary graph updates:
 
@@ -833,22 +755,9 @@ delete edge -> delete_edge(graph, edge_id)
 ```
 
 These functions update the canonical graph. They do not try to prove the graph
-is executable, and they clear stale diagnostics from the returned graph.
-
-After each update, callers can return the graph to the user or continue piping
-more updates:
-
-```elixir
-graph =
-  graph
-  |> Docket.Graph.put_node!("writer", %{label: "Writer"})
-  |> Docket.Graph.put_edge!("edge_start_writer", %{from: "$start", to: "writer"})
-
-case Docket.Graph.verify(graph) do
-  {:ok, verified_graph} -> {:ok, verified_graph}
-  {:error, verified_graph} -> {:error, verified_graph.diagnostics}
-end
-```
+is executable, and they clear stale diagnostics from the returned graph. After
+each update, callers can return the graph to the user or continue piping more
+updates, then run `Docket.Graph.verify/2` when they want diagnostics.
 
 Compiler diagnostics should allow incomplete work before verification:
 

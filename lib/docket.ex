@@ -47,12 +47,14 @@ defmodule Docket do
   end
 
   @doc """
-  Compiles `graph`, builds a fresh `Docket.Run` from `input`, and starts a
+  Compiles `graph` (a `Docket.Graph`; a precompiled `Docket.Runtime.Graph`
+  is accepted as-is), builds a fresh `Docket.Run` from `input`, and starts a
   supervised `Docket.Runtime` owning it.
 
   Returns `{:ok, run}` after the sync `:run_initialized` checkpoint is
-  accepted and the first tick is scheduled; no node has executed yet when
-  this returns. Input validation failures return
+  accepted. The returned run is the initialized pre-execution snapshot;
+  execution proceeds concurrently in the Runtime process and may already be
+  underway when this returns. Input validation failures return
   `{:error, %Docket.Error{type: :invalid_input}}` before anything durable is
   written, and initial checkpoint failures return
   `{:error, %Docket.Error{type: :checkpoint_failed}}` with no runtime left
@@ -73,8 +75,8 @@ defmodule Docket do
   matches `run.graph_hash`; a mismatch returns
   `{:error, %Docket.Error{type: :graph_mismatch}}`. A terminal run is
   returned unchanged without starting a runtime. Resume passes through the
-  same `Docket.Runtime.Loop.init/3` durable barrier as `run/4`, so the
-  checkpoint handler upserts the host run record by ID.
+  same durable initialization barrier as `run/4`, so the checkpoint handler
+  upserts the host run record by ID.
   """
   def resume(runtime, graph, %Run{} = run, opts \\ []) do
     with {:ok, opts} <- instance_opts(runtime, opts),
