@@ -130,6 +130,119 @@ defmodule Docket.GraphTest do
     assert Docket.Graph.hash(reloaded) == Docket.Graph.hash(graph)
   end
 
+  describe "inline field declarations on put_node!" do
+    test "materializes inputs and fields as ordinary graph fields" do
+      graph =
+        Docket.Graph.new!(id: "inline")
+        |> Docket.Graph.put_node!("draft",
+          implementation: Writer,
+          inputs: %{"customer_message" => [schema: :string, required: true]},
+          fields: %{
+            "draft_response" => :string,
+            "llm_usage" => [schema: :map],
+            "messages" => [schema: {:list, :map}, reducer: :append]
+          }
+        )
+
+      assert %Docket.Graph.Field{
+               kind: :input,
+               required: true,
+               schema: %Docket.Schema{type: :string}
+             } =
+               graph.inputs["customer_message"]
+
+      assert %Docket.Graph.Field{kind: :state, schema: %Docket.Schema{type: :string}} =
+               graph.fields["draft_response"]
+
+      assert %Docket.Schema{type: :map} = graph.fields["llm_usage"].schema
+
+      assert %Docket.Graph.Field{
+               reducer: %Docket.Reducer{type: :append},
+               schema: %Docket.Schema{type: :list, item: %Docket.Schema{type: :map}}
+             } = graph.fields["messages"]
+
+      refute Map.has_key?(Map.from_struct(graph.nodes["draft"]), :fields)
+
+      # Materialized fields are ordinary fields: they serialize and hash.
+      reloaded = Docket.Graph.from_map!(Docket.Graph.to_map(graph))
+      assert Docket.Graph.hash(reloaded) == Docket.Graph.hash(graph)
+    end
+
+    test "identical redeclaration is a no-op regardless of order" do
+      declare = fn graph, node_id ->
+        Docket.Graph.put_node!(graph, node_id,
+          implementation: Writer,
+          fields: %{"shared" => [schema: {:list, :string}, reducer: :append]}
+        )
+      end
+
+      graph = Docket.Graph.new!(id: "shared-fields") |> declare.("a") |> declare.("b")
+
+      assert %Docket.Graph.Field{kind: :state} = graph.fields["shared"]
+      assert map_size(graph.fields) == 1
+    end
+
+    test "conflicting declarations raise instead of overwriting" do
+      graph =
+        Docket.Graph.new!(id: "conflict")
+        |> Docket.Graph.put_field!("shared", schema: :string)
+
+      error =
+        assert_raise Docket.Graph.Error, fn ->
+          Docket.Graph.put_node!(graph, "n",
+            implementation: Writer,
+            fields: %{"shared" => :integer}
+          )
+        end
+
+      assert error.code == :conflicting_field
+
+      assert {:error, %Docket.Graph.Error{code: :conflicting_field}} =
+               Docket.Graph.put_node(graph, "n",
+                 implementation: Writer,
+                 fields: %{"shared" => :integer}
+               )
+    end
+
+    test "declaring an existing input as a state field conflicts" do
+      graph =
+        Docket.Graph.new!(id: "kind-conflict")
+        |> Docket.Graph.put_input!("message", schema: :string)
+
+      assert_raise Docket.Graph.Error, fn ->
+        Docket.Graph.put_node!(graph, "n",
+          implementation: Writer,
+          fields: %{"message" => :string}
+        )
+      end
+    end
+
+    test "explicit put_field! still updates freely after an inline declaration" do
+      graph =
+        Docket.Graph.new!(id: "explicit-update")
+        |> Docket.Graph.put_node!("n",
+          implementation: Writer,
+          fields: %{"out" => :string}
+        )
+        |> Docket.Graph.put_field!("out", schema: :integer)
+
+      assert %Docket.Schema{type: :integer} = graph.fields["out"].schema
+    end
+
+    test "deleting the node keeps the materialized fields" do
+      graph =
+        Docket.Graph.new!(id: "delete-node")
+        |> Docket.Graph.put_node!("n",
+          implementation: Writer,
+          fields: %{"out" => :string}
+        )
+        |> Docket.Graph.delete_node!("n")
+
+      refute Map.has_key?(graph.nodes, "n")
+      assert Map.has_key?(graph.fields, "out")
+    end
+  end
+
   test "keeps public IDs scoped by record kind" do
     graph =
       Docket.Graph.new!(id: "report-flow")
