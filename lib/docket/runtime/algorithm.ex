@@ -262,26 +262,29 @@ defmodule Docket.Runtime.Algorithm do
   changed, even when the value is equal).
   """
   def apply_state_writes(rtg, channels, writes) do
-    writes
-    |> Enum.sort_by(fn {node_id, _update} -> node_id end)
-    |> Enum.flat_map(fn {node_id, update} ->
-      update
-      |> Enum.sort_by(fn {field_id, _value} -> field_id end)
-      |> Enum.map(fn {field_id, value} -> {field_id, node_id, value} end)
-    end)
-    |> Enum.group_by(fn {field_id, _node, _value} -> field_id end)
-    |> Enum.sort_by(fn {field_id, _writes} -> field_id end)
-    |> Enum.reduce({channels, MapSet.new(), %{}}, fn {field_id, field_writes},
-                                                     {channels, changed, writers} ->
-      channel_id = "state:" <> field_id
-      channel = Map.fetch!(rtg.channels, channel_id)
-      values = Enum.map(field_writes, fn {_field, _node, value} -> value end)
-      value = reduce_values(channel.reducer, values)
-      node_ids = Enum.map(field_writes, fn {_field, node_id, _value} -> node_id end)
+    per_field =
+      writes
+      |> Enum.sort_by(fn {node_id, _update} -> node_id end)
+      |> Enum.flat_map(fn {node_id, update} ->
+        Enum.map(update, fn {field_id, value} -> {field_id, {node_id, value}} end)
+      end)
+      |> Enum.group_by(fn {field_id, _write} -> field_id end, fn {_field_id, write} -> write end)
+      |> Enum.map(fn {field_id, field_writes} ->
+        channel = Map.fetch!(rtg.channels, "state:" <> field_id)
+        values = Enum.map(field_writes, fn {_node_id, value} -> value end)
+        node_ids = Enum.map(field_writes, fn {node_id, _value} -> node_id end)
+        {field_id, reduce_values(channel.reducer, values), node_ids}
+      end)
 
-      {bump_channel(channels, channel_id, value), MapSet.put(changed, field_id),
-       Map.put(writers, field_id, node_ids)}
-    end)
+    channels =
+      Enum.reduce(per_field, channels, fn {field_id, value, _node_ids}, acc ->
+        bump_channel(acc, "state:" <> field_id, value)
+      end)
+
+    changed = MapSet.new(per_field, fn {field_id, _value, _node_ids} -> field_id end)
+    writers = Map.new(per_field, fn {field_id, _value, node_ids} -> {field_id, node_ids} end)
+
+    {channels, changed, writers}
   end
 
   # v1 supports only the :last_value reducer: the last write in deterministic
