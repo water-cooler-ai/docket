@@ -25,6 +25,23 @@ defmodule Docket.Schema do
   Unknown constraint keys are stored but ignored. Objects accept an
   `open: true` option (stored in `constraints`) that permits unknown keys;
   by default unknown object keys are rejected.
+
+  ## Shorthand
+
+  Everywhere the constructors and the graph editing API expect a schema,
+  terse literals normalize (via `normalize/1`) into real schemas:
+
+      :string                          # bare primitive type
+      {:integer, min: 0}               # type + options
+      {:list, :string}                 # list + item shorthand
+      {:list, :string, max_items: 10}
+      {:enum, ["low", "high"]}
+      {:object, %{"name" => :string}, open: true}
+
+  Object field values and list items normalize recursively, so
+  `Docket.Schema.object(%{age: {:integer, min: 0}, tags: {:list, :string}})`
+  is fully shorthand. Values that match no shorthand pass through unchanged
+  and are reported by the compiler.
   """
 
   @no_default :__docket_no_default__
@@ -73,18 +90,18 @@ defmodule Docket.Schema do
   @spec map(keyword()) :: t()
   def map(opts \\ []), do: build(:map, opts)
 
-  @spec list(t(), keyword()) :: t()
-  def list(%__MODULE__{} = item, opts \\ []) do
+  @spec list(t() | term(), keyword()) :: t()
+  def list(item, opts \\ []) do
     :list
     |> build(opts)
-    |> Map.put(:item, item)
+    |> Map.put(:item, normalize(item))
   end
 
   @spec object(map(), keyword()) :: t()
   def object(fields, opts \\ []) when is_map(fields) do
     :object
     |> build(opts)
-    |> Map.put(:fields, fields)
+    |> Map.put(:fields, Map.new(fields, fn {name, value} -> {name, normalize(value)} end))
   end
 
   @spec enum([term()], keyword()) :: t()
@@ -93,6 +110,42 @@ defmodule Docket.Schema do
     |> build(opts)
     |> Map.put(:values, values)
   end
+
+  @doc """
+  Normalizes schema shorthand (see the module documentation) into a
+  `Docket.Schema` struct.
+
+  Real schemas and values matching no shorthand pass through unchanged; the
+  compiler reports the latter as invalid schemas.
+  """
+  @spec normalize(term()) :: term()
+  def normalize(%__MODULE__{} = schema), do: schema
+
+  def normalize(type) when type in [:boolean, :float, :integer, :map, :string] do
+    build(type, [])
+  end
+
+  def normalize({:list, item}), do: list(item)
+  def normalize({:list, item, opts}) when is_list(opts), do: list(item, opts)
+
+  def normalize({:enum, values}) when is_list(values), do: enum(values)
+
+  def normalize({:enum, values, opts}) when is_list(values) and is_list(opts) do
+    enum(values, opts)
+  end
+
+  def normalize({:object, fields}) when is_map(fields), do: object(fields)
+
+  def normalize({:object, fields, opts}) when is_map(fields) and is_list(opts) do
+    object(fields, opts)
+  end
+
+  def normalize({type, opts})
+      when type in [:boolean, :float, :integer, :map, :string] and is_list(opts) do
+    build(type, opts)
+  end
+
+  def normalize(other), do: other
 
   defp build(type, opts) do
     {known, constraints} =

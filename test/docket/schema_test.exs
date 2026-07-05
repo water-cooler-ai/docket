@@ -179,6 +179,61 @@ defmodule Docket.SchemaTest do
     end
   end
 
+  describe "normalize/1 shorthand" do
+    test "bare atoms normalize to primitive schemas" do
+      assert %Schema{type: :string} = Schema.normalize(:string)
+      assert %Schema{type: :integer} = Schema.normalize(:integer)
+      assert %Schema{type: :boolean} = Schema.normalize(:boolean)
+      assert %Schema{type: :float} = Schema.normalize(:float)
+      assert %Schema{type: :map} = Schema.normalize(:map)
+    end
+
+    test "type + opts tuples carry options and constraints" do
+      assert %Schema{type: :integer, required: true, constraints: %{"min" => 0}} =
+               Schema.normalize({:integer, min: 0, required: true})
+    end
+
+    test "list shorthand normalizes the item recursively" do
+      assert %Schema{type: :list, item: %Schema{type: :string}} =
+               Schema.normalize({:list, :string})
+
+      assert %Schema{
+               type: :list,
+               item: %Schema{type: :list, item: %Schema{type: :integer}},
+               constraints: %{"max_items" => 3}
+             } = Schema.normalize({:list, {:list, :integer}, max_items: 3})
+    end
+
+    test "enum and object shorthands" do
+      assert %Schema{type: :enum, values: ["low", "high"]} =
+               Schema.normalize({:enum, ["low", "high"]})
+
+      assert %Schema{type: :object, fields: %{"name" => %Schema{type: :string}}} =
+               Schema.normalize({:object, %{"name" => :string}})
+    end
+
+    test "object constructor normalizes field values" do
+      schema =
+        Schema.object(%{
+          "name" => :string,
+          "age" => {:integer, min: 0},
+          "tags" => {:list, :string}
+        })
+
+      assert %Schema{type: :integer, constraints: %{"min" => 0}} = schema.fields["age"]
+      assert %Schema{type: :list, item: %Schema{type: :string}} = schema.fields["tags"]
+      assert :ok = Schema.validate(schema, %{"name" => "a", "age" => 3, "tags" => ["x"]})
+    end
+
+    test "real schemas and unrecognized values pass through unchanged" do
+      schema = Schema.string(min_length: 2)
+
+      assert Schema.normalize(schema) == schema
+      assert Schema.normalize("not a schema") == "not a schema"
+      assert Schema.normalize(:bogus_type) == :bogus_type
+    end
+  end
+
   describe "validate/2 nil handling" do
     test "nil is valid unless the schema is required" do
       assert :ok = Schema.validate(Schema.string(), nil)

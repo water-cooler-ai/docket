@@ -100,7 +100,8 @@ defmodule Docket.Graph do
 
   `attrs` may be a keyword list, a map, or a `Docket.Graph.Field` struct. The
   explicit `id` argument is used as the stored field ID, and the stored field
-  kind is forced to `:input`.
+  kind is forced to `:input`. `:schema` accepts a `Docket.Schema` or schema
+  shorthand (see `Docket.Schema.normalize/1`).
   """
   @spec put_input(t(), id(), keyword() | map() | Field.t(), keyword()) :: edit_result()
   def put_input(graph, id, attrs, opts \\ []) do
@@ -138,7 +139,8 @@ defmodule Docket.Graph do
 
   `attrs` may be a keyword list, a map, or a `Docket.Graph.Field` struct. The
   explicit `id` argument is used as the stored field ID, and the stored field
-  kind is forced to `:state`.
+  kind is forced to `:state`. `:schema` accepts a `Docket.Schema` or schema
+  shorthand (see `Docket.Schema.normalize/1`).
   """
   @spec put_field(t(), id(), keyword() | map() | Field.t(), keyword()) :: edit_result()
   def put_field(graph, id, attrs, opts \\ []) do
@@ -176,7 +178,8 @@ defmodule Docket.Graph do
 
   `attrs` may be a keyword list, a map, or a `Docket.Graph.Output` struct. The
   explicit `id` argument is used as the stored output ID. If `:source` is omitted,
-  it defaults to the output ID.
+  it defaults to the output ID. `:schema` accepts a `Docket.Schema` or schema
+  shorthand (see `Docket.Schema.normalize/1`).
   """
   @spec put_output(t(), id(), keyword() | map() | Output.t(), keyword()) :: edit_result()
   def put_output(graph, id, attrs, opts \\ []) do
@@ -197,6 +200,7 @@ defmodule Docket.Graph do
       |> attrs_to_map()
       |> Map.put(:id, id)
       |> Map.put_new(:source, id)
+      |> normalize_schema_attr()
 
     output = struct(Output, attrs)
 
@@ -701,7 +705,15 @@ defmodule Docket.Graph do
     |> attrs_to_map()
     |> Map.put_new(:id, id)
     |> Map.put_new(:kind, :state)
+    |> normalize_schema_attr()
     |> then(&struct(Field, &1))
+  end
+
+  defp normalize_schema_attr(attrs) do
+    case Map.fetch(attrs, :schema) do
+      {:ok, schema} -> Map.put(attrs, :schema, Docket.Schema.normalize(schema))
+      :error -> attrs
+    end
   end
 
   defp node_from_attrs(%Node{} = node, _id) do
