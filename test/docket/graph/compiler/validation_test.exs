@@ -95,7 +95,7 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       |> assert_diagnostic(:invalid_schema, path: [:fields, "result", :schema])
     end
 
-    test "rejects reducers other than last_value in v1" do
+    test "rejects unknown reducer types" do
       graph = Graphs.minimal_linear()
       broken = %{graph.fields["result"] | reducer: %Reducer{type: :concat}}
 
@@ -104,9 +104,113 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       |> assert_diagnostic(:invalid_reducer, path: [:fields, "result", :reducer])
     end
 
+    test "accepts built-in reducers paired with matching schemas" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_field!("messages",
+          schema: Schema.list(Schema.map()),
+          reducer: Reducer.append(max_length: 50)
+        )
+        |> Graph.put_field!("total", schema: Schema.integer(), reducer: Reducer.sum())
+        |> Graph.put_field!("meta", schema: Schema.map(), reducer: Reducer.merge(deep: true))
+        |> Graph.put_field!("tags",
+          schema: Schema.list(Schema.string()),
+          reducer: Reducer.union(by: "id")
+        )
+        |> Graph.put_field!("winner", schema: Schema.string(), reducer: Reducer.first_value())
+
+      assert {:ok, _verified} = Graph.verify(graph)
+    end
+
+    test "rejects reducer/schema pairing mismatches" do
+      Graphs.minimal_linear()
+      |> Graph.put_field!("messages", schema: Schema.string(), reducer: Reducer.append())
+      |> verify_error!()
+      |> assert_diagnostic(:reducer_schema_mismatch, path: [:fields, "messages", :reducer])
+
+      Graphs.minimal_linear()
+      |> Graph.put_field!("total", schema: Schema.string(), reducer: Reducer.sum())
+      |> verify_error!()
+      |> assert_diagnostic(:reducer_schema_mismatch, path: [:fields, "total", :reducer])
+
+      Graphs.minimal_linear()
+      |> Graph.put_field!("meta", schema: Schema.list(Schema.map()), reducer: Reducer.merge())
+      |> verify_error!()
+      |> assert_diagnostic(:reducer_schema_mismatch, path: [:fields, "meta", :reducer])
+    end
+
+    test "rejects malformed reducer options" do
+      Graphs.minimal_linear()
+      |> Graph.put_field!("messages",
+        schema: Schema.list(Schema.string()),
+        reducer: Reducer.append(max_length: -1)
+      )
+      |> verify_error!()
+      |> assert_diagnostic(:invalid_reducer, path: [:fields, "messages", :reducer])
+
+      Graphs.minimal_linear()
+      |> Graph.put_field!("tags",
+        schema: Schema.list(Schema.string()),
+        reducer: Reducer.union(by: 42)
+      )
+      |> verify_error!()
+      |> assert_diagnostic(:invalid_reducer, path: [:fields, "tags", :reducer])
+    end
+
+    test "warns about state fields nothing references" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_field!("leftover", schema: Schema.string())
+
+      assert {:ok, verified} = Graph.verify(graph)
+
+      assert Enum.any?(
+               verified.diagnostics,
+               &(&1.code == :orphaned_field and &1.severity == :warning and
+                   &1.public_id == "leftover")
+             )
+
+      # Fields referenced by outputs or node configs are not flagged.
+      assert {:ok, verified} = Graph.verify(Graphs.minimal_linear())
+      refute Enum.any?(verified.diagnostics, &(&1.code == :orphaned_field))
+    end
+
+    test "warns when an append item is itself a list" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_field!("matrix",
+          schema: Schema.list(Schema.list(Schema.float())),
+          reducer: Reducer.append()
+        )
+
+      assert {:ok, verified} = Graph.verify(graph)
+
+      assert Enum.any?(
+               verified.diagnostics,
+               &(&1.code == :ambiguous_list_write and &1.severity == :warning)
+             )
+    end
+
     test "rejects field defaults that fail the field schema" do
       Graphs.minimal_linear()
       |> Graph.put_field!("count", schema: Schema.float(), default: "ten")
+      |> verify_error!()
+      |> assert_diagnostic(:invalid_field_default, path: [:fields, "count", :default])
+    end
+
+    test "accepts v1.1 schema types on fields" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_field!("count", schema: Schema.integer(min: 0), default: 0)
+        |> Graph.put_field!("done", schema: Schema.boolean(), default: false)
+        |> Graph.put_field!("messages", schema: Schema.list(Schema.map()), default: [])
+
+      assert {:ok, _verified} = Graph.verify(graph)
+    end
+
+    test "rejects field defaults that violate schema constraints" do
+      Graphs.minimal_linear()
+      |> Graph.put_field!("count", schema: Schema.integer(min: 0), default: -1)
       |> verify_error!()
       |> assert_diagnostic(:invalid_field_default, path: [:fields, "count", :default])
     end

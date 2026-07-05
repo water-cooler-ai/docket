@@ -100,7 +100,8 @@ defmodule Docket.Graph do
 
   `attrs` may be a keyword list, a map, or a `Docket.Graph.Field` struct. The
   explicit `id` argument is used as the stored field ID, and the stored field
-  kind is forced to `:input`.
+  kind is forced to `:input`. `:schema` accepts a `Docket.Schema` or schema
+  shorthand (see `Docket.Schema.normalize/1`).
   """
   @spec put_input(t(), id(), keyword() | map() | Field.t(), keyword()) :: edit_result()
   def put_input(graph, id, attrs, opts \\ []) do
@@ -138,7 +139,8 @@ defmodule Docket.Graph do
 
   `attrs` may be a keyword list, a map, or a `Docket.Graph.Field` struct. The
   explicit `id` argument is used as the stored field ID, and the stored field
-  kind is forced to `:state`.
+  kind is forced to `:state`. `:schema` accepts a `Docket.Schema` or schema
+  shorthand (see `Docket.Schema.normalize/1`).
   """
   @spec put_field(t(), id(), keyword() | map() | Field.t(), keyword()) :: edit_result()
   def put_field(graph, id, attrs, opts \\ []) do
@@ -176,7 +178,8 @@ defmodule Docket.Graph do
 
   `attrs` may be a keyword list, a map, or a `Docket.Graph.Output` struct. The
   explicit `id` argument is used as the stored output ID. If `:source` is omitted,
-  it defaults to the output ID.
+  it defaults to the output ID. `:schema` accepts a `Docket.Schema` or schema
+  shorthand (see `Docket.Schema.normalize/1`).
   """
   @spec put_output(t(), id(), keyword() | map() | Output.t(), keyword()) :: edit_result()
   def put_output(graph, id, attrs, opts \\ []) do
@@ -197,6 +200,7 @@ defmodule Docket.Graph do
       |> attrs_to_map()
       |> Map.put(:id, id)
       |> Map.put_new(:source, id)
+      |> normalize_schema_attr()
 
     output = struct(Output, attrs)
 
@@ -345,6 +349,27 @@ defmodule Docket.Graph do
   - `MyNode` becomes `%{type: :module, module: MyNode, function: :call}`
   - `{MyNode, :run}` becomes `%{type: :module, module: MyNode, function: :run}`
   - maps are preserved for compiler/runtime validation
+
+  `:inputs` and `:fields` declare graph fields inline: each entry maps a
+  field ID to either field attrs (everything `put_input!`/`put_field!`
+  accepts) or bare schema shorthand, and materializes as an ordinary graph
+  field — nothing lands on the node record:
+
+      Graph.put_node!(graph, "draft",
+        implementation: MyApp.Nodes.LLM,
+        inputs: %{"customer_message" => [schema: :string, required: true]},
+        fields: %{
+          "draft_response" => :string,
+          "messages" => [schema: {:list, :map}, reducer: :append]
+        }
+      )
+
+  Declaring a field that already exists with an identical definition is a
+  no-op, so multiple nodes can declare a shared field in any order.
+  A conflicting definition raises (`{:error, %Docket.Graph.Error{}}` from
+  `put_node/4`); redefinition stays explicit via `put_input!`/`put_field!`.
+  Deleting the node later does not delete the fields — they are shared
+  state, and `verify/2` flags fields nothing references.
   """
   @spec put_node(t(), id(), keyword() | map() | Node.t(), keyword()) :: edit_result()
   def put_node(graph, id, attrs, opts \\ []) do
@@ -360,12 +385,16 @@ defmodule Docket.Graph do
   def put_node!(%__MODULE__{} = graph, id, attrs, opts) do
     assert_public_id!(id, :node_id)
 
+    {inline_inputs, inline_fields, attrs} = pop_inline_declarations(attrs)
+
     node =
       attrs
       |> node_from_attrs(id)
       |> Map.put(:id, id)
 
     graph
+    |> materialize_inline!(:input, inline_inputs, id)
+    |> materialize_inline!(:state, inline_fields, id)
     |> put_in([Access.key!(:nodes), id], node)
     |> finalize_edit(opts)
   end
@@ -701,8 +730,116 @@ defmodule Docket.Graph do
     |> attrs_to_map()
     |> Map.put_new(:id, id)
     |> Map.put_new(:kind, :state)
+    |> normalize_schema_attr()
+    |> normalize_reducer_attr()
     |> then(&struct(Field, &1))
   end
+
+  defp normalize_schema_attr(attrs) do
+    case Map.fetch(attrs, :schema) do
+      {:ok, schema} -> Map.put(attrs, :schema, Docket.Schema.normalize(schema))
+      :error -> attrs
+    end
+  end
+
+  defp normalize_reducer_attr(attrs) do
+    case Map.fetch(attrs, :reducer) do
+      {:ok, reducer} -> Map.put(attrs, :reducer, Docket.Reducer.normalize(reducer))
+      :error -> attrs
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Inline field declarations on put_node!
+  # ---------------------------------------------------------------------------
+
+  defp pop_inline_declarations(%Node{} = node), do: {%{}, %{}, node}
+
+  defp pop_inline_declarations(attrs) do
+    attrs = attrs_to_map(attrs)
+    {inline_inputs, attrs} = Map.pop(attrs, :inputs, %{})
+    {inline_fields, attrs} = Map.pop(attrs, :fields, %{})
+    {inline_inputs, inline_fields, attrs}
+  end
+
+  defp materialize_inline!(graph, kind, declarations, node_id)
+       when is_map(declarations) and not is_struct(declarations) do
+    declarations
+    |> Enum.sort_by(fn {field_id, _declaration} -> field_id end)
+    |> Enum.reduce(graph, fn {field_id, declaration}, graph ->
+      put_inline_field!(graph, kind, field_id, declaration, node_id)
+    end)
+  end
+
+  defp materialize_inline!(_graph, kind, declarations, node_id) do
+    invalid!(
+      :invalid_attrs,
+      "node #{inspect(node_id)} #{inline_key(kind)} must be a map of field declarations, got #{inspect(declarations)}"
+    )
+  end
+
+  # Identical redeclaration is a no-op so shared fields can be declared by
+  # every node that uses them; a conflicting definition raises rather than
+  # silently overwriting shared state. Explicit put_input!/put_field! still
+  # update freely.
+  defp put_inline_field!(graph, kind, field_id, declaration, node_id) do
+    assert_public_id!(field_id, :field_id)
+
+    field =
+      declaration
+      |> inline_declaration_attrs(node_id, field_id)
+      |> Map.put(:id, field_id)
+      |> Map.put(:kind, kind)
+      |> field_from_attrs()
+
+    existing = Map.get(graph.inputs, field_id) || Map.get(graph.fields, field_id)
+
+    cond do
+      existing == nil and kind == :input ->
+        %{graph | inputs: Map.put(graph.inputs, field_id, field)}
+
+      existing == nil ->
+        %{graph | fields: Map.put(graph.fields, field_id, field)}
+
+      existing == field ->
+        graph
+
+      true ->
+        invalid!(
+          :conflicting_field,
+          "node #{inspect(node_id)} inline declaration of #{inspect(field_id)} conflicts with the existing #{existing_kind(existing)} field; update it explicitly with put_input!/put_field!",
+          %{node_id: node_id, field_id: field_id}
+        )
+    end
+  end
+
+  # A declaration is either field attrs (keyword list or map) or bare schema
+  # shorthand standing in for [schema: shorthand].
+  defp inline_declaration_attrs(declaration, _node_id, _field_id)
+       when is_map(declaration) and not is_struct(declaration) do
+    declaration
+  end
+
+  defp inline_declaration_attrs(declaration, node_id, field_id) when is_list(declaration) do
+    if Keyword.keyword?(declaration) do
+      Map.new(declaration)
+    else
+      invalid!(
+        :invalid_attrs,
+        "node #{inspect(node_id)} inline declaration of #{inspect(field_id)} must be field attrs or schema shorthand, got #{inspect(declaration)}"
+      )
+    end
+  end
+
+  defp inline_declaration_attrs(declaration, _node_id, _field_id) do
+    %{schema: declaration}
+  end
+
+  defp inline_key(:input), do: ":inputs"
+  defp inline_key(:state), do: ":fields"
+
+  defp existing_kind(%Field{kind: :input}), do: "input"
+  defp existing_kind(_field), do: "state"
 
   defp node_from_attrs(%Node{} = node, _id) do
     Map.update!(node, :implementation, &Serializer.normalize_implementation/1)

@@ -13,7 +13,7 @@ defmodule Docket.Runtime.Algorithm do
   alias Docket.Guard
   alias Docket.Run.ChannelState
   alias Docket.Runtime.Activation
-  alias Docket.{Schema, Wire}
+  alias Docket.{Reducer, Schema, Wire}
 
   @start_id "$start"
   @finish_id "$finish"
@@ -229,7 +229,8 @@ defmodule Docket.Runtime.Algorithm do
     cond do
       Map.has_key?(rtg.lowering.public_to_runtime.fields, field_id) ->
         channel = Map.fetch!(rtg.channels, "state:" <> field_id)
-        validate_write_schema(node_id, field_id, value, channel.value_schema)
+        write_schema = Reducer.write_schema(channel.reducer, channel.value_schema, value)
+        validate_write_schema(node_id, field_id, value, write_schema)
 
       Map.has_key?(rtg.lowering.public_to_runtime.inputs, field_id) ->
         ["node #{inspect(node_id)} wrote #{inspect(field_id)}, which is an input and read-only"]
@@ -273,7 +274,8 @@ defmodule Docket.Runtime.Algorithm do
         channel = Map.fetch!(rtg.channels, "state:" <> field_id)
         values = Enum.map(field_writes, fn {_node_id, value} -> value end)
         node_ids = Enum.map(field_writes, fn {node_id, _value} -> node_id end)
-        {field_id, reduce_values(channel.reducer, values), node_ids}
+        current = current_value(channels, channel)
+        {field_id, Reducer.reduce(channel.reducer, current, values), node_ids}
       end)
 
     channels =
@@ -287,11 +289,21 @@ defmodule Docket.Runtime.Algorithm do
     {channels, changed, writers}
   end
 
-  # v1 supports only the :last_value reducer: the last write in deterministic
-  # order (sorted by writer node ID) wins. The compiler guarantees the
-  # reducer type.
-  defp reduce_values(%Docket.Reducer{type: :last_value}, values), do: List.last(values)
-  defp reduce_values(nil, values), do: List.last(values)
+  # The prior committed value the reducer folds into: the channel state when
+  # written, else the channel's effective default (which lowering fills with
+  # the reducer's zero for accumulating fields), else unset.
+  defp current_value(channels, channel) do
+    case Map.fetch(channels, channel.id) do
+      {:ok, %ChannelState{value: value}} ->
+        {:ok, value}
+
+      :error ->
+        case channel.default do
+          nil -> :unset
+          default -> {:ok, default}
+        end
+    end
+  end
 
   defp bump_channel(channels, channel_id, value) do
     Map.update(

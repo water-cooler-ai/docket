@@ -106,6 +106,143 @@ defmodule Docket.GraphTest do
            }
   end
 
+  test "accepts schema shorthand across the editing API" do
+    graph =
+      Docket.Graph.new!(id: "shorthand")
+      |> Docket.Graph.put_input!("message", schema: :string, required: true)
+      |> Docket.Graph.put_field!("count", schema: {:integer, min: 0})
+      |> Docket.Graph.put_field!("tags", schema: {:list, :string})
+      |> Docket.Graph.put_output!("count", schema: :integer)
+      |> Docket.Graph.update_field!("count", schema: {:integer, min: 1})
+
+    assert %Docket.Schema{type: :string, required: false} = graph.inputs["message"].schema
+    assert graph.inputs["message"].required
+
+    assert %Docket.Schema{type: :integer, constraints: %{"min" => 1}} =
+             graph.fields["count"].schema
+
+    assert %Docket.Schema{type: :list, item: %Docket.Schema{type: :string}} =
+             graph.fields["tags"].schema
+
+    assert %Docket.Schema{type: :integer} = graph.outputs["count"].schema
+
+    reloaded = Docket.Graph.from_map!(Docket.Graph.to_map(graph))
+    assert Docket.Graph.hash(reloaded) == Docket.Graph.hash(graph)
+  end
+
+  describe "inline field declarations on put_node!" do
+    test "materializes inputs and fields as ordinary graph fields" do
+      graph =
+        Docket.Graph.new!(id: "inline")
+        |> Docket.Graph.put_node!("draft",
+          implementation: Writer,
+          inputs: %{"customer_message" => [schema: :string, required: true]},
+          fields: %{
+            "draft_response" => :string,
+            "llm_usage" => [schema: :map],
+            "messages" => [schema: {:list, :map}, reducer: :append]
+          }
+        )
+
+      assert %Docket.Graph.Field{
+               kind: :input,
+               required: true,
+               schema: %Docket.Schema{type: :string}
+             } =
+               graph.inputs["customer_message"]
+
+      assert %Docket.Graph.Field{kind: :state, schema: %Docket.Schema{type: :string}} =
+               graph.fields["draft_response"]
+
+      assert %Docket.Schema{type: :map} = graph.fields["llm_usage"].schema
+
+      assert %Docket.Graph.Field{
+               reducer: %Docket.Reducer{type: :append},
+               schema: %Docket.Schema{type: :list, item: %Docket.Schema{type: :map}}
+             } = graph.fields["messages"]
+
+      refute Map.has_key?(Map.from_struct(graph.nodes["draft"]), :fields)
+
+      # Materialized fields are ordinary fields: they serialize and hash.
+      reloaded = Docket.Graph.from_map!(Docket.Graph.to_map(graph))
+      assert Docket.Graph.hash(reloaded) == Docket.Graph.hash(graph)
+    end
+
+    test "identical redeclaration is a no-op regardless of order" do
+      declare = fn graph, node_id ->
+        Docket.Graph.put_node!(graph, node_id,
+          implementation: Writer,
+          fields: %{"shared" => [schema: {:list, :string}, reducer: :append]}
+        )
+      end
+
+      graph = Docket.Graph.new!(id: "shared-fields") |> declare.("a") |> declare.("b")
+
+      assert %Docket.Graph.Field{kind: :state} = graph.fields["shared"]
+      assert map_size(graph.fields) == 1
+    end
+
+    test "conflicting declarations raise instead of overwriting" do
+      graph =
+        Docket.Graph.new!(id: "conflict")
+        |> Docket.Graph.put_field!("shared", schema: :string)
+
+      error =
+        assert_raise Docket.Graph.Error, fn ->
+          Docket.Graph.put_node!(graph, "n",
+            implementation: Writer,
+            fields: %{"shared" => :integer}
+          )
+        end
+
+      assert error.code == :conflicting_field
+
+      assert {:error, %Docket.Graph.Error{code: :conflicting_field}} =
+               Docket.Graph.put_node(graph, "n",
+                 implementation: Writer,
+                 fields: %{"shared" => :integer}
+               )
+    end
+
+    test "declaring an existing input as a state field conflicts" do
+      graph =
+        Docket.Graph.new!(id: "kind-conflict")
+        |> Docket.Graph.put_input!("message", schema: :string)
+
+      assert_raise Docket.Graph.Error, fn ->
+        Docket.Graph.put_node!(graph, "n",
+          implementation: Writer,
+          fields: %{"message" => :string}
+        )
+      end
+    end
+
+    test "explicit put_field! still updates freely after an inline declaration" do
+      graph =
+        Docket.Graph.new!(id: "explicit-update")
+        |> Docket.Graph.put_node!("n",
+          implementation: Writer,
+          fields: %{"out" => :string}
+        )
+        |> Docket.Graph.put_field!("out", schema: :integer)
+
+      assert %Docket.Schema{type: :integer} = graph.fields["out"].schema
+    end
+
+    test "deleting the node keeps the materialized fields" do
+      graph =
+        Docket.Graph.new!(id: "delete-node")
+        |> Docket.Graph.put_node!("n",
+          implementation: Writer,
+          fields: %{"out" => :string}
+        )
+        |> Docket.Graph.delete_node!("n")
+
+      refute Map.has_key?(graph.nodes, "n")
+      assert Map.has_key?(graph.fields, "out")
+    end
+  end
+
   test "keeps public IDs scoped by record kind" do
     graph =
       Docket.Graph.new!(id: "report-flow")
@@ -237,6 +374,68 @@ defmodule Docket.GraphTest do
     assert Docket.Graph.to_map(Docket.Graph.from_map!(map)) == map
     assert map["schema_version"] == 1
     refute Map.has_key?(map, "diagnostics")
+  end
+
+  test "round-trips v1.1 schema types and constraints" do
+    messages = Docket.Schema.list(Docket.Schema.map(), max_items: 50)
+    count = Docket.Schema.integer(min: 0)
+    flag = Docket.Schema.boolean(default: false)
+    extras = Docket.Schema.object(%{"note" => Docket.Schema.string()}, open: true)
+
+    graph =
+      Docket.Graph.new!(id: "typed")
+      |> Docket.Graph.put_field!("messages", schema: messages)
+      |> Docket.Graph.put_field!("count", schema: count)
+      |> Docket.Graph.put_field!("flag", schema: flag)
+      |> Docket.Graph.put_field!("extras", schema: extras)
+
+    map = Docket.Graph.to_map(graph)
+
+    assert %{
+             "type" => "list",
+             "item" => %{"type" => "map"},
+             "constraints" => %{"max_items" => 50}
+           } =
+             map["fields"]["messages"]["schema"]
+
+    assert %{"type" => "integer", "constraints" => %{"min" => 0}} =
+             map["fields"]["count"]["schema"]
+
+    assert %{"type" => "boolean", "default" => false} = map["fields"]["flag"]["schema"]
+
+    assert %{"type" => "object", "constraints" => %{"open" => true}} =
+             map["fields"]["extras"]["schema"]
+
+    assert Docket.Graph.from_map!(map) == graph
+    assert Docket.Graph.to_map(Docket.Graph.from_map!(map)) == map
+  end
+
+  test "round-trips v1.1 reducer types and opts" do
+    graph =
+      Docket.Graph.new!(id: "reduced")
+      |> Docket.Graph.put_field!("messages",
+        schema: Docket.Schema.list(Docket.Schema.map()),
+        reducer: Docket.Reducer.append(unique: true, max_length: 50)
+      )
+      |> Docket.Graph.put_field!("total",
+        schema: Docket.Schema.integer(),
+        reducer: Docket.Reducer.sum()
+      )
+      |> Docket.Graph.put_field!("tags",
+        schema: Docket.Schema.list(Docket.Schema.map()),
+        reducer: Docket.Reducer.union(by: "id")
+      )
+
+    map = Docket.Graph.to_map(graph)
+
+    assert %{"type" => "append", "opts" => %{"unique" => true, "max_length" => 50}} =
+             map["fields"]["messages"]["reducer"]
+
+    assert %{"type" => "sum"} = map["fields"]["total"]["reducer"]
+    assert %{"type" => "union", "opts" => %{"by" => "id"}} = map["fields"]["tags"]["reducer"]
+
+    assert Docket.Graph.from_map!(map) == graph
+    assert Docket.Graph.to_map(Docket.Graph.from_map!(map)) == map
   end
 
   test "wraps guards nested in plain argument positions with a $guard tag" do
