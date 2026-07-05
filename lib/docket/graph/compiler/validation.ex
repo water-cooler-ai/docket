@@ -36,7 +36,8 @@ defmodule Docket.Graph.Compiler.Validation do
       validate_guards(graph, opts),
       validate_topology(graph, opts),
       analyze_cycles(graph, opts),
-      analyze_dead_ends(graph, opts)
+      analyze_dead_ends(graph, opts),
+      analyze_orphaned_fields(graph, opts)
     ])
   end
 
@@ -1383,6 +1384,60 @@ defmodule Docket.Graph.Compiler.Validation do
 
   defp source_list(from) when is_list(from), do: from
   defp source_list(from), do: [from]
+
+  # ---------------------------------------------------------------------------
+  # 9.12 Orphaned fields
+  # ---------------------------------------------------------------------------
+
+  # Nodes read and write fields dynamically, so field usage is not statically
+  # knowable; this pass over-approximates references by collecting every
+  # string that appears in an output source, a guard expression, or a node
+  # config value. A state field named nowhere is likely left over from a
+  # deleted node (inline declarations survive node deletion by design) and
+  # gets a warning, never an error.
+  defp analyze_orphaned_fields(graph, _opts) do
+    referenced = referenced_strings(graph)
+
+    for field_id <- Enum.sort(Map.keys(graph.fields)),
+        not MapSet.member?(referenced, field_id) do
+      warning(
+        :orphaned_field,
+        "field #{inspect(field_id)} is not referenced by any output, guard, or node config; delete it explicitly if it is no longer used",
+        path: [:fields, field_id],
+        public_id: field_id
+      )
+    end
+  end
+
+  defp referenced_strings(graph) do
+    output_sources =
+      for {_id, %Graph.Output{source: source}} <- graph.outputs, is_binary(source), do: source
+
+    guard_strings =
+      Enum.flat_map(graph.edges, fn
+        {_id, %Edge{guard: %Guard{} = guard}} -> collect_strings(guard)
+        {_id, _edge} -> []
+      end)
+
+    config_strings =
+      Enum.flat_map(graph.nodes, fn
+        {_id, %Graph.Node{config: config}} -> collect_strings(config)
+        {_id, _node} -> []
+      end)
+
+    MapSet.new(output_sources ++ guard_strings ++ config_strings)
+  end
+
+  defp collect_strings(value) when is_binary(value), do: [value]
+  defp collect_strings(value) when is_atom(value) and not is_nil(value), do: [to_string(value)]
+  defp collect_strings(%Guard{args: args}), do: collect_strings(args)
+  defp collect_strings(value) when is_list(value), do: Enum.flat_map(value, &collect_strings/1)
+
+  defp collect_strings(value) when is_map(value) and not is_struct(value) do
+    Enum.flat_map(value, fn {_key, child} -> collect_strings(child) end)
+  end
+
+  defp collect_strings(_value), do: []
 
   # ---------------------------------------------------------------------------
   # Shared helpers

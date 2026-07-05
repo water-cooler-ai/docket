@@ -157,6 +157,24 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       |> assert_diagnostic(:invalid_reducer, path: [:fields, "tags", :reducer])
     end
 
+    test "warns about state fields nothing references" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_field!("leftover", schema: Schema.string())
+
+      assert {:ok, verified} = Graph.verify(graph)
+
+      assert Enum.any?(
+               verified.diagnostics,
+               &(&1.code == :orphaned_field and &1.severity == :warning and
+                   &1.public_id == "leftover")
+             )
+
+      # Fields referenced by outputs or node configs are not flagged.
+      assert {:ok, verified} = Graph.verify(Graphs.minimal_linear())
+      refute Enum.any?(verified.diagnostics, &(&1.code == :orphaned_field))
+    end
+
     test "warns when an append item is itself a list" do
       graph =
         Graphs.minimal_linear()

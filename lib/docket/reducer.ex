@@ -86,6 +86,23 @@ defmodule Docket.Reducer do
   @spec union(keyword() | map()) :: t()
   def union(opts \\ []), do: build(:union, opts)
 
+  @doc """
+  Normalizes reducer shorthand into a `Docket.Reducer` struct: a built-in
+  type atom (`:append`) or a `{type, opts}` tuple (`{:append, max_length: 50}`).
+
+  Real reducers and values matching no shorthand pass through unchanged; the
+  compiler reports the latter as invalid reducers.
+  """
+  @spec normalize(term()) :: term()
+  def normalize(%__MODULE__{} = reducer), do: reducer
+  def normalize(type) when type in @types, do: build(type, [])
+
+  def normalize({type, opts}) when type in @types and (is_list(opts) or is_map(opts)) do
+    build(type, opts)
+  end
+
+  def normalize(other), do: other
+
   defp build(type, opts), do: %__MODULE__{type: type, opts: attrs_to_map(opts)}
 
   defp attrs_to_map(attrs) do
