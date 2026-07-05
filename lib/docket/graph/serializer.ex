@@ -61,14 +61,20 @@ defmodule Docket.Graph.Serializer do
   @schema_types %{
     "string" => :string,
     "float" => :float,
+    "integer" => :integer,
+    "boolean" => :boolean,
     "map" => :map,
+    "list" => :list,
     "object" => :object,
     "enum" => :enum
   }
   @schema_types_out %{
     string: "string",
     float: "float",
+    integer: "integer",
+    boolean: "boolean",
     map: "map",
+    list: "list",
     object: "object",
     enum: "enum"
   }

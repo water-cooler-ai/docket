@@ -15,7 +15,7 @@ defmodule Docket.Graph.Compiler.NodeContracts do
   alias Docket.Graph
   alias Docket.Schema
 
-  @schema_types [:string, :float, :map, :object, :enum]
+  @schema_types [:boolean, :enum, :float, :integer, :list, :map, :object, :string]
 
   @type fetch_result :: {:ok, Schema.t()} | {:error, map()}
 
