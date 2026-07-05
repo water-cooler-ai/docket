@@ -79,8 +79,22 @@ defmodule Docket.Graph.Serializer do
     enum: "enum"
   }
 
-  @reducer_types %{"last_value" => :last_value}
-  @reducer_types_out %{last_value: "last_value"}
+  @reducer_types %{
+    "append" => :append,
+    "first_value" => :first_value,
+    "last_value" => :last_value,
+    "merge" => :merge,
+    "sum" => :sum,
+    "union" => :union
+  }
+  @reducer_types_out %{
+    append: "append",
+    first_value: "first_value",
+    last_value: "last_value",
+    merge: "merge",
+    sum: "sum",
+    union: "union"
+  }
 
   @guard_ops %{
     "all" => :all,

@@ -50,6 +50,9 @@ defmodule Docket.Graph.Compiler.Lowering do
          }}
       end
 
+    # Accumulating reducers get their natural zero as the effective default
+    # when the field declares none, so snapshots and the first reduction see
+    # [] / %{} / 0 instead of missing state.
     state_channels =
       for {id, field} <- graph.fields, into: %{} do
         {state_channel_id(id),
@@ -58,7 +61,7 @@ defmodule Docket.Graph.Compiler.Lowering do
            type: :last_value,
            value_schema: field.schema,
            reducer: field.reducer || Reducer.last_value(),
-           default: field.default
+           default: field.default || Reducer.zero(field.reducer)
          }}
       end
 
