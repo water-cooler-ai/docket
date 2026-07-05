@@ -21,6 +21,7 @@ defmodule Docket.Graph.Compiler.Validation do
   @supported_schema_version 1
   @supported_guard_ops [:all, :any, :changed, :equals, :exists, :not, :path, :version_at_least]
   @schema_types [:boolean, :enum, :float, :integer, :list, :map, :object, :string]
+  @reducer_types Docket.Reducer.types()
 
   @spec run(Graph.t(), %{optional(String.t()) => NodeContracts.fetch_result()}, keyword()) ::
           [Docket.Graph.Diagnostic.t()]
@@ -161,7 +162,7 @@ defmodule Docket.Graph.Compiler.Validation do
   defp validate_field(collection, id, %Field{} = field) do
     List.flatten([
       check_field_schema(collection, id, field.schema),
-      check_field_reducer(collection, id, field.reducer),
+      check_field_reducer(collection, id, field),
       check_field_default(collection, id, field)
     ])
   end
@@ -201,18 +202,141 @@ defmodule Docket.Graph.Compiler.Validation do
     end
   end
 
-  defp check_field_reducer(_collection, _id, nil), do: []
-  defp check_field_reducer(_collection, _id, %Reducer{type: :last_value}), do: []
+  defp check_field_reducer(_collection, _id, %Field{reducer: nil}), do: []
 
-  defp check_field_reducer(collection, id, reducer) do
+  defp check_field_reducer(
+         collection,
+         id,
+         %Field{reducer: %Reducer{type: type} = reducer} = field
+       )
+       when type in @reducer_types do
+    List.flatten([
+      check_reducer_pairing(collection, id, type, field.schema),
+      check_reducer_opts(collection, id, reducer),
+      check_ambiguous_list_item(collection, id, type, field.schema)
+    ])
+  end
+
+  defp check_field_reducer(collection, id, %Field{reducer: reducer}) do
     [
       error(
         :invalid_reducer,
-        "#{singular(collection)} #{inspect(id)} reducer is not supported in v1; only last_value reducers are supported, got #{inspect(reducer)}",
+        "#{singular(collection)} #{inspect(id)} reducer is not supported; supported types are #{inspect(@reducer_types)}, got #{inspect(reducer)}",
         path: [collection, id, :reducer],
         public_id: id
       )
     ]
+  end
+
+  # Reducer/schema pairing: append/union accumulate into a list, sum into a
+  # number, merge into a map. A missing or malformed schema already carries
+  # its own diagnostic, so pairing only fires against a valid schema.
+  defp check_reducer_pairing(collection, id, type, schema) do
+    expected =
+      case type do
+        t when t in [:append, :union] -> {[:list], "a :list schema"}
+        :sum -> {[:float, :integer], "a numeric schema"}
+        :merge -> {[:map, :object], "a :map or :object schema"}
+        _last_or_first -> nil
+      end
+
+    case expected do
+      nil ->
+        []
+
+      {allowed, description} ->
+        if valid_schema?(schema) and schema.type not in allowed do
+          [
+            error(
+              :reducer_schema_mismatch,
+              "#{singular(collection)} #{inspect(id)} #{type} reducer requires #{description}, got #{inspect(schema.type)}",
+              path: [collection, id, :reducer],
+              public_id: id
+            )
+          ]
+        else
+          []
+        end
+    end
+  end
+
+  # With concatenate semantics, a list-typed item makes list writes
+  # ambiguous: they always concatenate, so appending one element requires
+  # wrapping it in an outer list.
+  defp check_ambiguous_list_item(collection, id, type, schema)
+       when type in [:append, :union] do
+    case schema do
+      %Schema{type: :list, item: %Schema{type: :list}} ->
+        [
+          warning(
+            :ambiguous_list_write,
+            "#{singular(collection)} #{inspect(id)} #{type} reducer has a list-typed item; list writes concatenate, so appending a single element requires wrapping it in an outer list",
+            path: [collection, id, :reducer],
+            public_id: id
+          )
+        ]
+
+      _other ->
+        []
+    end
+  end
+
+  defp check_ambiguous_list_item(_collection, _id, _type, _schema), do: []
+
+  defp check_reducer_opts(collection, id, %Reducer{type: type, opts: opts})
+       when is_map(opts) do
+    known =
+      case type do
+        :append ->
+          [
+            {"unique", &is_boolean/1, "a boolean"},
+            {"max_length", &pos_int?/1, "a positive integer"}
+          ]
+
+        :union ->
+          [{"by", &dedupe_key?/1, "a string or list of strings"}]
+
+        :merge ->
+          [{"deep", &is_boolean/1, "a boolean"}]
+
+        _other ->
+          []
+      end
+
+    for {key, valid?, description} <- known,
+        {:ok, value} <- [fetch_opt(opts, key)],
+        not valid?.(value) do
+      error(
+        :invalid_reducer,
+        "#{singular(collection)} #{inspect(id)} #{type} reducer option #{inspect(key)} must be #{description}, got #{inspect(value)}",
+        path: [collection, id, :reducer],
+        public_id: id
+      )
+    end
+  end
+
+  defp check_reducer_opts(collection, id, %Reducer{opts: opts}) do
+    [
+      error(
+        :invalid_reducer,
+        "#{singular(collection)} #{inspect(id)} reducer opts must be a map, got #{inspect(opts)}",
+        path: [collection, id, :reducer],
+        public_id: id
+      )
+    ]
+  end
+
+  defp pos_int?(value), do: is_integer(value) and value > 0
+
+  defp dedupe_key?(value) do
+    is_binary(value) or (is_list(value) and value != [] and Enum.all?(value, &is_binary/1))
+  end
+
+  defp fetch_opt(opts, key) do
+    case Map.fetch(opts, key) do
+      {:ok, value} -> {:ok, value}
+      :error -> Map.fetch(opts, String.to_atom(key))
+    end
   end
 
   defp check_field_default(_collection, _id, %Field{default: nil}), do: []

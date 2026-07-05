@@ -138,6 +138,54 @@ defmodule Docket.Test.Fixtures.Nodes do
     def unrelated, do: :ok
   end
 
+  defmodule WriteValue do
+    @moduledoc false
+    # WriteStatic for non-string values: the open config schema accepts any
+    # durable "value".
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{"field" => Docket.Schema.string(required: true)}, open: true)
+    end
+
+    @impl true
+    def call(_state, config, _context) do
+      {:ok, %{config["field"] => config["value"]}}
+    end
+  end
+
+  defmodule InterruptWhileEmpty do
+    @moduledoc false
+    # InterruptOnce for accumulating resume fields, whose effective default
+    # makes the field always present in snapshots: interrupts while the
+    # resume field is empty, then copies it into the write field.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{
+        "resume_field" => Docket.Schema.string(required: true),
+        "write_field" => Docket.Schema.string(required: true)
+      })
+    end
+
+    @impl true
+    def call(state, config, _context) do
+      case Map.get(state, config["resume_field"]) do
+        empty when empty in [nil, [], %{}] ->
+          {:interrupt,
+           %Docket.Interrupt{
+             prompt: "value for #{config["resume_field"]}?",
+             resume_channel: config["resume_field"]
+           }}
+
+        value ->
+          {:ok, %{config["write_field"] => value}}
+      end
+    end
+  end
+
   defmodule Increment do
     @moduledoc false
     @behaviour Docket.Node

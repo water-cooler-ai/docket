@@ -254,15 +254,48 @@ defmodule Docket.GraphTest do
 
     map = Docket.Graph.to_map(graph)
 
-    assert %{"type" => "list", "item" => %{"type" => "map"}, "constraints" => %{"max_items" => 50}} =
+    assert %{
+             "type" => "list",
+             "item" => %{"type" => "map"},
+             "constraints" => %{"max_items" => 50}
+           } =
              map["fields"]["messages"]["schema"]
 
     assert %{"type" => "integer", "constraints" => %{"min" => 0}} =
              map["fields"]["count"]["schema"]
 
     assert %{"type" => "boolean", "default" => false} = map["fields"]["flag"]["schema"]
+
     assert %{"type" => "object", "constraints" => %{"open" => true}} =
              map["fields"]["extras"]["schema"]
+
+    assert Docket.Graph.from_map!(map) == graph
+    assert Docket.Graph.to_map(Docket.Graph.from_map!(map)) == map
+  end
+
+  test "round-trips v1.1 reducer types and opts" do
+    graph =
+      Docket.Graph.new!(id: "reduced")
+      |> Docket.Graph.put_field!("messages",
+        schema: Docket.Schema.list(Docket.Schema.map()),
+        reducer: Docket.Reducer.append(unique: true, max_length: 50)
+      )
+      |> Docket.Graph.put_field!("total",
+        schema: Docket.Schema.integer(),
+        reducer: Docket.Reducer.sum()
+      )
+      |> Docket.Graph.put_field!("tags",
+        schema: Docket.Schema.list(Docket.Schema.map()),
+        reducer: Docket.Reducer.union(by: "id")
+      )
+
+    map = Docket.Graph.to_map(graph)
+
+    assert %{"type" => "append", "opts" => %{"unique" => true, "max_length" => 50}} =
+             map["fields"]["messages"]["reducer"]
+
+    assert %{"type" => "sum"} = map["fields"]["total"]["reducer"]
+    assert %{"type" => "union", "opts" => %{"by" => "id"}} = map["fields"]["tags"]["reducer"]
 
     assert Docket.Graph.from_map!(map) == graph
     assert Docket.Graph.to_map(Docket.Graph.from_map!(map)) == map
