@@ -239,6 +239,35 @@ defmodule Docket.GraphTest do
     refute Map.has_key?(map, "diagnostics")
   end
 
+  test "round-trips v1.1 schema types and constraints" do
+    messages = Docket.Schema.list(Docket.Schema.map(), max_items: 50)
+    count = Docket.Schema.integer(min: 0)
+    flag = Docket.Schema.boolean(default: false)
+    extras = Docket.Schema.object(%{"note" => Docket.Schema.string()}, open: true)
+
+    graph =
+      Docket.Graph.new!(id: "typed")
+      |> Docket.Graph.put_field!("messages", schema: messages)
+      |> Docket.Graph.put_field!("count", schema: count)
+      |> Docket.Graph.put_field!("flag", schema: flag)
+      |> Docket.Graph.put_field!("extras", schema: extras)
+
+    map = Docket.Graph.to_map(graph)
+
+    assert %{"type" => "list", "item" => %{"type" => "map"}, "constraints" => %{"max_items" => 50}} =
+             map["fields"]["messages"]["schema"]
+
+    assert %{"type" => "integer", "constraints" => %{"min" => 0}} =
+             map["fields"]["count"]["schema"]
+
+    assert %{"type" => "boolean", "default" => false} = map["fields"]["flag"]["schema"]
+    assert %{"type" => "object", "constraints" => %{"open" => true}} =
+             map["fields"]["extras"]["schema"]
+
+    assert Docket.Graph.from_map!(map) == graph
+    assert Docket.Graph.to_map(Docket.Graph.from_map!(map)) == map
+  end
+
   test "wraps guards nested in plain argument positions with a $guard tag" do
     guard = Docket.Guard.equals(Docket.Guard.path("review", ["status"]), "approved")
 

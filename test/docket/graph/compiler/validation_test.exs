@@ -111,6 +111,23 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       |> assert_diagnostic(:invalid_field_default, path: [:fields, "count", :default])
     end
 
+    test "accepts v1.1 schema types on fields" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_field!("count", schema: Schema.integer(min: 0), default: 0)
+        |> Graph.put_field!("done", schema: Schema.boolean(), default: false)
+        |> Graph.put_field!("messages", schema: Schema.list(Schema.map()), default: [])
+
+      assert {:ok, _verified} = Graph.verify(graph)
+    end
+
+    test "rejects field defaults that violate schema constraints" do
+      Graphs.minimal_linear()
+      |> Graph.put_field!("count", schema: Schema.integer(min: 0), default: -1)
+      |> verify_error!()
+      |> assert_diagnostic(:invalid_field_default, path: [:fields, "count", :default])
+    end
+
     test "accepts fields without reducers by defaulting to last_value" do
       graph =
         Graphs.minimal_linear()

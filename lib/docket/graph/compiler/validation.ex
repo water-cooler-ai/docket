@@ -20,7 +20,7 @@ defmodule Docket.Graph.Compiler.Validation do
   @finish_id "$finish"
   @supported_schema_version 1
   @supported_guard_ops [:all, :any, :changed, :equals, :exists, :not, :path, :version_at_least]
-  @schema_types [:string, :float, :map, :object, :enum]
+  @schema_types [:boolean, :enum, :float, :integer, :list, :map, :object, :string]
 
   @spec run(Graph.t(), %{optional(String.t()) => NodeContracts.fetch_result()}, keyword()) ::
           [Docket.Graph.Diagnostic.t()]
@@ -302,9 +302,18 @@ defmodule Docket.Graph.Compiler.Validation do
     end
   end
 
-  # v1 compatibility: same type; enum outputs must accept every source value.
+  # v1 compatibility: same type; enum outputs must accept every source value;
+  # list outputs with a declared item must accept the source's items.
   defp compatible_schemas?(%Schema{type: :enum} = source, %Schema{type: :enum} = output) do
     MapSet.subset?(MapSet.new(source.values), MapSet.new(output.values))
+  end
+
+  defp compatible_schemas?(%Schema{type: :list} = source, %Schema{type: :list} = output) do
+    case {source.item, output.item} do
+      {_source_item, nil} -> true
+      {nil, %Schema{}} -> false
+      {source_item, output_item} -> compatible_schemas?(source_item, output_item)
+    end
   end
 
   defp compatible_schemas?(%Schema{type: type}, %Schema{type: type}), do: true
