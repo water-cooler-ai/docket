@@ -106,6 +106,30 @@ defmodule Docket.GraphTest do
            }
   end
 
+  test "accepts schema shorthand across the editing API" do
+    graph =
+      Docket.Graph.new!(id: "shorthand")
+      |> Docket.Graph.put_input!("message", schema: :string, required: true)
+      |> Docket.Graph.put_field!("count", schema: {:integer, min: 0})
+      |> Docket.Graph.put_field!("tags", schema: {:list, :string})
+      |> Docket.Graph.put_output!("count", schema: :integer)
+      |> Docket.Graph.update_field!("count", schema: {:integer, min: 1})
+
+    assert %Docket.Schema{type: :string, required: false} = graph.inputs["message"].schema
+    assert graph.inputs["message"].required
+
+    assert %Docket.Schema{type: :integer, constraints: %{"min" => 1}} =
+             graph.fields["count"].schema
+
+    assert %Docket.Schema{type: :list, item: %Docket.Schema{type: :string}} =
+             graph.fields["tags"].schema
+
+    assert %Docket.Schema{type: :integer} = graph.outputs["count"].schema
+
+    reloaded = Docket.Graph.from_map!(Docket.Graph.to_map(graph))
+    assert Docket.Graph.hash(reloaded) == Docket.Graph.hash(graph)
+  end
+
   test "keeps public IDs scoped by record kind" do
     graph =
       Docket.Graph.new!(id: "report-flow")
