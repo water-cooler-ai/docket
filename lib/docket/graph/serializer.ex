@@ -32,8 +32,11 @@ defmodule Docket.Graph.Serializer do
   # `nil`, lists, and string-keyed maps.
   #
   # Because dump/2 re-canonicalizes on every call, the hash is stable across
-  # storage round trips for every dumpable graph:
-  # `hash(from_map!(to_map(graph))) == hash(graph)`. Struct equality
+  # storage round trips for graphs built through the editing API:
+  # `hash(from_map!(to_map(graph))) == hash(graph)`. (A hand-built node
+  # implementation map that omits :function dumps without "function", but
+  # load! defaults it to :call, so the re-dump - and hash - differ.) Struct
+  # equality
   # `from_map!(to_map(graph)) == graph` holds for graphs whose open content is
   # already canonical (string keys/values); a graph built with atom content
   # reloads in canonical string form, exactly as a Jason/JSONB round trip

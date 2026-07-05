@@ -5,14 +5,11 @@ Date: 2026-06-25
 
 Related documents:
 
-- `docs/architecture/docket-v1-implementation-path.md`
 - `docs/architecture/docket-runtime-design.md`
 - `docs/architecture/docket-graph-construction-design.md`
-- `docs/architecture/docket-v1-test-suite-design.md`
 
-Implementation note: use `docket-v1-implementation-path.md` as the active v1
-build sequence. This document owns the detailed execution and checkpoint
-contract.
+Implementation note: this document owns the detailed execution and checkpoint
+contract; concrete APIs are canonical in the module docs under `lib/docket/`.
 
 ## 1. Purpose
 
@@ -633,11 +630,14 @@ Known node callback shape:
 @callback call(state :: map(), config :: map(), context :: map()) ::
             {:ok, state_update :: map()}
             | {:interrupt, Docket.Interrupt.t()}
-            | {:await, Docket.Await.t()}
+            | {:await, term()}
             | {:error, term()}
 ```
 
-Known call shape:
+`{:await, term()}` is reserved for post-v1 late-completion protocols; in v1
+the dispatcher treats it as a permanent node failure.
+
+Known call shape (see `lib/docket/runtime/dispatcher.ex`):
 
 ```elixir
 state = committed_state_snapshot
@@ -645,11 +645,11 @@ config = node_config
 context = %{
   run_id: run_id,
   node_id: node_id,
-  superstep: step,
-  source_versions: state_channel_versions,
-  application: application_context,
+  step: step,
   attempt: attempt,
-  idempotency_key: key
+  source_versions: source_versions,
+  idempotency_key: idempotency_key,
+  application: application_context
 }
 ```
 
@@ -706,9 +706,12 @@ Known executor callback:
           ) ::
             {:ok, state_update :: map()}
             | {:interrupt, Docket.Interrupt.t()}
-            | {:await, Docket.Await.t()}
+            | {:await, term()}
             | {:error, term()}
 ```
+
+`{:await, term()}` is reserved for post-v1 late-completion protocols; v1
+treats it as a permanent node failure.
 
 Design-space executor families:
 
@@ -951,7 +954,8 @@ Known interrupt return shape:
    node_id: node_id,
    prompt: prompt,
    schema: schema,
-   resume_channel: channel
+   resume_channel: channel,
+   metadata: %{}
  }}
 ```
 

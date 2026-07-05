@@ -1,41 +1,23 @@
 # Docket Architecture Docs
 
-Status: active index
-Date: 2026-06-26
-
-## Start Here
-
-Docket v1 has two primary flows:
-
-1. Build a graph document.
-2. Run a graph document.
-
-Use `docket-v1-implementation-path.md` as the active build guide. The older
-design documents remain useful reference notes, but they are no longer the
-first thing to read when deciding what to implement next.
+These documents record the design rationale behind Docket. The code and its
+module docs are the authoritative reference for the current API; read these
+when you want to understand *why* the contracts are shaped the way they are.
 
 ## Reading Order
 
-1. `docs/architecture/docket-v1-implementation-path.md`
-   - The lean v1 spine.
-   - Defines the build path, run path, implementation slices, and test gates.
-2. `docs/architecture/docket-implementation-progress.md`
-   - Tracks what has actually landed in code for the MVP so far.
-3. `docs/architecture/docket-compiler-design.md`
-   - Compiler verification, diagnostics, runtime graph lowering, LangGraph
-     audit notes, and compiler test strategy.
-4. `docs/architecture/docket-graph-construction-design.md`
-   - Public `Docket.Graph` document, graph editing API, compiler boundary, ID
-     rules, lowering rules, and host storage boundary.
-5. `docs/architecture/docket-graph-execution-contract-design.md`
-   - Runtime, execution loop, public run APIs, checkpoints, executors, guards,
-     failures, interrupts, and inline test runtime contract.
-6. `docs/architecture/docket-v1-test-suite-design.md`
-   - Test layers, fixtures, in-memory/ETS checkpoint helpers, and v1 coverage
-     progression.
-7. `docs/architecture/docket-runtime-design.md`
-   - Longer research and architecture background. Use it for rationale and
-     future design space, not as the day-to-day implementation checklist.
+1. `docket-graph-construction-design.md`
+   - The public `Docket.Graph` document: editing API, serialization and hash
+     contract, ID rules, and the host storage boundary.
+2. `docket-compiler-design.md`
+   - Compiler verification, diagnostics, and lowering from the public graph
+     to the internal runtime graph.
+3. `docket-graph-execution-contract-design.md`
+   - The execution contract: runtime loop, public run APIs, checkpoints,
+     executors, guards, failures, and interrupts.
+4. `docket-runtime-design.md`
+   - Long-form research and background: goals, alternatives considered
+     (Pregel, LangGraph, Temporal), and future design space.
 
 ## Canonical v1 Shape
 
@@ -66,10 +48,6 @@ Host-owned surfaces:
 
 ## Documentation Rule
 
-When a v1 implementation decision changes:
-
-- Update `docket-v1-implementation-path.md` if it changes the build sequence,
-  scope, or active contract.
-- Update the focused reference doc if it changes low-level API or runtime
-  details.
-- Keep this index small. It should route people, not repeat the whole design.
+When an implementation decision changes a contract, update the focused design
+doc if the rationale changed; keep API details in module docs, not here. Keep
+this index small: it should route people, not repeat the design.

@@ -255,6 +255,32 @@ defmodule Docket.Test.Fixtures.Nodes do
     def call(_state, _config, _context), do: {:await, :external}
   end
 
+  defmodule SleepsUntilReleased do
+    @moduledoc false
+    # Announces itself to the test coordinator and blocks until released - no
+    # wall-clock sleep. Tests release it deterministically with
+    # `send(pid, :release)` or let a "timeout_ms" policy kill the attempt.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{
+        "field" => Docket.Schema.string(required: true),
+        "value" => Docket.Schema.string(required: true)
+      })
+    end
+
+    @impl true
+    def call(_state, config, context) do
+      coordinator = Map.fetch!(context.application, :coordinator)
+      send(coordinator, {:blocked, self(), context.node_id, context.attempt})
+
+      receive do
+        :release -> {:ok, %{config["field"] => config["value"]}}
+      end
+    end
+  end
+
   defmodule AtomWriter do
     @moduledoc false
     # Returns atom-keyed/atom-valued content; the update barrier coerces it

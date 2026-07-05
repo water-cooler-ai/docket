@@ -164,24 +164,33 @@ defmodule Docket.Runtime.FailureRetryTest do
       refute_received {:slept, _}
     end
 
+    # The compiler rejects invalid node policies at verify time; these two
+    # tests bypass it with a mutated precompiled runtime graph to prove the
+    # plan-time defense holds for hand-built or stale runtime graphs.
     test "invalid node policies fail the run with a typed failure" do
-      graph =
+      rtg =
         Graphs.retry_then_continue()
-        |> Graph.update_node!("flaky", policies: %{"retry" => %{"max_attempts" => 0}})
+        |> compile!()
+        |> put_in([Access.key!(:nodes), "node:flaky", Access.key!(:policies)], %{
+          "retry" => %{"max_attempts" => 0}
+        })
 
-      assert {:ok, run, checkpoints} = Docket.Test.run_inline(graph, %{})
+      assert {:ok, run, checkpoints} = Docket.Test.run_inline(rtg, %{})
 
       assert run.status == :failed
       run_failed = List.last(checkpoints)
       assert Enum.any?(run_failed.events, &(&1.payload["reason"] == "invalid_policy"))
     end
 
-    test "the reserved on_error policy is rejected" do
-      graph =
+    test "the reserved on_error policy is rejected at plan time" do
+      rtg =
         Graphs.retry_then_continue()
-        |> Graph.update_node!("flaky", policies: %{"on_error" => "route"})
+        |> compile!()
+        |> put_in([Access.key!(:nodes), "node:flaky", Access.key!(:policies)], %{
+          "on_error" => "route"
+        })
 
-      assert {:ok, run, _} = Docket.Test.run_inline(graph, %{})
+      assert {:ok, run, _} = Docket.Test.run_inline(rtg, %{})
       assert run.status == :failed
     end
   end

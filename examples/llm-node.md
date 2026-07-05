@@ -42,19 +42,19 @@ defmodule MyApp.DocketNodes.LLM do
 
   @impl true
   def call(state, config, context) do
-    rendered_prompt = MyApp.PromptTemplate.render(config.prompt_template, state)
+    rendered_prompt = MyApp.PromptTemplate.render(config["prompt_template"], state)
 
     messages =
       [
-        system_message(config.system_prompt),
+        system_message(config["system_prompt"]),
         %{role: "user", content: rendered_prompt}
       ]
       |> Enum.reject(&is_nil/1)
 
     request = %{
-      model: config.model,
-      reasoning_effort: config.reasoning_effort,
-      temperature: config.temperature,
+      model: config["model"],
+      reasoning_effort: config["reasoning_effort"],
+      temperature: config["temperature"],
       messages: messages,
       idempotency_key: context.idempotency_key
     }
@@ -63,8 +63,8 @@ defmodule MyApp.DocketNodes.LLM do
          {:ok, response} <- client.chat(request) do
       update =
         %{}
-        |> Map.put(config.output_field, response.text)
-        |> maybe_put(config[:usage_field], response.usage)
+        |> Map.put(config["output_field"], response.text)
+        |> maybe_put(config["usage_field"], response.usage)
 
       {:ok, update}
     end
@@ -77,7 +77,7 @@ defmodule MyApp.DocketNodes.LLM do
   defp system_message(""), do: nil
   defp system_message(prompt), do: %{role: "system", content: prompt}
 
-  defp fetch_llm_client(%{llm_client: client}), do: {:ok, client}
+  defp fetch_llm_client(%{application: %{llm_client: client}}), do: {:ok, client}
   defp fetch_llm_client(_context), do: {:error, :missing_llm_client}
 end
 ```
@@ -85,6 +85,18 @@ end
 `MyApp.DocketNodes.LLM` does know graph state keys, but only because the node
 instance config names them. The reusable implementation stays generic because
 the prompt and output fields are configuration.
+
+A few contract details worth noting:
+
+- Config schemas may be declared with atom keys, but graphs are canonicalized
+  through the JSON-safe wire format before compilation, so `call/3` always
+  receives **string-keyed** config.
+- App-owned context (like the LLM client) is passed as the `:context` run
+  option, and arrives at the node under `context.application`. The other
+  context keys (`run_id`, `node_id`, `step`, `attempt`, `source_versions`,
+  `idempotency_key`) are supplied by the runtime.
+- Constraints like `min`/`max` on `Docket.Schema.float/1` are stored in the
+  schema but not enforced by the v1 validation engine.
 
 ## Prompt Template Helper
 
@@ -173,21 +185,24 @@ state = %{
 }
 
 config = %{
-  model: "gpt-4.1-mini",
-  reasoning_effort: "medium",
-  temperature: 0.3,
-  system_prompt: "You write concise customer support replies.",
-  prompt_template:
+  "model" => "gpt-4.1-mini",
+  "reasoning_effort" => "medium",
+  "temperature" => 0.3,
+  "system_prompt" => "You write concise customer support replies.",
+  "prompt_template" =>
     "Reply to {{customer_message}} using this context: {{account_context}}",
-  output_field: "draft_response",
-  usage_field: "llm_usage"
+  "output_field" => "draft_response",
+  "usage_field" => "llm_usage"
 }
 
 context = %{
-  node_id: "draft_reply",
   run_id: "run_123",
+  node_id: "draft_reply",
+  step: 1,
+  attempt: 1,
+  source_versions: %{"customer_message" => 1, "account_context" => 1},
   idempotency_key: "run_123:1:draft_reply:1",
-  llm_client: client
+  application: %{llm_client: client}
 }
 
 MyApp.DocketNodes.LLM.call(state, config, context)

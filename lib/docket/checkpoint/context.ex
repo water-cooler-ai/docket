@@ -1,6 +1,6 @@
 defmodule Docket.Checkpoint.Context do
   @moduledoc """
-  Context passed to `Docket.Checkpoint.handle/2` alongside each checkpoint.
+  Context passed to `c:Docket.Checkpoint.handle/2` alongside each checkpoint.
 
   `application` carries the caller-supplied application context from the run
   options; Docket does not interpret it.

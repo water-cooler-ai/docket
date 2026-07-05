@@ -8,8 +8,8 @@ defmodule Docket.Event do
 
   - `:run_initialized`, `:run_completed`, `:run_failed`
   - `:node_completed`, `:node_failed` (one `:node_failed` per failed attempt)
-  - `:channel_updated` (payload carries the new version and writer node IDs,
-    not the value)
+  - `:channel_updated` (payload carries the new version or the writer node
+    IDs depending on the write's origin, never the value)
   - `:edge_triggered`
   - `:interrupt_requested`, `:interrupt_resolved`
   """

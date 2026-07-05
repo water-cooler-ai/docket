@@ -54,13 +54,13 @@ defmodule MyApp.Workflows do
     input = Map.new(attrs)
 
     metadata = %{
-      user_id: user.id,
-      account_id: user.account_id,
-      workflow_id: workflow.id,
-      app_run_id: run_id
+      "user_id" => user.id,
+      "account_id" => user.account_id,
+      "workflow_id" => workflow.id,
+      "app_run_id" => run_id
     }
 
-    with {:ok, run} <- MyApp.Docket.run(graph, input, id: run_id, metadata: metadata) do
+    with {:ok, run} <- MyApp.Docket.run(graph, input, run_id: run_id, metadata: metadata) do
       Repo.get_by!(WorkflowRun, docket_run_id: run.id)
     end
   end
@@ -71,7 +71,9 @@ end
 
 `metadata` belongs to the parent app. It is durable identifying context for
 authorization, tenancy, database relationships, projections, and support tools.
-Docket stores and re-emits it, but does not interpret it.
+Docket stores and re-emits it, but does not interpret it. Use string keys:
+metadata crosses the JSON-safe wire format, so a run loaded through
+`Docket.Run.from_map!/1` always carries string-keyed metadata.
 
 ## Persisting Checkpoints
 
@@ -89,9 +91,9 @@ defmodule MyApp.DocketCheckpoint do
   def handle(%Docket.Checkpoint{run: run} = checkpoint, _context) do
     metadata = run.metadata || %{}
 
-    with {:ok, user_id} <- fetch_metadata(metadata, :user_id),
-         {:ok, account_id} <- fetch_metadata(metadata, :account_id),
-         {:ok, workflow_id} <- fetch_metadata(metadata, :workflow_id) do
+    with {:ok, user_id} <- fetch_metadata(metadata, "user_id"),
+         {:ok, account_id} <- fetch_metadata(metadata, "account_id"),
+         {:ok, workflow_id} <- fetch_metadata(metadata, "workflow_id") do
       attrs = %{
         docket_run_id: run.id,
         user_id: user_id,

@@ -1,6 +1,11 @@
 defmodule Docket.Guard do
   @moduledoc """
-  Durable guard expression descriptors used by graph nodes and edges.
+  Durable guard expression descriptors evaluated on graph edges.
+
+  `changed/1`, `version_at_least/2`, `exists/1`, `equals/2`, `all/1`,
+  `any/1`, and `not/1` build boolean expressions. `path/2` (and a bare
+  channel ID) is a reference expression usable only inside `exists/1` and
+  `equals/2`; it is not a standalone guard.
   """
 
   import Kernel, except: [not: 1]

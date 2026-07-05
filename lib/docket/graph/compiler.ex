@@ -3,9 +3,10 @@ defmodule Docket.Graph.Compiler do
   Public verification and runtime materialization entry point.
 
   The compiler is the only path from the public `Docket.Graph` document to the
-  internal `Docket.Runtime.Graph`. `verify/2` and `compile/2` share the same
-  validation rules; `compile/2` additionally lowers the graph and validates
-  the lowered result when no blocking diagnostics were found.
+  internal `Docket.Runtime.Graph`. `verify/2` and `compile/2` run the same
+  pipeline - including lowering and lowered-result validation when no blocking
+  diagnostics were found - and differ only in what they return: `verify/2`
+  returns the annotated public graph, `compile/2` returns the runtime graph.
 
   Representable graph invalidity surfaces as `Docket.Graph.Diagnostic` values
   attached to the returned graph, never as exceptions. Stale diagnostics on

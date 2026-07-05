@@ -110,28 +110,30 @@ defmodule Docket.Runtime.Algorithm do
     |> Enum.reduce_while({:ok, []}, fn node_id, {:ok, acc} ->
       node = Map.fetch!(rtg.nodes, "node:" <> node_id)
 
-      with {:ok, timeout_ms} <- node_timeout(node),
-           {:ok, retry} <- node_retry(node) do
-        task_id = "#{run.id}:#{run.step}:#{node_id}"
+      case Policies.node_policies(node.policies) do
+        {:ok, %{timeout_ms: timeout_ms, retry: retry}} ->
+          task_id = "#{run.id}:#{run.step}:#{node_id}"
 
-        activation = %Activation{
-          task_id: task_id,
-          node_id: node_id,
-          runtime_node_id: node.id,
-          step: run.step,
-          attempt: 1,
-          input_hash: input_hash,
-          idempotency_key: "#{task_id}:1",
-          snapshot: snapshot,
-          source_versions: versions,
-          config: node.config,
-          timeout_ms: timeout_ms,
-          retry: retry
-        }
+          activation = %Activation{
+            task_id: task_id,
+            node_id: node_id,
+            runtime_node_id: node.id,
+            step: run.step,
+            attempt: 1,
+            input_hash: input_hash,
+            idempotency_key: "#{task_id}:1",
+            snapshot: snapshot,
+            source_versions: versions,
+            config: node.config,
+            timeout_ms: timeout_ms,
+            retry: retry
+          }
 
-        {:cont, {:ok, [activation | acc]}}
-      else
-        {:error, message} ->
+          {:cont, {:ok, [activation | acc]}}
+
+        {:error, errors} ->
+          message = Enum.map_join(errors, "; ", fn {_key, message} -> message end)
+
           {:halt,
            {:error, Docket.Error.new(:invalid_policy, message, node_id: node_id, phase: :plan)}}
       end
@@ -139,70 +141,6 @@ defmodule Docket.Runtime.Algorithm do
     |> case do
       {:ok, activations} -> {:ok, Enum.reverse(activations)}
       error -> error
-    end
-  end
-
-  # v1 node policy surface: "timeout_ms" and "retry" => %{"max_attempts",
-  # "backoff_ms"}. "on_error" is reserved for post-v1 routing and rejected so
-  # graphs cannot silently depend on it.
-  defp node_timeout(node) do
-    case Map.get(node.policies, "on_error") do
-      nil ->
-        case Map.get(node.policies, "timeout_ms") do
-          nil ->
-            {:ok, nil}
-
-          value when is_integer(value) and value > 0 ->
-            {:ok, value}
-
-          other ->
-            {:error,
-             "node policy \"timeout_ms\" must be a positive integer, got #{inspect(other)}"}
-        end
-
-      _reserved ->
-        {:error, "node policy \"on_error\" is reserved and not supported in v1"}
-    end
-  end
-
-  defp node_retry(node) do
-    case Map.get(node.policies, "retry") do
-      nil ->
-        {:ok, %{max_attempts: 1, backoff_ms: 0}}
-
-      %{} = retry ->
-        with {:ok, max_attempts} <- retry_field(retry, "max_attempts", 1, &(&1 >= 1)),
-             {:ok, backoff_ms} <- retry_field(retry, "backoff_ms", 0, &(&1 >= 0)),
-             :ok <- retry_known_keys(retry) do
-          {:ok, %{max_attempts: max_attempts, backoff_ms: backoff_ms}}
-        end
-
-      other ->
-        {:error, "node policy \"retry\" must be a map, got #{inspect(other)}"}
-    end
-  end
-
-  defp retry_field(retry, key, default, valid?) do
-    case Map.get(retry, key) do
-      nil ->
-        {:ok, default}
-
-      value when is_integer(value) ->
-        if valid?.(value) do
-          {:ok, value}
-        else
-          {:error, "node retry policy #{inspect(key)} is out of range, got #{value}"}
-        end
-
-      other ->
-        {:error, "node retry policy #{inspect(key)} must be an integer, got #{inspect(other)}"}
-    end
-  end
-
-  defp retry_known_keys(retry) do
-    case Map.keys(retry) -- ["max_attempts", "backoff_ms"] do
-      [] -> :ok
-      extra -> {:error, "node retry policy has unknown keys #{inspect(Enum.sort(extra))}"}
     end
   end
 

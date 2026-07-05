@@ -2,9 +2,8 @@ defmodule Docket.Test.Fixtures.Graphs do
   @moduledoc """
   Small canonical graph fixtures named for the behavior they prove.
 
-  Fixtures follow the catalogs in `docket-v1-test-suite-design.md` section 6
-  and `docket-compiler-design.md` section 15.5. They are plain values; no
-  fixture requires processes or external services.
+  Fixtures are plain values; no fixture requires processes or external
+  services.
   """
 
   alias Docket.Test.Fixtures.Nodes
@@ -169,6 +168,27 @@ defmodule Docket.Test.Fixtures.Graphs do
     )
     |> Graph.put_edge!("edge_start_gate", from: "$start", to: "gate")
     |> Graph.put_edge!("edge_gate_finish", from: "gate", to: "$finish")
+  end
+
+  @doc """
+  start -> blocker -> finish; blocker announces itself to the test
+  coordinator and blocks until released.
+
+  Proves task-executor timeouts, in-flight crash recovery, and deterministic
+  release without wall-clock sleeps. `policies` lets tests attach
+  "timeout_ms"/"retry" node policies.
+  """
+  def blocking(policies \\ %{}) do
+    Graph.new!(id: "blocking")
+    |> Graph.put_field!("out", schema: Schema.string())
+    |> Graph.put_node!("blocker",
+      implementation: Nodes.SleepsUntilReleased,
+      config: %{field: "out", value: "released"},
+      policies: policies
+    )
+    |> Graph.put_edge!("edge_start_blocker", from: "$start", to: "blocker")
+    |> Graph.put_edge!("edge_blocker_finish", from: "blocker", to: "$finish")
+    |> Graph.put_output!("out", [])
   end
 
   @doc """

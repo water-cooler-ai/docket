@@ -325,10 +325,30 @@ defmodule Docket.Graph.Compiler.Validation do
 
   defp validate_nodes(graph, config_schemas) do
     for {id, node} <- sorted(graph.nodes),
-        diagnostic <- validate_node(id, node, config_schemas) do
+        diagnostic <- validate_node(id, node, config_schemas) ++ validate_node_policies(id, node) do
       diagnostic
     end
   end
+
+  # 9.5: the v1 node policy surface defined by the runtime ("timeout_ms",
+  # "retry", reserved "on_error"). The rules live in Policies so the compiler
+  # and plan-time validation cannot drift apart.
+  defp validate_node_policies(id, %Graph.Node{policies: policies}) do
+    case Policies.node_policies(canonicalize_open(policies)) do
+      {:ok, _resolved} ->
+        []
+
+      {:error, errors} ->
+        for {key, message} <- errors do
+          error(:invalid_policy, "node #{inspect(id)}: #{message}",
+            path: [:nodes, id, :policies] ++ List.wrap(key),
+            public_id: id
+          )
+        end
+    end
+  end
+
+  defp validate_node_policies(_id, _other), do: []
 
   defp validate_node(id, %Graph.Node{} = node, config_schemas) do
     case node.implementation do

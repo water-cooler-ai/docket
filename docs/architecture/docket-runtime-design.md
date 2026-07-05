@@ -1,11 +1,14 @@
-# Docket: Elixir Durable Graph Runtime Library Design
+# Docket Runtime: Design Rationale And Background
 
-Status: reference draft
+Status: design rationale and background, not a current spec
 Date: 2026-06-25
 
-Implementation note: use `docs/architecture/docket-v1-implementation-path.md`
-as the active v1 build sequence. This document is background and rationale for
-the runtime model.
+Implementation note: this document records the research basis, mental
+model, goals, and alternatives considered for the runtime. Concrete
+structs and APIs are canonical in code under `lib/docket/` and in
+`docket-graph-execution-contract-design.md` and `docket-compiler-design.md`;
+where an earlier draft sketched a struct, this document now points at the real
+module instead.
 
 ## 1. Executive Summary
 
@@ -360,7 +363,6 @@ Major v1 modules:
 ```text
 Docket.Graph
 Docket.Node
-Docket.Channel
 Docket.Run
 Docket.Runtime
 Docket.Runtime.Registry
@@ -371,6 +373,9 @@ Docket.Event
 Docket.Interrupt
 Docket.Graph.Compiler
 ```
+
+Channels are internal in v1: state fields and edges lower to
+`Docket.Runtime.Graph.Channel` records rather than a public channel module.
 
 Post-v1 modules can add first-class telemetry, streaming, timers, and related
 inspection surfaces without changing the v1 execution loop.
@@ -405,40 +410,9 @@ Docket lowers the canonical graph into `Docket.Runtime.Graph` when it needs to
 verify a publish or start a run. The host application should not assemble
 runtime graph internals or persist ad hoc runtime structure outside Docket.
 
-```elixir
-defmodule Docket.Graph do
-  defstruct [
-    :id,
-    :name,
-    :schema_version,
-    fields: %{},
-    inputs: %{},
-    outputs: %{},
-    nodes: %{},
-    edges: %{},
-    metadata: %{},
-    policies: %{}
-  ]
-end
-```
-
-The runtime materialization is internal:
-
-```elixir
-defmodule Docket.Runtime.Graph do
-  defstruct [
-    :id,
-    :schema_version,
-    :input_channels,
-    :output_channels,
-    nodes: %{},
-    channels: %{},
-    lowering: %{},
-    metadata: %{},
-    policies: %{}
-  ]
-end
-```
+See `Docket.Graph` (`lib/docket/graph.ex`) for the canonical public graph
+document struct and `Docket.Runtime.Graph` (`lib/docket/runtime/graph.ex`) for
+the internal runtime materialization.
 
 Graph metadata belongs in the canonical graph or host storage metadata, not in
 run state:
@@ -459,70 +433,17 @@ expression indexes if it needs operational queries.
 
 ### 8.1 Runtime Graph Node
 
-```elixir
-defmodule Docket.Runtime.Graph.Node do
-  defstruct [
-    :id,
-    :module,
-    :function,
-    :executor,
-    :timeout,
-    :retry,
-    :cache,
-    :on_error,
-    config: %{},
-    subscribe: [],
-    outgoing_edges: [],
-    metadata: %{}
-  ]
-end
-```
-
-Fields:
-
-- `id`: stable runtime node identity derived from the public graph node.
-- `module` / `function`: local implementation, if any.
-- `executor`: local, remote, task queue, MCP, HTTP, or custom adapter.
-- `subscribe`: channels whose version changes activate the node.
-- `outgoing_edges`: runtime edge records evaluated after successful completion.
-- `timeout`: node execution timeout.
-- `retry`: retry policy.
-- `cache`: optional deterministic memoization policy.
-- `on_error`: fail run, write error channel, retry, skip, or route.
-- `config`: normalized node-facing configuration passed to `Docket.Node.call/3`.
-- `metadata`: application-owned data plus public ID mapping.
+A runtime graph node names the implementation, subscriptions, outgoing edge
+references, executor settings, and normalized config for one lowered public
+node. See `Docket.Runtime.Graph.Node` (`lib/docket/runtime/graph/node.ex`) for
+the canonical struct.
 
 ### 8.2 Runtime Graph Channel
 
-```elixir
-defmodule Docket.Runtime.Graph.Channel do
-  defstruct [
-    :id,
-    :type,
-    :value_schema,
-    :update_schema,
-    :reducer,
-    :visibility,
-    :retention,
-    :snapshot_frequency,
-    :default,
-    metadata: %{}
-  ]
-end
-```
-
-Fields:
-
-- `id`: stable channel identity.
-- `type`: channel module or built-in type.
-- `value_schema`: stored value shape.
-- `update_schema`: write/update shape.
-- `reducer`: how pending writes become the next channel value.
-- `visibility`: persistent, ephemeral, run_private, stream_public, etc.
-- `retention`: how much write history to keep.
-- `snapshot_frequency`: for delta channels.
-- `default`: initial value.
-- `metadata`: application-owned data.
+A runtime graph channel is the lowered storage/activation primitive behind a
+public input, state field, or edge. See `Docket.Runtime.Graph.Channel`
+(`lib/docket/runtime/graph/channel.ex`) for the canonical struct; v1 channel
+types are `:last_value`, `:ephemeral`, and `:barrier`.
 
 Channel schemas should be strongly typed by default. The runtime should validate
 both stored values and incoming updates before applying reducers.
@@ -648,37 +569,10 @@ fresh `Docket.Run` from input; resume passes the durable run loaded by the host.
 initialize a fresh run or continue a saved run.
 
 `Docket.Run` should be a real struct with nested structs for channel, task,
-interrupt, and timer records where useful. Host applications persist and pass it
+and interrupt records where useful. Host applications persist and pass it
 back, but they do not construct, pattern match, mutate, or depend on
-Docket-owned execution internals.
-
-```elixir
-defmodule Docket.Run do
-  defstruct [
-    :id,
-    :graph_id,
-    :graph_hash,
-    :status,
-    :step,
-    :input,
-    :output,
-    :started_at,
-    :updated_at,
-    :finished_at,
-    channels: %{},
-    channel_versions: %{},
-    changed_channels: MapSet.new(),
-    active_tasks: %{},
-    pending_writes: [],
-    interrupts: %{},
-    timers: %{},
-    checkpoint_seq: 0,
-    event_seq: 0,
-    version: 1,
-    metadata: %{}
-  ]
-end
-```
+Docket-owned execution internals. See `Docket.Run` (`lib/docket/run.ex`) for
+the canonical struct.
 
 If a host stores runs in a format that cannot persist Elixir structs directly,
 Docket should provide explicit codecs rather than making hosts treat the run as
@@ -698,79 +592,12 @@ Docket.Run.from_map!(map()) :: %Docket.Run{}
 The wire representation is a map at the storage boundary. The public runtime
 API and in-memory state remain structured `%Docket.Run{}` values.
 
-### 9.1 Channel State
+### 9.1 Nested Run State
 
-```elixir
-defmodule Docket.Run.ChannelState do
-  defstruct [
-    :channel_id,
-    :value,
-    :version,
-    :updated_at,
-    :last_writer,
-    writes_by_step: %{}
-  ]
-end
-```
-
-Channel version increments only when the update barrier changes the stored
-value or when the channel policy says every write creates a new version.
-
-### 9.2 Task State
-
-```elixir
-defmodule Docket.Run.TaskState do
-  defstruct [
-    :task_id,
-    :node_id,
-    :superstep,
-    :attempt,
-    :status,
-    :input_hash,
-    :started_at,
-    :deadline_at,
-    :executor_ref,
-    :idempotency_key,
-    metadata: %{}
-  ]
-end
-```
-
-Task state is durable enough to reconcile late completions after process restarts.
-
-### 9.3 Interrupt State
-
-```elixir
-defmodule Docket.Run.InterruptState do
-  defstruct [
-    :id,
-    :node_id,
-    :status,
-    :resume_channel,
-    :schema,
-    :created_at,
-    :resolved_at,
-    metadata: %{}
-  ]
-end
-```
-
-### 9.4 Timer State
-
-```elixir
-defmodule Docket.Run.TimerState do
-  defstruct [
-    :id,
-    :kind,
-    :status,
-    :due_at,
-    :created_at,
-    :fired_at,
-    payload: %{},
-    metadata: %{}
-  ]
-end
-```
+The nested channel, task, and interrupt records are canonical in code: see
+`Docket.Run.ChannelState`, `Docket.Run.TaskState`, and
+`Docket.Run.InterruptState` under `lib/docket/run/`. Timers are a post-v1
+surface; `Docket.Run.timers` is a plain map placeholder in v1.
 
 ## 10. Runtime Process Topology
 
@@ -865,11 +692,11 @@ config = node_config
 context = %{
   run_id: run_id,
   node_id: node_id,
-  superstep: step,
-  source_versions: state_channel_versions,
-  application: application_context,
+  step: step,
   attempt: attempt,
-  idempotency_key: key
+  source_versions: source_versions,
+  idempotency_key: idempotency_key,
+  application: application_context
 }
 ```
 
@@ -883,7 +710,7 @@ or:
 
 ```elixir
 {:interrupt, %Docket.Interrupt{...}}
-{:await, %Docket.Await{...}}
+{:await, term}   # reserved post-v1; v1 treats it as a permanent node failure
 {:error, reason}
 ```
 
@@ -924,7 +751,7 @@ def update(graph, run, task_outputs) do
       changed_channels: changed,
       pending_writes: [],
       active_tasks: %{},
-      superstep: run.superstep + 1,
+      step: run.step + 1,
       updated_at: now()
     }
 
@@ -959,31 +786,18 @@ channels. A channel owns:
 - retention
 - checkpoint encoding
 
-### 12.1 Channel Behaviour
+### 12.1 Channel Representation
 
-```elixir
-defmodule Docket.Channel do
-  @callback init(definition :: map()) :: {:ok, term()} | {:error, term()}
+v1 does not expose a public channel behaviour. Channel types are a closed
+internal set on `Docket.Runtime.Graph.Channel`
+(`lib/docket/runtime/graph/channel.ex`), and reducer/guard semantics live in
+`Docket.Runtime.Algorithm`.
 
-  @callback apply_updates(
-              current :: term(),
-              updates :: [term()],
-              context :: map()
-            ) :: {:ok, term()} | {:error, term()}
+### 12.2 v1 Channel Types
 
-  @callback changed?(old :: term(), new :: term()) :: boolean()
+#### LastValue (`:last_value`)
 
-  @callback encode(value :: term()) :: {:ok, term()} | {:error, term()}
-
-  @callback decode(value :: term()) :: {:ok, term()} | {:error, term()}
-end
-```
-
-### 12.2 Built-In Channel Types
-
-#### LastValue
-
-Stores the last update. Useful for simple state and edge signals.
+Stores the last committed value. Used for input and state channels.
 
 Conflict policy:
 
@@ -991,48 +805,15 @@ Conflict policy:
 - If multiple updates in one step: error by default, or use a configured
   conflict policy.
 
-#### Topic
+#### Ephemeral (`:ephemeral`)
 
-Stores a collection of updates. Useful for fan-in, messages, and streaming
-outputs.
+Visible for one step and then cleared. Used for generated edge activation
+channels.
 
-Options:
+#### Barrier (`:barrier`)
 
-- accumulate across steps
-- clear after read
-- deduplicate by key
-- max length
-- retention window
-
-#### Aggregate
-
-Stores a persistent value updated by a reducer.
-
-Reducer requirements:
-
-- deterministic
-- associative when batching may vary
-- side-effect free
-
-#### Delta
-
-Stores writes per step and reconstructs the value with snapshots. Useful for
-large growing values such as message lists.
-
-Options:
-
-- snapshot frequency
-- compaction policy
-- reconstruction limit
-
-#### Ephemeral
-
-Visible for one step and then cleared. Useful for edge signals.
-
-#### Barrier
-
-Activates only when a configured set of upstream channels has reached required
-versions or predicates.
+Activates only when every source of a multi-source edge has completed since
+the barrier last fired.
 
 Useful for fan-in:
 
@@ -1040,13 +821,10 @@ Useful for fan-in:
 run reviewer only after researcher and tester have both written
 ```
 
-#### Error
-
-Collects node failures when policy routes errors instead of failing the run.
-
-#### Command
-
-Records external commands to be performed by the host application or executor.
+Richer channel families explored during research - topics, reducer-backed
+aggregates, delta channels with snapshots, error-collection channels, and
+command channels - are deferred post-v1 design space (see the resolved v1
+scope section).
 
 ## 13. Activation and Guards
 
@@ -1103,11 +881,14 @@ External effects should use one of two paths:
 1. Node execution via an Executor adapter.
 2. Commands emitted by nodes and interpreted by the host.
 
-Each effect gets an idempotency key:
+Each effect gets an idempotency key derived from committed run state:
 
 ```text
-{run_id}:{superstep}:{node_id}:{attempt}:{command_index}
+{run_id}:{step}:{node_id}:{attempt}
 ```
+
+A future command protocol may append a command index for node-emitted
+commands.
 
 Executor adapters must support one of these delivery semantics:
 
@@ -1255,32 +1036,8 @@ be safe to receive the same checkpoint more than once.
 
 ### 15.3 Run Document Shape
 
-`Docket.Run` is the public restorable run document:
-
-```elixir
-%Docket.Run{
-  id: run_id,
-  graph_id: graph.id,
-  graph_hash: Docket.Graph.hash(graph),
-  status: :running,
-  step: 12,
-  input: input,
-  output: nil,
-  channels: %{},
-  channel_versions: %{},
-  changed_channels: MapSet.new(),
-  active_tasks: %{},
-  pending_writes: [],
-  interrupts: %{},
-  timers: %{},
-  checkpoint_seq: 0,
-  event_seq: 0,
-  metadata: metadata,
-  started_at: started_at,
-  updated_at: updated_at,
-  finished_at: nil
-}
-```
+`Docket.Run` is the public restorable run document; see `Docket.Run`
+(`lib/docket/run.ex`) for the canonical struct.
 
 Apps may inspect top-level fields such as `id`, `graph_id`, `graph_hash`,
 `status`, `step`, `input`, `output`, and timestamps. The run also contains
@@ -1310,47 +1067,11 @@ graph = MyApp.Graphs.fetch_docket_graph!(run.graph_id, run.graph_hash)
 
 ### 15.4 Event History
 
-Events should be append-only.
-
-Common event types:
-
-- `run_initialized`
-- `run_completed`
-- `run_failed`
-- `superstep_planned`
-- `node_started`
-- `node_completed`
-- `node_failed`
-- `node_awaiting`
-- `async_node_completed`
-- `async_node_failed`
-- `channel_updated`
-- `checkpoint_emitted`
-- `interrupt_requested`
-- `interrupt_resolved`
-- `timer_scheduled`
-- `timer_fired`
-- `command_emitted`
-- `command_completed`
-
-Event shape:
-
-```elixir
-defmodule Docket.Event do
-  defstruct [
-    :run_id,
-    :seq,
-    :type,
-    :superstep,
-    :node_id,
-    :channel_id,
-    :task_id,
-    :timestamp,
-    :payload,
-    :metadata
-  ]
-end
-```
+Events should be append-only. See `Docket.Event` (`lib/docket/event.ex`) for
+the canonical struct and the v1 event types (run lifecycle, node completion
+and failure, channel updates, edge triggers, and interrupts). Post-v1
+protocols may add event types for planning, async/late completions, timers,
+and commands.
 
 Events are emitted with checkpoints. Apps that need replay, time travel,
 debugging, or audit history may persist `checkpoint.events`. Apps that only need
@@ -1814,10 +1535,6 @@ Docket.resolve_interrupt(MyApp.Docket, run.id, interrupt_id, %{"approved" => tru
 
 ### 24.5 Test Helpers And Inline Runtime
 
-See `docs/architecture/docket-v1-test-suite-design.md` for the full v1 test
-suite plan, including construction, compiler, inline execution, supervised
-runtime, fixture, helper, and ETS-backed test adapter coverage.
-
 Most Docket runtime tests should not need to exercise supervision, GenServer
 mailboxes, or BEAM scheduling. Docket should expose an inline test runtime that
 executes graph transitions in the calling test process while using the same loop
@@ -1899,10 +1616,13 @@ defmodule Docket.Executor do
             ) ::
               {:ok, state_update :: map()}
               | {:interrupt, Docket.Interrupt.t()}
-              | {:await, Docket.Await.t()}
+              | {:await, term()}
               | {:error, term()}
 end
 ```
+
+`{:await, term()}` is reserved for post-v1 late-completion protocols; v1
+treats it as a permanent node failure.
 
 Built-in executors:
 

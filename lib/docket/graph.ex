@@ -62,7 +62,7 @@ defmodule Docket.Graph do
 
   Options must be a keyword list. Supported options are:
 
-  - `:id` - graph ID; generated when omitted
+  - `:id` - graph ID; generated when omitted (via `:id_generator` when given)
   - `:name` - optional display name
   - `:description` - optional description
   - `:schema_version` - Docket graph document schema version
@@ -225,7 +225,7 @@ defmodule Docket.Graph do
   strings and terms with no JSON representation are rejected. Keys starting
   with `"$"` are reserved for the wire format.
   """
-  @spec policy!(t(), binary(), term(), keyword()) :: t()
+  @spec policy!(t(), binary() | atom(), term(), keyword()) :: t()
   def policy!(graph, key, value, opts \\ [])
 
   def policy!(%__MODULE__{} = graph, key, value, opts) do
@@ -254,7 +254,7 @@ defmodule Docket.Graph do
   strings and terms with no JSON representation are rejected. Keys starting
   with `"$"` are reserved for the wire format.
   """
-  @spec metadata!(t(), binary(), term(), keyword()) :: t()
+  @spec metadata!(t(), binary() | atom(), term(), keyword()) :: t()
   def metadata!(graph, key, value, opts \\ [])
 
   def metadata!(%__MODULE__{} = graph, key, value, opts) do
@@ -288,11 +288,11 @@ defmodule Docket.Graph do
   JSON representation - tuples, keyword lists, pids, refs, functions, structs -
   raise `Docket.Graph.Error` (`:non_durable_value` and friends).
 
-  The graph hash is computed from this document, so it is stable across
-  storage round trips: `hash(from_map!(to_map(graph))) == hash(graph)` for any
-  dumpable graph. Graphs whose open content is already canonical (string keys
-  and values) also round-trip on struct equality:
-  `from_map!(to_map(graph)) == graph`.
+  The graph hash is computed from this document, so for graphs built through
+  the editing API it is stable across storage round trips:
+  `hash(from_map!(to_map(graph))) == hash(graph)`. Graphs whose open content
+  is already canonical (string keys and values) also round-trip on struct
+  equality: `from_map!(to_map(graph)) == graph`.
   """
   @spec to_map(t(), keyword()) :: map()
   def to_map(%__MODULE__{} = graph, opts \\ []) do
