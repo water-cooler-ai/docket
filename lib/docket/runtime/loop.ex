@@ -771,6 +771,7 @@ defmodule Docket.Runtime.Loop do
       :sync ->
         case deliver_checkpoint(config.checkpoint, checkpoint, context) do
           :ok ->
+            Docket.Telemetry.emit_events(run, events)
             {:ok, run, [{:checkpoint, checkpoint, context, :accepted}]}
 
           {:error, reason} ->
@@ -782,6 +783,7 @@ defmodule Docket.Runtime.Loop do
         end
 
       :async ->
+        Docket.Telemetry.emit_events(run, events)
         {:ok, run, [{:checkpoint, checkpoint, context, :pending}]}
     end
   end
