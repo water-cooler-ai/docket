@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Optional Postgres deps present — the default experience.
+          - name: full
+            core_only: ""
+          # Core-only host: no ecto_sql/postgrex. See CONTRIBUTING.md.
+          - name: core
+            core_only: "1"
+    env:
+      DOCKET_CORE_ONLY: ${{ matrix.core_only }}
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ matrix.name }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-${{ matrix.name }}-
+
+      - run: mix deps.get
+
+      - run: mix compile --warnings-as-errors
+
+      - run: mix test

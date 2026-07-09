@@ -5,6 +5,10 @@ built for long-running, interruptible work like agentic LLM sessions, where a
 run may pause for a human decision, survive a deploy, and resume exactly where
 it left off.
 
+This README describes the `0.0.x` core runtime line. The transition toward the
+`0.1.0` operational runtime with the `Docket.Postgres` backend is documented in
+[docs/architecture/docket-operational-transition-spec.md](docs/architecture/docket-operational-transition-spec.md).
+
 You describe a workflow as a graph document: nodes that do work, shared state
 fields they read and write, and edges (optionally guarded) that decide what
 runs next. Docket executes the graph in deterministic supersteps, emitting a

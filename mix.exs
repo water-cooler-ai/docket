@@ -1,7 +1,13 @@
 defmodule Docket.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.1.0-dev"
+  @source_url "https://github.com/water-cooler-ai/docket"
+
+  # Set by the core-only CI leg to build and test without the optional
+  # Postgres dependencies, mirroring a host application that uses only the
+  # dependency-free core. See CONTRIBUTING.md.
+  @core_only? System.get_env("DOCKET_CORE_ONLY") in ["1", "true"]
 
   def project do
     [
@@ -10,7 +16,12 @@ defmodule Docket.MixProject do
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      description:
+        "Durable, graph-based workflow execution for long-running, " <>
+          "interruptible work like agentic LLM sessions.",
+      package: package(),
+      source_url: @source_url
     ]
   end
 
@@ -27,6 +38,29 @@ defmodule Docket.MixProject do
     [
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false, warn_if_outdated: true}
+    ] ++ postgres_deps()
+  end
+
+  # The Postgres backend (`Docket.Postgres.*`) compiles only when the host
+  # application already depends on ecto_sql and postgrex; core-only hosts
+  # pull in nothing beyond telemetry.
+  defp postgres_deps do
+    if @core_only? do
+      []
+    else
+      [
+        {:ecto_sql, "~> 3.10", optional: true},
+        {:postgrex, "~> 0.17", optional: true}
+      ]
+    end
+  end
+
+  defp package do
+    [
+      # TODO: choose a license before the first Hex publish.
+      licenses: [],
+      links: %{"GitHub" => @source_url},
+      files: ~w(lib mix.exs README.md docs/architecture)
     ]
   end
 end
