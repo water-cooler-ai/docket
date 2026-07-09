@@ -1,88 +1,93 @@
 defmodule Docket.Test.MemoryBackend do
   @moduledoc """
-  Agent-backed reference implementation of `Docket.Storage` and
-  `Docket.Coordinator`.
+  Agent-backed conformance backend for the storage and coordination contracts.
 
-  Tests start one agent per test and pass its pid as the backend context:
-
-      {:ok, backend} = MemoryBackend.start_link()
-      {:ok, run} =
-        MemoryBackend.initialize_run(
-          backend,
-          graph_id,
-          graph_hash,
-          graph_document,
-          checkpoint,
-          wake_at,
-          []
-        )
-      {:ok, run} = MemoryBackend.fetch_run(backend, run.id, [])
-
-  The claim TTL that governs steals is controllable with the `:orphan_ttl_ms`
-  start option (default generous) so a steal test need not sleep long.
+  `transaction/2` works on an isolated state snapshot and publishes that
+  snapshot only when the transaction function returns `{:ok, value}`. This is
+  intentionally a test implementation; production backends provide their own
+  transactional context.
   """
 
   @behaviour Docket.Storage
+  @behaviour Docket.Storage.Graphs
+  @behaviour Docket.Storage.Runs
+  @behaviour Docket.Storage.Events
   @behaviour Docket.Coordinator
 
   @default_orphan_ttl_ms 60_000
 
   defstruct runs: %{}, graphs: %{}, orphan_ttl_ms: @default_orphan_ttl_ms
 
-  # Per-run record held in the agent state.
-  defp new_record(run, tenant_id) do
-    %{
-      run: run,
-      tenant_id: tenant_id,
-      claim_token: nil,
-      claimed_at: nil,
-      wake_at: nil,
-      attempts: 0,
-      operational_status: :active,
-      operational_error: nil,
-      checkpoints: [],
-      events: []
-    }
-  end
-
   def start_link(opts \\ []) do
     ttl = Keyword.get(opts, :orphan_ttl_ms, @default_orphan_ttl_ms)
     Agent.start_link(fn -> %__MODULE__{orphan_ttl_ms: ttl} end)
   end
 
-  # ---------------------------------------------------------------------------
-  # Docket.Storage
-  # ---------------------------------------------------------------------------
-
   @impl Docket.Storage
-  def initialize_run(backend, graph_id, graph_hash, document, checkpoint, wake_at, opts) do
-    run = checkpoint.run
-    tenant_id = Keyword.get(opts, :tenant_id)
+  def transaction(backend, fun) do
+    snapshot = Agent.get(backend, & &1)
+    {:ok, transaction} = Agent.start_link(fn -> snapshot end)
 
+    try do
+      case fun.(transaction) do
+        {:ok, _value} = result ->
+          committed = Agent.get(transaction, & &1)
+          Agent.update(backend, fn _state -> committed end)
+          result
+
+        {:error, _reason} = error ->
+          error
+
+        other ->
+          raise ArgumentError,
+                "storage transaction must return {:ok, value} or {:error, reason}, got: #{inspect(other)}"
+      end
+    after
+      if Process.alive?(transaction), do: Agent.stop(transaction)
+    end
+  end
+
+  @impl Docket.Storage.Graphs
+  def save_graph(backend, graph_id, graph_hash, document, _opts) do
     Agent.get_and_update(backend, fn state ->
-      with false <- Map.has_key?(state.runs, run.id),
-           :ok <- graph_compatible?(state, graph_id, graph_hash, document) do
-        record = %{
-          new_record(run, tenant_id)
-          | wake_at: wake_at,
-            checkpoints: [checkpoint],
-            events: checkpoint.events
-        }
+      case Map.fetch(state.graphs, {graph_id, graph_hash}) do
+        :error ->
+          {:ok, put_in(state.graphs[{graph_id, graph_hash}], document)}
 
-        state =
-          state
-          |> put_in([Access.key(:graphs), {graph_id, graph_hash}], document)
-          |> put_in([Access.key(:runs), run.id], record)
+        {:ok, ^document} ->
+          {:ok, state}
 
-        {{:ok, run}, state}
-      else
-        true -> {{:error, :already_exists}, state}
-        {:error, reason} -> {{:error, reason}, state}
+        {:ok, _other} ->
+          {{:error, :graph_hash_conflict}, state}
       end
     end)
   end
 
-  @impl Docket.Storage
+  @impl Docket.Storage.Graphs
+  def fetch_graph(backend, graph_id, graph_hash, _opts) do
+    Agent.get(backend, fn state ->
+      case Map.fetch(state.graphs, {graph_id, graph_hash}) do
+        {:ok, document} -> {:ok, document}
+        :error -> {:error, :not_found}
+      end
+    end)
+  end
+
+  @impl Docket.Storage.Runs
+  def insert_run(backend, run, wake_at, opts) do
+    tenant_id = Keyword.get(opts, :tenant_id)
+
+    Agent.get_and_update(backend, fn state ->
+      if Map.has_key?(state.runs, run.id) do
+        {{:error, :already_exists}, state}
+      else
+        record = new_record(run, tenant_id, wake_at)
+        {{:ok, run}, put_in(state.runs[run.id], record)}
+      end
+    end)
+  end
+
+  @impl Docket.Storage.Runs
   def fetch_run(backend, run_id, opts) do
     tenant_id = Keyword.get(opts, :tenant_id, :_any)
 
@@ -96,19 +101,107 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage
-  def fetch_graph(backend, graph_id, graph_hash, _opts) do
-    Agent.get(backend, fn state ->
-      case Map.fetch(state.graphs, {graph_id, graph_hash}) do
-        {:ok, document} -> {:ok, document}
-        :error -> {:error, :not_found}
+  @impl Docket.Storage.Runs
+  def commit(backend, checkpoint, fence, disposition, _opts) do
+    run = checkpoint.run
+    now = DateTime.utc_now()
+
+    Agent.get_and_update(backend, fn state ->
+      case fetch_record(state, run.id) do
+        {:ok, record} ->
+          if fence_ok?(record, fence) and valid_commit?(checkpoint, record) do
+            record =
+              record
+              |> Map.put(:run, run)
+              |> apply_disposition(disposition, fence.claim_token, now)
+
+            {{:ok, run}, put_in(state.runs[run.id], record)}
+          else
+            {{:error, :stale_fence}, state}
+          end
+
+        :error ->
+          {{:error, :not_found}, state}
       end
     end)
   end
 
-  # ---------------------------------------------------------------------------
-  # Docket.Coordinator
-  # ---------------------------------------------------------------------------
+  @impl Docket.Storage.Runs
+  def mutate_run(backend, run_id, mutation, opts) do
+    tenant_id = Keyword.get(opts, :tenant_id, :_any)
+    now = DateTime.utc_now()
+
+    Agent.get_and_update(backend, fn state ->
+      with {:ok, record} <- fetch_record(state, run_id),
+           :ok <- tenant_check(record, tenant_id),
+           {:commit, checkpoint, disposition} <- mutation.(record.run),
+           :ok <- validate_serialized_checkpoint(record, checkpoint) do
+        record =
+          record
+          |> Map.put(:run, checkpoint.run)
+          |> apply_disposition(disposition, nil, now)
+
+        {{:ok, checkpoint}, put_in(state.runs[run_id], record)}
+      else
+        :error -> {{:error, :not_found}, state}
+        {:error, reason} -> {{:error, reason}, state}
+        _invalid_proposal -> {{:error, :invalid_mutation}, state}
+      end
+    end)
+  end
+
+  @impl Docket.Storage.Runs
+  def retry_poisoned_run(backend, run_id, opts) do
+    tenant_id = Keyword.get(opts, :tenant_id, :_any)
+
+    Agent.get_and_update(backend, fn state ->
+      with {:ok, record} <- fetch_record(state, run_id),
+           true <- tenant_matches?(record, tenant_id) do
+        case {record.operational_status, Docket.Run.terminal?(record.run)} do
+          {:active, _} ->
+            {{:ok, record.run}, state}
+
+          {:blocked, _} ->
+            {{:error, :blocked}, state}
+
+          {:poisoned, true} ->
+            {{:error, :inactive_run}, state}
+
+          {:poisoned, false} ->
+            record = %{
+              record
+              | operational_status: :active,
+                operational_error: nil,
+                attempts: 0,
+                claim_token: nil,
+                claimed_at: nil,
+                wake_at: DateTime.utc_now()
+            }
+
+            {{:ok, record.run}, put_in(state.runs[run_id], record)}
+        end
+      else
+        _ -> {{:error, :not_found}, state}
+      end
+    end)
+  end
+
+  @impl Docket.Storage.Events
+  def append_events(backend, run_id, events, opts) do
+    tenant_id = Keyword.get(opts, :tenant_id, :_any)
+
+    Agent.get_and_update(backend, fn state ->
+      with {:ok, record} <- fetch_record(state, run_id),
+           :ok <- tenant_check(record, tenant_id),
+           {:ok, merged} <- merge_events(record.events, run_id, events) do
+        record = %{record | events: merged}
+        {:ok, put_in(state.runs[run_id], record)}
+      else
+        :error -> {{:error, :not_found}, state}
+        {:error, reason} -> {{:error, reason}, state}
+      end
+    end)
+  end
 
   @impl Docket.Coordinator
   def claim_run(backend, run_id, claim_token, _opts) do
@@ -158,112 +251,10 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage
-  def commit(backend, checkpoint, fence, disposition, _opts) do
-    run = checkpoint.run
-    now = DateTime.utc_now()
-
-    Agent.get_and_update(backend, fn state ->
-      case fetch_record(state, run.id) do
-        {:ok, record} ->
-          if fence_ok?(record, fence) do
-            record =
-              record
-              |> Map.put(:run, run)
-              |> Map.update!(:checkpoints, &(&1 ++ [checkpoint]))
-              |> Map.update!(:events, &(&1 ++ checkpoint.events))
-              |> apply_disposition(disposition, fence.claim_token, now)
-
-            {{:ok, run}, put_in(state.runs[run.id], record)}
-          else
-            {{:error, :stale_fence}, state}
-          end
-
-        :error ->
-          {{:error, :not_found}, state}
-      end
-    end)
-  end
-
-  @impl Docket.Storage
-  def mutate_run(backend, run_id, mutation, opts) do
-    tenant_id = Keyword.get(opts, :tenant_id, :_any)
-    now = DateTime.utc_now()
-
-    Agent.get_and_update(backend, fn state ->
-      with {:ok, record} <- fetch_record(state, run_id),
-           :ok <- tenant_check(record, tenant_id),
-           {:commit, checkpoint, disposition} <- mutation.(record.run),
-           :ok <- validate_serialized_checkpoint(record, checkpoint) do
-        record =
-          record
-          |> Map.put(:run, checkpoint.run)
-          |> Map.update!(:checkpoints, &(&1 ++ [checkpoint]))
-          |> Map.update!(:events, &(&1 ++ checkpoint.events))
-          |> apply_disposition(disposition, nil, now)
-
-        {{:ok, checkpoint.run}, put_in(state.runs[run_id], record)}
-      else
-        :error -> {{:error, :not_found}, state}
-        {:error, reason} -> {{:error, reason}, state}
-        _invalid_proposal -> {{:error, :invalid_mutation}, state}
-      end
-    end)
-  end
-
-  @impl Docket.Storage
-  def retry_poisoned_run(backend, run_id, opts) do
-    tenant_id = Keyword.get(opts, :tenant_id, :_any)
-
-    Agent.get_and_update(backend, fn state ->
-      with {:ok, record} <- fetch_record(state, run_id),
-           true <- tenant_matches?(record, tenant_id) do
-        case {record.operational_status, Docket.Run.terminal?(record.run)} do
-          {:active, _} ->
-            {{:ok, record.run}, state}
-
-          {:blocked, _} ->
-            {{:error, :blocked}, state}
-
-          {:poisoned, true} ->
-            {{:error, :inactive_run}, state}
-
-          {:poisoned, false} ->
-            record = %{
-              record
-              | operational_status: :active,
-                operational_error: nil,
-                attempts: 0,
-                claim_token: nil,
-                claimed_at: nil,
-                wake_at: DateTime.utc_now()
-            }
-
-            {{:ok, record.run}, put_in(state.runs[run_id], record)}
-        end
-      else
-        _ -> {{:error, :not_found}, state}
-      end
-    end)
-  end
-
-  # ---------------------------------------------------------------------------
-  # Read helpers for assertions
-  # ---------------------------------------------------------------------------
-
   def events(backend, run_id) do
     Agent.get(backend, fn state ->
       case fetch_record(state, run_id) do
         {:ok, record} -> record.events
-        :error -> nil
-      end
-    end)
-  end
-
-  def checkpoints(backend, run_id) do
-    Agent.get(backend, fn state ->
-      case fetch_record(state, run_id) do
-        {:ok, record} -> record.checkpoints
         :error -> nil
       end
     end)
@@ -299,19 +290,21 @@ defmodule Docket.Test.MemoryBackend do
     Agent.get(backend, &get_in(&1.runs[run_id].operational_status))
   end
 
-  # ---------------------------------------------------------------------------
-  # Internals
-  # ---------------------------------------------------------------------------
+  defp new_record(run, tenant_id, wake_at) do
+    %{
+      run: run,
+      tenant_id: tenant_id,
+      claim_token: nil,
+      claimed_at: nil,
+      wake_at: wake_at,
+      attempts: 0,
+      operational_status: :active,
+      operational_error: nil,
+      events: []
+    }
+  end
 
   defp fetch_record(state, run_id), do: Map.fetch(state.runs, run_id)
-
-  defp graph_compatible?(state, graph_id, graph_hash, document) do
-    case Map.fetch(state.graphs, {graph_id, graph_hash}) do
-      :error -> :ok
-      {:ok, ^document} -> :ok
-      {:ok, _other} -> {:error, :graph_hash_conflict}
-    end
-  end
 
   defp tenant_matches?(_record, :_any), do: true
   defp tenant_matches?(%{tenant_id: tenant_id}, tenant_id), do: true
@@ -319,6 +312,27 @@ defmodule Docket.Test.MemoryBackend do
 
   defp tenant_check(record, tenant_id) do
     if tenant_matches?(record, tenant_id), do: :ok, else: {:error, :not_found}
+  end
+
+  defp merge_events(existing, run_id, incoming) do
+    Enum.reduce_while(incoming, {:ok, existing}, fn event, {:ok, accumulated} ->
+      cond do
+        event.run_id != run_id ->
+          {:halt, {:error, :event_run_mismatch}}
+
+        previous = Enum.find(accumulated, &(&1.seq == event.seq)) ->
+          if previous == event,
+            do: {:cont, {:ok, accumulated}},
+            else: {:halt, {:error, :event_conflict}}
+
+        true ->
+          {:cont, {:ok, accumulated ++ [event]}}
+      end
+    end)
+  end
+
+  defp valid_commit?(checkpoint, record) do
+    checkpoint.run.id == record.run.id and checkpoint.seq == checkpoint.run.checkpoint_seq
   end
 
   defp validate_serialized_checkpoint(record, checkpoint) do
@@ -332,13 +346,9 @@ defmodule Docket.Test.MemoryBackend do
   end
 
   defp fence_ok?(record, fence) do
-    record.run.checkpoint_seq == fence.expected_seq and
-      token_ok?(record, fence.claim_token)
+    record.run.checkpoint_seq == fence.expected_seq and token_ok?(record, fence.claim_token)
   end
 
-  # A nil fence token fences on seq alone. A non-nil token must equal the
-  # current claim; expiry only makes a claim stealable, it never fails the
-  # fence.
   defp token_ok?(_record, nil), do: true
   defp token_ok?(record, token), do: record.claim_token == token
 

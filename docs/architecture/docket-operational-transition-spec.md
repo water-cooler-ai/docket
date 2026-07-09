@@ -1,6 +1,6 @@
 # Docket Operational Transition Spec
 
-Status: transition spec (rev 6 — three operational tables, atomic storage lifecycle, post-commit notifications, durable retry state, retained-run graph integrity, serialized named signals)
+Status: transition spec (rev 7 — three operational tables and stores, shared transaction boundary, post-commit notifications, durable retry state, retained-run graph integrity, serialized named signals)
 Date: 2026-07-09
 Target: move from core runtime library to an Oban-shaped durable runtime
 
@@ -200,7 +200,8 @@ Owns:
 - Supervised runtime process (the in-process, Postgres-free driver).
 - Processless loop driver that a stateless worker can call.
 - Inline test runtime.
-- Storage and coordinator behaviour contracts.
+- Storage transaction, graph-store, run-store, event-store, and coordinator
+  behaviour contracts.
 - Signal application as pure run-mutation functions (section 8).
 
 Must avoid:
@@ -218,9 +219,11 @@ Reference production backend, compiled when the optional `ecto_sql` and
 Owns:
 
 - Migrations for Docket-owned tables.
-- Run store.
-- Graph store.
-- Event store (checkpoint-commit history persists as metadata-only events).
+- Graph store for immutable, content-addressed graph versions.
+- Run store for lifecycle commits, fences, disposition, serialized mutation,
+  and operational recovery.
+- Event store for append and retention policy (checkpoint-commit history
+  persists as metadata-only events).
 - Per-run claim, optimistic commit fence, and atomic commit-and-schedule.
 - The dispatcher: `SKIP LOCKED` claim polling, a `LISTEN/NOTIFY` fast path,
   per-node concurrency, and graceful shutdown draining.
@@ -324,15 +327,17 @@ latest-version pointer, listing, graph-level ownership), which arrives with
 the explicit publish/version-management API post-`0.1.0`; adding it then is a
 purely additive migration.
 
-Publishing is implicit and content-addressed. `start_run(graph, input)`
-upserts the canonical `Docket.Graph.to_map/1` document keyed by
-`graph_id + graph_hash` (the hash
-already exists in core) with `ON CONFLICT DO NOTHING`, in the same
-transaction that inserts the run row. Two nodes racing to publish the same
-version both succeed idempotently. If the existing document under that key is
-not byte-equivalent, initialization fails with a graph-content conflict rather
-than treating `ON CONFLICT DO NOTHING` as proof that the content matched. No
-separate publish workflow is required for `0.1.0`; an explicit
+Publishing is implicit and content-addressed. `start_run(graph, input)` calls
+the graph store's simple `save_graph` operation with the canonical
+`Docket.Graph.to_map/1` document keyed by `graph_id + graph_hash` (the hash
+already exists in core). It does so inside the same backend transaction in
+which the run store inserts the run and the event store appends initialization
+events. Postgres implements `save_graph` with `ON CONFLICT DO NOTHING`. Two
+nodes racing to publish the same version both succeed idempotently. If the
+existing document under that key is not byte-equivalent, `save_graph` returns a
+graph-content conflict rather than treating the conflict clause as proof that
+the content matched. Recovery uses the corresponding `fetch_graph` operation.
+No separate publish workflow is required for `0.1.0`; an explicit
 publish/version-management API can arrive with graph tooling later without
 changing this contract.
 
@@ -696,11 +701,12 @@ posture as the resident model's split-brain window, with no owner node and no
 lease epoch.
 
 The atomic commit-and-schedule happens at a park boundary (section 9). The
-Postgres backend, not the core loop, owns that transaction: it persists the
-proposed event rows (checkpoint-commit metadata among them), updates the run
-row under the fence, releases the claim, and sets the next `wake_at` as one
-database operation — followed by a
-`pg_notify` when the wake is immediate. Within a drain, each superstep
+Postgres backend, not the core loop, owns that transaction. Inside one
+`Docket.Storage.transaction/2`, the run store commits the run under its fence,
+releases or refreshes the claim, and sets the next `wake_at`; the event store
+appends the proposed event rows (checkpoint-commit metadata among them).
+Neither store independently commits. The backend issues `pg_notify` after the
+database transaction when the wake is immediate. Within a drain, each superstep
 checkpoints on its own, and the in-process loop is the "next" — the live vehicle
 is itself the schedule. The invariant: a run is always either terminal, parked
 with an explicit wake source (`wake_at` or an external event that will set it),
@@ -832,13 +838,15 @@ Signal application rules:
 
 - Signals are addressed by `run_id`; tenancy is enforced by the facade's
   configured tenant mode before the storage mutation begins.
-- The backend serializes the mutation as one short transaction. Postgres uses
-  `SELECT ... FOR UPDATE`; a non-relational backend may use an equivalent
-  serialized mutation primitive. Core validation and transition calculation
-  are pure and perform no external I/O while the lock is held.
-- Checkpoint metadata, retained events, the new run, claim release, and wake are
-  committed together. Only after commit do checkpoint observers and telemetry
-  run.
+- The run store owns serialized mutation. The backend calls it inside one short
+  storage transaction. Postgres uses `SELECT ... FOR UPDATE`; a non-relational
+  backend may use an equivalent serialized mutation primitive. Core validation
+  and transition calculation are pure and perform no external I/O while the
+  lock is held.
+- In that same storage transaction, the run store commits the new run, claim
+  release, and wake while the event store appends checkpoint metadata and
+  retained events. Only after the transaction commits do checkpoint observers
+  and telemetry run.
 - Validation errors return directly to the caller and change nothing.
 - A concurrent advance commit either precedes the locked signal read or fails
   its next fence after the signal clears its claim and increments the sequence.
@@ -847,8 +855,9 @@ Signal application rules:
 
 There is no signal struct, no signal behaviour, and no generic
 `signal(run_id, type, opts)` dispatch. Core defines each graph signal as a pure
-named run-mutation function. The Postgres backend wraps it in the serialized
-storage mutation; the GenServer and inline runtimes call it directly.
+named run-mutation function. The Postgres backend wraps it in the run store's
+serialized mutation and composes event append through the shared transaction;
+the GenServer and inline runtimes call it directly.
 
 Durability is reached when the transaction commits, before the call returns.
 There is no general exactly-once request receipt in `0.1.0`; operations define
@@ -860,10 +869,11 @@ their repeated-call result explicitly in the table above.
 
 ```text
 validate tenant and graph access
-in one storage operation / transaction:
-  verify-or-insert the canonical graph version
-  insert run row with wake_at = now
-  persist :run_initialized checkpoint metadata and retained events
+Storage.transaction(storage, fn tx ->
+  Graphs.save_graph(tx, canonical graph version)
+  Runs.insert_run(tx, initialized run with wake_at = now)
+  Events.append_events(tx, :run_initialized checkpoint metadata + retained events)
+end)
 pg_notify dispatchers
 deliver post-commit checkpoint observers and telemetry
 return initialized run
@@ -882,8 +892,11 @@ boundary
   each mid-drain commit refreshes the claim and resets attempts
   a failed fence means discard, release the claim, and stop
   a single long superstep either fits inside orphan_ttl or refreshes the claim
-at the boundary, in one transaction: final checkpoint, release the claim,
-  set the park's wake_at (or NULL)
+at the boundary, Storage.transaction(storage, fn tx ->
+  Runs.commit(tx, final checkpoint, fence, and claim disposition)
+  Events.append_events(tx, checkpoint metadata + retained runtime events)
+end)
+after commit, notify an immediate wake and deliver checkpoint observers/telemetry
 ```
 
 ### Yield Boundaries And Parking
@@ -936,11 +949,16 @@ yield costs one dispatch hop, never lost progress.
 ### Signal Run
 
 ```text
-in the caller's process, one short transaction:
-  lock and load run row, validate signal, apply the pure mutation
-  increment checkpoint_seq, clear any claim
-  set wake_at = now in the same transaction if the run became runnable
+in the caller's process, Storage.transaction(storage, fn tx ->
+  Runs.mutate_run(tx, fn current_run ->
+    validate signal and apply the pure mutation
+    increment checkpoint_seq, clear any claim
+    set wake_at = now if the run became runnable
+  end)
+  Events.append_events(tx, checkpoint metadata + retained signal events)
+end)
 pg_notify dispatchers
+deliver checkpoint observers and telemetry after commit
 return the updated run (or a validation error) to the caller
 ```
 
@@ -1028,15 +1046,24 @@ The core package needs a few seams before the Postgres backend can be excellent.
 These seams are substrate-independent: they would be identical under any
 durable backend.
 
-- Define `Docket.Storage` around atomic lifecycle mutations: initialization
-  atomically stores graph + initialized run + checkpoint metadata event(s) +
-  initial wake; commit atomically stores run + checkpoint metadata + retained
-  events + disposition.
-  Do not expose independent run-update/event-append callbacks on the driver
-  path. Its serialized-mutation callback lets signals validate and commit
-  against one current run without exposing database locks to core, and its
-  poison-retry callback owns operational state. Keep `Docket.Coordinator`
-  focused on claim lifecycle.
+- Define `Docket.Storage` as the shared backend transaction boundary. A
+  transaction passes one backend context to three independent behaviours, and
+  store operations invoked with that context must participate in it rather
+  than opening or committing an independent transaction:
+
+  - `Docket.Storage.Graphs`: simple, static `save_graph` and `fetch_graph`
+    operations for immutable content-addressed graph versions.
+  - `Docket.Storage.Runs`: `insert_run`, `fetch_run`, fenced `commit`,
+    serialized mutation, claim disposition, scheduling, and poison recovery.
+  - `Docket.Storage.Events`: event append plus the backend's persistence and
+    retention policy.
+
+  Lifecycle orchestration composes these APIs. Start stores the graph, run,
+  and initialization events inside one transaction. A checkpoint stores the
+  run commit, checkpoint metadata, retained runtime events, claim disposition,
+  and next wake inside one transaction. This preserves atomicity without one
+  lifecycle callback owning graph, run, and event persistence. Keep
+  `Docket.Coordinator` focused on claim lifecycle.
 - Add first-class `resolve_interrupt` and `cancel_run` pure named run-mutation
   functions: validate against the loaded `Docket.Run`, apply the mutation, and
   return the updated run and whether it became runnable. Add `:run_cancelled`
@@ -1049,8 +1076,9 @@ durable backend.
 - Expose a processless "advance one superstep, or drain to a yield boundary"
   entrypoint that a stateless worker can call, returning proposed checkpoint(s),
   events, and the park action without performing durable storage writes itself.
-  The Postgres backend then commits those effects and the next `wake_at` in one
-  transaction. This is the seam the dispatcher's vehicle drives;
+  The Postgres backend then composes the run and event stores inside one
+  storage transaction to commit those effects and the next `wake_at`. This is
+  the seam the dispatcher's vehicle drives;
   `Docket.Test.step_inline` already proves the same loop runs outside a
   GenServer, so this is a third driver, not a second interpreter.
 - Include superstep/attempt and run identity in checkpoint context, so the
@@ -1076,17 +1104,24 @@ The 0.1.0 implementation should include:
 
 - `mix docket.gen.migration` or documented migration copy path.
 - Migrations for runs, graph versions, and events.
-- `Docket.Postgres.Storage` implementing the atomic `Docket.Storage`
-  initialization and commit callbacks. Its row codec maps promoted columns plus
-  `state` to `Docket.Run`; initialization verifies/inserts the canonical graph,
-  run, initial metadata-only checkpoint event(s), and wake in one transaction.
+- `Docket.Postgres.Storage` implementing the shared transaction boundary, with
+  `Docket.Postgres.GraphStore`, `Docket.Postgres.RunStore`, and
+  `Docket.Postgres.EventStore` implementing the three store behaviours against
+  its transaction context. The run row codec maps promoted columns plus
+  `state` to `Docket.Run`.
+- Start-run orchestration that composes `Graphs.save_graph`,
+  `Runs.insert_run`, and `Events.append_events` inside one storage transaction,
+  verifying/inserting the canonical graph, initialized run, initial
+  metadata-only checkpoint event(s), and wake atomically.
 - `Docket.Postgres.Coordinator` for run claim win/refresh/steal and
   token-guarded release. Advance storage commits require both
   `checkpoint_seq` and `claim_token`; the connection is released before node
   execution.
-- The storage commit path persists metadata-only checkpoint events and retained
-  runtime events atomically with the run row and disposition, with a policy to
-  persist all, none, or selected event types.
+- The checkpoint commit path composes `Runs.commit` and
+  `Events.append_events` inside one storage transaction, persisting
+  metadata-only checkpoint events and retained runtime events atomically with
+  the run row and disposition. The event store owns the policy to persist all,
+  none, or selected event types.
 - `Docket.Postgres.Dispatcher` (per-node `SKIP LOCKED` claim polling,
   `LISTEN/NOTIFY` fast path with a supported poll-only configuration for
   transaction-pooled environments, per-node concurrency demand, poison
@@ -1146,8 +1181,10 @@ Design for those spaces, but ship the durable Postgres path first.
 
 Substrate-independent.
 
-- Introduce atomic storage lifecycle and claim-only coordinator behaviour
-  contracts, with an in-memory conformance backend.
+- Introduce the `Docket.Storage` transaction boundary plus independent graph,
+  run, and event store behaviour contracts, with an in-memory conformance
+  backend. Test that lifecycle composition is atomic while each entity API
+  remains independently usable; keep the coordinator claim-only.
 - Separate checkpoint proposal from delivery and define post-commit observer
   semantics for the durable driver.
 - Introduce pure named `resolve_interrupt` / `cancel_run` functions with no
@@ -1167,12 +1204,15 @@ Substrate-independent.
 - Add the three-table migration and Postgres storage (including `wake_at`,
   `attempts`, the composite run-to-graph-version foreign key, and metadata-only
   checkpoint history events).
-- Implement atomic graph publish + initialized run insertion, rejecting a
-  graph key whose existing document differs.
+- Implement the Postgres transaction boundary and graph, run, and event stores.
+- Compose graph publish, initialized run insertion, and initialization-event
+  append in one transaction, rejecting a graph key whose existing document
+  differs.
 - Implement the run claim, optimistic commit fence, atomic
   commit-and-schedule, and claim release on fence loss.
-- Persist run/events/disposition atomically through the storage
-  behaviour; invoke handlers and telemetry only after a successful commit.
+- Compose the run-store commit and event-store append inside one storage
+  transaction so run/events/disposition remain atomic; invoke handlers and
+  telemetry only after a successful commit.
 - Implement the dispatcher: `SKIP LOCKED` claiming, `LISTEN/NOTIFY` fast path,
   per-node concurrency, shutdown drain.
 - Implement synchronous signals through a short serialized row transaction and

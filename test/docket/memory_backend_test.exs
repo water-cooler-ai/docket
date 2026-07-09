@@ -37,16 +37,24 @@ defmodule Docket.MemoryBackendTest do
 
   defp initialize(backend, run, opts \\ []) do
     cp = checkpoint(run, type: :run_initialized, delivery: :sync)
+    graph_document = Keyword.get(opts, :graph_document, @graph_document)
+    store_opts = Keyword.delete(opts, :graph_document)
 
-    MemoryBackend.initialize_run(
-      backend,
-      run.graph_id,
-      run.graph_hash,
-      @graph_document,
-      cp,
-      @initial_wake,
-      opts
-    )
+    MemoryBackend.transaction(backend, fn transaction ->
+      with :ok <-
+             MemoryBackend.save_graph(
+               transaction,
+               run.graph_id,
+               run.graph_hash,
+               graph_document,
+               store_opts
+             ),
+           {:ok, initialized} <-
+             MemoryBackend.insert_run(transaction, run, @initial_wake, store_opts),
+           :ok <- MemoryBackend.append_events(transaction, run.id, cp.events, store_opts) do
+        {:ok, initialized}
+      end
+    end)
   end
 
   defp commit(backend, checkpoint, token, disposition, expected_seq \\ nil) do
@@ -55,7 +63,19 @@ defmodule Docket.MemoryBackendTest do
       claim_token: token
     }
 
-    MemoryBackend.commit(backend, checkpoint, fence, disposition, [])
+    MemoryBackend.transaction(backend, fn transaction ->
+      with {:ok, committed} <-
+             MemoryBackend.commit(transaction, checkpoint, fence, disposition, []),
+           :ok <-
+             MemoryBackend.append_events(
+               transaction,
+               checkpoint.run.id,
+               checkpoint.events,
+               []
+             ) do
+        {:ok, committed}
+      end
+    end)
   end
 
   defp event(run_id, seq) do
@@ -68,12 +88,12 @@ defmodule Docket.MemoryBackendTest do
     }
   end
 
-  test "initialize atomically stores graph, run, checkpoint, schedule, and events", %{backend: b} do
+  test "initialize composes graph, run, schedule, and events in one transaction", %{backend: b} do
     r = run("r1")
     assert {:ok, ^r} = initialize(b, r)
     assert {:ok, ^r} = MemoryBackend.fetch_run(b, "r1", [])
     assert {:ok, @graph_document} = MemoryBackend.fetch_graph(b, "g", @graph_hash, [])
-    assert [%Checkpoint{type: :run_initialized}] = MemoryBackend.checkpoints(b, "r1")
+    assert [] == MemoryBackend.events(b, "r1")
     assert @initial_wake == MemoryBackend.wake_at(b, "r1")
     assert {:error, :not_found} = MemoryBackend.fetch_run(b, "missing", [])
   end
@@ -88,20 +108,49 @@ defmodule Docket.MemoryBackendTest do
   test "the same graph key cannot be reused with different content", %{backend: b} do
     assert {:ok, _} = initialize(b, run("r1"))
     r2 = run("r2")
-    cp2 = checkpoint(r2, type: :run_initialized, delivery: :sync)
 
     assert {:error, :graph_hash_conflict} =
-             MemoryBackend.initialize_run(
-               b,
-               "g",
-               @graph_hash,
-               %{"id" => "different"},
-               cp2,
-               @initial_wake,
-               []
-             )
+             initialize(b, r2, graph_document: %{"id" => "different"})
 
     assert {:error, :not_found} = MemoryBackend.fetch_run(b, "r2", [])
+  end
+
+  test "a failed event append rolls back graph and run initialization", %{backend: b} do
+    r = run("r1")
+    mismatched = event("another-run", 1)
+
+    assert {:error, :event_run_mismatch} =
+             MemoryBackend.transaction(b, fn transaction ->
+               with :ok <-
+                      MemoryBackend.save_graph(
+                        transaction,
+                        r.graph_id,
+                        r.graph_hash,
+                        @graph_document,
+                        []
+                      ),
+                    {:ok, _run} <-
+                      MemoryBackend.insert_run(transaction, r, @initial_wake, []),
+                    :ok <- MemoryBackend.append_events(transaction, r.id, [mismatched], []) do
+                 {:ok, r}
+               end
+             end)
+
+    assert {:error, :not_found} = MemoryBackend.fetch_graph(b, "g", @graph_hash, [])
+    assert {:error, :not_found} = MemoryBackend.fetch_run(b, "r1", [])
+  end
+
+  test "an exception rolls back and propagates", %{backend: b} do
+    r = run("r1")
+
+    assert_raise RuntimeError, "boom", fn ->
+      MemoryBackend.transaction(b, fn transaction ->
+        assert {:ok, _run} = MemoryBackend.insert_run(transaction, r, @initial_wake, [])
+        raise "boom"
+      end)
+    end
+
+    assert {:error, :not_found} = MemoryBackend.fetch_run(b, "r1", [])
   end
 
   test "tenant scoping", %{backend: b} do
@@ -110,6 +159,19 @@ defmodule Docket.MemoryBackendTest do
     assert {:ok, ^r} = MemoryBackend.fetch_run(b, "r1", tenant_id: "t1")
     assert {:error, :not_found} = MemoryBackend.fetch_run(b, "r1", tenant_id: "t2")
     assert {:ok, ^r} = MemoryBackend.fetch_run(b, "r1", [])
+  end
+
+  test "event append is idempotent and rejects conflicting sequence content", %{backend: b} do
+    {:ok, _} = initialize(b, run("r1"))
+    persisted = event("r1", 1)
+
+    assert :ok = MemoryBackend.append_events(b, "r1", [persisted], [])
+    assert :ok = MemoryBackend.append_events(b, "r1", [persisted], [])
+    assert [^persisted] = MemoryBackend.events(b, "r1")
+
+    conflicting = %{persisted | type: :node_failed}
+    assert {:error, :event_conflict} = MemoryBackend.append_events(b, "r1", [conflicting], [])
+    assert [^persisted] = MemoryBackend.events(b, "r1")
   end
 
   test "commit fence leaves every durable effect untouched on failure", %{backend: b} do
@@ -123,11 +185,23 @@ defmodule Docket.MemoryBackendTest do
     assert {:error, :stale_fence} = commit(b, cp, "wrong", :continue, 5)
     assert {:ok, ^stored} = MemoryBackend.fetch_run(b, "r1", [])
     assert [] == MemoryBackend.events(b, "r1")
-    assert [_initialized] = MemoryBackend.checkpoints(b, "r1")
 
     assert {:ok, ^next} = commit(b, cp, "tok", :continue)
     assert [%Event{seq: 1}] = MemoryBackend.events(b, "r1")
-    assert [_initialized, ^cp] = MemoryBackend.checkpoints(b, "r1")
+  end
+
+  test "an event-store failure rolls back a successful run commit", %{backend: b} do
+    stored = run("r1")
+    {:ok, _} = initialize(b, stored)
+    {:ok, _} = MemoryBackend.claim_run(b, "r1", "tok", [])
+
+    next = run("r1", checkpoint_seq: 2)
+    cp = checkpoint(next, events: [event("another-run", 1)])
+
+    assert {:error, :event_run_mismatch} = commit(b, cp, "tok", :continue)
+    assert {:ok, ^stored} = MemoryBackend.fetch_run(b, "r1", [])
+    assert "tok" == MemoryBackend.claim(b, "r1")
+    assert [] == MemoryBackend.events(b, "r1")
   end
 
   test "claim win, held, refresh, and idempotent token-guarded release", %{backend: b} do
@@ -201,17 +275,73 @@ defmodule Docket.MemoryBackendTest do
           finished_at: DateTime.utc_now()
       }
 
-      {:commit, checkpoint(cancelled, type: :run_cancelled, delivery: :sync), {:park, nil}}
+      proposal =
+        checkpoint(cancelled,
+          type: :run_cancelled,
+          delivery: :sync,
+          events: [event("r1", 1)]
+        )
+
+      {:commit, proposal, {:park, nil}}
     end
 
-    assert {:ok, %Run{status: :cancelled, checkpoint_seq: 2}} =
-             MemoryBackend.mutate_run(b, "r1", mutation, [])
+    assert {:ok, %Checkpoint{run: %Run{status: :cancelled, checkpoint_seq: 2}}} =
+             MemoryBackend.transaction(b, fn transaction ->
+               with {:ok, committed} <-
+                      MemoryBackend.mutate_run(transaction, "r1", mutation, []),
+                    :ok <-
+                      MemoryBackend.append_events(
+                        transaction,
+                        "r1",
+                        committed.events,
+                        []
+                      ) do
+                 {:ok, committed}
+               end
+             end)
 
     assert nil == MemoryBackend.claim(b, "r1")
     assert nil == MemoryBackend.wake_at(b, "r1")
 
-    assert [_initialized, %Checkpoint{type: :run_cancelled}] =
-             MemoryBackend.checkpoints(b, "r1")
+    assert [%Event{seq: 1}] = MemoryBackend.events(b, "r1")
+  end
+
+  test "an event failure rolls a serialized mutation back", %{backend: b} do
+    stored = run("r1")
+    {:ok, _} = initialize(b, stored)
+    {:ok, _} = MemoryBackend.claim_run(b, "r1", "a", [])
+
+    mutation = fn current ->
+      cancelled = %{current | status: :cancelled, checkpoint_seq: 2}
+
+      proposal =
+        checkpoint(cancelled,
+          type: :run_cancelled,
+          delivery: :sync,
+          events: [event("another-run", 1)]
+        )
+
+      {:commit, proposal, {:park, nil}}
+    end
+
+    assert {:error, :event_run_mismatch} =
+             MemoryBackend.transaction(b, fn transaction ->
+               with {:ok, committed} <-
+                      MemoryBackend.mutate_run(transaction, "r1", mutation, []),
+                    :ok <-
+                      MemoryBackend.append_events(
+                        transaction,
+                        "r1",
+                        committed.events,
+                        []
+                      ) do
+                 {:ok, committed}
+               end
+             end)
+
+    assert {:ok, ^stored} = MemoryBackend.fetch_run(b, "r1", [])
+    assert "a" == MemoryBackend.claim(b, "r1")
+    assert [] == MemoryBackend.events(b, "r1")
   end
 
   test "mutate_run leaves storage untouched on validation or proposal error", %{backend: b} do
@@ -227,7 +357,7 @@ defmodule Docket.MemoryBackendTest do
              )
 
     assert {:ok, ^stored} = MemoryBackend.fetch_run(b, "r1", [])
-    assert [_initialized] = MemoryBackend.checkpoints(b, "r1")
+    assert [] == MemoryBackend.events(b, "r1")
   end
 
   test "retry_poisoned_run changes only operational state and wake", %{backend: b} do
@@ -240,7 +370,7 @@ defmodule Docket.MemoryBackendTest do
     assert :active == MemoryBackend.operational_status(b, "r1")
     assert %DateTime{} = MemoryBackend.wake_at(b, "r1")
     assert {:ok, ^stored} = MemoryBackend.fetch_run(b, "r1", [])
-    assert [_initialized] = MemoryBackend.checkpoints(b, "r1")
+    assert [] == MemoryBackend.events(b, "r1")
   end
 
   test "expiry alone does not invalidate an unstolen token", %{backend: _} do

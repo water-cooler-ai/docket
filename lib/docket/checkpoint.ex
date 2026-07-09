@@ -32,9 +32,10 @@ defmodule Docket.Checkpoint do
 
   The `handle/2` callback is the host-facing notification contract: hosts
   persist runs from checkpoints exactly as before in the host-owned driver.
-  `Docket.Storage` and `Docket.Coordinator` are the deeper seam a durable
-  backend implements. In that driver this callback is post-commit observation,
-  because an arbitrary callback cannot participate in the backend transaction.
+  `Docket.Storage`, its graph/run/event store behaviours, and
+  `Docket.Coordinator` are the deeper seam a durable backend implements. In
+  that driver this callback is post-commit observation, because an arbitrary
+  callback cannot participate in the backend transaction.
   """
 
   defstruct [:type, :delivery, :seq, :run, :created_at, events: [], metadata: %{}]

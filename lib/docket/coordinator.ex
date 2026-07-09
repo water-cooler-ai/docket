@@ -5,7 +5,7 @@ defmodule Docket.Coordinator do
   One active run has one current claim holder. An expired holder may still be
   alive briefly after another worker steals its claim, so claims limit current
   commit authority rather than guaranteeing that only one process exists.
-  `Docket.Storage.commit/5` combines the claim token with the checkpoint
+  `Docket.Storage.Runs.commit/5` combines the claim token with the checkpoint
   sequence fence so at most one durable commit wins.
 
   ## Invariant vocabulary
@@ -32,7 +32,7 @@ defmodule Docket.Coordinator do
 
   Wins if the run has no claim or the existing claim is expired per backend
   policy. Winning over an expired claim is safe for durable state because the
-  stale token can no longer pass `Docket.Storage.commit/5`.
+  stale token can no longer pass `Docket.Storage.Runs.commit/5`.
   """
   @callback claim_run(ctx(), run_id :: String.t(), claim_token(), opts :: keyword()) ::
               {:ok, Docket.Run.t()} | {:error, :claim_held} | {:error, :not_found}
