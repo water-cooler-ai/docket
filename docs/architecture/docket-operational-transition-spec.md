@@ -1,6 +1,6 @@
 # Docket Operational Transition Spec
 
-Status: transition spec (rev 4 — row-is-the-run schema (columns + `state` jsonb), single graph-versions table, single package with optional Ecto deps, optional tenancy, metadata-only checkpoint history)
+Status: transition spec (rev 5 — three operational tables (checkpoint history folded into `docket_events`), signals as named run-mutation functions (no signal structs or behaviour), row-is-the-run schema (columns + `state` jsonb), single graph-versions table, single package with optional Ecto deps, optional tenancy)
 Date: 2026-07-09
 Target: move from core runtime library to an Oban-shaped durable runtime
 
@@ -97,7 +97,7 @@ It should include:
 - Durable run store and graph store.
 - Per-run claim and optimistic commit fence for single-writer.
 - Synchronous, fenced signal application with confirmed results.
-- Checkpoint and event persistence.
+- Event persistence, including metadata-only checkpoint-commit history.
 - Run scheduling via `wake_at` on the run row and a `SKIP LOCKED` dispatcher.
 - Crash recovery via claim expiry — the dispatch poll is the recovery path.
 - Optional tenant scoping on run APIs — no tenant concept required to adopt.
@@ -138,10 +138,8 @@ Application code defines nodes and graphs, then starts or signals runs:
   )
 
 {:ok, run} =
-  MyApp.Docket.signal(run.id, :resolve_interrupt,
-    tenant_id: account.id,
-    interrupt_id: interrupt_id,
-    value: "approved"
+  MyApp.Docket.resolve_interrupt(run.id, interrupt_id, "approved",
+    tenant_id: account.id
   )
 ```
 
@@ -202,7 +200,8 @@ Owns:
 - Supervised runtime process (the in-process, Postgres-free driver).
 - Processless loop driver that a stateless worker can call.
 - Inline test runtime.
-- Storage, coordinator, and signal behaviour contracts.
+- Storage and coordinator behaviour contracts.
+- Signal application as pure run-mutation functions (section 8).
 
 Must avoid:
 
@@ -221,7 +220,7 @@ Owns:
 - Migrations for Docket-owned tables.
 - Run store.
 - Graph store.
-- Checkpoint and event store.
+- Event store (checkpoint-commit history persists as metadata-only events).
 - Per-run claim, optimistic commit fence, and atomic commit-and-schedule.
 - The dispatcher: `SKIP LOCKED` claim polling, a `LISTEN/NOTIFY` fast path,
   per-node concurrency, and graceful shutdown draining.
@@ -297,13 +296,15 @@ Recommended baseline:
 ```text
 docket_graph_versions
 docket_runs
-docket_checkpoints
 docket_events
 ```
 
-There is no signal table and no job table. Signals are synchronous fenced
-commits (section 8), and the run row itself carries the schedule. The exact
-naming of the Docket tables can change, but the ownership concepts should not.
+There is no signal table, no job table, and no checkpoint table. Signals are
+synchronous fenced commits (section 8), the run row itself carries the
+schedule, and checkpoint history is metadata-only event data (see the
+state-size notes below). Everything the correctness path reads lives on the
+run row. The exact naming of the Docket tables can change, but the ownership
+concepts should not.
 
 `docket_graph_versions` exists because recovery is autonomous: a worker
 picking up a recovered run on another node must be able to load the exact
@@ -449,13 +450,16 @@ must not multiply copies of that document:
   design the same cancel would rewrite megabytes to flip one field. Likewise
   `input` is written once at start and never re-serialized into every
   superstep commit.
-- **`docket_checkpoints` is metadata-only.** A checkpoint row records seq,
-  type, step, park action, and timestamps — never the run document.
-  Checkpoint history is audit and observability data; storing
-  O(supersteps × state size) snapshots for it would be the hidden cost that
-  melts an adopter's database. If replay or time-travel debugging ever
-  becomes a goal, full-snapshot retention becomes an explicit opt-in policy
-  at that point.
+- **Checkpoint history is events, not a table.** Nothing on the correctness
+  path reads checkpoint history: recovery loads the run row, the fence is the
+  `checkpoint_seq` column, and the latest checkpoint type is a run column. A
+  checkpoint commit therefore records a metadata-only event row (seq, type,
+  step, park action) in `docket_events` — never the run document — under the
+  same persistence policy and pruner as every other event. Turning event
+  persistence off costs history, never correctness. Storing
+  O(supersteps × state size) snapshots would be the hidden cost that melts an
+  adopter's database; if replay or time-travel debugging ever becomes a goal,
+  full-snapshot retention becomes an explicit opt-in policy at that point.
 - **Event persistence is a policy, not a given.** Events default to on, but
   `0.1.0` ships the volume knob (persist all, none, or selected types),
   because turning event volume down is the first request every high-volume
@@ -487,8 +491,8 @@ should demonstrate compact state from the first example.
 
 The backend separates three roles that a resident process previously fused:
 
-- **State — Postgres.** The durable run (the `docket_runs` row, checkpoints)
-  is the source of truth. A parked run lives entirely here and needs no process.
+- **State — Postgres.** The durable run — the `docket_runs` row — is the
+  source of truth. A parked run lives entirely here and needs no process.
 - **Schedule — `wake_at` plus the dispatcher.** The run row says *when* it
   should next advance; the per-node dispatcher turns due rows into work,
   coordinates with the run claim so only one vehicle drives at a time, and owns
@@ -678,8 +682,9 @@ lease epoch.
 
 The atomic commit-and-schedule happens at a park boundary (section 9). The
 Postgres backend, not the core loop, owns that transaction: it persists the
-proposed checkpoint/events, updates the run row under the fence, releases the
-claim, and sets the next `wake_at` as one database operation — followed by a
+proposed event rows (checkpoint-commit metadata among them), updates the run
+row under the fence, releases the claim, and sets the next `wake_at` as one
+database operation — followed by a
 `pg_notify` when the wake is immediate. Within a drain, each superstep
 checkpoints on its own, and the in-process loop is the "next" — the live vehicle
 is itself the schedule. The invariant: a run is always either terminal, parked
@@ -751,8 +756,9 @@ if terminal, serve from storage
 otherwise apply the signal synchronously under the fence and return the result
 ```
 
-A read (`fetch_run`) is a storage read. A state change (`signal`) is a fenced
-commit executed in the caller's process. Neither needs to know which node, if
+A read (`fetch_run`) is a storage read. A state change (`cancel_run`,
+`resolve_interrupt`, and the other signal functions) is a fenced commit
+executed in the caller's process. Neither needs to know which node, if
 any, is currently advancing the run. Dispatchers across any number of nodes —
 or regions, pointed at the same database — pull work; correctness comes from
 the claim, the commit fence, and the store, never from process lookup.
@@ -775,16 +781,27 @@ no contract.
 
 ## 8. Signals
 
-State-changing public APIs (`signal/2` and friends) are synchronous fenced
-commits. There is no signal queue, no signal worker, and no "accepted"
-acknowledgment: the caller gets the actual result.
+State-changing public APIs are synchronous fenced commits. There is no signal
+queue, no signal worker, and no "accepted" acknowledgment: the caller gets the
+actual result.
 
-Initial signal types:
+The v1 signals, each a named public function:
 
-- `:resolve_interrupt`
-- `:cancel_run`
-- `:resume_run`
-- `:retry_failed`
+- `resolve_interrupt`
+- `cancel_run`
+- `resume_run`
+- `retry_failed`
+
+There is no signal struct, no signal behaviour, and no generic
+`signal(run_id, type, opts)` dispatch. A reified signal envelope is queue
+machinery — something to serialize, enqueue, deliver later, and dispatch on by
+type — and there is no queue. Core defines each signal as a pure run-mutation
+function: validate against the loaded `Docket.Run`, apply the mutation, and
+return the updated run plus whether it became runnable. The Postgres backend
+wraps these functions in the fenced commit; the GenServer and inline runtimes
+call them directly. Each signal has distinct arguments and distinct
+validation, so named functions are also the right public API shape — matching
+`0.0.x`, which already exposes `resolve_interrupt` by name.
 
 Signal application rules:
 
@@ -808,7 +825,7 @@ Signal application rules:
   superstep commit, milliseconds). If the signal is no longer meaningful after
   the re-read — the run completed, the interrupt was resolved — it returns the
   appropriate result instead.
-- The v1 signal types are naturally idempotent state transitions: resolving an
+- The v1 signals are naturally idempotent state transitions: resolving an
   already-resolved interrupt, cancelling an already-cancelled run, and resuming
   an already-running run each return a well-defined result on repeat calls.
   There is no retention-window idempotency contract because there is no queue.
@@ -935,15 +952,20 @@ clear:
 
 ```elixir
 MyApp.Docket.start_run(graph, input, opts)
-MyApp.Docket.signal(run_id, signal, opts)
+MyApp.Docket.resolve_interrupt(run_id, interrupt_id, value, opts)
+MyApp.Docket.cancel_run(run_id, opts)
+MyApp.Docket.resume_run(run_id, opts)
+MyApp.Docket.retry_failed(run_id, opts)
 MyApp.Docket.fetch_run(run_id, opts)
 MyApp.Docket.await_run(run_id, opts)
 ```
 
-`signal/3` is synchronous: it returns the updated run on success and a typed
-error on validation failure, preserving the `0.0.x` error-reporting contract
-(`resolve_interrupt` returning schema validation errors directly to the
-caller).
+Each signal function is synchronous: it returns the updated run on success
+and a typed error on validation failure, preserving the `0.0.x`
+error-reporting contract (`resolve_interrupt` returning schema validation
+errors directly to the caller). There is no generic `signal/3`: each signal
+has its own arguments and validation, and the named functions carry that
+surface directly (section 8).
 
 `fetch_run` is a storage read and is the primary read API — it always works,
 because a parked run's truth is in Postgres. `get_run` is the optional live read:
@@ -973,9 +995,12 @@ These seams are substrate-independent: they would be identical under any
 durable backend.
 
 - Define storage and coordination behaviours.
-- Add first-class signal structs and signal application APIs. Core defines the
-  signal shape and the application seam; the Postgres backend applies signals
-  as synchronous fenced commits. Core keeps no queue or scheduling dependency.
+- Add signal application as pure run-mutation functions: validate against the
+  loaded `Docket.Run`, apply the mutation, return the updated run and whether
+  it became runnable. No signal structs and no signal behaviour — the reified
+  envelope was queue machinery, and there is no queue (section 8). The
+  Postgres backend wraps these functions in synchronous fenced commits. Core
+  keeps no queue or scheduling dependency.
 - Expose a processless "advance one superstep, or drain to a yield boundary"
   entrypoint that a stateless worker can call, returning proposed checkpoint(s),
   events, and the park action without performing durable storage writes itself.
@@ -998,7 +1023,7 @@ runtime be owned by a durable coordinator without weakening the execution model.
 The 0.1.0 implementation should include:
 
 - `mix docket.gen.migration` or documented migration copy path.
-- Migrations for runs, graph versions, checkpoints, and events.
+- Migrations for runs, graph versions, and events.
 - `Docket.Postgres.RunStore` (row-is-the-run mapping: promoted columns plus
   the `state` jsonb, composed to and from `Docket.Run` via `to_map/1` /
   `from_map/1`; section 5).
@@ -1008,9 +1033,10 @@ The 0.1.0 implementation should include:
   fence loss or non-runnable claim, and the commit fence; advance commits
   require both `checkpoint_seq` and `claim_token`; releases the
   connection before node execution).
-- `Docket.Postgres.CheckpointStore` (fenced checkpoint metadata + `wake_at`
-  in one transaction; checkpoint rows are metadata-only per section 5).
-- Event persistence policy (persist all, none, or selected event types).
+- `Docket.Postgres.EventStore` (event rows — including metadata-only
+  checkpoint-commit events — persisted in the same fenced transaction as the
+  run-row commit and `wake_at`; policy knob for persist all, none, or
+  selected event types).
 - `Docket.Postgres.Dispatcher` (per-node `SKIP LOCKED` claim polling,
   `LISTEN/NOTIFY` fast path with a supported poll-only configuration for
   transaction-pooled environments, per-node concurrency demand, poison
@@ -1021,9 +1047,9 @@ The 0.1.0 implementation should include:
 - Claim freshness policy for long single-superstep execution: either strict
   timeout alignment (`node timeout < orphan_ttl`) or a token-guarded lightweight
   claim heartbeat while awaiting node results.
-- `Docket.Postgres.Pruner` (periodic, idempotent pruning of terminal runs,
-  checkpoints, and events per policy; never prunes a graph version an active
-  run references).
+- `Docket.Postgres.Pruner` (periodic, idempotent pruning of terminal runs
+  and events per policy; never prunes a graph version an active run
+  references).
 - Documented operational introspection queries (runnable backlog, stale
   claims, poisoned runs, oldest due wake) — the psql-level story that precedes
   `docket_dashboard`.
@@ -1067,7 +1093,8 @@ Design for those spaces, but ship the durable Postgres path first.
 Substrate-independent; unchanged from rev 1 of this spec.
 
 - Introduce storage/coordinator behaviour contracts.
-- Introduce signal structs and storage-backed signal semantics.
+- Introduce signal application as pure run-mutation functions with
+  storage-backed semantics.
 - Add a processless advance entrypoint (advance one superstep or drain to a
   yield boundary) the worker driver can call, returning proposed durable effects
   rather than committing them itself.
@@ -1077,11 +1104,11 @@ Substrate-independent; unchanged from rev 1 of this spec.
 ### Milestone C - `Docket.Postgres` MVP
 
 - Add migrations and Postgres-backed stores (including `wake_at` and
-  `attempts` on `docket_runs`; checkpoint rows metadata-only).
+  `attempts` on `docket_runs`; checkpoint history as metadata-only events).
 - Implement publish-on-start graph version upsert.
 - Implement the run claim, optimistic commit fence, atomic
   commit-and-schedule, and claim release on fence loss.
-- Persist checkpoints/events.
+- Persist events, checkpoint-commit history included.
 - Implement the dispatcher: `SKIP LOCKED` claiming, `LISTEN/NOTIFY` fast path,
   per-node concurrency, shutdown drain.
 - Implement synchronous signal application with bounded fence-race retry.
