@@ -1,12 +1,14 @@
 defmodule Docket.MemoryBackendTest do
   use ExUnit.Case, async: true
 
-  alias Docket.{Checkpoint, Event, Run}
+  alias Docket.{Event, Run}
   alias Docket.Test.MemoryBackend
 
   @graph_hash String.duplicate("ab", 32)
   @graph_document %{"id" => "g", "nodes" => []}
-  @initial_wake ~U[2026-07-09 12:00:00Z]
+  @initial_wake ~U[2026-07-09 11:00:00Z]
+  @now ~U[2026-07-09 12:00:00Z]
+  @commit_now ~U[2026-07-09 12:30:00Z]
 
   setup do
     {:ok, backend} = MemoryBackend.start_link()
@@ -16,29 +18,33 @@ defmodule Docket.MemoryBackendTest do
   defp run(id, opts \\ []) do
     %Run{
       id: id,
-      graph_id: "g",
+      graph_id: Keyword.get(opts, :graph_id, "g"),
       graph_hash: @graph_hash,
       status: Keyword.get(opts, :status, :running),
       input: %{},
+      started_at: @initial_wake,
+      updated_at: @initial_wake,
       checkpoint_seq: Keyword.get(opts, :checkpoint_seq, 1)
     }
   end
 
-  defp checkpoint(run, opts \\ []) do
-    %Checkpoint{
-      type: Keyword.get(opts, :type, :step_committed),
-      delivery: Keyword.get(opts, :delivery, :async),
-      seq: run.checkpoint_seq,
-      run: run,
-      events: Keyword.get(opts, :events, []),
-      created_at: DateTime.utc_now()
+  defp event(run_id, seq, opts \\ []) do
+    %Event{
+      run_id: run_id,
+      seq: seq,
+      type: Keyword.get(opts, :type, :node_completed),
+      step: Keyword.get(opts, :step, seq),
+      timestamp: @now,
+      payload: Keyword.get(opts, :payload, %{}),
+      metadata: Keyword.get(opts, :metadata, %{})
     }
   end
 
   defp initialize(backend, run, opts \\ []) do
-    cp = checkpoint(run, type: :run_initialized, delivery: :sync)
+    owner_scope = Keyword.get(opts, :scope, :tenantless)
     graph_document = Keyword.get(opts, :graph_document, @graph_document)
-    store_opts = Keyword.delete(opts, :graph_document)
+    wake_at = Keyword.get(opts, :wake_at, @initial_wake)
+    events = Keyword.get(opts, :events, [])
 
     MemoryBackend.transaction(backend, fn transaction ->
       with :ok <-
@@ -46,344 +52,951 @@ defmodule Docket.MemoryBackendTest do
                transaction,
                run.graph_id,
                run.graph_hash,
-               graph_document,
-               store_opts
+               graph_document
              ),
            {:ok, initialized} <-
-             MemoryBackend.insert_run(transaction, run, @initial_wake, store_opts),
-           :ok <- MemoryBackend.append_events(transaction, run.id, cp.events, store_opts) do
+             MemoryBackend.insert_run(
+               transaction,
+               owner_scope,
+               run,
+               :run_initialized,
+               wake_at
+             ),
+           :ok <- MemoryBackend.append_events(transaction, owner_scope, run.id, events) do
         {:ok, initialized}
       end
     end)
   end
 
-  defp commit(backend, checkpoint, token, disposition, expected_seq \\ nil) do
-    fence = %{
-      expected_seq: expected_seq || checkpoint.seq - 1,
-      claim_token: token
+  defp claim_policy(now, opts) do
+    %{
+      now: now,
+      limit: Keyword.get(opts, :limit, 10),
+      orphan_ttl_ms: Keyword.get(opts, :orphan_ttl_ms, 60_000),
+      max_claim_attempts: Keyword.get(opts, :max_claim_attempts, 3)
+    }
+  end
+
+  defp claim_due(backend, now, opts) do
+    MemoryBackend.claim_due(backend, :system, claim_policy(now, opts))
+  end
+
+  defp claim_one(backend, now, opts \\ []) do
+    assert {:ok, %{leases: [lease], poisoned: []}} =
+             claim_due(backend, now, Keyword.put(opts, :limit, 1))
+
+    lease
+  end
+
+  defp commit(backend, next_run, token, schedule, opts \\ []) do
+    scope = Keyword.get(opts, :scope, :system)
+    expected = Keyword.get(opts, :expected_seq, next_run.checkpoint_seq - 1)
+    checkpoint_type = Keyword.get(opts, :checkpoint_type, :step_committed)
+    events = Keyword.get(opts, :events, [])
+
+    proposal = %{
+      run: next_run,
+      expected_checkpoint_seq: expected,
+      claim_token: token,
+      checkpoint_type: checkpoint_type,
+      schedule: schedule
     }
 
     MemoryBackend.transaction(backend, fn transaction ->
-      with {:ok, committed} <-
-             MemoryBackend.commit(transaction, checkpoint, fence, disposition, []),
-           :ok <-
-             MemoryBackend.append_events(
-               transaction,
-               checkpoint.run.id,
-               checkpoint.events,
-               []
-             ) do
+      with {:ok, committed} <- MemoryBackend.commit(transaction, scope, proposal),
+           :ok <- MemoryBackend.append_events(transaction, scope, next_run.id, events) do
         {:ok, committed}
       end
     end)
   end
 
-  defp event(run_id, seq) do
-    %Event{
-      run_id: run_id,
-      seq: seq,
-      type: :node_completed,
-      step: seq,
-      timestamp: DateTime.utc_now()
-    }
+  test "backend is one bundle for compatible capabilities", %{backend: backend} do
+    assert MemoryBackend.storage() == MemoryBackend
+    assert MemoryBackend.graphs() == MemoryBackend
+    assert MemoryBackend.runs() == MemoryBackend
+    assert MemoryBackend.events() == MemoryBackend
+
+    assert %{start: {MemoryBackend, :start_link, [_opts]}} =
+             MemoryBackend.child_spec(name: {:global, {:memory_backend, backend}})
   end
 
-  test "initialize composes graph, run, schedule, and events in one transaction", %{backend: b} do
-    r = run("r1")
-    assert {:ok, ^r} = initialize(b, r)
-    assert {:ok, ^r} = MemoryBackend.fetch_run(b, "r1", [])
-    assert {:ok, @graph_document} = MemoryBackend.fetch_graph(b, "g", @graph_hash, [])
-    assert [] == MemoryBackend.events(b, "r1")
+  test "initialization composes graph, run, schedule, and assigned events", %{backend: b} do
+    initialized = run("r1")
+    retained = event("r1", 7)
+
+    assert {:ok, ^initialized} = initialize(b, initialized, events: [retained])
+    assert {:ok, ^initialized} = MemoryBackend.fetch_run(b, :tenantless, "r1")
+    assert {:ok, @graph_document} = MemoryBackend.fetch_graph(b, "g", @graph_hash)
+    assert [^retained] = MemoryBackend.events(b, :system, "r1")
     assert @initial_wake == MemoryBackend.wake_at(b, "r1")
-    assert {:error, :not_found} = MemoryBackend.fetch_run(b, "missing", [])
   end
 
-  test "duplicate run id errors without changing the stored graph", %{backend: b} do
-    r = run("r1")
-    assert {:ok, ^r} = initialize(b, r)
-    assert {:error, :already_exists} = initialize(b, r)
-    assert {:ok, @graph_document} = MemoryBackend.fetch_graph(b, "g", @graph_hash, [])
+  test "durable insertion accepts only a scheduled initialized running run", %{backend: b} do
+    for status <- [:created, :waiting, :done, :failed, :cancelled] do
+      id = Atom.to_string(status)
+
+      assert {:error, :invalid_run} =
+               MemoryBackend.insert_run(
+                 b,
+                 :tenantless,
+                 run(id, status: status),
+                 :run_initialized,
+                 @initial_wake
+               )
+
+      assert {:error, :not_found} = MemoryBackend.fetch_run(b, :system, id)
+    end
+
+    assert {:error, :invalid_run} =
+             MemoryBackend.insert_run(
+               b,
+               :tenantless,
+               run("missing-checkpoint-type"),
+               nil,
+               @initial_wake
+             )
+
+    assert {:error, :invalid_run} =
+             MemoryBackend.insert_run(
+               b,
+               :tenantless,
+               run("wrong-sequence", checkpoint_seq: 0),
+               :run_initialized,
+               @initial_wake
+             )
+
+    assert {:error, :invalid_run} =
+             MemoryBackend.insert_run(
+               b,
+               :tenantless,
+               run("wrong-checkpoint-type"),
+               :step_committed,
+               @initial_wake
+             )
   end
 
-  test "the same graph key cannot be reused with different content", %{backend: b} do
-    assert {:ok, _} = initialize(b, run("r1"))
-    r2 = run("r2")
+  test "graph storage is structurally idempotent and rejects conflicting content", %{backend: b} do
+    assert :ok = MemoryBackend.save_graph(b, "g", @graph_hash, %{"a" => 1, "b" => 2})
+    assert :ok = MemoryBackend.save_graph(b, "g", @graph_hash, %{"b" => 2, "a" => 1})
 
-    assert {:error, :graph_hash_conflict} =
-             initialize(b, r2, graph_document: %{"id" => "different"})
+    assert {:error, :graph_content_conflict} =
+             MemoryBackend.save_graph(b, "g", @graph_hash, %{"a" => 2})
 
-    assert {:error, :not_found} = MemoryBackend.fetch_run(b, "r2", [])
+    assert {:ok, %{"a" => 1, "b" => 2}} = MemoryBackend.fetch_graph(b, "g", @graph_hash)
   end
 
-  test "a failed event append rolls back graph and run initialization", %{backend: b} do
-    r = run("r1")
+  test "failed event append rolls graph and run initialization back", %{backend: b} do
+    initialized = run("r1")
     mismatched = event("another-run", 1)
 
     assert {:error, :event_run_mismatch} =
-             MemoryBackend.transaction(b, fn transaction ->
-               with :ok <-
-                      MemoryBackend.save_graph(
-                        transaction,
-                        r.graph_id,
-                        r.graph_hash,
-                        @graph_document,
-                        []
-                      ),
-                    {:ok, _run} <-
-                      MemoryBackend.insert_run(transaction, r, @initial_wake, []),
-                    :ok <- MemoryBackend.append_events(transaction, r.id, [mismatched], []) do
-                 {:ok, r}
-               end
-             end)
+             initialize(b, initialized, events: [mismatched])
 
-    assert {:error, :not_found} = MemoryBackend.fetch_graph(b, "g", @graph_hash, [])
-    assert {:error, :not_found} = MemoryBackend.fetch_run(b, "r1", [])
+    assert {:error, :not_found} = MemoryBackend.fetch_graph(b, "g", @graph_hash)
+    assert {:error, :not_found} = MemoryBackend.fetch_run(b, :system, "r1")
   end
 
-  test "an exception rolls back and propagates", %{backend: b} do
-    r = run("r1")
+  test "transaction errors, exceptions, and throws roll back and propagate", %{backend: b} do
+    assert {:error, :stop} =
+             MemoryBackend.transaction(b, fn tx ->
+               assert {:ok, _} =
+                        MemoryBackend.insert_run(
+                          tx,
+                          :tenantless,
+                          run("error"),
+                          :run_initialized,
+                          @initial_wake
+                        )
+
+               {:error, :stop}
+             end)
 
     assert_raise RuntimeError, "boom", fn ->
-      MemoryBackend.transaction(b, fn transaction ->
-        assert {:ok, _run} = MemoryBackend.insert_run(transaction, r, @initial_wake, [])
+      MemoryBackend.transaction(b, fn tx ->
+        assert {:ok, _} =
+                 MemoryBackend.insert_run(
+                   tx,
+                   :tenantless,
+                   run("raise"),
+                   :run_initialized,
+                   @initial_wake
+                 )
+
         raise "boom"
       end)
     end
 
-    assert {:error, :not_found} = MemoryBackend.fetch_run(b, "r1", [])
+    assert catch_throw(
+             MemoryBackend.transaction(b, fn tx ->
+               assert {:ok, _} =
+                        MemoryBackend.insert_run(
+                          tx,
+                          :tenantless,
+                          run("throw"),
+                          :run_initialized,
+                          @initial_wake
+                        )
+
+               throw(:boom)
+             end)
+           ) == :boom
+
+    for id <- ~w(error raise throw) do
+      assert {:error, :not_found} = MemoryBackend.fetch_run(b, :system, id)
+    end
   end
 
-  test "tenant scoping", %{backend: b} do
-    r = run("r1")
-    assert {:ok, ^r} = initialize(b, r, tenant_id: "t1")
-    assert {:ok, ^r} = MemoryBackend.fetch_run(b, "r1", tenant_id: "t1")
-    assert {:error, :not_found} = MemoryBackend.fetch_run(b, "r1", tenant_id: "t2")
-    assert {:ok, ^r} = MemoryBackend.fetch_run(b, "r1", [])
+  test "nested transactions join the outer transaction", %{backend: b} do
+    assert {:ok, :outer} =
+             MemoryBackend.transaction(b, fn tx ->
+               assert {:ok, _} =
+                        MemoryBackend.insert_run(
+                          tx,
+                          :tenantless,
+                          run("outer"),
+                          :run_initialized,
+                          @initial_wake
+                        )
+
+               assert {:ok, :inner} =
+                        MemoryBackend.transaction(tx, fn nested ->
+                          assert {:ok, _} =
+                                   MemoryBackend.insert_run(
+                                     nested,
+                                     :tenantless,
+                                     run("inner"),
+                                     :run_initialized,
+                                     @initial_wake
+                                   )
+
+                          {:ok, :inner}
+                        end)
+
+               {:ok, :outer}
+             end)
+
+    assert {:ok, %Run{id: "outer"}} = MemoryBackend.fetch_run(b, :system, "outer")
+    assert {:ok, %Run{id: "inner"}} = MemoryBackend.fetch_run(b, :system, "inner")
   end
 
-  test "event append is idempotent and rejects conflicting sequence content", %{backend: b} do
-    {:ok, _} = initialize(b, run("r1"))
-    persisted = event("r1", 1)
+  test "overlapping transactions cannot erase each other's commits", %{backend: b} do
+    parent = self()
 
-    assert :ok = MemoryBackend.append_events(b, "r1", [persisted], [])
-    assert :ok = MemoryBackend.append_events(b, "r1", [persisted], [])
-    assert [^persisted] = MemoryBackend.events(b, "r1")
+    first =
+      Task.async(fn ->
+        MemoryBackend.transaction(b, fn tx ->
+          send(parent, :first_entered)
 
-    conflicting = %{persisted | type: :node_failed}
-    assert {:error, :event_conflict} = MemoryBackend.append_events(b, "r1", [conflicting], [])
-    assert [^persisted] = MemoryBackend.events(b, "r1")
+          receive do
+            :release_first -> :ok
+          end
+
+          assert {:ok, _} =
+                   MemoryBackend.insert_run(
+                     tx,
+                     :tenantless,
+                     run("first"),
+                     :run_initialized,
+                     @initial_wake
+                   )
+
+          {:ok, :first}
+        end)
+      end)
+
+    assert_receive :first_entered
+
+    second =
+      Task.async(fn ->
+        send(parent, :second_attempting)
+
+        MemoryBackend.transaction(b, fn tx ->
+          send(parent, :second_entered)
+
+          assert {:ok, _} =
+                   MemoryBackend.insert_run(
+                     tx,
+                     :tenantless,
+                     run("second"),
+                     :run_initialized,
+                     @initial_wake
+                   )
+
+          {:ok, :second}
+        end)
+      end)
+
+    assert_receive :second_attempting
+    refute_receive :second_entered, 100
+    send(first.pid, :release_first)
+    assert {:ok, :first} = Task.await(first)
+    assert_receive :second_entered, 1_000
+    assert {:ok, :second} = Task.await(second)
+
+    assert {:ok, %Run{id: "first"}} = MemoryBackend.fetch_run(b, :system, "first")
+    assert {:ok, %Run{id: "second"}} = MemoryBackend.fetch_run(b, :system, "second")
   end
 
-  test "commit fence leaves every durable effect untouched on failure", %{backend: b} do
-    stored = run("r1", checkpoint_seq: 5)
-    {:ok, _} = initialize(b, stored)
-    {:ok, _} = MemoryBackend.claim_run(b, "r1", "tok", [])
-    next = run("r1", checkpoint_seq: 6)
-    cp = checkpoint(next, events: [event("r1", 1)])
+  test "a rolled-back overlapping transaction cannot erase a later commit", %{backend: b} do
+    parent = self()
 
-    assert {:error, :stale_fence} = commit(b, cp, "tok", :continue, 4)
-    assert {:error, :stale_fence} = commit(b, cp, "wrong", :continue, 5)
-    assert {:ok, ^stored} = MemoryBackend.fetch_run(b, "r1", [])
-    assert [] == MemoryBackend.events(b, "r1")
+    first =
+      Task.async(fn ->
+        MemoryBackend.transaction(b, fn tx ->
+          send(parent, :rollback_entered)
 
-    assert {:ok, ^next} = commit(b, cp, "tok", :continue)
-    assert [%Event{seq: 1}] = MemoryBackend.events(b, "r1")
+          receive do
+            :release_rollback -> :ok
+          end
+
+          assert {:ok, _} =
+                   MemoryBackend.insert_run(
+                     tx,
+                     :tenantless,
+                     run("rolled-back"),
+                     :run_initialized,
+                     @initial_wake
+                   )
+
+          {:error, :rollback}
+        end)
+      end)
+
+    assert_receive :rollback_entered
+
+    second =
+      Task.async(fn ->
+        send(parent, :commit_attempting)
+
+        MemoryBackend.transaction(b, fn tx ->
+          send(parent, :commit_entered)
+
+          with {:ok, _} <-
+                 MemoryBackend.insert_run(
+                   tx,
+                   :tenantless,
+                   run("committed"),
+                   :run_initialized,
+                   @initial_wake
+                 ) do
+            {:ok, :committed}
+          end
+        end)
+      end)
+
+    assert_receive :commit_attempting
+    refute_receive :commit_entered, 100
+    send(first.pid, :release_rollback)
+    assert {:error, :rollback} = Task.await(first)
+    assert_receive :commit_entered, 1_000
+    assert {:ok, :committed} = Task.await(second)
+
+    assert {:error, :not_found} = MemoryBackend.fetch_run(b, :system, "rolled-back")
+    assert {:ok, %Run{id: "committed"}} = MemoryBackend.fetch_run(b, :system, "committed")
   end
 
-  test "an event-store failure rolls back a successful run commit", %{backend: b} do
-    stored = run("r1")
-    {:ok, _} = initialize(b, stored)
-    {:ok, _} = MemoryBackend.claim_run(b, "r1", "tok", [])
+  test "an overlapping direct root write cannot be overwritten by a transaction", %{backend: b} do
+    parent = self()
 
-    next = run("r1", checkpoint_seq: 2)
-    cp = checkpoint(next, events: [event("another-run", 1)])
+    transaction =
+      Task.async(fn ->
+        MemoryBackend.transaction(b, fn tx ->
+          send(parent, :transaction_entered)
 
-    assert {:error, :event_run_mismatch} = commit(b, cp, "tok", :continue)
-    assert {:ok, ^stored} = MemoryBackend.fetch_run(b, "r1", [])
-    assert "tok" == MemoryBackend.claim(b, "r1")
-    assert [] == MemoryBackend.events(b, "r1")
+          receive do
+            :release_transaction -> :ok
+          end
+
+          with {:ok, _} <-
+                 MemoryBackend.insert_run(
+                   tx,
+                   :tenantless,
+                   run("transaction"),
+                   :run_initialized,
+                   @initial_wake
+                 ) do
+            {:ok, :transaction}
+          end
+        end)
+      end)
+
+    assert_receive :transaction_entered
+
+    direct =
+      Task.async(fn ->
+        send(parent, :direct_attempting)
+
+        result =
+          MemoryBackend.insert_run(
+            b,
+            :tenantless,
+            run("direct"),
+            :run_initialized,
+            @initial_wake
+          )
+
+        send(parent, :direct_finished)
+        result
+      end)
+
+    assert_receive :direct_attempting
+    refute_receive :direct_finished, 100
+    send(transaction.pid, :release_transaction)
+    assert {:ok, :transaction} = Task.await(transaction)
+    assert {:ok, %Run{id: "direct"}} = Task.await(direct)
+    assert_receive :direct_finished
+
+    assert {:ok, %Run{id: "transaction"}} =
+             MemoryBackend.fetch_run(b, :system, "transaction")
+
+    assert {:ok, %Run{id: "direct"}} = MemoryBackend.fetch_run(b, :system, "direct")
   end
 
-  test "claim win, held, refresh, and idempotent token-guarded release", %{backend: b} do
-    {:ok, _} = initialize(b, run("r1"))
-    assert {:ok, _} = MemoryBackend.claim_run(b, "r1", "a", [])
-    assert {:error, :claim_held} = MemoryBackend.claim_run(b, "r1", "b", [])
-    assert :ok = MemoryBackend.refresh_claim(b, "r1", "a", [])
-    assert {:error, :claim_lost} = MemoryBackend.refresh_claim(b, "r1", "b", [])
-    assert :ok = MemoryBackend.release_claim(b, "r1", "b", [])
-    assert "a" = MemoryBackend.claim(b, "r1")
-    assert :ok = MemoryBackend.release_claim(b, "r1", "a", [])
-    assert nil == MemoryBackend.claim(b, "r1")
-    assert :ok = MemoryBackend.release_claim(b, "r1", "a", [])
+  test "scope is explicit and cannot fail open", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("tenantless"))
+    assert {:ok, _} = initialize(b, run("tenant"), scope: {:tenant, "t1"})
+
+    assert {:ok, _} = MemoryBackend.fetch_run(b, :system, "tenantless")
+    assert {:ok, _} = MemoryBackend.fetch_run(b, :system, "tenant")
+    assert {:ok, _} = MemoryBackend.fetch_run(b, :tenantless, "tenantless")
+    assert {:error, :not_found} = MemoryBackend.fetch_run(b, :tenantless, "tenant")
+    assert {:ok, _} = MemoryBackend.fetch_run(b, {:tenant, "t1"}, "tenant")
+    assert {:error, :not_found} = MemoryBackend.fetch_run(b, {:tenant, "t2"}, "tenant")
+
+    assert_raise ArgumentError, ~r/scope must be/, fn ->
+      MemoryBackend.fetch_run(b, nil, "tenant")
+    end
   end
 
-  test "claim steal invalidates the stale holder", %{backend: _} do
-    {:ok, b} = MemoryBackend.start_link(orphan_ttl_ms: 0)
-    {:ok, _} = initialize(b, run("r1"))
-    assert {:ok, _} = MemoryBackend.claim_run(b, "r1", "a", [])
-    assert {:ok, _} = MemoryBackend.claim_run(b, "r1", "b", [])
-    assert "b" = MemoryBackend.claim(b, "r1")
-    assert {:error, :claim_lost} = MemoryBackend.refresh_claim(b, "r1", "a", [])
+  test "inspect_run exposes operational state but never the claim token", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("r1"))
+    lease = claim_one(b, @now)
 
-    cp = checkpoint(run("r1", checkpoint_seq: 2))
-    assert {:error, :stale_fence} = commit(b, cp, "a", :continue)
+    assert {:ok, info} = MemoryBackend.inspect_run(b, :system, "r1")
+    assert info.run.id == "r1"
+    assert info.claimed_at == @now
+    assert info.claim_attempts == 1
+    assert info.wake_at == nil
+    refute Map.has_key?(info, :claim_token)
+    assert lease.claim_token == MemoryBackend.claim(b, "r1")
   end
 
-  test "mid-drain commit persists effects and retains the claim", %{backend: b} do
-    {:ok, _} = initialize(b, run("r1"))
-    {:ok, _} = MemoryBackend.claim_run(b, "r1", "a", [])
-    cp = checkpoint(run("r1", checkpoint_seq: 2), events: [event("r1", 1)])
+  test "empty event append is a no-op and assigned event replay is idempotent", %{backend: b} do
+    assert :ok = MemoryBackend.append_events(b, :tenantless, "missing", [])
+    assert {:ok, _} = initialize(b, run("r1"))
 
-    assert {:ok, committed} = commit(b, cp, "a", :continue)
-    assert committed.checkpoint_seq == 2
-    assert [%Event{seq: 1}] = MemoryBackend.events(b, "r1")
-    assert "a" = MemoryBackend.claim(b, "r1")
+    checkpoint_fact =
+      event("r1", 41,
+        type: :checkpoint_committed,
+        step: 3,
+        metadata: %{
+          "checkpoint_seq" => 2,
+          "checkpoint_type" => "step_committed",
+          "park_reason" => "budget",
+          "wake_disposition" => "immediate"
+        }
+      )
+
+    assert :ok = MemoryBackend.append_events(b, :tenantless, "r1", [checkpoint_fact])
+    assert :ok = MemoryBackend.append_events(b, :tenantless, "r1", [checkpoint_fact])
+    assert [^checkpoint_fact] = MemoryBackend.events(b, :tenantless, "r1")
+    assert checkpoint_fact.seq != checkpoint_fact.metadata["checkpoint_seq"]
+
+    conflicting = put_in(checkpoint_fact.metadata["checkpoint_seq"], 3)
+
+    assert {:error, :event_conflict} =
+             MemoryBackend.append_events(b, :tenantless, "r1", [conflicting])
+
+    assert {:error, :event_run_mismatch} =
+             MemoryBackend.append_events(b, :tenantless, "r1", [event("other", 42)])
+
+    assert {:error, :not_found} =
+             MemoryBackend.append_events(b, {:tenant, "t1"}, "r1", [event("r1", 42)])
+
+    earlier = event("r1", 3)
+    middle = event("r1", 10)
+    assert :ok = MemoryBackend.append_events(b, :tenantless, "r1", [middle, earlier])
+
+    assert {:ok, [^middle, ^checkpoint_fact]} =
+             MemoryBackend.list_events(b, :tenantless, "r1", 3, 2)
+
+    assert [^earlier, ^middle, ^checkpoint_fact] =
+             MemoryBackend.events(b, :tenantless, "r1")
   end
 
-  test "park commit atomically releases the claim and records wake_at", %{backend: b} do
-    {:ok, _} = initialize(b, run("r1"))
-    {:ok, _} = MemoryBackend.claim_run(b, "r1", "a", [])
-    wake = ~U[2026-07-10 12:00:00Z]
-    cp = checkpoint(run("r1", checkpoint_seq: 2))
+  test "claim_due batches ready and expired candidates with backend-minted tokens", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("a"))
+    assert {:ok, _} = initialize(b, run("b"))
 
-    assert {:ok, _} = commit(b, cp, "a", {:park, wake})
-    assert nil == MemoryBackend.claim(b, "r1")
-    assert ^wake = MemoryBackend.wake_at(b, "r1")
+    first = claim_one(b, @now, limit: 1)
+    assert first.run_id == "a"
+    assert first.claim_attempt == 1
+    assert is_binary(first.claim_token) and first.claim_token != ""
+    assert MemoryBackend.wake_at(b, "a") == nil
+
+    later = DateTime.add(@now, 61, :second)
+
+    assert {:ok, %{leases: leases, poisoned: []}} =
+             claim_due(b, later, limit: 2, orphan_ttl_ms: 60_000)
+
+    assert Enum.map(leases, & &1.run_id) |> Enum.sort() == ["a", "b"]
+    stolen = Enum.find(leases, &(&1.run_id == "a"))
+    assert stolen.claim_token != first.claim_token
+    assert stolen.claim_attempt == 2
   end
 
-  test "signal-style commit revokes a live claim and wins the sequence fence", %{backend: b} do
-    {:ok, _} = initialize(b, run("r1"))
-    {:ok, _} = MemoryBackend.claim_run(b, "r1", "a", [])
-    advance = checkpoint(run("r1", checkpoint_seq: 2), events: [event("r1", 1)])
-    signal = checkpoint(run("r1", checkpoint_seq: 2), events: [event("r1", 99)])
+  test "claim_due excludes future wakes until they become due", %{backend: b} do
+    future = DateTime.add(@now, 60, :second)
+    assert {:ok, _} = initialize(b, run("future"), wake_at: future)
 
-    assert {:ok, _} = commit(b, signal, nil, {:park, nil})
-    assert nil == MemoryBackend.claim(b, "r1")
-    assert {:error, :stale_fence} = commit(b, advance, "a", :continue)
-    assert [%Event{seq: 99}] = MemoryBackend.events(b, "r1")
+    assert {:ok, %{leases: [], poisoned: []}} = claim_due(b, @now, limit: 1)
+
+    assert {:ok, %{leases: [%{run_id: "future"}], poisoned: []}} =
+             claim_due(b, future, limit: 1)
   end
 
-  test "mutate_run serializes a signal and atomically revokes the claim", %{backend: b} do
-    {:ok, _} = initialize(b, run("r1"))
-    {:ok, _} = MemoryBackend.claim_run(b, "r1", "a", [])
+  test "maximum N launches exactly N attempts before poisoning", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("r1"))
 
-    mutation = fn current ->
-      cancelled = %{
-        current
-        | status: :cancelled,
-          checkpoint_seq: current.checkpoint_seq + 1,
-          finished_at: DateTime.utc_now()
-      }
+    for attempt <- 1..3 do
+      now = DateTime.add(@now, attempt, :millisecond)
 
-      proposal =
-        checkpoint(cancelled,
-          type: :run_cancelled,
-          delivery: :sync,
-          events: [event("r1", 1)]
-        )
+      assert {:ok, %{leases: [lease], poisoned: []}} =
+               claim_due(b, now,
+                 limit: 1,
+                 orphan_ttl_ms: 0,
+                 max_claim_attempts: 3
+               )
 
-      {:commit, proposal, {:park, nil}}
+      assert lease.claim_attempt == attempt
     end
 
-    assert {:ok, %Checkpoint{run: %Run{status: :cancelled, checkpoint_seq: 2}}} =
-             MemoryBackend.transaction(b, fn transaction ->
-               with {:ok, committed} <-
-                      MemoryBackend.mutate_run(transaction, "r1", mutation, []),
-                    :ok <-
-                      MemoryBackend.append_events(
-                        transaction,
-                        "r1",
-                        committed.events,
-                        []
-                      ) do
-                 {:ok, committed}
+    poison_time = DateTime.add(@now, 4, :millisecond)
+
+    assert {:ok, %{leases: [], poisoned: [poison]}} =
+             claim_due(b, poison_time,
+               limit: 1,
+               orphan_ttl_ms: 0,
+               max_claim_attempts: 3
+             )
+
+    assert poison.run_id == "r1"
+    assert poison.poisoned_at == poison_time
+
+    assert {:ok, info} = MemoryBackend.inspect_run(b, :system, "r1")
+    assert info.claim_attempts == 3
+    assert info.poisoned_at == poison_time
+    assert info.wake_at == nil
+    assert MemoryBackend.claim(b, "r1") == nil
+    assert {:ok, %Run{checkpoint_seq: 1}} = MemoryBackend.fetch_run(b, :system, "r1")
+    assert MemoryBackend.record(b, "r1").latest_checkpoint_type == :run_initialized
+
+    assert {:ok, %{leases: [], poisoned: []}} =
+             claim_due(b, DateTime.add(poison_time, 1, :second),
+               limit: 1,
+               orphan_ttl_ms: 0,
+               max_claim_attempts: 3
+             )
+  end
+
+  test "a claim becomes stealable only after the TTL boundary", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("r1"))
+    first = claim_one(b, @now)
+
+    boundary = DateTime.add(@now, 60, :second)
+
+    assert {:ok, %{leases: [], poisoned: []}} =
+             claim_due(b, boundary, limit: 1, orphan_ttl_ms: 60_000)
+
+    after_boundary = DateTime.add(boundary, 1, :millisecond)
+
+    assert {:ok, %{leases: [stolen], poisoned: []}} =
+             claim_due(b, after_boundary, limit: 1, orphan_ttl_ms: 60_000)
+
+    assert stolen.claim_token != first.claim_token
+  end
+
+  test "concurrent claim_due calls produce one current lease", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("r1"))
+    policy = claim_policy(@now, limit: 1, orphan_ttl_ms: 60_000)
+
+    results =
+      1..2
+      |> Task.async_stream(
+        fn _ -> MemoryBackend.claim_due(b, :system, policy) end,
+        ordered: false,
+        max_concurrency: 2
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    leases = for {:ok, %{leases: batch}} <- results, lease <- batch, do: lease
+    assert [%{run_id: "r1"}] = leases
+  end
+
+  test "refresh and release are token guarded and stale release is harmless", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("r1"))
+    first = claim_one(b, @now)
+    refreshed_at = DateTime.add(@now, 1, :second)
+
+    assert {:error, :claim_lost} =
+             MemoryBackend.refresh_claim(b, :system, "r1", "wrong", refreshed_at)
+
+    assert :ok = MemoryBackend.refresh_claim(b, :system, "r1", first.claim_token, refreshed_at)
+    assert :ok = MemoryBackend.release_claim(b, :system, "r1", "wrong", refreshed_at)
+    assert MemoryBackend.claim(b, "r1") == first.claim_token
+
+    stolen =
+      claim_one(b, DateTime.add(refreshed_at, 1, :millisecond),
+        orphan_ttl_ms: 0,
+        max_claim_attempts: 3
+      )
+
+    assert stolen.claim_token != first.claim_token
+
+    assert :ok =
+             MemoryBackend.release_claim(
+               b,
+               :system,
+               "r1",
+               first.claim_token,
+               refreshed_at
+             )
+
+    assert MemoryBackend.claim(b, "r1") == stolen.claim_token
+    released_at = DateTime.add(refreshed_at, 1, :second)
+
+    assert :ok =
+             MemoryBackend.release_claim(b, :system, "r1", stolen.claim_token, released_at)
+
+    assert MemoryBackend.claim(b, "r1") == nil
+    assert MemoryBackend.wake_at(b, "r1") == released_at
+  end
+
+  test "advance commit requires the current non-nil token and exact next sequence", %{backend: b} do
+    stored = run("r1", checkpoint_seq: 5)
+    assert {:ok, _} = initialize(b, stored)
+    lease = claim_one(b, @now)
+    next = run("r1", checkpoint_seq: 6)
+    retained = event("r1", 20)
+
+    assert {:error, :invalid_commit} =
+             commit(b, next, nil, :retain_claim, events: [retained])
+
+    assert {:error, :stale_fence} =
+             commit(b, next, "wrong", :retain_claim, events: [retained])
+
+    assert {:error, :invalid_commit} =
+             commit(b, next, lease.claim_token, :retain_claim,
+               expected_seq: 4,
+               events: [retained]
+             )
+
+    assert {:error, :stale_fence} =
+             commit(b, run("r1", checkpoint_seq: 5), lease.claim_token, :retain_claim,
+               expected_seq: 4,
+               events: [retained]
+             )
+
+    jumped = run("r1", checkpoint_seq: 7)
+
+    assert {:error, :invalid_commit} =
+             commit(b, jumped, lease.claim_token, :retain_claim,
+               expected_seq: 5,
+               events: [retained]
+             )
+
+    assert {:ok, ^stored} = MemoryBackend.fetch_run(b, :system, "r1")
+    assert [] == MemoryBackend.events(b, :system, "r1")
+
+    assert {:ok, ^next} =
+             commit(b, next, lease.claim_token, :retain_claim,
+               checkpoint_type: :step_committed,
+               events: [retained]
+             )
+
+    assert [^retained] = MemoryBackend.events(b, :system, "r1")
+    assert MemoryBackend.claim(b, "r1") == lease.claim_token
+    assert {:ok, %{claim_attempts: 0}} = MemoryBackend.inspect_run(b, :system, "r1")
+    assert MemoryBackend.record(b, "r1").latest_checkpoint_type == :step_committed
+  end
+
+  test "event failure rolls an otherwise valid run commit back", %{backend: b} do
+    stored = run("r1")
+    assert {:ok, _} = initialize(b, stored)
+    lease = claim_one(b, @now)
+    next = run("r1", checkpoint_seq: 2)
+
+    assert {:error, :event_run_mismatch} =
+             commit(b, next, lease.claim_token, :retain_claim, events: [event("other", 1)])
+
+    assert {:ok, ^stored} = MemoryBackend.fetch_run(b, :system, "r1")
+    assert MemoryBackend.claim(b, "r1") == lease.claim_token
+    assert [] == MemoryBackend.events(b, :system, "r1")
+  end
+
+  test "commits and mutations cannot rebind the immutable graph version", %{backend: b} do
+    stored = run("r1")
+    assert {:ok, _} = initialize(b, stored)
+    lease = claim_one(b, @now)
+
+    rebound = %{run("r1", checkpoint_seq: 2) | graph_id: "other"}
+
+    assert {:error, :invalid_commit} =
+             commit(b, rebound, lease.claim_token, :retain_claim)
+
+    assert {:error, :invalid_commit} =
+             commit(b, run("r1", checkpoint_seq: 2), lease.claim_token, :retain_claim,
+               checkpoint_type: nil
+             )
+
+    assert {:error, :invalid_mutation} =
+             MemoryBackend.mutate_run(b, :tenantless, "r1", fn current ->
+               rebound = %{
+                 current
+                 | graph_hash: String.duplicate("cd", 32),
+                   checkpoint_seq: current.checkpoint_seq + 1
+               }
+
+               {:commit, rebound, :interrupt_resolved, {:release_claim, :immediate}, :rebound}
+             end)
+
+    assert {:ok, ^stored} = MemoryBackend.fetch_run(b, :system, "r1")
+    assert MemoryBackend.claim(b, "r1") == lease.claim_token
+  end
+
+  test "two commits under the same fence produce one durable winner", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("r1"))
+    lease = claim_one(b, @now)
+
+    results =
+      [10, 20]
+      |> Task.async_stream(
+        fn seq ->
+          next = %{run("r1", checkpoint_seq: 2) | metadata: %{"winner" => seq}}
+
+          commit(b, next, lease.claim_token, {:release_claim, :immediate},
+            events: [event("r1", seq)]
+          )
+        end,
+        ordered: false,
+        max_concurrency: 2
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.count(results, &match?({:ok, _}, &1)) == 1
+    assert Enum.count(results, &match?({:error, :stale_fence}, &1)) == 1
+    assert [_winner] = MemoryBackend.events(b, :system, "r1")
+  end
+
+  test "commit schedule effects retain, wake, and park without ambiguity", %{backend: _} do
+    {:ok, b} = MemoryBackend.start_link(clock: fn -> @commit_now end)
+
+    for id <- ~w(retain immediate future external terminal) do
+      assert {:ok, _} = initialize(b, run(id))
+    end
+
+    first = claim_one(b, @now, limit: 1)
+
+    # Claim deterministically in run-id order through separate due scans.
+    leases =
+      [first | claim_all_remaining(b, DateTime.add(@now, 1, :second), 4)]
+      |> Map.new(&{&1.run_id, &1})
+
+    assert {:ok, _} =
+             commit(
+               b,
+               run("retain", checkpoint_seq: 2),
+               leases["retain"].claim_token,
+               :retain_claim
+             )
+
+    assert MemoryBackend.claim(b, "retain") == leases["retain"].claim_token
+    assert {:ok, %{claimed_at: @commit_now}} = MemoryBackend.inspect_run(b, :system, "retain")
+
+    assert {:ok, _} =
+             commit(
+               b,
+               run("immediate", checkpoint_seq: 2),
+               leases["immediate"].claim_token,
+               {:release_claim, :immediate}
+             )
+
+    assert MemoryBackend.wake_at(b, "immediate") == @commit_now
+    assert MemoryBackend.claim(b, "immediate") == nil
+
+    future = ~U[2026-07-10 12:00:00Z]
+
+    assert {:ok, _} =
+             commit(
+               b,
+               run("future", checkpoint_seq: 2),
+               leases["future"].claim_token,
+               {:release_claim, {:at, future}}
+             )
+
+    assert MemoryBackend.wake_at(b, "future") == future
+    assert MemoryBackend.claim(b, "future") == nil
+
+    assert {:ok, _} =
+             commit(
+               b,
+               run("external", checkpoint_seq: 2, status: :waiting),
+               leases["external"].claim_token,
+               {:release_claim, :external}
+             )
+
+    assert MemoryBackend.wake_at(b, "external") == nil
+    assert MemoryBackend.claim(b, "external") == nil
+
+    done = run("terminal", checkpoint_seq: 2, status: :done)
+
+    assert {:ok, _} =
+             commit(
+               b,
+               done,
+               leases["terminal"].claim_token,
+               {:release_claim, :terminal}
+             )
+
+    assert MemoryBackend.wake_at(b, "terminal") == nil
+    assert MemoryBackend.claim(b, "terminal") == nil
+  end
+
+  defp claim_all_remaining(backend, now, limit) do
+    assert {:ok, %{leases: leases, poisoned: []}} =
+             claim_due(backend, now, limit: limit, orphan_ttl_ms: 60_000)
+
+    leases
+  end
+
+  test "serialized mutation returns opaque commit data and revokes a live claim", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("r1"))
+    _lease = claim_one(b, @now)
+    retained = event("r1", 1)
+
+    mutation = fn current ->
+      next = %{current | checkpoint_seq: current.checkpoint_seq + 1}
+      {:commit, next, :interrupt_resolved, {:release_claim, :immediate}, [retained]}
+    end
+
+    assert {:ok, {:committed, [^retained]}} =
+             MemoryBackend.transaction(b, fn tx ->
+               with {:ok, {:committed, events}} <-
+                      MemoryBackend.mutate_run(tx, :tenantless, "r1", mutation),
+                    :ok <- MemoryBackend.append_events(tx, :tenantless, "r1", events) do
+                 {:ok, {:committed, events}}
                end
              end)
 
-    assert nil == MemoryBackend.claim(b, "r1")
-    assert nil == MemoryBackend.wake_at(b, "r1")
-
-    assert [%Event{seq: 1}] = MemoryBackend.events(b, "r1")
+    assert {:ok, %Run{checkpoint_seq: 2}} = MemoryBackend.fetch_run(b, :tenantless, "r1")
+    assert MemoryBackend.claim(b, "r1") == nil
+    assert %DateTime{} = MemoryBackend.wake_at(b, "r1")
+    assert [^retained] = MemoryBackend.events(b, :tenantless, "r1")
   end
 
-  test "an event failure rolls a serialized mutation back", %{backend: b} do
+  test "serialized mutation event failure rolls the row and claim back", %{backend: b} do
     stored = run("r1")
-    {:ok, _} = initialize(b, stored)
-    {:ok, _} = MemoryBackend.claim_run(b, "r1", "a", [])
+    assert {:ok, _} = initialize(b, stored)
+    lease = claim_one(b, @now)
 
     mutation = fn current ->
-      cancelled = %{current | status: :cancelled, checkpoint_seq: 2}
+      next = %{current | checkpoint_seq: current.checkpoint_seq + 1}
 
-      proposal =
-        checkpoint(cancelled,
-          type: :run_cancelled,
-          delivery: :sync,
-          events: [event("another-run", 1)]
-        )
-
-      {:commit, proposal, {:park, nil}}
+      {:commit, next, :interrupt_resolved, {:release_claim, :immediate}, [event("other", 1)]}
     end
 
     assert {:error, :event_run_mismatch} =
-             MemoryBackend.transaction(b, fn transaction ->
-               with {:ok, committed} <-
-                      MemoryBackend.mutate_run(transaction, "r1", mutation, []),
-                    :ok <-
-                      MemoryBackend.append_events(
-                        transaction,
-                        "r1",
-                        committed.events,
-                        []
-                      ) do
-                 {:ok, committed}
+             MemoryBackend.transaction(b, fn tx ->
+               with {:ok, {:committed, events}} <-
+                      MemoryBackend.mutate_run(tx, :tenantless, "r1", mutation),
+                    :ok <- MemoryBackend.append_events(tx, :tenantless, "r1", events) do
+                 {:ok, :committed}
                end
              end)
 
-    assert {:ok, ^stored} = MemoryBackend.fetch_run(b, "r1", [])
-    assert "a" == MemoryBackend.claim(b, "r1")
-    assert [] == MemoryBackend.events(b, "r1")
+    assert {:ok, ^stored} = MemoryBackend.fetch_run(b, :tenantless, "r1")
+    assert MemoryBackend.claim(b, "r1") == lease.claim_token
+    assert [] == MemoryBackend.events(b, :tenantless, "r1")
   end
 
-  test "mutate_run leaves storage untouched on validation or proposal error", %{backend: b} do
-    stored = run("r1")
-    {:ok, _} = initialize(b, stored, tenant_id: "t1")
+  test "serialized no-change result leaves the aggregate byte-for-byte untouched", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("r1"))
+    _lease = claim_one(b, @now)
+    before = MemoryBackend.record(b, "r1")
+
+    assert {:ok, {:unchanged, :already_resolved}} =
+             MemoryBackend.mutate_run(b, :tenantless, "r1", fn _current ->
+               {:no_change, :already_resolved}
+             end)
+
+    assert MemoryBackend.record(b, "r1") == before
+  end
+
+  test "serialized mutation checks scope before invoking the callback", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("r1"), scope: {:tenant, "t1"})
 
     assert {:error, :not_found} =
-             MemoryBackend.mutate_run(b, "r1", fn _ -> flunk("must not run") end, tenant_id: "t2")
+             MemoryBackend.mutate_run(b, {:tenant, "t2"}, "r1", fn _ ->
+               flunk("mutation must not run outside scope")
+             end)
 
     assert {:error, :invalid_signal} =
-             MemoryBackend.mutate_run(b, "r1", fn _ -> {:error, :invalid_signal} end,
-               tenant_id: "t1"
+             MemoryBackend.mutate_run(b, {:tenant, "t1"}, "r1", fn _ ->
+               {:error, :invalid_signal}
+             end)
+  end
+
+  test "retry_poisoned_run is terminal-first and fully resets non-terminal poison", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("running"))
+
+    # One launch is permitted, then the next recovery need poisons.
+    assert {:ok, %{leases: [_], poisoned: []}} =
+             claim_due(b, @now, limit: 1, orphan_ttl_ms: 0, max_claim_attempts: 1)
+
+    poisoned_at = DateTime.add(@now, 1, :millisecond)
+
+    assert {:ok, %{leases: [], poisoned: [_]}} =
+             claim_due(b, poisoned_at,
+               limit: 1,
+               orphan_ttl_ms: 0,
+               max_claim_attempts: 1
              )
 
-    assert {:ok, ^stored} = MemoryBackend.fetch_run(b, "r1", [])
-    assert [] == MemoryBackend.events(b, "r1")
-  end
+    retry_at = DateTime.add(@now, 1, :second)
 
-  test "retry_poisoned_run changes only operational state and wake", %{backend: b} do
-    stored = run("r1")
-    {:ok, _} = initialize(b, stored)
-    :ok = MemoryBackend.poison(b, "r1")
-    assert :poisoned == MemoryBackend.operational_status(b, "r1")
+    assert {:ok, %Run{id: "running"}} =
+             MemoryBackend.retry_poisoned_run(b, :tenantless, "running", retry_at)
 
-    assert {:ok, ^stored} = MemoryBackend.retry_poisoned_run(b, "r1", [])
-    assert :active == MemoryBackend.operational_status(b, "r1")
-    assert %DateTime{} = MemoryBackend.wake_at(b, "r1")
-    assert {:ok, ^stored} = MemoryBackend.fetch_run(b, "r1", [])
-    assert [] == MemoryBackend.events(b, "r1")
-  end
+    assert {:ok, info} = MemoryBackend.inspect_run(b, :tenantless, "running")
+    assert info.poisoned_at == nil
+    assert info.poison_reason == nil
+    assert info.claim_attempts == 0
+    assert info.wake_at == retry_at
+    assert MemoryBackend.claim(b, "running") == nil
 
-  test "expiry alone does not invalidate an unstolen token", %{backend: _} do
-    {:ok, b} = MemoryBackend.start_link(orphan_ttl_ms: 0)
-    {:ok, _} = initialize(b, run("r1"))
-    {:ok, _} = MemoryBackend.claim_run(b, "r1", "a", [])
-    cp = checkpoint(run("r1", checkpoint_seq: 2))
-    assert {:ok, _} = commit(b, cp, "a", :continue)
-    assert "a" = MemoryBackend.claim(b, "r1")
-  end
+    unchanged = MemoryBackend.record(b, "running")
 
-  test "commit on an unknown run is not_found", %{backend: b} do
-    cp = checkpoint(run("missing", checkpoint_seq: 2))
-    assert {:error, :not_found} = commit(b, cp, nil, {:park, nil})
+    assert {:ok, %Run{id: "running"}} =
+             MemoryBackend.retry_poisoned_run(
+               b,
+               :tenantless,
+               "running",
+               DateTime.add(retry_at, 1, :second)
+             )
+
+    assert MemoryBackend.record(b, "running") == unchanged
+
+    assert {:ok, _} = initialize(b, run("terminal"))
+
+    assert {:ok, {:committed, :done}} =
+             MemoryBackend.mutate_run(b, :tenantless, "terminal", fn current ->
+               terminal = %{current | status: :done, checkpoint_seq: current.checkpoint_seq + 1}
+               {:commit, terminal, :run_completed, {:release_claim, :terminal}, :done}
+             end)
+
+    :ok = MemoryBackend.poison(b, "terminal", %{"code" => "test"})
+
+    assert {:error, :inactive_run} =
+             MemoryBackend.retry_poisoned_run(b, :tenantless, "terminal", retry_at)
   end
 end

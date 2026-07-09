@@ -70,9 +70,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert indexes("docket_graph_versions")["docket_graph_versions_graph_id_graph_hash_index"] =~
                "CREATE UNIQUE INDEX"
 
-      assert foreign_key("docket_runs", "docket_runs_graph_version_fkey") ==
-               {"docket_graph_versions", ["graph_id", "graph_hash"], ["graph_id", "graph_hash"]}
-
       assert indexes("docket_events")["docket_events_run_id_seq_index"] =~
                "CREATE UNIQUE INDEX"
 
@@ -218,35 +215,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       Map.new(rows, fn [name, def] -> {name, def} end)
-    end
-
-    defp foreign_key(table, constraint) do
-      %{rows: [[foreign_table, local_columns, foreign_columns]]} =
-        TestRepo.query!(
-          """
-          SELECT foreign_table.relname,
-                 array_agg(local_column.attname ORDER BY key_position.ordinality),
-                 array_agg(foreign_column.attname ORDER BY key_position.ordinality)
-          FROM pg_constraint
-          JOIN pg_class local_table ON local_table.oid = pg_constraint.conrelid
-          JOIN pg_class foreign_table ON foreign_table.oid = pg_constraint.confrelid
-          JOIN unnest(pg_constraint.conkey, pg_constraint.confkey)
-            WITH ORDINALITY AS key_position(local_num, foreign_num, ordinality) ON true
-          JOIN pg_attribute local_column
-            ON local_column.attrelid = local_table.oid
-           AND local_column.attnum = key_position.local_num
-          JOIN pg_attribute foreign_column
-            ON foreign_column.attrelid = foreign_table.oid
-           AND foreign_column.attnum = key_position.foreign_num
-          WHERE local_table.relname = $1
-            AND pg_constraint.conname = $2
-            AND pg_constraint.contype = 'f'
-          GROUP BY foreign_table.relname
-          """,
-          [table, constraint]
-        )
-
-      {foreign_table, local_columns, foreign_columns}
     end
   end
 end

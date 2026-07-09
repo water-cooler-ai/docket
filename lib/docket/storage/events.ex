@@ -8,6 +8,7 @@ defmodule Docket.Storage.Events do
   """
 
   @type ctx :: Docket.Storage.ctx()
+  @type scope :: Docket.Storage.scope()
 
   @doc """
   Appends retained events for `run_id` in sequence order.
@@ -17,13 +18,20 @@ defmodule Docket.Storage.Events do
   Every event must belong to `run_id`; a backend must reject a mismatched
   event rather than storing it under the supplied run.
 
-  An empty event list succeeds without changing storage. `opts` may carry
-  backend-independent scoping such as `:tenant_id`.
+  Event identities are assigned before this callback. The store never derives
+  a sequence with `MAX(seq)`, never substitutes the run's checkpoint sequence,
+  and accepts gaps left by persistence filtering. In particular,
+  `:checkpoint_committed` is an ordinary assigned event at this boundary.
+
+  For a non-empty append, `scope` is checked through the owning run and a
+  tenant mismatch is reported as `{:error, :not_found}`. An empty event list
+  validates the scope value but succeeds without a run lookup or storage
+  change.
   """
   @callback append_events(
               ctx(),
+              scope(),
               run_id :: String.t(),
-              events :: [Docket.Event.t()],
-              opts :: keyword()
+              events :: [Docket.Event.t()]
             ) :: :ok | {:error, term()}
 end

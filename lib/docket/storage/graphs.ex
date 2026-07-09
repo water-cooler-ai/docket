@@ -5,6 +5,9 @@ defmodule Docket.Storage.Graphs do
   Graph documents are immutable and addressed by `{graph_id, graph_hash}`.
   Lifecycle orchestration uses `Docket.Storage.transaction/2` when publishing
   a graph version must be atomic with creating a run and its initial events.
+
+  Graph versions are content addressed rather than tenant scoped. Backend
+  configuration belongs in the opaque context, not per-call options.
   """
 
   @type ctx :: Docket.Storage.ctx()
@@ -14,15 +17,14 @@ defmodule Docket.Storage.Graphs do
 
   Saving the same document again is idempotent. Reusing the key for different
   content is an error; a backend must not silently accept a hash/document
-  mismatch. `opts` carries backend-specific storage options.
+  mismatch.
   """
   @callback save_graph(
               ctx(),
               graph_id :: String.t(),
               graph_hash :: String.t(),
-              graph_document :: map(),
-              opts :: keyword()
-            ) :: :ok | {:error, term()}
+              graph_document :: map()
+            ) :: :ok | {:error, :graph_content_conflict | term()}
 
   @doc """
   Reads a canonical graph document by `{graph_id, graph_hash}`.
@@ -30,7 +32,6 @@ defmodule Docket.Storage.Graphs do
   @callback fetch_graph(
               ctx(),
               graph_id :: String.t(),
-              graph_hash :: String.t(),
-              opts :: keyword()
+              graph_hash :: String.t()
             ) :: {:ok, map()} | {:error, :not_found}
 end

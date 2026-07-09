@@ -45,14 +45,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       create_if_not_exists(unique_index(:docket_runs, [:run_id], prefix: prefix))
 
-      execute("""
-      ALTER TABLE #{prefix}.docket_runs
-      ADD CONSTRAINT docket_runs_graph_version_fkey
-      FOREIGN KEY (graph_id, graph_hash)
-      REFERENCES #{prefix}.docket_graph_versions (graph_id, graph_hash)
-      ON DELETE RESTRICT
-      """)
-
       create_if_not_exists(
         index(:docket_runs, [:tenant_id, :status],
           where: "tenant_id IS NOT NULL",
