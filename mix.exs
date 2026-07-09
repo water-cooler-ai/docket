@@ -57,10 +57,9 @@ defmodule Docket.MixProject do
 
   defp package do
     [
-      # TODO: choose a license before the first Hex publish.
-      licenses: [],
+      licenses: ["Apache-2.0"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib mix.exs README.md docs/architecture)
+      files: ~w(lib mix.exs README.md LICENSE docs/architecture)
     ]
   end
 end
