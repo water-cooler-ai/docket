@@ -6,7 +6,7 @@ defmodule Docket.Event do
   Events are built at update barriers and delivered inside checkpoints. The
   v1 event types are:
 
-  - `:run_initialized`, `:run_completed`, `:run_failed`
+  - `:run_initialized`, `:run_completed`, `:run_failed`, `:run_cancelled`
   - `:node_completed`, `:node_failed` (one `:node_failed` per failed attempt)
   - `:channel_updated` (payload carries the new version or the writer node
     IDs depending on the write's origin, never the value)
@@ -31,6 +31,7 @@ defmodule Docket.Event do
           :run_initialized
           | :run_completed
           | :run_failed
+          | :run_cancelled
           | :node_completed
           | :node_failed
           | :channel_updated
@@ -55,6 +56,7 @@ defmodule Docket.Event do
     :run_initialized,
     :run_completed,
     :run_failed,
+    :run_cancelled,
     :node_completed,
     :node_failed,
     :channel_updated,

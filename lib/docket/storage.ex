@@ -1,103 +1,135 @@
 defmodule Docket.Storage do
   @moduledoc """
-  Persistence seam a durable backend implements: a run store, a graph store,
-  and event persistence.
+  Atomic persistence seam implemented by a durable backend.
 
   The run store holds the canonical `Docket.Run` document as the single full
   document for a run. Reads through this behaviour are storage-backed: they
-  return the last committed run and may lag a live in-memory run by one
-  uncommitted superstep. A storage-backed read is distinct from a live process
-  read, which reflects work a running worker has not yet committed.
+  return the last committed run and may lag live execution by one uncommitted
+  superstep.
 
-  The graph store is a content-addressed record of compiled graph documents,
-  keyed by `{graph_id, graph_hash}`, that a worker reloads with no host call
-  in the loop. Event persistence appends run facts under a backend-defined
-  policy.
+  The graph store holds canonical graph documents keyed by
+  `{graph_id, graph_hash}` so a worker can recover without a host call.
 
-  Checkpoint-commit history persists as metadata-only events: a backend that
-  wants a durable per-commit record derives a metadata-only entry from the
-  checkpoint it is committing and persists it through `persist_events/4`.
-  There is no checkpoint-snapshot callback, and a backend never persists a
-  full run document per commit — the stored run is the only full document.
+  Run initialization and every later checkpoint commit are atomic backend
+  operations. A successful mutation persists the run, checkpoint metadata,
+  retained events, claim disposition, and schedule together. There are
+  deliberately no public `update_run` or `persist_events` callbacks that a
+  driver could compose non-atomically. The stored run is the only full
+  document; checkpoint history is metadata-only.
 
-  `Docket.Checkpoint` handlers remain the host-facing notification seam;
-  implementing this behaviour is a separate, deeper commitment for backends
-  that own persistence directly.
+  `Docket.Checkpoint` handlers remain the host-facing integration seam. Under
+  a Docket-owned durable driver they are post-commit notifications, not the
+  durable committer.
 
-  All callbacks take an opaque backend context as the first argument. `ctx`
-  is whatever the backend needs — a repo, an agent pid, a config struct — and
-  core never interprets it.
+  All callbacks take an opaque backend context as the first argument. Core
+  never interprets it.
   """
 
   @type ctx :: term()
   @type claim_token :: String.t()
 
+  @typedoc "How an atomic commit leaves execution ownership and scheduling."
+  @type disposition :: :continue | {:park, wake_at :: DateTime.t() | nil}
+
   @typedoc """
   Optimistic commit guard.
 
   `expected_seq` is the `Docket.Run.checkpoint_seq` the committer read. When
-  `claim_token` is non-nil the write additionally fences on the current claim
-  for the run.
+  `claim_token` is non-nil the write additionally fences on the backend's
+  current claim for the run.
   """
   @type fence :: %{expected_seq: non_neg_integer(), claim_token: claim_token() | nil}
 
-  @doc """
-  Persists a new run.
+  @typedoc "Result returned by a pure serialized run mutation."
+  @type mutation_result ::
+          {:commit, Docket.Checkpoint.t(), disposition()} | {:error, term()}
 
-  Inserting a `run_id` that already exists is an error. `opts` may carry a
-  `:tenant_id`, a scoping value the backend stores alongside the run; core has
-  no tenant field on `Docket.Run`.
+  @type mutation :: (Docket.Run.t() -> mutation_result())
+
+  @doc """
+  Atomically publishes a graph version and persists an initialized run.
+
+  `checkpoint` must be the run's `:run_initialized` checkpoint. The operation
+  upserts `graph_document`, inserts the checkpoint's run, persists checkpoint
+  metadata and retained events, and records `wake_at` as one durable mutation.
+  A backend must never make the run visible without its graph version or make
+  it dispatchable without its initialized checkpoint.
+
+  Inserting a `run_id` that already exists is an error. Reusing a
+  `{graph_id, graph_hash}` with different content is also an error rather than
+  silently accepting a hash/document mismatch. `opts` may carry `:tenant_id`.
   """
-  @callback insert_run(ctx(), Docket.Run.t(), opts :: keyword()) ::
-              {:ok, Docket.Run.t()} | {:error, term()}
+  @callback initialize_run(
+              ctx(),
+              graph_id :: String.t(),
+              graph_hash :: String.t(),
+              graph_document :: map(),
+              Docket.Checkpoint.t(),
+              wake_at :: DateTime.t(),
+              opts :: keyword()
+            ) :: {:ok, Docket.Run.t()} | {:error, term()}
 
   @doc """
   Reads the last committed run by id.
 
-  This is the storage-backed read: it returns the last committed document and
-  may lag a live in-memory run by one uncommitted superstep. Runs are keyed by
-  `run_id` alone; a `:tenant_id` in `opts` scopes the lookup, and a tenant
-  mismatch reads as `{:error, :not_found}`, never a permission error. An
-  unscoped fetch by `run_id` succeeds regardless of the stored tenant.
+  A `:tenant_id` in `opts` scopes the lookup, and a tenant mismatch reads as
+  `{:error, :not_found}`. Whether an unscoped public read is permitted is an
+  instance-level facade policy; storage itself supports unscoped internal
+  reads for dispatch and recovery.
   """
   @callback fetch_run(ctx(), run_id :: String.t(), opts :: keyword()) ::
               {:ok, Docket.Run.t()} | {:error, :not_found}
 
   @doc """
-  Replaces the stored run under an optimistic fence.
+  Atomically commits one proposed runtime moment under an optimistic fence.
 
-  Succeeds only if the stored run's `checkpoint_seq` equals
-  `fence.expected_seq` and, when `fence.claim_token` is non-nil, only if it
-  matches the backend's current claim for the run. No lock is held between the
-  committer's read and this write; the fence is checked at commit time only.
-  Any mismatch returns `{:error, :stale_fence}` and leaves the stored run
-  untouched.
+  The stored sequence must equal `fence.expected_seq`; a non-nil claim token
+  must also match the current claim. On a mismatch, nothing changes.
+
+  On success the backend replaces the run with `checkpoint.run`, stores
+  checkpoint metadata, persists retained events, and applies `disposition` in
+  one operation. `:continue` keeps and refreshes the claim. `{:park, wake_at}`
+  releases any claim and records the next wake; `nil` means an external wake
+  source or a terminal run.
   """
-  @callback update_run(ctx(), Docket.Run.t(), fence(), opts :: keyword()) ::
-              {:ok, Docket.Run.t()} | {:error, :stale_fence} | {:error, :not_found}
-
-  @doc """
-  Upserts a compiled graph document keyed by `{graph_id, graph_hash}`.
-
-  `document` is the compiled graph wire map from `Docket.Graph.to_map/1`. The
-  upsert is content-addressed and idempotent: two callers racing to put the
-  same version both succeed, because content addressing makes the document
-  byte-identical.
-  """
-  @callback put_graph(
+  @callback commit(
               ctx(),
-              graph_id :: String.t(),
-              graph_hash :: String.t(),
-              document :: map(),
+              Docket.Checkpoint.t(),
+              fence(),
+              disposition(),
               opts :: keyword()
-            ) :: :ok | {:error, term()}
+            ) :: {:ok, Docket.Run.t()} | {:error, :stale_fence} | {:error, :not_found}
 
   @doc """
-  Reads a compiled graph document by `{graph_id, graph_hash}`.
+  Serializes a short read/validate/commit mutation for a public signal.
 
-  This is the recovery read a worker uses to reload the exact graph content
-  for a run it claimed, with no host call in the loop. An unknown key returns
-  `{:error, :not_found}`.
+  The backend loads and exclusively serializes mutation of `run_id`, invokes
+  the pure `mutation` function with the current committed run, and either
+  returns its error unchanged or atomically persists the returned checkpoint
+  and disposition. The function must perform no external I/O.
+
+  Postgres implements this with a short `SELECT ... FOR UPDATE` transaction.
+  Other stores may use an equivalent per-key serialization primitive. The
+  callback must enforce tenant scoping from `opts` before invoking `mutation`.
+  """
+  @callback mutate_run(ctx(), run_id :: String.t(), mutation(), opts :: keyword()) ::
+              {:ok, Docket.Run.t()} | {:error, term()}
+
+  @doc """
+  Reactivates a poisoned run's backend-owned operational state.
+
+  This is deliberately not a `Docket.Run` signal: it atomically resets the
+  backend attempt counter and operational error/status, clears any claim,
+  and schedules an immediate wake. Calling it for an already-active run returns
+  the stored run. Operational telemetry records the command; it does not
+  consume the graph run's checkpoint or event sequence.
+  """
+  @callback retry_poisoned_run(ctx(), run_id :: String.t(), opts :: keyword()) ::
+              {:ok, Docket.Run.t()}
+              | {:error, :not_found | :blocked | :inactive_run}
+
+  @doc """
+  Reads a canonical graph document by `{graph_id, graph_hash}`.
   """
   @callback fetch_graph(
               ctx(),
@@ -105,14 +137,4 @@ defmodule Docket.Storage do
               graph_hash :: String.t(),
               opts :: keyword()
             ) :: {:ok, map()} | {:error, :not_found}
-
-  @doc """
-  Appends run events under the backend's persistence policy.
-
-  Events are append-only facts. Persistence volume is backend policy — all,
-  none, or selected types — so the callback may drop events per that policy
-  and still return `:ok`.
-  """
-  @callback persist_events(ctx(), run_id :: String.t(), [Docket.Event.t()], opts :: keyword()) ::
-              :ok | {:error, term()}
 end

@@ -18,20 +18,23 @@ defmodule Docket.Checkpoint do
   | `:interrupt_resolved` | `:sync` |
   | `:run_completed` | `:sync` |
   | `:run_failed` | `:sync` |
+  | `:run_cancelled` | `:sync` |
 
-  Sync checkpoints must be accepted (`:ok`) before the state transition is
-  committed or the related public API reports success. Async checkpoints are
-  delivered after the in-memory transition commits; their failure is
-  observable but does not roll back the active run.
+  In the host-owned driver, sync checkpoints must be accepted (`:ok`) before
+  the in-memory transition commits or the related public API reports success.
+
+  In a Docket-owned durable driver, the storage backend is the committer.
+  Handlers run only after the fenced storage commit succeeds and are
+  notifications: handler failure is observable but cannot roll back durable
+  state. A proposal that loses its fence is never delivered as committed.
 
   ## Relation to storage backends
 
   The `handle/2` callback is the host-facing notification contract: hosts
-  persist runs from checkpoints exactly as before, and custom backends built
-  on it keep working unchanged. `Docket.Storage` and `Docket.Coordinator` are
-  the deeper seam a durable backend implements to own persistence, claims, and
-  fenced commits itself. Implementing those behaviours does not change or
-  replace this handler contract.
+  persist runs from checkpoints exactly as before in the host-owned driver.
+  `Docket.Storage` and `Docket.Coordinator` are the deeper seam a durable
+  backend implements. In that driver this callback is post-commit observation,
+  because an arbitrary callback cannot participate in the backend transaction.
   """
 
   defstruct [:type, :delivery, :seq, :run, :created_at, events: [], metadata: %{}]
@@ -43,6 +46,7 @@ defmodule Docket.Checkpoint do
           | :interrupt_resolved
           | :run_completed
           | :run_failed
+          | :run_cancelled
 
   @type delivery :: :sync | :async
 
@@ -65,7 +69,8 @@ defmodule Docket.Checkpoint do
     :interrupt_requested,
     :interrupt_resolved,
     :run_completed,
-    :run_failed
+    :run_failed,
+    :run_cancelled
   ]
 
   @default_deliveries %{
@@ -74,7 +79,8 @@ defmodule Docket.Checkpoint do
     interrupt_requested: :sync,
     interrupt_resolved: :sync,
     run_completed: :sync,
-    run_failed: :sync
+    run_failed: :sync,
+    run_cancelled: :sync
   }
 
   @doc false
