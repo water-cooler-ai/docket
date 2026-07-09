@@ -4,10 +4,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Row schema for `docket_events` — append-only run facts, mirroring
     `Docket.Event`.
 
-    Whether events are persisted at all is a policy, not a given: the store
-    ships a volume knob (persist all, none, or selected types). This schema
-    only defines the row shape.
-
     `occurred_at` is the event's own timestamp (`Docket.Event.timestamp`);
     `inserted_at` is when it was persisted.
     """

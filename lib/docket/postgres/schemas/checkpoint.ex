@@ -1,24 +1,14 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.Schemas.Checkpoint do
     @moduledoc """
-    Row schema for `docket_checkpoints` — checkpoint metadata, and only
-    metadata.
+    Row schema for `docket_checkpoints` — checkpoint metadata: seq, type,
+    step, park action, and timestamps. The run itself lives on
+    `docket_runs`.
 
-    A checkpoint row records seq, type, step, park action, and timestamps —
-    never the run document. The latest committed document lives solely in
-    `docket_runs.docket_run`; storing O(supersteps × state size) snapshots
-    here would be the hidden cost that melts an adopter's database
-    (operational transition spec, section 5).
-
-    `park_action` records how the committing vehicle parked the run (spec
-    section 9: terminal, waiting on interrupt, timer, remote await, drain
-    budget yield, or retry backoff). It is `nil` for checkpoints committed
-    mid-drain. The exact value vocabulary is pinned by the coordinator
-    (DCKT-15), not by this schema.
-
-    `created_at` is when the runtime built the checkpoint
-    (`Docket.Checkpoint.created_at`); `inserted_at` is when it was
-    persisted.
+    `park_action` records how the committing vehicle parked the run; it is
+    `nil` for checkpoints committed mid-drain. `created_at` is when the
+    runtime built the checkpoint (`Docket.Checkpoint.created_at`);
+    `inserted_at` is when it was persisted.
     """
 
     use Ecto.Schema

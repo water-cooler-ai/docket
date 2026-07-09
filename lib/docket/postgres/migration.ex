@@ -3,11 +3,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduledoc """
     Creates and versions the tables Docket's Postgres backend owns.
 
-    Docket ships its schema as versioned migration modules, à la Oban: the
-    host application owns a single migration file that delegates here, and
-    upgrading Docket never requires editing that file — bumping `version:`
-    (or omitting it to take the latest) applies any steps the database is
-    missing.
+    The host application owns a single migration file that delegates here;
+    bumping `version:` (or omitting it to take the latest) applies any
+    steps the database is missing.
 
     ## Usage
 
@@ -40,11 +38,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     ## Tables
 
-    Version 1 installs the four tables from the operational transition spec
-    (section 5, rev 4): `docket_graph_versions`, `docket_runs`,
-    `docket_checkpoints` (checkpoint metadata only — never a run snapshot),
-    and `docket_events`. There is deliberately no `docket_graphs` parent
-    table: every 0.1.0 operation is keyed by `(graph_id, graph_hash)`.
+    Version 1 installs `docket_graph_versions`, `docket_runs`,
+    `docket_checkpoints`, and `docket_events`.
 
     The migrated version is recorded as a `COMMENT` on the `docket_runs`
     table, so `up/1` and `down/1` are idempotent and only apply the steps

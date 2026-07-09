@@ -26,7 +26,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @tables ~w(docket_checkpoints docket_events docket_graph_versions docket_runs)
 
-    # Spec section 5 (rev 4), exactly — plus the surrogate bigserial id.
     @run_columns ~w(
       id run_id tenant_id graph_id graph_hash status step input output
       metadata state checkpoint_seq latest_checkpoint_type claim_token
@@ -49,7 +48,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
       assert columns("docket_runs") == Enum.sort(@run_columns)
 
-      # tenant_id is nullable; nothing requires it.
       assert nullable?("docket_runs", "tenant_id")
 
       indexes = indexes("docket_runs")
@@ -119,8 +117,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert tables("docket_private") == []
     end
 
-    # Inserting through every schema proves the field/column mapping is real,
-    # not just parallel bookkeeping.
     defp assert_row_round_trip do
       now = DateTime.utc_now()
 

@@ -1,15 +1,11 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.Schemas.GraphVersion do
     @moduledoc """
-    Row schema for `docket_graph_versions` — content-addressed compiled
-    graph documents.
+    Row schema for `docket_graph_versions` — compiled graph documents,
+    content-addressed by `graph_id` + `graph_hash`.
 
-    Keyed by `graph_id` + `graph_hash` so a worker recovering a run on
-    another node can load the exact graph content with no host call in the
-    loop. Rows are immutable: publish-on-start upserts with `ON CONFLICT DO
-    NOTHING`, and content addressing makes racing publishes byte-identical.
     `graph` holds the JSON-safe wire map produced by
-    `Docket.Graph.Serializer`.
+    `Docket.Graph.Serializer`. Rows are immutable once inserted.
     """
 
     use Ecto.Schema

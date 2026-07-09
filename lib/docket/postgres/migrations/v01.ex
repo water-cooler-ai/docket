@@ -2,29 +2,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.Migrations.V01 do
     @moduledoc false
 
-    # Schema version 1: the four tables from the operational transition spec,
-    # section 5 (rev 4).
-    #
-    # Layout invariants this version encodes:
-    #
-    #   * The row is the run: stable public `Docket.Run` fields are relational
-    #     columns; only Docket-owned execution internals live in the `state`
-    #     jsonb. No other table stores a run snapshot.
-    #   * There is no `docket_graphs` parent table: every 0.1.0 operation is
-    #     keyed by `(graph_id, graph_hash)` and touches only version rows.
-    #   * `docket_checkpoints` is metadata-only: seq, type, step, park action,
-    #     and timestamps.
-    #   * `tenant_id` is nullable and appears only on `docket_runs`; tenancy
-    #     is an optional scoping concept, never a requirement.
-    #   * The dispatch scan index covers only rows with a non-null `wake_at`,
-    #     structurally excluding terminal and externally-parked runs.
-
     use Ecto.Migration
 
     def up(%{prefix: prefix}) do
-      # Content-addressed graph documents, keyed by graph_id + graph_hash.
-      # Rows are immutable: publish-on-start upserts with ON CONFLICT DO
-      # NOTHING, so there is no updated_at.
       create_if_not_exists table(:docket_graph_versions, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
         add(:graph_id, :text, null: false)
@@ -37,10 +17,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         unique_index(:docket_graph_versions, [:graph_id, :graph_hash], prefix: prefix)
       )
 
-      # The row is the run: public fields are columns, execution internals
-      # (channels, interrupts, pending nodes and writes, active tasks, timers,
-      # internal counters) are the `state` jsonb — versioned internally by the
-      # document's own `version` field, never interpreted by hosts.
       create_if_not_exists table(:docket_runs, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
         add(:run_id, :text, null: false)
@@ -83,7 +59,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
       )
 
-      # The dispatch scan.
       create_if_not_exists(
         index(:docket_runs, [:wake_at], where: "wake_at IS NOT NULL", prefix: prefix)
       )
@@ -95,12 +70,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
       )
 
-      # Ops introspection.
       create_if_not_exists(index(:docket_runs, [:status, :updated_at], prefix: prefix))
 
-      # Checkpoint history is audit and observability metadata. created_at is
-      # when the runtime built the checkpoint; inserted_at is when it was
-      # persisted.
       create_if_not_exists table(:docket_checkpoints, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
         add(:run_id, :text, null: false)
@@ -114,8 +85,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       create_if_not_exists(unique_index(:docket_checkpoints, [:run_id, :seq], prefix: prefix))
 
-      # occurred_at is the event's own timestamp (Docket.Event.timestamp);
-      # inserted_at is when it was persisted.
       create_if_not_exists table(:docket_events, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
         add(:run_id, :text, null: false)

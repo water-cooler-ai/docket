@@ -51,8 +51,7 @@ defmodule Docket.MixProject do
       [
         {:ecto_sql, "~> 3.10", optional: true},
         {:postgrex, "~> 0.17", optional: true},
-        # Postgrex encodes the jsonb columns Docket's migrations create with
-        # a JSON library; hosts bring their own (Jason is Postgrex's default).
+        # Postgrex's default JSON library for jsonb columns.
         {:jason, "~> 1.4", optional: true}
       ]
     end

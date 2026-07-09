@@ -1,33 +1,24 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.Schemas.Run do
     @moduledoc """
-    Row schema for `docket_runs` — the row is the run.
+    Row schema for `docket_runs`.
 
-    There is no run document column: the stable public `Docket.Run` fields
-    (`run_id`, `graph_id`, `graph_hash`, `status`, `step`, `input`,
-    `output`, `metadata`, timestamps) are relational columns, and only the
-    Docket-owned execution internals — channels, interrupts, pending nodes
-    and writes, active tasks, timers, internal counters — live in the
-    `state` jsonb. `state` is exactly the "do not interpret" blob of the
-    `Docket.Run` contract, versioned internally by the document's own
-    `version` field so its shape can evolve without migrations. Every fact
-    is stored once: `checkpoint_seq` the column and `checkpoint_seq` the
-    document field are the same value (operational transition spec,
-    section 5, rev 4).
+    The public `Docket.Run` fields (`run_id`, `graph_id`, `graph_hash`,
+    `status`, `step`, `input`, `output`, `metadata`, timestamps) are
+    columns; `state` holds the Docket-owned execution internals and must
+    not be interpreted by hosts.
 
-    Operationally the row also carries:
+    Operational columns:
 
-      * `wake_at` — the schedule. `now` means runnable, a future instant
-        means a timer or retry backoff, and `nil` means parked on an
-        external wake source or terminal.
-      * `claim_token` / `claimed_at` — execution ownership; commits are
-        fenced on `checkpoint_seq` plus `claim_token`.
+      * `wake_at` — when the run next advances: `now` means runnable, a
+        future instant means a timer or retry backoff, and `nil` means
+        externally parked or terminal.
+      * `claim_token` / `claimed_at` — execution ownership.
+      * `checkpoint_seq` — the optimistic commit fence.
       * `attempts`, `operational_status`, `operational_error` — operational
-        health. `status` stays the graph-run status; a poisoned run is an
-        `operational_status` concern, never a mutation of graph state.
+        health, separate from the graph-run `status`.
 
-    `tenant_id` is a nullable scoping column. Runs are keyed by `run_id`
-    alone; nothing requires a tenant.
+    `tenant_id` is a nullable scoping column; nothing requires it.
     """
 
     use Ecto.Schema
