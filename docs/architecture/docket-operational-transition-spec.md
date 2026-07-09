@@ -1,7 +1,7 @@
 # Docket Operational Transition Spec
 
-Status: transition spec (rev 3 — single package with optional Ecto deps, optional tenancy, metadata-only checkpoint history)
-Date: 2026-07-08
+Status: transition spec (rev 4 — row-is-the-run schema (columns + `state` jsonb), single graph-versions table, single package with optional Ecto deps, optional tenancy, metadata-only checkpoint history)
+Date: 2026-07-09
 Target: move from core runtime library to an Oban-shaped durable runtime
 
 ## 1. Purpose
@@ -295,7 +295,6 @@ The Postgres backend should start with boring, explicit tables.
 Recommended baseline:
 
 ```text
-docket_graphs
 docket_graph_versions
 docket_runs
 docket_checkpoints
@@ -306,12 +305,20 @@ There is no signal table and no job table. Signals are synchronous fenced
 commits (section 8), and the run row itself carries the schedule. The exact
 naming of the Docket tables can change, but the ownership concepts should not.
 
-`docket_graphs` and `docket_graph_versions` exist because recovery is
-autonomous: a worker picking up a recovered run on another node must be able to
-load the exact graph content by `graph_id + graph_hash` with no host call in
-the loop. Graph content that a non-terminal run still references must therefore
-outlive pruning: the pruner must never delete a graph version an active run
-still points at.
+`docket_graph_versions` exists because recovery is autonomous: a worker
+picking up a recovered run on another node must be able to load the exact
+graph content by `graph_id + graph_hash` with no host call in the loop. Graph
+content that a non-terminal run still references must therefore outlive
+pruning: the pruner must never delete a graph version an active run still
+points at.
+
+There is deliberately no `docket_graphs` parent table in `0.1.0`. Every
+operation the release defines — publish upsert, recovery load, prune
+retention — is keyed by `(graph_id, graph_hash)` and touches only version
+rows. A parent table earns its place when graph-level data exists (a
+latest-version pointer, listing, graph-level ownership), which arrives with
+the explicit publish/version-management API post-`0.1.0`; adding it then is a
+purely additive migration.
 
 Publishing is implicit and content-addressed. `start_run(graph, input)`
 upserts the compiled document keyed by `graph_id + graph_hash` (the hash
@@ -324,6 +331,26 @@ with graph tooling later without changing this contract.
 
 ### `docket_runs`
 
+**The row is the run.** There is no `docket_run` document column: the run's
+stable public fields are relational columns, and only the Docket-owned
+execution internals — channels, interrupts, pending nodes and writes, active
+tasks, timers, internal counters — live in a single `state` jsonb column. The
+line between the two is not new; it is the contract `Docket.Run` already
+declares: hosts may inspect the top-level fields (`id`, `graph_id`,
+`graph_hash`, `status`, `step`, `input`, `output`, timestamps) and must never
+interpret the internals. Columns are that inspectable surface plus what the
+operational layer itself reads and writes; `state` is exactly the
+"do not interpret" blob, versioned internally by the document's own `version`
+field so its shape can evolve without migrations. The store maps between the
+row and `Docket.Run` via the existing `to_map/1` / `from_map/1` boundary; core
+is unchanged.
+
+This shape means every fact is stored once. `status`, `step`, and the fence
+sequence are not denormalized copies of fields inside a document blob — they
+are the storage. `checkpoint_seq` the column and `checkpoint_seq` the document
+field are the same value, so there is no dual-write to keep consistent and no
+drift class to test for.
+
 Required concepts:
 
 ```text
@@ -332,18 +359,21 @@ run_id
 graph_id
 graph_hash
 status
-operational_status
-operational_error
-docket_run
+step
+input
+output
 metadata
-current_superstep
-latest_checkpoint_seq
+state
+checkpoint_seq
 latest_checkpoint_type
 claim_token
 claimed_at
 wake_at
 attempts
+operational_status
+operational_error
 inserted_at
+started_at
 updated_at
 finished_at
 ```
@@ -357,7 +387,7 @@ groups carry the whole operational model:
   interrupt, a remote completion) or terminal. A run cannot be runnable and
   unscheduled: the schedule is a column on the run.
 - **Execution ownership — `claim_token` / `claimed_at`.** Single-writer is a
-  claim plus an optimistic fence on `latest_checkpoint_seq` at commit — not a
+  claim plus an optimistic fence on `checkpoint_seq` at commit — not a
   held connection and not a correctness-bearing expiry (see section 6).
   `claimed_at` lets the dispatcher tell whether the current holder is still
   alive.
@@ -381,7 +411,11 @@ a run is adoption friction Oban never imposes. Hosts that pass `tenant_id`
 get scoped reads and signals — a tenant mismatch reads as `:not_found` — and
 hosts that don't never see the concept.
 
-`current_superstep` is the resume point a recovered run drives from.
+There is no separate resume-target column: a recovered run has no fixed resume
+target. A vehicle loads the committed row, reconstructs `Docket.Run`, and
+drives from whatever state it finds. `step` is a column because it is the
+single storage location of the document's field — introspection reads it, but
+nothing in recovery treats it as an instruction.
 
 Important indexes:
 
@@ -399,14 +433,22 @@ terminal and externally-parked runs structurally.
 
 ### State size and write amplification
 
-A run document is not a job row. Oban args are small; `docket_run` carries
-every channel value, and for the target workload — agentic LLM sessions —
-that can be megabytes of transcript rewritten at every superstep commit. The
-hot path must not multiply copies of that document:
+A run document is not a job row. Oban args are small; `state` carries every
+channel value, and for the target workload — agentic LLM sessions — that can
+be megabytes of transcript rewritten at every superstep commit. The hot path
+must not multiply copies of that document:
 
-- **The run row holds the only full document.** Recovery needs exactly the
-  latest committed document, and it lives in `docket_runs.docket_run`. No
-  other table stores a full run snapshot.
+- **The run row is the only full document.** Recovery needs exactly the
+  latest committed run, and it is reconstructed from the `docket_runs` row —
+  promoted columns plus `state`. No other table stores a full run snapshot.
+- **The column/state split keeps small writes small.** A superstep commit
+  rewrites `state` because channels changed — that cost is intrinsic. But a
+  signal that touches no execution state (`cancel_run` flipping `status`)
+  updates in-line columns only; Postgres carries the unchanged out-of-line
+  `state` TOAST value over without rewriting it. Under a single-document
+  design the same cancel would rewrite megabytes to flip one field. Likewise
+  `input` is written once at start and never re-serialized into every
+  superstep commit.
 - **`docket_checkpoints` is metadata-only.** A checkpoint row records seq,
   type, step, park action, and timestamps — never the run document.
   Checkpoint history is audit and observability data; storing
@@ -419,10 +461,25 @@ hot path must not multiply copies of that document:
   because turning event volume down is the first request every high-volume
   adopter makes.
 
-The remaining cost — TOAST churn and WAL volume from rewriting one large
-document per superstep — is bounded per dispatch by the drain budget.
-Per-channel or delta storage is a possible post-v1 optimization; it must not
-change the correctness story (one fenced, single-document commit).
+The remaining cost — TOAST churn and WAL volume from rewriting `state` once
+per superstep — is bounded per dispatch by the drain budget. Per-channel or
+delta storage is a possible post-v1 optimization scoped to the `state` column
+alone; it must not change the correctness story (one fenced, single-row
+commit).
+
+**What belongs in state — the cold-resume test.** Megabyte state is the
+workload the write path must survive, not the pattern the docs should teach.
+State is a resume contract, not an audit log: a value belongs in a channel
+only if a run resuming cold on another node needs it for the next superstep
+to behave correctly. A sub-graph or specialist node that can rebuild its
+context from the inputs it is handed should write back its conclusion — the
+artifact, the decision, the structured result — not its transcript; only
+memory that must survive across invocations checkpoints. Data kept for
+observation rather than resumption goes to `docket_events` or to host storage
+by pointer, and conversational fidelity uses compaction — a rolling summary
+plus a recent-turns window (the `:append` reducer's `max_length` option) —
+rather than an unbounded transcript channel. The paved-road docs and examples
+should demonstrate compact state from the first example.
 
 ## 6. Coordination And Single-Writer Commits
 
@@ -430,7 +487,7 @@ change the correctness story (one fenced, single-document commit).
 
 The backend separates three roles that a resident process previously fused:
 
-- **State — Postgres.** The durable run (`docket_runs.docket_run`, checkpoints)
+- **State — Postgres.** The durable run (the `docket_runs` row, checkpoints)
   is the source of truth. A parked run lives entirely here and needs no process.
 - **Schedule — `wake_at` plus the dispatcher.** The run row says *when* it
   should next advance; the per-node dispatcher turns due rows into work,
@@ -526,7 +583,7 @@ I/O.
   it. This can span slow external I/O, so it must not hold a database connection.
 
 **Single committer is optimistic, not locked.** Every state mutation commits
-with a conditional UPDATE fenced on the monotonic `latest_checkpoint_seq` — no
+with a conditional UPDATE fenced on the monotonic `checkpoint_seq` — no
 long-held lock, only the row lock intrinsic to the write. Advance-worker commits
 also fence on their `claim_token`; signal commits intentionally do not. That
 keeps cancellation and interrupt resolution timely while preventing a stale
@@ -535,17 +592,18 @@ advance worker from refreshing or clearing a claim it no longer owns:
 ```sql
 -- one short transaction per advance-worker superstep
 UPDATE docket_runs
-SET docket_run = $run,
+SET state = $state,
     status = $status,
-    current_superstep = $next_superstep,
-    latest_checkpoint_seq = $seq + 1,
+    step = $step,
+    output = $output,              -- non-null only at a terminal commit
+    checkpoint_seq = $seq + 1,
     latest_checkpoint_type = $type,
     attempts = 0,                  -- any committed progress proves health
     claimed_at = now(),            -- mid-drain: refresh
     -- at a park: claim_token = NULL, wake_at = $next_wake_or_null
     updated_at = now()
 WHERE run_id = $run_id
-  AND latest_checkpoint_seq = $seq
+  AND checkpoint_seq = $seq
   AND claim_token = $claim_token;
 
 -- signal commits use the same sequence fence but omit claim_token:
@@ -556,7 +614,7 @@ If this affects zero rows, someone else already committed past `$seq`, the
 worker lost its claim, or a signal changed the run first. An advance worker
 discards its uncommitted work, **releases its claim, and stops**. The release
 is its own small UPDATE fenced on `claim_token` alone (it does not touch
-`latest_checkpoint_seq` or `wake_at`, which the winning commit already set
+`checkpoint_seq` or `wake_at`, which the winning commit already set
 correctly):
 
 ```sql
@@ -941,12 +999,14 @@ The 0.1.0 implementation should include:
 
 - `mix docket.gen.migration` or documented migration copy path.
 - Migrations for runs, graph versions, checkpoints, and events.
-- `Docket.Postgres.RunStore`.
+- `Docket.Postgres.RunStore` (row-is-the-run mapping: promoted columns plus
+  the `state` jsonb, composed to and from `Docket.Run` via `to_map/1` /
+  `from_map/1`; section 5).
 - `Docket.Postgres.GraphStore` (content-addressed publish-on-start upsert,
   section 5).
 - `Docket.Postgres.Coordinator` (run claim win/refresh/steal, claim release on
   fence loss or non-runnable claim, and the commit fence; advance commits
-  require both `latest_checkpoint_seq` and `claim_token`; releases the
+  require both `checkpoint_seq` and `claim_token`; releases the
   connection before node execution).
 - `Docket.Postgres.CheckpointStore` (fenced checkpoint metadata + `wake_at`
   in one transaction; checkpoint rows are metadata-only per section 5).
