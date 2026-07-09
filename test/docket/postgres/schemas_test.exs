@@ -1,0 +1,142 @@
+if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
+  defmodule Docket.Postgres.SchemasTest do
+    use ExUnit.Case, async: true
+
+    alias Docket.Postgres.Schemas.Checkpoint
+    alias Docket.Postgres.Schemas.Event
+    alias Docket.Postgres.Schemas.GraphVersion
+    alias Docket.Postgres.Schemas.Run
+
+    @valid_run %{
+      run_id: "run_1",
+      graph_id: "g1",
+      graph_hash: "abc123",
+      status: :running,
+      input: %{"prompt" => "hello"},
+      state: %{"channels" => %{}, "version" => 1}
+    }
+
+    describe "Run.changeset/2" do
+      test "valid with the required public fields and state" do
+        changeset = Run.changeset(@valid_run)
+
+        assert changeset.valid?
+      end
+
+      test "tenant_id is never required" do
+        changeset = Run.changeset(@valid_run)
+
+        assert changeset.valid?
+        assert Ecto.Changeset.get_field(changeset, :tenant_id) == nil
+
+        with_tenant = Run.changeset(Map.put(@valid_run, :tenant_id, "acme"))
+
+        assert with_tenant.valid?
+      end
+
+      test "applies operational defaults" do
+        run = Ecto.Changeset.apply_changes(Run.changeset(@valid_run))
+
+        assert run.operational_status == :active
+        assert run.step == 0
+        assert run.checkpoint_seq == 0
+        assert run.attempts == 0
+        assert run.metadata == %{}
+      end
+
+      test "requires run identity, status, input, and state" do
+        changeset = Run.changeset(%{})
+
+        for field <- [:run_id, :graph_id, :graph_hash, :status, :input, :state] do
+          assert {_msg, [validation: :required]} = changeset.errors[field]
+        end
+      end
+
+      test "status values mirror Docket.Run.statuses/0" do
+        assert Ecto.Enum.values(Run, :status) == Docket.Run.statuses()
+
+        changeset = Run.changeset(Map.put(@valid_run, :status, :sideways))
+
+        refute changeset.valid?
+      end
+
+      test "latest_checkpoint_type values mirror Docket.Checkpoint.types/0" do
+        assert Ecto.Enum.values(Run, :latest_checkpoint_type) == Docket.Checkpoint.types()
+      end
+
+      test "rejects negative counters" do
+        for field <- [:step, :checkpoint_seq, :attempts] do
+          changeset = Run.changeset(Map.put(@valid_run, field, -1))
+
+          refute changeset.valid?
+        end
+      end
+    end
+
+    describe "GraphVersion.changeset/2" do
+      test "requires the content address and the document" do
+        changeset = GraphVersion.changeset(%{})
+
+        for field <- [:graph_id, :graph_hash, :graph] do
+          assert {_msg, [validation: :required]} = changeset.errors[field]
+        end
+
+        assert GraphVersion.changeset(%{
+                 graph_id: "g1",
+                 graph_hash: "abc123",
+                 graph: %{"nodes" => []}
+               }).valid?
+      end
+    end
+
+    describe "Checkpoint.changeset/2" do
+      @valid_checkpoint %{
+        run_id: "run_1",
+        seq: 1,
+        type: :run_initialized,
+        step: 0,
+        created_at: ~U[2026-07-09 00:00:00.000000Z]
+      }
+
+      test "valid as metadata only; park_action is optional" do
+        assert Checkpoint.changeset(@valid_checkpoint).valid?
+
+        assert Checkpoint.changeset(Map.put(@valid_checkpoint, :park_action, "timer")).valid?
+      end
+
+      test "type values mirror Docket.Checkpoint.types/0" do
+        assert Ecto.Enum.values(Checkpoint, :type) == Docket.Checkpoint.types()
+      end
+
+      test "requires a positive seq" do
+        refute Checkpoint.changeset(Map.put(@valid_checkpoint, :seq, 0)).valid?
+      end
+    end
+
+    describe "Event.changeset/2" do
+      @valid_event %{
+        run_id: "run_1",
+        seq: 1,
+        type: :node_completed,
+        step: 3,
+        occurred_at: ~U[2026-07-09 00:00:00.000000Z]
+      }
+
+      test "valid without optional origin columns; payload and metadata default" do
+        changeset = Event.changeset(@valid_event)
+
+        assert changeset.valid?
+
+        event = Ecto.Changeset.apply_changes(changeset)
+
+        assert event.payload == %{}
+        assert event.metadata == %{}
+        assert event.node_id == nil
+      end
+
+      test "type values mirror Docket.Event.types/0" do
+        assert Ecto.Enum.values(Event, :type) == Docket.Event.types()
+      end
+    end
+  end
+end

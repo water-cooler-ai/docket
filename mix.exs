@@ -50,7 +50,9 @@ defmodule Docket.MixProject do
     else
       [
         {:ecto_sql, "~> 3.10", optional: true},
-        {:postgrex, "~> 0.17", optional: true}
+        {:postgrex, "~> 0.17", optional: true},
+        # Postgrex's default JSON library for jsonb columns.
+        {:jason, "~> 1.4", optional: true}
       ]
     end
   end

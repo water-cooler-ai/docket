@@ -57,3 +57,16 @@ DOCKET_CORE_ONLY=1 mix test
 
 (Re-run `mix deps.get` without the variable afterwards to restore
 `mix.lock` — the core-only `deps.get` prunes the optional entries.)
+
+### Postgres-backed tests
+
+Tests tagged `:postgres` (the migration up/down round trip) need a live
+Postgres and are excluded by default. Opt in with:
+
+```sh
+mix test --include postgres
+```
+
+The connection defaults to `postgres://localhost:5432/docket_migration_test`
+(your OS username, no password); override with `DOCKET_TEST_DATABASE_URL`.
+The test database is dropped and recreated on every run.

@@ -50,4 +50,20 @@ defmodule Docket.Event do
           payload: map(),
           metadata: map()
         }
+
+  @types [
+    :run_initialized,
+    :run_completed,
+    :run_failed,
+    :node_completed,
+    :node_failed,
+    :channel_updated,
+    :edge_triggered,
+    :interrupt_requested,
+    :interrupt_resolved
+  ]
+
+  @doc false
+  @spec types() :: [type()]
+  def types, do: @types
 end
