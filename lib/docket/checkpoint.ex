@@ -23,6 +23,15 @@ defmodule Docket.Checkpoint do
   committed or the related public API reports success. Async checkpoints are
   delivered after the in-memory transition commits; their failure is
   observable but does not roll back the active run.
+
+  ## Relation to storage backends
+
+  The `handle/2` callback is the host-facing notification contract: hosts
+  persist runs from checkpoints exactly as before, and custom backends built
+  on it keep working unchanged. `Docket.Storage` and `Docket.Coordinator` are
+  the deeper seam a durable backend implements to own persistence, claims, and
+  fenced commits itself. Implementing those behaviours does not change or
+  replace this handler contract.
   """
 
   defstruct [:type, :delivery, :seq, :run, :created_at, events: [], metadata: %{}]
