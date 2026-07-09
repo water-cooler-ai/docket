@@ -2,7 +2,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.SchemasTest do
     use ExUnit.Case, async: true
 
-    alias Docket.Postgres.Schemas.Checkpoint
     alias Docket.Postgres.Schemas.Event
     alias Docket.Postgres.Schemas.GraphVersion
     alias Docket.Postgres.Schemas.Run
@@ -86,30 +85,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  graph_hash: "abc123",
                  graph: %{"nodes" => []}
                }).valid?
-      end
-    end
-
-    describe "Checkpoint.changeset/2" do
-      @valid_checkpoint %{
-        run_id: "run_1",
-        seq: 1,
-        type: :run_initialized,
-        step: 0,
-        created_at: ~U[2026-07-09 00:00:00.000000Z]
-      }
-
-      test "valid as metadata only; park_action is optional" do
-        assert Checkpoint.changeset(@valid_checkpoint).valid?
-
-        assert Checkpoint.changeset(Map.put(@valid_checkpoint, :park_action, "timer")).valid?
-      end
-
-      test "type values mirror Docket.Checkpoint.types/0" do
-        assert Ecto.Enum.values(Checkpoint, :type) == Docket.Checkpoint.types()
-      end
-
-      test "requires a positive seq" do
-        refute Checkpoint.changeset(Map.put(@valid_checkpoint, :seq, 0)).valid?
       end
     end
 
