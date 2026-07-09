@@ -80,19 +80,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       create_if_not_exists(index(:docket_runs, [:status, :updated_at], prefix: prefix))
 
-      create_if_not_exists table(:docket_checkpoints, primary_key: false, prefix: prefix) do
-        add(:id, :bigserial, primary_key: true)
-        add(:run_id, :text, null: false)
-        add(:seq, :bigint, null: false)
-        add(:type, :text, null: false)
-        add(:step, :integer, null: false)
-        add(:park_action, :text)
-        add(:created_at, :timestamptz, null: false)
-        add(:inserted_at, :timestamptz, null: false)
-      end
-
-      create_if_not_exists(unique_index(:docket_checkpoints, [:run_id, :seq], prefix: prefix))
-
       create_if_not_exists table(:docket_events, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
         add(:run_id, :text, null: false)
@@ -113,7 +100,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     def down(%{prefix: prefix}) do
       drop_if_exists(table(:docket_events, prefix: prefix))
-      drop_if_exists(table(:docket_checkpoints, prefix: prefix))
       drop_if_exists(table(:docket_runs, prefix: prefix))
       drop_if_exists(table(:docket_graph_versions, prefix: prefix))
     end
