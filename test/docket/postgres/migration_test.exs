@@ -24,7 +24,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @migration_version 20_260_709_000_001
     @prefixed_migration_version 20_260_709_000_002
 
-    @tables ~w(docket_checkpoints docket_events docket_graph_versions docket_runs)
+    @tables ~w(docket_events docket_graph_versions docket_runs)
 
     @run_columns ~w(
       id run_id tenant_id graph_id graph_hash status step input output
@@ -68,9 +68,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert indexes["docket_runs_status_updated_at_index"] =~ "(status, updated_at)"
 
       assert indexes("docket_graph_versions")["docket_graph_versions_graph_id_graph_hash_index"] =~
-               "CREATE UNIQUE INDEX"
-
-      assert indexes("docket_checkpoints")["docket_checkpoints_run_id_seq_index"] =~
                "CREATE UNIQUE INDEX"
 
       assert indexes("docket_events")["docket_events_run_id_seq_index"] =~
@@ -158,17 +155,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                |> TestRepo.insert()
 
       assert {"has already been taken", _meta} = changeset.errors[:run_id]
-
-      assert {:ok, _checkpoint} =
-               %{
-                 run_id: "run_1",
-                 seq: 1,
-                 type: :run_initialized,
-                 step: 0,
-                 created_at: now
-               }
-               |> Docket.Postgres.Schemas.Checkpoint.changeset()
-               |> TestRepo.insert()
 
       assert {:ok, _event} =
                %{
