@@ -19,6 +19,7 @@ defmodule Docket.Checkpoint do
   | `:interrupt_resolved` | `:sync` |
   | `:run_completed` | `:sync` |
   | `:run_failed` | `:sync` |
+  | `:run_cancelled` | `:sync` |
 
   `:retry_scheduled` commits retry-park control state mid-superstep: the
   graph step does not advance and the run stays `:running`, parked until the
@@ -41,6 +42,7 @@ defmodule Docket.Checkpoint do
           | :interrupt_resolved
           | :run_completed
           | :run_failed
+          | :run_cancelled
 
   @type delivery :: :sync | :async
 
@@ -64,7 +66,8 @@ defmodule Docket.Checkpoint do
     :interrupt_requested,
     :interrupt_resolved,
     :run_completed,
-    :run_failed
+    :run_failed,
+    :run_cancelled
   ]
 
   @default_deliveries %{
@@ -74,7 +77,8 @@ defmodule Docket.Checkpoint do
     interrupt_requested: :sync,
     interrupt_resolved: :sync,
     run_completed: :sync,
-    run_failed: :sync
+    run_failed: :sync,
+    run_cancelled: :sync
   }
 
   @doc false
