@@ -3,6 +3,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     use ExUnit.Case, async: true
 
     alias Docket.Postgres.Schemas.Event
+    alias Docket.Postgres.Schemas.GraphArtifact
     alias Docket.Postgres.Schemas.GraphVersion
     alias Docket.Postgres.Schemas.Run
 
@@ -10,6 +11,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       run_id: "run_1",
       graph_id: "g1",
       graph_hash: "abc123",
+      graph_compiler_abi: "docket-runtime-graph/v1",
       status: :running,
       input: %{"prompt" => "hello"},
       state: %{"channels" => %{}, "version" => 1},
@@ -49,7 +51,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       test "requires run identity, status, input, state, and started_at" do
         changeset = Run.changeset(%{})
 
-        for field <- [:run_id, :graph_id, :graph_hash, :status, :input, :state, :started_at] do
+        for field <- [
+              :run_id,
+              :graph_id,
+              :graph_hash,
+              :graph_compiler_abi,
+              :status,
+              :input,
+              :state,
+              :started_at
+            ] do
           assert {_msg, [validation: :required]} = changeset.errors[field]
         end
       end
@@ -113,6 +124,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  graph_id: "g1",
                  graph_hash: "abc123",
                  graph: %{"nodes" => []}
+               }).valid?
+      end
+    end
+
+    describe "GraphArtifact.changeset/2" do
+      test "requires graph version, compiler identity, content hash, and artifact" do
+        changeset = GraphArtifact.changeset(%{})
+
+        for field <- [:graph_id, :graph_hash, :compiler_abi, :artifact_hash, :artifact] do
+          assert {_msg, [validation: :required]} = changeset.errors[field]
+        end
+
+        assert GraphArtifact.changeset(%{
+                 graph_id: "g1",
+                 graph_hash: "abc123",
+                 compiler_abi: "docket-runtime-graph/v1",
+                 artifact_hash: "def456",
+                 artifact: %{"format_version" => 1}
                }).valid?
       end
     end

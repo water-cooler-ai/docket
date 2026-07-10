@@ -8,6 +8,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     alias Docket.Postgres.RunStore
     alias Docket.Postgres.RunStoreTestRepo, as: TestRepo
+    alias Docket.Postgres.Schemas.GraphArtifact
     alias Docket.Postgres.Schemas.GraphVersion
     alias Docket.Postgres.Schemas.Run
 
@@ -81,11 +82,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       for lease <- leases do
         assert Map.keys(lease) |> Enum.sort() ==
-                 ~w(claim_attempt claim_token claimed_at checkpoint_seq graph_hash graph_id run_id)a
+                 ~w(claim_attempt claim_token claimed_at checkpoint_seq graph_compiler_abi graph_hash graph_id run_id)a
                  |> Enum.sort()
 
         assert lease.graph_id == "graph"
         assert lease.graph_hash == "hash"
+        assert lease.graph_compiler_abi == "docket-runtime-graph/v1"
         assert lease.checkpoint_seq == 7
         assert lease.claim_attempt == 1
         assert {:ok, _} = Ecto.UUID.cast(lease.claim_token)
@@ -335,7 +337,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
           TestRepo.query!(
             "EXPLAIN (COSTS OFF) " <> RunStore.claim_statement(),
-            [@now, cutoff, 3, 3]
+            [@now, cutoff, 3, 3, Docket.Runtime.Graph.Artifact.compiler_abi()]
           ).rows
         end)
         |> elem(1)
@@ -418,6 +420,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp insert_graph!(prefix \\ nil) do
       changeset = GraphVersion.changeset(%{graph_id: "graph", graph_hash: "hash", graph: %{}})
       TestRepo.insert!(changeset, prefix: prefix)
+
+      GraphArtifact.changeset(%{
+        graph_id: "graph",
+        graph_hash: "hash",
+        compiler_abi: "docket-runtime-graph/v1",
+        artifact_hash: "artifact",
+        artifact: %{}
+      })
+      |> TestRepo.insert!(prefix: prefix)
     end
 
     defp insert_run!(run_id, overrides \\ [], prefix \\ nil) do
@@ -426,6 +437,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           run_id: run_id,
           graph_id: "graph",
           graph_hash: "hash",
+          graph_compiler_abi: "docket-runtime-graph/v1",
           status: :running,
           input: %{},
           state: %{"version" => 2},

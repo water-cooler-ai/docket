@@ -28,4 +28,4 @@ end
 # docket_run_store_test on localhost (OS username, no password). Override them
 # with DOCKET_TEST_DATABASE_URL and DOCKET_RUN_STORE_TEST_DATABASE_URL. Both
 # databases are dropped and recreated by their suites.
-ExUnit.start(exclude: [:postgres])
+ExUnit.start(exclude: [:postgres], assert_receive_timeout: 500)

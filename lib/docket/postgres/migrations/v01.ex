@@ -36,10 +36,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         unique_index(:docket_graph_versions, [:graph_id, :graph_hash], prefix: prefix)
       )
 
-      create_if_not_exists table(:docket_runs, primary_key: false, prefix: prefix) do
+      create_if_not_exists table(:docket_graph_artifacts, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
-        add(:run_id, :text, null: false)
-        add(:tenant_id, :text)
         add(:graph_id, :text, null: false)
 
         add(
@@ -47,6 +45,39 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           references(:docket_graph_versions,
             column: :graph_hash,
             with: [graph_id: :graph_id],
+            type: :text,
+            on_delete: :delete_all,
+            prefix: prefix
+          ),
+          null: false
+        )
+
+        add(:compiler_abi, :text, null: false)
+        add(:artifact_hash, :text, null: false)
+        add(:artifact, :jsonb, null: false)
+        add(:inserted_at, :timestamptz, null: false)
+      end
+
+      create_if_not_exists(
+        unique_index(
+          :docket_graph_artifacts,
+          [:graph_id, :graph_hash, :compiler_abi],
+          prefix: prefix
+        )
+      )
+
+      create_if_not_exists table(:docket_runs, primary_key: false, prefix: prefix) do
+        add(:id, :bigserial, primary_key: true)
+        add(:run_id, :text, null: false)
+        add(:tenant_id, :text)
+        add(:graph_id, :text, null: false)
+        add(:graph_compiler_abi, :text, null: false)
+
+        add(
+          :graph_hash,
+          references(:docket_graph_artifacts,
+            column: :graph_hash,
+            with: [graph_id: :graph_id, graph_compiler_abi: :compiler_abi],
             type: :text,
             on_delete: :restrict,
             prefix: prefix
@@ -96,7 +127,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
 
       create_if_not_exists(
-        index(:docket_runs, [:wake_at, :id],
+        index(:docket_runs, [:graph_compiler_abi, :wake_at, :id],
+          name: :docket_runs_wake_at_id_index,
           where:
             "status = 'running' AND poisoned_at IS NULL AND " <>
               "claim_token IS NULL AND wake_at IS NOT NULL",
@@ -105,7 +137,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
 
       create_if_not_exists(
-        index(:docket_runs, [:claimed_at, :id],
+        index(:docket_runs, [:graph_compiler_abi, :claimed_at, :id],
+          name: :docket_runs_claimed_at_id_index,
           where: "status = 'running' AND poisoned_at IS NULL AND claim_token IS NOT NULL",
           prefix: prefix
         )
@@ -149,6 +182,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def down(%{prefix: prefix}) do
       drop_if_exists(table(:docket_events, prefix: prefix))
       drop_if_exists(table(:docket_runs, prefix: prefix))
+      drop_if_exists(table(:docket_graph_artifacts, prefix: prefix))
       drop_if_exists(table(:docket_graph_versions, prefix: prefix))
     end
   end

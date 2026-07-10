@@ -20,6 +20,7 @@ defmodule Docket.MemoryBackendTest do
       id: id,
       graph_id: Keyword.get(opts, :graph_id, "g"),
       graph_hash: @graph_hash,
+      graph_compiler_abi: Keyword.get(opts, :graph_compiler_abi, "docket-runtime-graph/v1"),
       status: Keyword.get(opts, :status, :running),
       input: %{},
       started_at: @initial_wake,
@@ -53,6 +54,14 @@ defmodule Docket.MemoryBackendTest do
                run.graph_id,
                run.graph_hash,
                graph_document
+             ),
+           :ok <-
+             MemoryBackend.save_artifact(
+               transaction,
+               run.graph_id,
+               run.graph_hash,
+               run.graph_compiler_abi,
+               %{"format_version" => 1, "artifact_hash" => "test"}
              ),
            {:ok, initialized} <-
              MemoryBackend.insert_run(
@@ -183,6 +192,21 @@ defmodule Docket.MemoryBackendTest do
              MemoryBackend.save_graph(b, "g", @graph_hash, %{"a" => 2})
 
     assert {:ok, %{"a" => 1, "b" => 2}} = MemoryBackend.fetch_graph(b, "g", @graph_hash)
+  end
+
+  test "compiled artifacts are immutable and selected by compiler ABI", %{backend: b} do
+    first = %{"format_version" => 1, "artifact_hash" => "one"}
+    other = %{"format_version" => 1, "artifact_hash" => "two"}
+
+    assert :ok = MemoryBackend.save_artifact(b, "g", @graph_hash, "abi-1", first)
+    assert :ok = MemoryBackend.save_artifact(b, "g", @graph_hash, "abi-1", first)
+
+    assert {:error, :artifact_content_conflict} =
+             MemoryBackend.save_artifact(b, "g", @graph_hash, "abi-1", other)
+
+    assert :ok = MemoryBackend.save_artifact(b, "g", @graph_hash, "abi-2", other)
+    assert {:ok, ^first} = MemoryBackend.fetch_artifact(b, "g", @graph_hash, "abi-1")
+    assert {:ok, ^other} = MemoryBackend.fetch_artifact(b, "g", @graph_hash, "abi-2")
   end
 
   test "failed event append rolls graph and run initialization back", %{backend: b} do
@@ -554,6 +578,15 @@ defmodule Docket.MemoryBackendTest do
 
     assert {:ok, %{leases: [%{run_id: "future"}], poisoned: []}} =
              claim_due(b, future, limit: 1)
+  end
+
+  test "claim_due leaves unsupported compiler ABIs untouched", %{backend: b} do
+    unsupported = run("old-abi", graph_compiler_abi: "docket-runtime-graph/v0")
+    assert {:ok, ^unsupported} = initialize(b, unsupported)
+
+    assert {:ok, %{leases: [], poisoned: []}} = claim_due(b, @now, [])
+    assert MemoryBackend.claim(b, unsupported.id) == nil
+    assert MemoryBackend.wake_at(b, unsupported.id) == @initial_wake
   end
 
   test "maximum N launches exactly N attempts before poisoning", %{backend: b} do

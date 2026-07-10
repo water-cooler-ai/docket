@@ -1,10 +1,25 @@
 defmodule Docket.LifecycleTest do
   use Docket.Test.Case, async: false
 
-  import ExUnit.CaptureLog
-
   alias Docket.Runtime.{Loop, Moment}
   alias Docket.Test.MemoryBackend
+
+  defmodule CompileOnceNode do
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      key = {__MODULE__, :compile_count}
+      count = Process.get(key, 0) + 1
+      Process.put(key, count)
+
+      if count > 1, do: raise("graph was compiled more than once")
+      Docket.Schema.object(%{})
+    end
+
+    @impl true
+    def call(_state, _config, _context), do: {:ok, %{}}
+  end
 
   defmodule RecordingObserver do
     @behaviour Docket.Checkpoint.Observer
@@ -22,6 +37,11 @@ defmodule Docket.LifecycleTest do
     @behaviour Docket.Checkpoint.Observer
 
     @impl true
+    def observe(_checkpoint, %{application: %{notify: pid}}) do
+      send(pid, :failing_observer_called)
+      {:error, :observer_down}
+    end
+
     def observe(_checkpoint, _context), do: {:error, :observer_down}
   end
 
@@ -64,31 +84,27 @@ defmodule Docket.LifecycleTest do
   end
 
   test "durable facade atomically starts, fetches, inspects, cancels, and observes" do
-    log =
-      capture_log(fn ->
-        assert {:ok, reference} = Host.save_graph(Graphs.minimal_linear())
+    assert {:ok, reference} = Host.save_graph(Graphs.minimal_linear())
 
-        assert {:ok, started} =
-                 Host.start_run(reference, %{"value" => "hello"}, context: %{notify: self()})
+    assert {:ok, started} =
+             Host.start_run(reference, %{"value" => "hello"}, context: %{notify: self()})
 
-        assert started.status == :running
-        assert {:ok, ^started} = Host.fetch_run(started.id)
+    assert started.status == :running
+    assert started.graph_compiler_abi == reference.compiler_abi
+    assert {:ok, ^started} = Host.fetch_run(started.id)
 
-        assert {:ok, %Docket.RunInfo{run: ^started, wake_at: %DateTime{}}} =
-                 Host.inspect_run(started.id)
+    assert {:ok, %Docket.RunInfo{run: ^started, wake_at: %DateTime{}}} =
+             Host.inspect_run(started.id)
 
-        assert_receive {:observed,
-                        %Docket.Checkpoint{type: :run_initialized, delivery: :observer}}
+    assert_receive {:observed, %Docket.Checkpoint{type: :run_initialized, delivery: :observer}}
+    assert_receive :failing_observer_called
 
-        assert {:ok, cancelled} =
-                 Host.cancel_run(started.id, context: %{notify: self()})
+    assert {:ok, cancelled} = Host.cancel_run(started.id, context: %{notify: self()})
 
-        assert cancelled.status == :cancelled
-        assert {:ok, ^cancelled} = Host.await_run(started.id, timeout: 0)
-        assert_receive {:observed, %Docket.Checkpoint{type: :run_cancelled}}
-      end)
-
-    assert log =~ "checkpoint observer failed after commit"
+    assert cancelled.status == :cancelled
+    assert {:ok, ^cancelled} = Host.await_run(started.id, timeout: 0)
+    assert_receive {:observed, %Docket.Checkpoint{type: :run_cancelled}}
+    assert_receive :failing_observer_called
   end
 
   test "durable resolve loads the stored graph and commits mutation plus events" do
@@ -178,10 +194,55 @@ defmodule Docket.LifecycleTest do
     assert {:ok, ^first} = Host.save_graph(graph)
 
     forged = %{first | graph_hash: String.duplicate("0", 64)}
-    assert {:error, :not_found} = Host.start_run(forged, %{"value" => "x"})
+
+    assert {:error, %Docket.Error{type: :graph_artifact_not_found}} =
+             Host.start_run(forged, %{"value" => "x"})
+
+    wrong_abi = %{first | compiler_abi: "unsupported"}
+
+    assert {:error, %Docket.Error{type: :graph_artifact_not_found}} =
+             Host.start_run(wrong_abi, %{"value" => "x"})
 
     assert {:error, %Docket.Error{type: :invalid_operation}} =
              Host.run(graph, %{"value" => "x"})
+  end
+
+  test "graph publication rolls canonical source back when artifact save conflicts" do
+    graph = Graphs.minimal_linear()
+    graph_hash = Docket.Graph.hash(graph)
+    {backend, context} = backend_ref(Host)
+
+    assert :ok =
+             backend.graphs().save_artifact(
+               context,
+               graph.id,
+               graph_hash,
+               Docket.Runtime.Graph.Artifact.compiler_abi(),
+               %{"conflict" => true}
+             )
+
+    assert {:error, :artifact_content_conflict} = Host.save_graph(graph)
+    assert {:error, :not_found} = backend.graphs().fetch_graph(context, graph.id, graph_hash)
+  end
+
+  test "full compilation happens at publication and not at start" do
+    key = {CompileOnceNode, :compile_count}
+    Process.delete(key)
+
+    try do
+      graph =
+        Docket.Graph.new!(id: "compile-once")
+        |> Docket.Graph.put_node!("node", implementation: CompileOnceNode)
+        |> Docket.Graph.put_edge!("start", from: "$start", to: "node")
+        |> Docket.Graph.put_edge!("finish", from: "node", to: "$finish")
+
+      assert {:ok, reference} = Host.save_graph(graph)
+      assert Process.get(key) == 1
+      assert {:ok, _run} = Host.start_run(reference, %{})
+      assert Process.get(key) == 1
+    after
+      Process.delete(key)
+    end
   end
 
   test "a blocking observer cannot delay a committed API result" do
@@ -234,7 +295,12 @@ defmodule Docket.LifecycleTest do
     {:ok, rtg} = Docket.ensure_compiled(graph, [])
     {backend, context} = backend_ref(Host)
 
-    fresh = Loop.build_initial_run(rtg, %{"value" => "x"}, run_id: "bad-start")
+    fresh =
+      Loop.build_initial_run(rtg, %{"value" => "x"},
+        run_id: "bad-start",
+        graph_compiler_abi: Docket.Runtime.Graph.Artifact.compiler_abi()
+      )
+
     {:ok, start_moment} = Loop.propose_init(rtg, fresh, [])
     [first | rest] = start_moment.events
     invalid_start = %{start_moment | events: [%{first | run_id: "other"} | rest]}

@@ -24,10 +24,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @migration_version 20_260_709_000_001
     @prefixed_migration_version 20_260_709_000_002
 
-    @tables ~w(docket_events docket_graph_versions docket_runs)
+    @tables ~w(docket_events docket_graph_artifacts docket_graph_versions docket_runs)
 
     @run_columns ~w(
-      id run_id tenant_id graph_id graph_hash status step input output failure
+      id run_id tenant_id graph_id graph_hash graph_compiler_abi status step input output failure
       metadata state checkpoint_seq latest_checkpoint_type claim_token
       claimed_at wake_at claim_attempts poisoned_at poison_reason
       inserted_at started_at updated_at finished_at
@@ -63,7 +63,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       ready = indexes["docket_runs_wake_at_id_index"]
 
-      assert ready =~ "btree (wake_at, id)"
+      assert ready =~ "btree (graph_compiler_abi, wake_at, id)"
       assert ready =~ "status = 'running'"
       assert ready =~ "poisoned_at IS NULL"
       assert ready =~ "claim_token IS NULL"
@@ -71,7 +71,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       expired = indexes["docket_runs_claimed_at_id_index"]
 
-      assert expired =~ "btree (claimed_at, id)"
+      assert expired =~ "btree (graph_compiler_abi, claimed_at, id)"
       assert expired =~ "status = 'running'"
       assert expired =~ "poisoned_at IS NULL"
       assert expired =~ "claim_token IS NOT NULL"
@@ -82,6 +82,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert indexes("docket_graph_versions")["docket_graph_versions_graph_id_graph_hash_index"] =~
                "CREATE UNIQUE INDEX"
+
+      assert indexes("docket_graph_artifacts")[
+               "docket_graph_artifacts_graph_id_graph_hash_compiler_abi_index"
+             ] =~ "CREATE UNIQUE INDEX"
 
       assert indexes("docket_events")["docket_events_run_id_seq_index"] =~
                "CREATE UNIQUE INDEX"
@@ -285,6 +289,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ready_scan = """
       SELECT id FROM docket_runs
       WHERE status = 'running' AND poisoned_at IS NULL
+        AND graph_compiler_abi = 'docket-runtime-graph/v1'
         AND claim_token IS NULL AND wake_at <= now()
       ORDER BY wake_at, id
       LIMIT 10
@@ -293,6 +298,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       expired_scan = """
       SELECT id FROM docket_runs
       WHERE status = 'running' AND poisoned_at IS NULL
+        AND graph_compiler_abi = 'docket-runtime-graph/v1'
         AND claim_token IS NOT NULL AND claimed_at < now() - interval '1 minute'
       ORDER BY claimed_at, id
       LIMIT 10
@@ -321,11 +327,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                |> Docket.Postgres.Schemas.GraphVersion.changeset()
                |> TestRepo.insert()
 
+      assert {:ok, _artifact} =
+               %{
+                 graph_id: "g1",
+                 graph_hash: "abc123",
+                 compiler_abi: "docket-runtime-graph/v1",
+                 artifact_hash: "artifact",
+                 artifact: %{}
+               }
+               |> Docket.Postgres.Schemas.GraphArtifact.changeset()
+               |> TestRepo.insert()
+
       assert {:ok, run} =
                %{
                  run_id: "run_1",
                  graph_id: "g1",
                  graph_hash: "abc123",
+                 graph_compiler_abi: "docket-runtime-graph/v1",
                  status: :running,
                  input: %{"prompt" => "hello"},
                  state: %{"channels" => %{}, "version" => 1},
@@ -350,6 +368,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  run_id: "run_1",
                  graph_id: "g1",
                  graph_hash: "abc123",
+                 graph_compiler_abi: "docket-runtime-graph/v1",
                  status: :running,
                  input: %{"prompt" => "hello"},
                  state: %{"channels" => %{}, "version" => 1},
@@ -386,6 +405,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         tenant_id: nil,
         graph_id: "g1",
         graph_hash: "abc123",
+        graph_compiler_abi: "docket-runtime-graph/v1",
         status: "running",
         step: 0,
         input: %{},
@@ -436,6 +456,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp ensure_graph_version(prefix) do
       insert_graph_version!("g1", "abc123", prefix)
+      insert_graph_artifact!("g1", "abc123", prefix)
     end
 
     defp insert_graph_version!(graph_id, graph_hash, prefix \\ "public") do
@@ -443,6 +464,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """
         INSERT INTO #{prefix}.docket_graph_versions (graph_id, graph_hash, graph, inserted_at)
         VALUES ($1, $2, '{}', $3)
+        ON CONFLICT DO NOTHING
+        """,
+        [graph_id, graph_hash, DateTime.utc_now()]
+      )
+    end
+
+    defp insert_graph_artifact!(graph_id, graph_hash, prefix) do
+      TestRepo.query!(
+        """
+        INSERT INTO #{prefix}.docket_graph_artifacts
+          (graph_id, graph_hash, compiler_abi, artifact_hash, artifact, inserted_at)
+        VALUES ($1, $2, 'docket-runtime-graph/v1', 'artifact', '{}', $3)
         ON CONFLICT DO NOTHING
         """,
         [graph_id, graph_hash, DateTime.utc_now()]

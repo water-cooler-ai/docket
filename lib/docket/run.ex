@@ -5,8 +5,9 @@ defmodule Docket.Run do
   A run is created by Docket when a run starts, advanced through
   `Docket.Checkpoint` emissions, stored by the host application, and passed
   back to Docket to resume. Hosts may inspect the top-level fields (`id`,
-  `graph_id`, `graph_hash`, `status`, `step`, `input`, `output`, and the
-  timestamps) but should not interpret, pattern match, mutate, or rebuild
+  `graph_id`, `graph_hash`, `graph_compiler_abi`, `status`, `step`, `input`,
+  `output`, and the timestamps) but should not interpret, pattern match,
+  mutate, or rebuild
   Docket-owned execution internals such as channels, interrupts, the
   changed-channel set, or the active-superstep state (`active_tasks`,
   `pending_writes`, and `timers`).
@@ -68,6 +69,7 @@ defmodule Docket.Run do
     :id,
     :graph_id,
     :graph_hash,
+    :graph_compiler_abi,
     :status,
     :input,
     :output,
@@ -99,6 +101,7 @@ defmodule Docket.Run do
           id: String.t(),
           graph_id: String.t(),
           graph_hash: String.t() | nil,
+          graph_compiler_abi: String.t() | nil,
           status: status(),
           input: map(),
           output: map() | nil,

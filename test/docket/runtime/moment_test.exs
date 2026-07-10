@@ -372,6 +372,10 @@ defmodule Docket.Runtime.MomentTest do
       backend
     end
 
+    defp durable_opts do
+      Keyword.put(opts(), :graph_compiler_abi, Docket.Runtime.Graph.Artifact.compiler_abi())
+    end
+
     defp insert!(backend, moment) do
       {:ok, _run} =
         MemoryBackend.transaction(backend, fn tx ->
@@ -414,7 +418,7 @@ defmodule Docket.Runtime.MomentTest do
 
     test "a vehicle drives propose -> commit -> continue until the terminal park" do
       rtg = compile!(Graphs.minimal_linear())
-      opts = opts()
+      opts = durable_opts()
       backend = start_backend()
 
       init_moment = propose_init!(rtg, %{"value" => "hello"}, opts)
@@ -451,7 +455,7 @@ defmodule Docket.Runtime.MomentTest do
 
     test "a lost fence discards the moment and exposes no committed checkpoint" do
       rtg = compile!(Graphs.minimal_linear())
-      opts = opts()
+      opts = durable_opts()
       backend = start_backend()
 
       init_moment = propose_init!(rtg, %{"value" => "hello"}, opts)
@@ -474,7 +478,7 @@ defmodule Docket.Runtime.MomentTest do
 
     test "an event append failure discards the whole moment" do
       rtg = compile!(Graphs.minimal_linear())
-      opts = opts()
+      opts = durable_opts()
       backend = start_backend()
 
       init_moment = propose_init!(rtg, %{"value" => "hello"}, opts)
@@ -515,7 +519,7 @@ defmodule Docket.Runtime.MomentTest do
 
     test "post-commit observer failure cannot change durable state" do
       rtg = compile!(Graphs.minimal_linear())
-      opts = opts()
+      opts = durable_opts()
       backend = start_backend()
 
       init_moment = propose_init!(rtg, %{"value" => "hello"}, opts)

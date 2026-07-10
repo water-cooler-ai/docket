@@ -10,6 +10,7 @@ defmodule Docket.RunTest do
       id: "run_1",
       graph_id: "essay-review",
       graph_hash: String.duplicate("ab", 32),
+      graph_compiler_abi: "docket-runtime-graph/v1",
       status: :waiting,
       input: %{"topic" => "durable graphs"},
       output: nil,
@@ -106,10 +107,10 @@ defmodule Docket.RunTest do
       assert loaded.failure == run.failure
     end
 
-    test "wire map is version 2, JSON-safe, and omits empty collections" do
+    test "wire map is version 3, JSON-safe, and omits empty collections" do
       map = Run.to_map(%Run{id: "run_2", graph_id: "g", status: :running, input: %{}})
 
-      assert map["version"] == 2
+      assert map["version"] == 3
       assert map["status"] == "running"
       refute Map.has_key?(map, "channels")
       refute Map.has_key?(map, "changed_channels")

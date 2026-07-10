@@ -44,7 +44,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       cutoff = DateTime.add(now, -ttl, :millisecond)
 
-      case Ecto.Adapters.SQL.query(repo, claim_statement(prefix), [now, cutoff, limit, max]) do
+      case Ecto.Adapters.SQL.query(repo, claim_statement(prefix), [
+             now,
+             cutoff,
+             limit,
+             max,
+             Docket.Runtime.Graph.Artifact.compiler_abi()
+           ]) do
         {:ok, %{rows: rows}} -> {:ok, decode_claim_batch(rows)}
         {:error, reason} -> {:error, reason}
       end
@@ -150,6 +156,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         SELECT id, wake_at AS eligible_at
         FROM #{table}
         WHERE status = 'running'
+          AND graph_compiler_abi = $5
           AND poisoned_at IS NULL
           AND claim_token IS NULL
           AND wake_at <= $1
@@ -161,6 +168,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         SELECT id, claimed_at AS eligible_at
         FROM #{table}
         WHERE status = 'running'
+          AND graph_compiler_abi = $5
           AND poisoned_at IS NULL
           AND claim_token IS NOT NULL
           AND claimed_at < $2
@@ -205,11 +213,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         FROM candidates
         WHERE runs.id = candidates.id
           AND runs.status = 'running'
+          AND runs.graph_compiler_abi = $5
           AND runs.poisoned_at IS NULL
         RETURNING
           runs.run_id,
           runs.graph_id,
           runs.graph_hash,
+          runs.graph_compiler_abi,
           runs.checkpoint_seq,
           runs.claim_token,
           runs.claimed_at,
@@ -221,6 +231,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         run_id,
         graph_id,
         graph_hash,
+        graph_compiler_abi,
         checkpoint_seq,
         claim_token,
         claimed_at,
@@ -245,6 +256,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             run_id,
             graph_id,
             graph_hash,
+            graph_compiler_abi,
             checkpoint_seq,
             claim_token,
             claimed_at,
@@ -257,6 +269,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               run_id: run_id,
               graph_id: graph_id,
               graph_hash: graph_hash,
+              graph_compiler_abi: graph_compiler_abi,
               checkpoint_seq: checkpoint_seq,
               claim_token: load_uuid!(claim_token),
               claimed_at: claimed_at,
@@ -269,6 +282,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             run_id,
             _graph_id,
             _graph_hash,
+            _graph_compiler_abi,
             _checkpoint_seq,
             nil,
             nil,

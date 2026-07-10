@@ -165,10 +165,12 @@ end
 {:ok, info} = MyApp.DurableDocket.inspect_run(run.id, tenant_id: account.id)
 ```
 
-`save_graph` validates and compiles the graph before storing its canonical,
-content-addressed document. `start_run` accepts only the returned stable
-reference, fetches the saved document, and compiles it for execution; starting
-a run never republishes the graph. The operational facade also provides
+`save_graph` canonicalizes and compiles once, then atomically stores the source
+document and a versioned JSON-safe execution artifact. `start_run` accepts only
+the returned stable reference and hydrates that artifact; starting, signaling,
+recovering, and claiming runs never invoke the full compiler. A node-local
+cache may retain hydrated values but is never required for correctness. The
+operational facade also provides
 `resolve_interrupt`, `cancel_run`,
 `retry_poisoned_run`, and bounded `await_run`. `tenant_mode: :none` permits
 only tenantless rows; `tenant_mode: :required` requires a non-empty

@@ -37,6 +37,7 @@ defmodule Docket.Runtime.Loop do
       id: Keyword.get(opts, :run_id) || config.id_generator.(:run),
       graph_id: rtg.graph_id,
       graph_hash: rtg.graph_hash,
+      graph_compiler_abi: Keyword.get(opts, :graph_compiler_abi),
       status: :created,
       input: input || %{},
       metadata: Keyword.get(opts, :metadata, %{})

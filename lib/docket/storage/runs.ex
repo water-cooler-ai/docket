@@ -50,6 +50,7 @@ defmodule Docket.Storage.Runs do
           required(:run_id) => String.t(),
           required(:graph_id) => String.t(),
           required(:graph_hash) => String.t(),
+          required(:graph_compiler_abi) => String.t(),
           required(:checkpoint_seq) => non_neg_integer(),
           required(:claim_token) => claim_token(),
           required(:claimed_at) => DateTime.t(),
@@ -97,7 +98,9 @@ defmodule Docket.Storage.Runs do
   have the transient `:created` status, must already carry its first committed
   sequence and start time, and requires `checkpoint_type == :run_initialized`.
   That type becomes the latest checkpoint metadata, and `wake_at` is the
-  run's first explicit schedule.
+  run's first explicit schedule. Durable insertion also requires the published
+  `graph_compiler_abi`, which remains immutable with graph id/hash so recovery
+  always selects the same execution artifact.
 
   This callback writes only the run aggregate. `Docket.Lifecycle` appends
   assigned initialization events in the same outer transaction; it never
