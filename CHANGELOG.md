@@ -39,6 +39,11 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   migrations (`Docket.Postgres.Migration`, v01), `docket_graph_versions` /
   `docket_runs` / `docket_events` schemas, and `mix docket.gen.migration`
   (DCKT-13, #10).
+- Postgres `Docket.Postgres.RunStore` atomic, demand-bounded claims over
+  separately indexed ready and expired paths, including `SKIP LOCKED`
+  dispatcher concurrency, exact claim-attempt poisoning, token-guarded
+  heartbeat/release, and the shared internal mandatory-commit token predicate
+  (DCKT-15).
 - `Docket.Event`: metadata-only `:checkpoint_committed` event type and the
   `types/0` helper (DCKT-8, #12).
 - `docs/architecture/docket-operational-transition-spec.md` revision 8 and

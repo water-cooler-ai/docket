@@ -24,9 +24,11 @@ human interrupts, remote execution, and replay.
 The central idea is:
 
 ```text
-One process owns one active graph run.
+One execution shell normally drives one active graph run. Durable backends may
+briefly have an expired holder overlap the current holder after a claim steal;
+the current claim token and checkpoint sequence fence durable commits.
 
-Inside that process, graph vertices are logical actors.
+Inside that shell, graph vertices are logical actors.
 Actors read channels, write updates, and execute in bulk-synchronous steps.
 Channel updates become visible only at the next step barrier.
 Durable checkpoints make replay and recovery possible.
