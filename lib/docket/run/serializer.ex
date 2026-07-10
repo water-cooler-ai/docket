@@ -11,17 +11,21 @@ defmodule Docket.Run.Serializer do
   # validation that never creates atoms.
   #
   # `active_tasks`, `pending_writes`, and `timers` are always empty on
-  # committed v1 runs and have no wire representation yet; the keys are
-  # reserved for post-v1 async execution.
+  # committed runs and have no wire representation yet; the keys are
+  # reserved for async execution.
+  #
+  # Version 2 adds the terminal `failure` payload and admits only the five
+  # durable statuses: the private `:created` sentinel is rejected on dump
+  # and load. Version-1 documents are not loadable; there is no released
+  # userbase to migrate.
 
   alias Docket.Run
-  alias Docket.Run.{ChannelState, InterruptState}
+  alias Docket.Run.{ChannelState, Failure, InterruptState}
   alias Docket.Wire
 
-  @version 1
+  @version 2
 
   @statuses %{
-    "created" => :created,
     "running" => :running,
     "waiting" => :waiting,
     "done" => :done,
@@ -33,12 +37,13 @@ defmodule Docket.Run.Serializer do
   @interrupt_statuses %{"open" => :open, "resolved" => :resolved}
   @interrupt_statuses_out Map.new(@interrupt_statuses, fn {string, atom} -> {atom, string} end)
 
-  @run_keys ~w(version id graph_id graph_hash status step input output
+  @run_keys ~w(version id graph_id graph_hash status step input output failure
                started_at updated_at finished_at channels changed_channels
                pending_nodes interrupts checkpoint_seq event_seq metadata)
   @channel_keys ~w(value version barrier_seen)
   @interrupt_keys ~w(node_id status resume_channel prompt schema created_at
                      resolved_at metadata)
+  @failure_keys ~w(code message node_id details)
 
   # ---------------------------------------------------------------------------
   # Dump
@@ -46,6 +51,8 @@ defmodule Docket.Run.Serializer do
 
   @spec dump(Run.t(), keyword()) :: map()
   def dump(%Run{} = run, _opts \\ []) do
+    validate_failure!(run)
+
     %{
       "version" => @version,
       "id" => required_string!(run.id, "run id"),
@@ -58,6 +65,7 @@ defmodule Docket.Run.Serializer do
     |> put_present("graph_hash", run.graph_hash)
     |> put_open_map("input", run.input || %{}, "run input")
     |> put_present("output", dump_output(run.output))
+    |> put_present("failure", dump_failure(run.failure))
     |> put_present("started_at", dump_timestamp(run.started_at))
     |> put_present("updated_at", dump_timestamp(run.updated_at))
     |> put_present("finished_at", dump_timestamp(run.finished_at))
@@ -92,6 +100,14 @@ defmodule Docket.Run.Serializer do
     |> put_open_map("metadata", interrupt.metadata, "interrupt metadata")
   end
 
+  defp dump_status(:created) do
+    invalid!(
+      :invalid_run,
+      "run status :created is a private initialization sentinel and cannot be " <>
+        "written durably; initialize the run first"
+    )
+  end
+
   defp dump_status(status) do
     Map.get(@statuses_out, status) ||
       invalid!(
@@ -99,6 +115,27 @@ defmodule Docket.Run.Serializer do
         "run status must be one of #{inspect(Map.keys(@statuses_out))}, got #{inspect(status)}"
       )
   end
+
+  defp validate_failure!(%Run{} = run) do
+    case Run.validate_failure(run) do
+      :ok -> :ok
+      {:error, %Docket.Error{} = error} -> raise error
+    end
+  end
+
+  defp dump_failure(nil), do: nil
+
+  defp dump_failure(%Failure{} = failure) do
+    %{
+      "code" => required_string!(failure.code, "failure code"),
+      "message" => required_string!(failure.message, "failure message")
+    }
+    |> put_present("node_id", dump_failure_node_id(failure.node_id))
+    |> put_open_map("details", failure.details, "failure details")
+  end
+
+  defp dump_failure_node_id(nil), do: nil
+  defp dump_failure_node_id(node_id), do: required_string!(node_id, "failure node_id")
 
   defp dump_interrupt_status(status) do
     Map.get(@interrupt_statuses_out, status) ||
@@ -175,10 +212,10 @@ defmodule Docket.Run.Serializer do
     end
 
     assert_string_keys!(map, "run document")
-    assert_known_keys!(map, @run_keys, "run")
     load_version!(map)
+    assert_known_keys!(map, @run_keys, "run")
 
-    %Run{
+    run = %Run{
       id: load_required_string!(map, "id", "run"),
       graph_id: load_required_string!(map, "graph_id", "run"),
       graph_hash: load_optional_string!(map, "graph_hash", "run"),
@@ -197,6 +234,13 @@ defmodule Docket.Run.Serializer do
       event_seq: load_non_neg_integer!(map, "event_seq", "run"),
       metadata: load_open_map!(map, "metadata", "run metadata")
     }
+
+    run = %{run | failure: load_failure!(map)}
+
+    case Run.validate_failure(run) do
+      :ok -> run
+      {:error, %Docket.Error{message: message}} -> invalid!(:invalid_document, message)
+    end
   end
 
   defp load_version!(map) do
@@ -204,10 +248,10 @@ defmodule Docket.Run.Serializer do
       {:ok, @version} ->
         :ok
 
-      {:ok, version} when is_integer(version) and version > @version ->
+      {:ok, version} when is_integer(version) and version >= 1 ->
         invalid!(
           :unsupported_schema_version,
-          "run document version #{version} is newer than supported version #{@version}",
+          "run document version #{version} is not the supported version #{@version}",
           %{version: version, supported: @version}
         )
 
@@ -219,6 +263,27 @@ defmodule Docket.Run.Serializer do
 
       :error ->
         invalid!(:invalid_document, "run document is missing required key \"version\"")
+    end
+  end
+
+  defp load_failure!(map) do
+    case Map.get(map, "failure") do
+      nil ->
+        nil
+
+      value when is_map(value) and not is_struct(value) ->
+        assert_string_keys!(value, "run failure")
+        assert_known_keys!(value, @failure_keys, "run failure")
+
+        %Failure{
+          code: load_required_string!(value, "code", "run failure"),
+          message: load_required_string!(value, "message", "run failure"),
+          node_id: load_optional_string!(value, "node_id", "run failure"),
+          details: load_open_map!(value, "details", "run failure details")
+        }
+
+      other ->
+        invalid!(:invalid_document, "run failure must be a map, got #{inspect(other)}")
     end
   end
 

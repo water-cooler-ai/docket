@@ -15,16 +15,43 @@ defmodule Docket.Run do
 
   ## Status
 
-  - `:created` - built but never initialized; the fresh-run sentinel consumed
-    by the runtime's init barrier. Never appears in a checkpoint.
-  - `:running` - graph execution can proceed.
-  - `:waiting` - open interrupts and nothing else can proceed.
-  - `:done` / `:failed` / `:cancelled` - terminal.
+  The durable/public status vocabulary is exactly five values:
 
-  Status describes graph execution state, not Runtime process liveness.
+  - `:running` - autonomous graph execution can proceed. This one value
+    covers ready, claimed, timer-scheduled, budget-yielded, and retry-backoff
+    positions; queue position is derived from schedule, claim, and
+    active-superstep facts, never stored as extra statuses.
+  - `:waiting` - open interrupts and nothing else can proceed; only an
+    external graph mutation resumes the run.
+  - `:done` / `:failed` / `:cancelled` - terminal and absorbing.
+
+  `:created` is a private initialization sentinel: a built-but-never
+  initialized run consumed by the runtime's init barrier. It never appears
+  in a checkpoint, is not cancellable, and is rejected by the wire format
+  and durable storage.
+
+  Status describes graph execution state, not Runtime process liveness and
+  not operational health - see `Docket.RunInfo` for the latter.
+
+  ## Transitions
+
+      created -> running                                    (initialization)
+      running -> running | waiting | done | failed | cancelled
+      waiting -> running | cancelled
+
+  Terminal statuses are absorbing. A retryable node failure stays `:running`
+  with a future wake; only permanent or exhausted graph failure becomes
+  `:failed`.
+
+  ## Failure
+
+  `failure` carries the durable, JSON-safe `Docket.Run.Failure` cause of a
+  terminal graph failure. It is present exactly when `status` is `:failed`
+  (see `validate_failure/1`), so a failed run retains its cause even when
+  event persistence is disabled.
   """
 
-  alias Docket.Run.Serializer
+  alias Docket.Run.{Failure, Serializer}
 
   defstruct [
     :id,
@@ -33,6 +60,7 @@ defmodule Docket.Run do
     :status,
     :input,
     :output,
+    :failure,
     :started_at,
     :updated_at,
     :finished_at,
@@ -50,7 +78,11 @@ defmodule Docket.Run do
     metadata: %{}
   ]
 
-  @type status :: :created | :running | :waiting | :done | :failed | :cancelled
+  @typedoc "Durable/public graph status."
+  @type durable_status :: :running | :waiting | :done | :failed | :cancelled
+
+  @typedoc "Any graph status, including the private `:created` sentinel."
+  @type status :: :created | durable_status()
 
   @type t :: %__MODULE__{
           id: String.t(),
@@ -59,6 +91,7 @@ defmodule Docket.Run do
           status: status(),
           input: map(),
           output: map() | nil,
+          failure: Failure.t() | nil,
           started_at: DateTime.t() | nil,
           updated_at: DateTime.t() | nil,
           finished_at: DateTime.t() | nil,
@@ -76,12 +109,24 @@ defmodule Docket.Run do
           metadata: map()
         }
 
-  @statuses [:created, :running, :waiting, :done, :failed, :cancelled]
+  @durable_statuses [:running, :waiting, :done, :failed, :cancelled]
   @terminal_statuses [:done, :failed, :cancelled]
 
-  @doc false
-  @spec statuses() :: [status()]
-  def statuses, do: @statuses
+  @doc """
+  Returns the five durable/public graph statuses.
+
+  The private `:created` sentinel is deliberately excluded: it must never be
+  written to storage or the wire format.
+  """
+  @spec durable_statuses() :: [durable_status()]
+  def durable_statuses, do: @durable_statuses
+
+  @doc """
+  Returns true for the five durable/public graph statuses and false for the
+  private `:created` sentinel (and anything else).
+  """
+  @spec durable_status?(term()) :: boolean()
+  def durable_status?(status), do: status in @durable_statuses
 
   @doc """
   Returns true when the run has reached a terminal status.
@@ -90,12 +135,56 @@ defmodule Docket.Run do
   def terminal?(%__MODULE__{status: status}), do: status in @terminal_statuses
 
   @doc """
-  Dumps the run to the plain, JSON-safe v1 wire map.
+  Returns true when a run may move from `from` to `to` in one committed
+  transition.
+
+  Encodes the transition matrix from the module documentation:
+  `:created -> :running` is the initialization edge, `:running` may recommit
+  itself or reach any other durable status, `:waiting` may only resume to
+  `:running` or be cancelled, and terminal statuses are absorbing.
+  """
+  @spec valid_transition?(status(), status()) :: boolean()
+  def valid_transition?(:created, :running), do: true
+  def valid_transition?(:running, to) when to in @durable_statuses, do: true
+  def valid_transition?(:waiting, to) when to in [:running, :cancelled], do: true
+  def valid_transition?(_from, _to), do: false
+
+  @doc """
+  Validates that `failure` is present exactly when the run is `:failed`.
+
+  Returns `{:error, Docket.Error.t()}` for a failed run without a
+  `Docket.Run.Failure`, any other status carrying one, or a failure value of
+  the wrong type.
+  """
+  @spec validate_failure(t()) :: :ok | {:error, Docket.Error.t()}
+  def validate_failure(%__MODULE__{status: :failed, failure: %Failure{}}), do: :ok
+  def validate_failure(%__MODULE__{status: status, failure: nil}) when status != :failed, do: :ok
+
+  def validate_failure(%__MODULE__{status: :failed, failure: failure}) do
+    {:error,
+     Docket.Error.new(
+       :invalid_run,
+       "a failed run must carry a Docket.Run.Failure, got: #{inspect(failure)}"
+     )}
+  end
+
+  def validate_failure(%__MODULE__{status: status, failure: failure}) do
+    {:error,
+     Docket.Error.new(
+       :invalid_run,
+       "failure is only present on a failed run, got status #{inspect(status)} " <>
+         "with failure #{inspect(failure)}"
+     )}
+  end
+
+  @doc """
+  Dumps the run to the plain, JSON-safe wire map.
 
   The wire map is the storage boundary for hosts that cannot persist Elixir
-  structs directly. Raises `Docket.Error` if the run contains non-durable
-  content, which indicates a Docket bug: the runtime coerces all open content
-  to durable form at write barriers.
+  structs directly. Raises `Docket.Error` for a `:created` run, a run whose
+  status and failure disagree, or non-durable content - the latter indicates
+  a Docket bug: the runtime coerces all open content to durable form at
+  write barriers.
   """
   @spec to_map(t(), keyword()) :: map()
   def to_map(%__MODULE__{} = run, opts \\ []), do: Serializer.dump(run, opts)

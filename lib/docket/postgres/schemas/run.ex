@@ -31,7 +31,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             tenant_id: String.t() | nil,
             graph_id: String.t() | nil,
             graph_hash: String.t() | nil,
-            status: Docket.Run.status() | nil,
+            status: Docket.Run.durable_status() | nil,
             step: non_neg_integer(),
             input: map() | nil,
             output: map() | nil,
@@ -58,7 +58,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       field(:tenant_id, :string)
       field(:graph_id, :string)
       field(:graph_hash, :string)
-      field(:status, Ecto.Enum, values: Docket.Run.statuses())
+      field(:status, Ecto.Enum, values: Docket.Run.durable_statuses())
       field(:step, :integer, default: 0)
       field(:input, :map)
       field(:output, :map)

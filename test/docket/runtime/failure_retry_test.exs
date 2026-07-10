@@ -11,6 +11,10 @@ defmodule Docket.Runtime.FailureRetryTest do
       assert field_value(run, "ok_out") == :unwritten
       assert checkpoint_types(checkpoints) == [:run_initialized, :run_failed]
 
+      assert %Docket.Run.Failure{code: "node_failed", node_id: "failing_node"} = run.failure
+      assert run.failure.details["nodes"] == ["failing_node"]
+      assert run.failure.details["errors"]["failing_node"] =~ "always_fails"
+
       run_failed = List.last(checkpoints)
       assert run_failed.delivery == :sync
 
@@ -132,6 +136,7 @@ defmodule Docket.Runtime.FailureRetryTest do
 
       assert {:ok, run, checkpoints} = Docket.Test.run_inline(graph, %{})
       assert run.status == :failed
+      assert %Docket.Run.Failure{code: "node_failed", node_id: "flaky"} = run.failure
 
       run_failed = List.last(checkpoints)
 
@@ -178,6 +183,8 @@ defmodule Docket.Runtime.FailureRetryTest do
       assert {:ok, run, checkpoints} = Docket.Test.run_inline(rtg, %{})
 
       assert run.status == :failed
+      assert %Docket.Run.Failure{code: "invalid_policy"} = run.failure
+
       run_failed = List.last(checkpoints)
       assert Enum.any?(run_failed.events, &(&1.payload["reason"] == "invalid_policy"))
     end

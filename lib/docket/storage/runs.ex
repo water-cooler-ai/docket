@@ -88,16 +88,6 @@ defmodule Docket.Storage.Runs do
   @type mutation_result ::
           {:ok, {:committed, term()} | {:unchanged, term()}} | {:error, term()}
 
-  @typedoc "Token-free operational projection returned by `inspect_run/3`."
-  @type run_info :: %{
-          required(:run) => Docket.Run.t(),
-          required(:wake_at) => DateTime.t() | nil,
-          required(:claimed_at) => DateTime.t() | nil,
-          required(:claim_attempts) => non_neg_integer(),
-          required(:poisoned_at) => DateTime.t() | nil,
-          required(:poison_reason) => map() | nil
-        }
-
   @doc """
   Inserts one initialized, already-durable run.
 
@@ -131,13 +121,12 @@ defmodule Docket.Storage.Runs do
   @doc """
   Reads the committed run with substrate-neutral operational information.
 
-  The projection exposes the wake, claimed time, claim-attempt count, and
-  poison facts, but never the current claim token. DCKT-31 promotes this
-  locked shape to the public `Docket.RunInfo` struct. An unknown run or scope
-  mismatch returns `{:error, :not_found}`.
+  The `Docket.RunInfo` projection exposes the wake, claimed time,
+  claim-attempt count, and poison facts, but never the current claim token.
+  An unknown run or scope mismatch returns `{:error, :not_found}`.
   """
   @callback inspect_run(ctx(), scope(), run_id :: String.t()) ::
-              {:ok, run_info()} | {:error, :not_found}
+              {:ok, Docket.RunInfo.t()} | {:error, :not_found}
 
   @doc """
   Atomically claims a batch of ready or expired runs for system execution.

@@ -472,11 +472,12 @@ defmodule Docket.MemoryBackendTest do
     assert {:ok, _} = initialize(b, run("r1"))
     lease = claim_one(b, @now)
 
-    assert {:ok, info} = MemoryBackend.inspect_run(b, :system, "r1")
+    assert {:ok, %Docket.RunInfo{} = info} = MemoryBackend.inspect_run(b, :system, "r1")
     assert info.run.id == "r1"
     assert info.claimed_at == @now
     assert info.claim_attempts == 1
     assert info.wake_at == nil
+    refute Docket.RunInfo.poisoned?(info)
     refute Map.has_key?(info, :claim_token)
     assert lease.claim_token == MemoryBackend.claim(b, "r1")
   end
@@ -860,6 +861,31 @@ defmodule Docket.MemoryBackendTest do
 
     assert MemoryBackend.wake_at(b, "terminal") == nil
     assert MemoryBackend.claim(b, "terminal") == nil
+  end
+
+  test "a failed terminal commit requires its failure payload", %{backend: b} do
+    assert {:ok, _} = initialize(b, run("r1"))
+    lease = claim_one(b, @now)
+
+    missing_failure = run("r1", checkpoint_seq: 2, status: :failed)
+
+    assert {:error, :invalid_commit} =
+             commit(b, missing_failure, lease.claim_token, {:release_claim, :terminal},
+               checkpoint_type: :run_failed
+             )
+
+    failed = %{
+      missing_failure
+      | failure: Docket.Run.Failure.new("node_failed", "node n1 failed permanently")
+    }
+
+    assert {:ok, _} =
+             commit(b, failed, lease.claim_token, {:release_claim, :terminal},
+               checkpoint_type: :run_failed
+             )
+
+    assert {:ok, %Run{failure: %Docket.Run.Failure{code: "node_failed"}}} =
+             MemoryBackend.fetch_run(b, :system, "r1")
   end
 
   defp claim_all_remaining(backend, now, limit) do
