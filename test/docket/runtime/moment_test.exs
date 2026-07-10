@@ -182,6 +182,42 @@ defmodule Docket.Runtime.MomentTest do
       assert List.last(moments).run.status == :done
     end
 
+    test "an active superstep with no attempt due parks uncommitted" do
+      graph =
+        Graph.new!(id: "slow-retry")
+        |> Graph.put_field!("out", schema: Docket.Schema.string())
+        |> Graph.put_node!("flaky",
+          implementation: Nodes.FlakyThenSucceeds,
+          config: %{failures: 1.0, field: "out", value: "done"},
+          policies: %{"retry" => %{"max_attempts" => 2, "backoff_ms" => 60_000}}
+        )
+        |> Graph.put_edge!("edge_start_flaky", from: "$start", to: "flaky")
+        |> Graph.put_edge!("edge_flaky_finish", from: "flaky", to: "$finish")
+
+      rtg = compile!(graph)
+      opts = opts()
+
+      init_moment = propose_init!(rtg, %{}, opts)
+      assert {:ok, retry_moment} = Loop.propose_advance(rtg, init_moment.run, opts)
+
+      deadline = DateTime.add(@now, 60_000, :millisecond)
+      assert retry_moment.disposition == {:park, {:at, deadline}, :retry_backoff}
+
+      # The frozen clock has not reached the deadline: nothing to commit,
+      # and the committed run stays exactly as proposed by the retry moment.
+      assert {:park, run, park} = Loop.propose_advance(rtg, retry_moment.run, opts)
+      assert run == retry_moment.run
+      assert park == %{resume_at: deadline, wait_ms: 60_000}
+
+      # A driver that served the park's wait passes the deadline as the
+      # floor, making exactly the due attempt eligible.
+      floored = Keyword.put(opts, :resume_floor, deadline)
+      assert {:ok, step_moment} = Loop.propose_advance(rtg, retry_moment.run, floored)
+      assert step_moment.checkpoint_type == :step_committed
+      assert step_moment.disposition == :continue
+      assert step_moment.run.active_tasks == %{}
+    end
+
     test "a waiting barrier parks externally; further advancement reports the interrupts" do
       rtg = compile!(Graphs.interrupt_review())
       opts = opts()

@@ -33,6 +33,10 @@ defmodule Docket.Runtime.Moment do
   | `{:park, {:at, timestamp}, reason}` | nothing dispatchable before `timestamp` (earliest retry deadline) |
   | `{:park, :terminal, reason}` | the run is terminal; it never wakes again |
 
+  `{:park, :immediate, reason}` is reserved for driver yield boundaries and
+  graph signals; no core transition produces it today. `checkpoint_metadata`
+  is likewise reserved and currently always empty.
+
   Disposition is decided by the runtime core; storage contracts receive
   only the schedule effect a lifecycle composer derives from it.
   """

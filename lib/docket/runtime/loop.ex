@@ -277,8 +277,17 @@ defmodule Docket.Runtime.Loop do
       {:already_terminal, run} ->
         {:terminal, run, []}
 
-      other ->
-        other
+      {:execute, run, activations} ->
+        {:execute, run, activations}
+
+      {:wait, run, interrupt_ids} ->
+        {:wait, run, interrupt_ids}
+
+      {:park, run, park} ->
+        {:park, run, park}
+
+      {:error, error} ->
+        {:error, error}
     end
   end
 
