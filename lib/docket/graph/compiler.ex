@@ -46,7 +46,7 @@ defmodule Docket.Graph.Compiler do
   """
   @spec verify(Graph.t(), opts()) :: {:ok, Graph.t()} | {:error, Graph.t()}
   def verify(%Graph{} = graph, opts \\ []) when is_list(opts) do
-    case run_pipeline(graph, validate_opts!(opts), :ordinary) do
+    case run_pipeline(graph, validate_opts!(opts), :authored) do
       {:ok, _effective_graph, _runtime_graph, diagnostics} ->
         {:ok, %{graph | diagnostics: diagnostics}}
 
@@ -60,7 +60,7 @@ defmodule Docket.Graph.Compiler do
   """
   @spec compile(Graph.t(), opts()) :: {:ok, Runtime.Graph.t()} | {:error, Graph.t()}
   def compile(%Graph{} = graph, opts \\ []) when is_list(opts) do
-    case run_pipeline(graph, validate_opts!(opts), :ordinary) do
+    case run_pipeline(graph, validate_opts!(opts), :authored) do
       {:ok, _effective_graph, runtime_graph, _diagnostics} -> {:ok, runtime_graph}
       {:error, diagnostics} -> {:error, %{graph | diagnostics: diagnostics}}
     end
@@ -98,7 +98,7 @@ defmodule Docket.Graph.Compiler do
     config_schemas = NodeContracts.config_schemas(canonical)
 
     {effective, materialization_diagnostics} =
-      materialize(canonical, config_schemas, mode == :publication)
+      materialize(canonical, config_schemas, mode != :effective_document)
 
     diagnostics =
       ingest_diagnostics ++
@@ -107,7 +107,7 @@ defmodule Docket.Graph.Compiler do
     if Diagnostics.blocking?(diagnostics) do
       {:error, diagnostics}
     else
-      runtime_graph = Lowering.run(effective, config_schemas, opts, mode == :ordinary)
+      runtime_graph = Lowering.run(effective, opts)
       diagnostics = diagnostics ++ RuntimeValidation.run(runtime_graph, effective)
 
       if Diagnostics.blocking?(diagnostics) do
