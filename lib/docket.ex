@@ -134,9 +134,11 @@ defmodule Docket do
   @doc """
   Starts a run from a previously saved graph reference.
 
-  The graph is fetched and compiled before the initialized run and assigned
-  events commit atomically. Durable checkpoint observers run only after that
-  commit; starting a run never publishes or changes a graph document.
+  The effective graph is fetched, validated against local node contracts, and
+  compiled without injecting defaults introduced after publication. The
+  initialized run and assigned events then commit atomically. Durable
+  checkpoint observers run only after that commit; starting a run never
+  publishes or changes a graph document.
   """
   def start_run(runtime, graph_ref, input, opts \\ [])
 
@@ -150,7 +152,7 @@ defmodule Docket do
              graph_ref.graph_hash
            ),
          {:ok, graph} <- Graph.from_map(document),
-         {:ok, rtg} <- ensure_compiled(graph, opts),
+         {:ok, rtg} <- ensure_compiled_effective(graph, opts),
          :ok <- check_graph_ref(rtg, graph_ref),
          run = Loop.build_initial_run(rtg, input, opts),
          {:ok, moment} <- Loop.propose_init(rtg, run, opts),
@@ -212,8 +214,8 @@ defmodule Docket do
   accepted. Unknown or already-resolved interrupts return
   `{:error, %Docket.Error{type: :not_found}}`; so do runs with no active
   Runtime. With `storage:` configured, the stored effective canonical graph is
-  loaded and compiled on the executing node, the pure mutation and its events
-  commit atomically, and tenant scope is enforced before storage access.
+  loaded and compiled on the executing node without injecting new defaults,
+  the pure mutation and its events commit atomically, and tenant scope is enforced before storage access.
   Authorization remains host-owned.
   """
   def resolve_interrupt(runtime, run_id, interrupt_id, value, opts \\ []) do
@@ -379,6 +381,22 @@ defmodule Docket do
      )}
   end
 
+  @doc false
+  def ensure_compiled_effective(%Graph{} = graph, opts) do
+    compile_opts = [profile: :run] ++ Keyword.take(opts, [:max_supersteps])
+
+    case Docket.Graph.Compiler.compile_effective_document(graph, compile_opts) do
+      {:ok, rtg} ->
+        {:ok, rtg}
+
+      {:error, %Graph{} = failed} ->
+        {:error,
+         Error.new(:invalid_graph, "graph #{inspect(graph.id)} failed verification",
+           details: %{diagnostics: failed.diagnostics}
+         )}
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Runtime instance plumbing
   # ---------------------------------------------------------------------------
@@ -480,7 +498,7 @@ defmodule Docket do
          {:ok, run} <- backend.runs().fetch_run(context, scope, run_id),
          {:ok, document} <- backend.graphs().fetch_graph(context, run.graph_id, run.graph_hash),
          {:ok, graph} <- Graph.from_map(document),
-         {:ok, rtg} <- ensure_compiled(graph, opts),
+         {:ok, rtg} <- ensure_compiled_effective(graph, opts),
          now = operation_now(opts),
          result <-
            Lifecycle.signal(backend_ref, scope, run_id, fn current ->

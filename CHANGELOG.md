@@ -114,10 +114,13 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   writes the graph store (DCKT-12).
 - Locked versioning amendment: publication materializes node schema defaults
   into the effective canonical graph before hashing. Runs pin only graph ID and
-  hash; the vehicle contract requires local compilation once per claim and
+  hash; later local compilation validates but never injects newly introduced
+  defaults. The vehicle contract requires local compilation once per claim and
   reuse for its drain. Compiler ABI and distributed artifacts are deliberately
   not durable run identity; the vehicle shell lands in its dedicated ticket
   (DCKT-12, DCKT-20).
+- Unbounded cyclic graphs are valid. `max_supersteps` remains an optional graph
+  policy or host/runtime safety limit rather than a publication requirement.
 - Durable operational facade functions: `start_run`, `fetch_run`,
   `inspect_run`, `resolve_interrupt`, `cancel_run`, `retry_poisoned_run`, and
   bounded `await_run`, with strict tenantless/required scope resolution and a

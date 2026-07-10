@@ -169,11 +169,15 @@ end
 and validates and compiles the effective graph before storing its canonical,
 content-addressed document. `start_run` accepts only the returned stable
 reference, fetches the saved document, and compiles it on the executing node;
+later schema defaults are never injected into that retained graph version, and
 starting a run never republishes the graph. Compiled runtime graphs are
 node-local and ephemeral. The operational vehicle will compile once per claim
 and reuse that value while draining supersteps. Applications must keep node code and
 retained checkpoints compatible across deploys, drain old vehicles, or use
-versioned node modules when behavior must remain fixed. The operational facade also provides
+versioned node modules when behavior must remain fixed. Cyclic graphs may run
+without a superstep limit; hosts may optionally configure `max_supersteps`, or
+publish a graph policy when the limit should be part of graph identity. The
+operational facade also provides
 `resolve_interrupt`, `cancel_run`,
 `retry_poisoned_run`, and bounded `await_run`. `tenant_mode: :none` permits
 only tenantless rows; `tenant_mode: :required` requires a non-empty
@@ -224,7 +228,7 @@ A run advances in Pregel-style supersteps:
 Edges carry the control flow: fan-out (multiple edges from one node), fan-in
 joins (multi-source barrier edges that fire when every source has completed),
 guarded branches (durable, serializable guard expressions over state), and
-cycles (bounded by a `max_supersteps` policy). Node failures retry per node
+cycles (optionally bounded by a graph or host `max_supersteps` policy). Node failures retry per node
 policy; a permanently failed superstep commits none of its writes.
 
 Everything that crosses a boundary is a document. `Docket.Graph` and

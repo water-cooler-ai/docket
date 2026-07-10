@@ -307,6 +307,19 @@ defmodule Docket.Graph.Compiler.LoweringTest do
       assert runtime_graph.policies["max_supersteps"] == 25
     end
 
+    test "publication permits an unbounded cyclic graph" do
+      graph =
+        Graphs.cycle_counter()
+        |> Map.update!(:policies, &Map.delete(&1, "max_supersteps"))
+
+      assert {:ok, effective, runtime_graph} =
+               Docket.Graph.Compiler.compile_for_publication(graph)
+
+      refute Map.has_key?(effective.policies, "max_supersteps")
+      refute Map.has_key?(runtime_graph.policies, "max_supersteps")
+      assert runtime_graph.graph_hash == Graph.hash(effective)
+    end
+
     test "an explicit nil policy is replaced by the opts runtime default" do
       graph =
         Graphs.cycle_counter()

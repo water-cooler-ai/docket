@@ -4,8 +4,8 @@ defmodule Docket.GraphRef do
 
   `save_graph/2` returns a reference to the effective canonical document after
   node configuration defaults have been materialized. Durable execution loads
-  that exact document and compiles it with the executing node's installed
-  Docket and application code.
+  that exact document, validates it against the executing node's installed
+  contracts, and compiles it without adding defaults introduced later.
   """
 
   @enforce_keys [:graph_id, :graph_hash]

@@ -1,7 +1,7 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.Schemas.GraphVersion do
     @moduledoc """
-    Row schema for `docket_graph_versions` — effective canonical graph documents,
+    Row schema for `docket_graph_versions` — compiled graph documents,
     content-addressed by `graph_id` + `graph_hash`.
 
     `graph` holds the JSON-safe wire map produced by

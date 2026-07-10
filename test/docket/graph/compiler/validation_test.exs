@@ -612,11 +612,13 @@ defmodule Docket.Graph.Compiler.ValidationTest do
   end
 
   describe "cycle analysis (9.10)" do
-    test "rejects cycles without a max-supersteps limit" do
-      Graphs.cycle_counter()
-      |> Map.update!(:policies, &Map.delete(&1, "max_supersteps"))
-      |> verify_error!()
-      |> assert_diagnostic(:unbounded_cycle)
+    test "allows cycles without a max-supersteps limit and warns they may run indefinitely" do
+      {:ok, verified} =
+        Graphs.cycle_counter()
+        |> Map.update!(:policies, &Map.delete(&1, "max_supersteps"))
+        |> Graph.verify()
+
+      assert_diagnostic(verified, :unbounded_cycle, severity: :warning)
     end
 
     test "accepts cycles bounded by graph policy" do
@@ -637,7 +639,8 @@ defmodule Docket.Graph.Compiler.ValidationTest do
         |> Map.update!(:policies, &Map.put(&1, "max_supersteps", nil))
 
       assert {:ok, _verified} = Graph.verify(graph, max_supersteps: 25)
-      assert {:error, _failed} = Graph.verify(graph)
+      assert {:ok, verified} = Graph.verify(graph)
+      assert_diagnostic(verified, :unbounded_cycle, severity: :warning)
     end
 
     test "rejects invalid max_supersteps policies even on acyclic graphs" do
@@ -682,11 +685,15 @@ defmodule Docket.Graph.Compiler.ValidationTest do
         |> Graph.put_edge!("edge_copy_trap", from: "copy", to: "trap")
         |> Graph.verify()
 
-      assert_diagnostic(verified, :dead_end_node,
-        severity: :warning,
-        path: [:nodes, "trap"],
-        public_id: "trap"
-      )
+      diagnostic =
+        assert_diagnostic(verified, :dead_end_node,
+          severity: :warning,
+          path: [:nodes, "trap"],
+          public_id: "trap"
+        )
+
+      assert diagnostic.message =~ "cannot reach $finish"
+      refute diagnostic.message =~ "indefinitely"
 
       # The node that still reaches $finish is not flagged.
       refute Enum.any?(
@@ -700,7 +707,11 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       # says the graph cannot finish rather than flagging every leaf.
       {:ok, verified} = Graph.verify(Graphs.fanout())
 
-      assert_diagnostic(verified, :no_terminal_edge, severity: :warning, path: [:edges])
+      diagnostic =
+        assert_diagnostic(verified, :no_terminal_edge, severity: :warning, path: [:edges])
+
+      assert diagnostic.message =~ "cannot complete through the terminal edge"
+      refute diagnostic.message =~ "indefinitely"
       refute Enum.any?(verified.diagnostics, &(&1.code == :dead_end_node))
     end
 

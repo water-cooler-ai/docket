@@ -1135,9 +1135,9 @@ defmodule Docket.Graph.Compiler.Validation do
 
       {:ok, nil} ->
         for component <- cycles do
-          error(
+          warning(
             :unbounded_cycle,
-            "graph contains a cycle through #{inspect(component)} with no max_supersteps limit; set the \"max_supersteps\" graph policy or a runtime default",
+            "graph contains a cycle through #{inspect(component)} with no max_supersteps limit and may run indefinitely",
             path: [:policies, Policies.max_supersteps_key()],
             metadata: %{nodes: component}
           )
@@ -1293,8 +1293,8 @@ defmodule Docket.Graph.Compiler.Validation do
   # The mirror of the topology pass. A graph with no edge to $finish can never
   # terminate normally: one graph-level warning says so, rather than flagging
   # every node as its own dead end. When a $finish edge exists, each node
-  # reachable from $start that still cannot reach $finish traps any run that
-  # enters it until the max_supersteps limit. Unreachable nodes are excluded —
+  # reachable from $start that still cannot reach $finish cannot complete
+  # through the terminal edge. Unreachable nodes are excluded —
   # they already carry :unreachable_node, and steering the user two ways at
   # once helps no one. A fully empty graph is left alone, matching topology.
   defp analyze_dead_ends(graph, _opts) do
@@ -1306,7 +1306,7 @@ defmodule Docket.Graph.Compiler.Validation do
         [
           warning(
             :no_terminal_edge,
-            "graph has no edge to $finish; no run can terminate normally and every run halts at the max_supersteps limit",
+            "graph has no edge to $finish; runs cannot complete through the terminal edge",
             path: [:edges]
           )
         ]
@@ -1320,7 +1320,7 @@ defmodule Docket.Graph.Compiler.Validation do
             not MapSet.member?(finish_reaching, node_id) do
           warning(
             :dead_end_node,
-            "node #{inspect(node_id)} is reachable from $start but cannot reach $finish; runs entering it can only halt at the max_supersteps limit",
+            "node #{inspect(node_id)} is reachable from $start but cannot reach $finish",
             path: [:nodes, node_id],
             public_id: node_id
           )

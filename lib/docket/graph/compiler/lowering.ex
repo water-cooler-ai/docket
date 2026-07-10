@@ -18,6 +18,16 @@ defmodule Docket.Graph.Compiler.Lowering do
   @spec run(Graph.t(), %{optional(String.t()) => NodeContracts.fetch_result()}, keyword()) ::
           Runtime.Graph.t()
   def run(%Graph{} = graph, config_schemas, opts) do
+    run(graph, config_schemas, opts, true)
+  end
+
+  @spec run(
+          Graph.t(),
+          %{optional(String.t()) => NodeContracts.fetch_result()},
+          keyword(),
+          boolean()
+        ) :: Runtime.Graph.t()
+  def run(%Graph{} = graph, config_schemas, opts, apply_config_defaults?) do
     graph_hash = Graph.hash(graph)
 
     %Runtime.Graph{
@@ -25,7 +35,7 @@ defmodule Docket.Graph.Compiler.Lowering do
       graph_id: graph.id,
       graph_hash: graph_hash,
       channels: channels(graph),
-      nodes: nodes(graph, config_schemas),
+      nodes: nodes(graph, config_schemas, apply_config_defaults?),
       edges: edge_descriptors(graph),
       outputs: output_projections(graph),
       policies: normalize_policies(graph, opts),
@@ -84,7 +94,7 @@ defmodule Docket.Graph.Compiler.Lowering do
   # Nodes
   # ---------------------------------------------------------------------------
 
-  defp nodes(graph, config_schemas) do
+  defp nodes(graph, config_schemas, apply_config_defaults?) do
     for {id, node} <- graph.nodes, into: %{} do
       %{module: module, function: function} = node.implementation
 
@@ -94,7 +104,11 @@ defmodule Docket.Graph.Compiler.Lowering do
          public_id: id,
          module: module,
          function: function,
-         config: config_with_defaults(config_schemas, id, node.config),
+         config:
+           if(apply_config_defaults?,
+             do: config_with_defaults(config_schemas, id, node.config),
+             else: node.config
+           ),
          subscribe: subscriptions(graph, id),
          outgoing_edges: outgoing_edges(graph, id),
          policies: node.policies,
@@ -103,10 +117,10 @@ defmodule Docket.Graph.Compiler.Lowering do
     end
   end
 
-  # Config schema defaults are applied here during lowering; they are never
-  # written back into the public graph document. The schema comes from the
-  # per-compile fetch shared with validation, so user config_schema/0 code is
-  # never re-entered here.
+  # Config schema defaults are applied idempotently here for ordinary in-memory
+  # compilation. Publication materializes the same snapshot into the effective
+  # canonical graph before hashing. The schema comes from the per-compile fetch
+  # shared with validation, so user config_schema/0 code is never re-entered.
   defp config_with_defaults(config_schemas, public_id, config) do
     case Map.get(config_schemas, public_id) do
       {:ok, schema} ->

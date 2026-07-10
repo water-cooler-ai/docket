@@ -49,11 +49,20 @@ defmodule Docket.LifecycleTest do
       calls = Process.get({__MODULE__, :calls}, 0)
       Process.put({__MODULE__, :calls}, calls + 1)
 
-      Docket.Schema.object(%{
+      fields = %{
         "from" => Docket.Schema.string(required: true),
         "to" => Docket.Schema.string(required: true),
         "tone" => Docket.Schema.string(default: Process.get({__MODULE__, :tone}, "calm"))
-      })
+      }
+
+      fields =
+        if Process.get({__MODULE__, :add_future_default}, false) do
+          Map.put(fields, "future", Docket.Schema.string(default: "new-release"))
+        else
+          fields
+        end
+
+      Docket.Schema.object(fields)
     end
 
     @impl true
@@ -136,6 +145,32 @@ defmodule Docket.LifecycleTest do
     Process.put({MutableDefaultsNode, :calls}, 0)
     assert {:ok, _started} = Host.start_run(calm_ref, %{"value" => "hello"})
     assert Process.get({MutableDefaultsNode, :calls}) == 1
+  end
+
+  test "local compilation never injects defaults introduced after publication" do
+    graph = graph_with_mutable_default()
+    {backend, context} = backend_ref(Host)
+
+    Process.put({MutableDefaultsNode, :add_future_default}, false)
+    assert {:ok, reference} = Host.save_graph(graph)
+
+    assert {:ok, document} =
+             backend.graphs().fetch_graph(context, reference.graph_id, reference.graph_hash)
+
+    effective = Docket.Graph.from_map!(document)
+    refute Map.has_key?(effective.nodes["copy"].config, "future")
+
+    Process.put({MutableDefaultsNode, :add_future_default}, true)
+
+    assert {:ok, ordinary} = Docket.ensure_compiled(effective, [])
+    assert ordinary.nodes["node:copy"].config["future"] == "new-release"
+
+    assert {:ok, pinned} = Docket.ensure_compiled_effective(effective, [])
+    refute Map.has_key?(pinned.nodes["node:copy"].config, "future")
+    assert pinned.graph_hash == reference.graph_hash
+
+    assert {:ok, started} = Host.start_run(reference, %{"value" => "hello"})
+    assert started.graph_hash == reference.graph_hash
   end
 
   test "explicit config wins over changing schema defaults" do
