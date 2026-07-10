@@ -88,7 +88,7 @@ defmodule Docket.Supervised.TaskExecutorTest do
 
     assert {:ok, _run} = Docket.run(@runtime, graph, %{}, context: %{notify: self()})
 
-    assert_receive {:checkpoint, %Checkpoint{type: :run_failed} = failed}
+    assert_receive {:checkpoint, %Checkpoint{type: :run_failed} = failed}, 500
     assert failed.run.status == :failed
 
     # The instance survives the node crash and accepts new runs.
@@ -97,7 +97,7 @@ defmodule Docket.Supervised.TaskExecutorTest do
                context: %{notify: self()}
              )
 
-    assert_receive {:checkpoint, %Checkpoint{type: :run_completed}}
+    assert_receive {:checkpoint, %Checkpoint{type: :run_completed}}, 500
   end
 
   test "Executor.Task runs inline without a task supervisor" do

@@ -76,6 +76,22 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   (`Docket.Run.PendingWrite` — completed sibling results invisible until
   the barrier), and `timers` (`Docket.Run.TimerState` retry deadlines)
   (DCKT-30, #18).
+- `Docket.Runtime.Moment`: the substrate-neutral pre-commit value every
+  runtime transition now calculates — proposed `Docket.Run`, assigned
+  events, checkpoint type/metadata, and an explicit core-owned disposition
+  (`:continue` or `{:park, :immediate | :external | {:at, timestamp} |
+  :terminal, reason}`). Calculation performs no storage write, checkpoint
+  delivery, or telemetry; `Moment.checkpoint/2`/`context/2` build the
+  committed checkpoint value only after the driver's commit succeeds
+  (DCKT-10).
+- Processless moment entrypoints on the shared runtime loop:
+  initialization calculates exactly one `:run_initialized` moment without
+  invoking a checkpoint handler, and advancement plans, dispatches, and
+  applies exactly one superstep per call — one commit-boundary moment
+  (barrier, retry park, or terminal), never a speculative multi-step
+  drain. Retry moments ride DCKT-30's durable control state: graph status
+  stays `:running` under the `:retry_scheduled` checkpoint type with a
+  `{:park, {:at, deadline}, :retry_backoff}` disposition (DCKT-10).
 
 ### Changed
 
@@ -121,6 +137,12 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   expired-claim `(claimed_at, id)`, and poison-introspection partial
   indexes behind positive dispatch eligibility (`status = 'running' AND
   poisoned_at IS NULL`) (DCKT-29, #19).
+- The runtime loop's checkpoint emission is split into pure moment
+  production plus a host-owned sync-committer adapter: the supervised and
+  inline shells adapt the same `Docket.Runtime.Moment` a durable driver
+  will commit transactionally, with unchanged public behavior — sync veto,
+  async pending effects, checkpoint/telemetry ordering, and park/wake
+  mechanics are byte-identical (DCKT-10).
 
 ### Removed
 
