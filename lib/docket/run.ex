@@ -7,8 +7,9 @@ defmodule Docket.Run do
   back to Docket to resume. Hosts may inspect the top-level fields (`id`,
   `graph_id`, `graph_hash`, `status`, `step`, `input`, `output`, and the
   timestamps) but should not interpret, pattern match, mutate, or rebuild
-  Docket-owned execution internals such as channels, interrupts, or the
-  changed-channel set.
+  Docket-owned execution internals such as channels, interrupts, the
+  changed-channel set, or the active-superstep state (`active_tasks`,
+  `pending_writes`, and `timers`).
 
   Code that needs an external storage format should use `to_map/1` and
   `from_map/1` rather than treating the run as a public map contract.
@@ -42,6 +43,16 @@ defmodule Docket.Run do
   Terminal statuses are absorbing. A retryable node failure stays `:running`
   with a future wake; only permanent or exhausted graph failure becomes
   `:failed`.
+
+  ## Active superstep
+
+  Between a retryable node failure and the superstep's update barrier, the
+  run durably encodes the superstep in flight: `active_tasks` holds the
+  parked next attempt of each still-executing task (stable identity,
+  snapshot, accumulated failures), `pending_writes` holds completed sibling
+  results that stay invisible to channels until the barrier, and `timers`
+  holds each parked task's retry deadline. These fields are non-empty only
+  on a `:running` run and are cleared by the barrier or a terminal commit.
 
   ## Failure
 
@@ -99,10 +110,10 @@ defmodule Docket.Run do
           channels: %{optional(String.t()) => Docket.Run.ChannelState.t()},
           changed_channels: MapSet.t(String.t()),
           pending_nodes: MapSet.t(String.t()),
-          active_tasks: map(),
-          pending_writes: list(),
+          active_tasks: %{optional(String.t()) => Docket.Run.TaskState.t()},
+          pending_writes: [Docket.Run.PendingWrite.t()],
           interrupts: %{optional(String.t()) => Docket.Run.InterruptState.t()},
-          timers: map(),
+          timers: %{optional(String.t()) => Docket.Run.TimerState.t()},
           checkpoint_seq: non_neg_integer(),
           event_seq: non_neg_integer(),
           version: pos_integer(),

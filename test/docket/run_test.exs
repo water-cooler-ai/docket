@@ -2,7 +2,7 @@ defmodule Docket.RunTest do
   use Docket.Test.Case, async: true
 
   alias Docket.Run
-  alias Docket.Run.{ChannelState, Failure, InterruptState}
+  alias Docket.Run.{ChannelState, Failure, InterruptState, PendingWrite, TaskState, TimerState}
   alias Docket.Schema
 
   defp rich_run do
@@ -168,6 +168,274 @@ defmodule Docket.RunTest do
       }
 
       assert_raise Docket.Error, fn -> Run.to_map(run) end
+    end
+  end
+
+  # A mid-superstep retry park: flaky is waiting out its backoff while its
+  # completed siblings (a state write and an interrupt request) are parked
+  # as pending writes.
+  defp parked_run do
+    snapshot = %{"topic" => "durable graphs", "draft" => "text"}
+    task_id = "run_1:2:flaky"
+
+    %Run{
+      rich_run()
+      | status: :running,
+        interrupts: %{},
+        active_tasks: %{
+          task_id => %TaskState{
+            task_id: task_id,
+            node_id: "flaky",
+            step: 2,
+            attempt: 2,
+            status: :retry_scheduled,
+            input_hash: TaskState.snapshot_hash(snapshot),
+            idempotency_key: "#{task_id}:2",
+            snapshot: snapshot,
+            source_versions: %{"topic" => 1, "draft" => 2},
+            failures: [%{attempt: 1, reason: "{:flaky, 1}"}]
+          }
+        },
+        pending_writes: [
+          %PendingWrite{
+            task_id: "run_1:2:steady",
+            node_id: "steady",
+            attempt: 1,
+            kind: :update,
+            value: %{"draft" => "revised"}
+          },
+          %PendingWrite{
+            task_id: "run_1:2:asker",
+            node_id: "asker",
+            attempt: 1,
+            kind: :interrupt,
+            value: %Docket.Interrupt{
+              node_id: "asker",
+              prompt: "approve?",
+              schema: Schema.string(),
+              resume_channel: "decision"
+            }
+          }
+        ],
+        timers: %{
+          task_id => %TimerState{kind: :retry, fires_at: ~U[2026-07-03 10:00:02.000000Z]}
+        }
+    }
+  end
+
+  describe "active superstep wire format" do
+    test "round trips a parked run on struct equality" do
+      run = parked_run()
+
+      assert {:ok, loaded} = Run.from_map(Run.to_map(run))
+      assert loaded == run
+    end
+
+    test "wire shape carries active tasks, pending writes, and timers" do
+      map = Run.to_map(parked_run())
+
+      assert %{
+               "node_id" => "flaky",
+               "attempt" => 2,
+               "failures" => [%{"attempt" => 1, "reason" => "{:flaky, 1}"}]
+             } = map["active_tasks"]["run_1:2:flaky"]
+
+      assert [
+               %{"kind" => "update", "node_id" => "steady", "update" => %{"draft" => "revised"}},
+               %{"kind" => "interrupt", "node_id" => "asker", "interrupt" => interrupt}
+             ] = map["pending_writes"]
+
+      assert interrupt["resume_channel"] == "decision"
+
+      assert %{"kind" => "retry", "fires_at" => "2026-07-03T10:00:02.000000Z"} =
+               map["timers"]["run_1:2:flaky"]
+
+      # Runs without an active superstep omit the keys entirely.
+      plain = Run.to_map(rich_run())
+      refute Map.has_key?(plain, "active_tasks")
+      refute Map.has_key?(plain, "pending_writes")
+      refute Map.has_key?(plain, "timers")
+    end
+
+    test "dump rejects pending writes or timers without active tasks" do
+      run = %{parked_run() | active_tasks: %{}, timers: %{}}
+
+      assert_raise Docket.Error, ~r/only durable while tasks are active/, fn ->
+        Run.to_map(run)
+      end
+    end
+
+    test "dump rejects an active superstep on a non-running run" do
+      run = %{parked_run() | status: :waiting}
+
+      assert_raise Docket.Error, ~r/only durable on a running run/, fn ->
+        Run.to_map(run)
+      end
+    end
+
+    test "load rejects an active superstep on a non-running status" do
+      map = Map.put(Run.to_map(parked_run()), "status", "waiting")
+
+      assert {:error, %Docket.Error{type: :invalid_document, message: message}} =
+               Run.from_map(map)
+
+      assert message =~ "only durable on a running run"
+    end
+
+    test "load rejects active tasks and timers that do not cover the same task IDs" do
+      base = Run.to_map(parked_run())
+
+      missing_timer = Map.delete(base, "timers")
+      assert {:error, %Docket.Error{type: :invalid_document}} = Run.from_map(missing_timer)
+
+      extra_timer =
+        put_in(base, ["timers", "run_1:2:ghost"], %{
+          "kind" => "retry",
+          "fires_at" => "2026-07-03T10:00:02.000000Z"
+        })
+
+      assert {:error, %Docket.Error{type: :invalid_document}} = Run.from_map(extra_timer)
+    end
+
+    test "load rejects pending writes without active tasks" do
+      map =
+        Run.to_map(parked_run())
+        |> Map.delete("active_tasks")
+        |> Map.delete("timers")
+
+      assert {:error, %Docket.Error{type: :invalid_document, message: message}} =
+               Run.from_map(map)
+
+      assert message =~ "only durable while tasks are active"
+    end
+
+    test "load rejects a tampered snapshot" do
+      map =
+        put_in(
+          Run.to_map(parked_run()),
+          ["active_tasks", "run_1:2:flaky", "snapshot", "draft"],
+          "tampered"
+        )
+
+      assert {:error, %Docket.Error{type: :invalid_document, message: message}} =
+               Run.from_map(map)
+
+      assert message =~ "snapshot does not match its recorded input_hash"
+    end
+
+    test "dump rejects inconsistent parked task state" do
+      run = parked_run()
+      [task_id] = Map.keys(run.active_tasks)
+      task = run.active_tasks[task_id]
+
+      tampered_snapshot = %{task | snapshot: Map.put(task.snapshot, "draft", "tampered")}
+      tampered = %{run | active_tasks: %{task_id => tampered_snapshot}}
+
+      assert_raise Docket.Error, ~r/snapshot does not match its recorded input_hash/, fn ->
+        Run.to_map(tampered)
+      end
+
+      skipped = %{run | active_tasks: %{task_id => %{task | attempt: 4}}}
+
+      assert_raise Docket.Error, ~r/does not follow its 1 recorded failed attempt/, fn ->
+        Run.to_map(skipped)
+      end
+
+      [write, pending_interrupt] = run.pending_writes
+      mismatched_value = %{pending_interrupt.value | node_id: "someone_else"}
+
+      mismatched = %{
+        run
+        | pending_writes: [write, %{pending_interrupt | value: mismatched_value}]
+      }
+
+      assert_raise Docket.Error, ~r/does not match the pending write's node/, fn ->
+        Run.to_map(mismatched)
+      end
+    end
+
+    test "load rejects a task identity that does not match run, step, and node" do
+      base = Run.to_map(parked_run())
+
+      {entry, active} = Map.pop(base["active_tasks"], "run_1:2:flaky")
+
+      renamed =
+        base
+        |> Map.put("active_tasks", Map.put(active, "run_9:2:flaky", entry))
+        |> Map.put("timers", %{"run_9:2:flaky" => base["timers"]["run_1:2:flaky"]})
+
+      assert {:error, %Docket.Error{message: message}} = Run.from_map(renamed)
+      assert message =~ "stable task identity"
+
+      bad_pending =
+        update_in(base, ["pending_writes"], fn [write, interrupt] ->
+          [Map.put(write, "task_id", "run_1:1:steady"), interrupt]
+        end)
+
+      assert {:error, %Docket.Error{message: message}} = Run.from_map(bad_pending)
+      assert message =~ "stable task identity"
+    end
+
+    test "load rejects attempt and failure records that disagree" do
+      base = Run.to_map(parked_run())
+
+      skipped_attempt = put_in(base, ["active_tasks", "run_1:2:flaky", "attempt"], 3)
+      assert {:error, %Docket.Error{message: message}} = Run.from_map(skipped_attempt)
+      assert message =~ "does not follow its 1 recorded failed attempt"
+
+      out_of_order =
+        put_in(base, ["active_tasks", "run_1:2:flaky", "failures"], [
+          %{"attempt" => 2, "reason" => "boom"}
+        ])
+
+      assert {:error, %Docket.Error{message: message}} = Run.from_map(out_of_order)
+      assert message =~ "attempts 1..n in order"
+
+      no_failures = put_in(base, ["active_tasks", "run_1:2:flaky", "failures"], [])
+      assert {:error, %Docket.Error{message: message}} = Run.from_map(no_failures)
+      assert message =~ "at least one failed attempt"
+    end
+
+    test "load rejects more than one result or attempt per node" do
+      base = Run.to_map(parked_run())
+
+      duplicated =
+        update_in(base, ["pending_writes"], fn [write, interrupt] ->
+          [write, write, interrupt]
+        end)
+
+      assert {:error, %Docket.Error{message: message}} = Run.from_map(duplicated)
+      assert message =~ "at most one result or parked attempt per superstep"
+    end
+
+    test "load rejects malformed pending writes and timers" do
+      base = Run.to_map(parked_run())
+
+      bad_kind =
+        update_in(base, ["pending_writes"], fn [write, interrupt] ->
+          [Map.put(write, "kind", "sideways"), interrupt]
+        end)
+
+      assert {:error, %Docket.Error{message: message}} = Run.from_map(bad_kind)
+      assert message =~ "unknown pending write kind"
+
+      missing_update =
+        update_in(base, ["pending_writes"], fn [write, interrupt] ->
+          [Map.delete(write, "update"), interrupt]
+        end)
+
+      assert {:error, %Docket.Error{message: message}} = Run.from_map(missing_update)
+      assert message =~ ~s(missing required key "update")
+
+      bad_timer_kind = put_in(base, ["timers", "run_1:2:flaky", "kind"], "cron")
+      assert {:error, %Docket.Error{message: message}} = Run.from_map(bad_timer_kind)
+      assert message =~ "unknown timer"
+
+      timerless =
+        put_in(base, ["timers", "run_1:2:flaky"], %{"kind" => "retry"})
+
+      assert {:error, %Docket.Error{message: message}} = Run.from_map(timerless)
+      assert message =~ ~s(missing required key "fires_at")
     end
   end
 

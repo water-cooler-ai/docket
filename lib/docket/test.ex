@@ -19,7 +19,9 @@ defmodule Docket.Test do
   - `:executor` - `Docket.Executor` module (default `Docket.Executor.Local`)
   - `:executor_opts` - keyword list passed through to the executor
   - `:context` - application context passed to nodes and checkpoint handlers
-  - `:clock`, `:id_generator`, `:sleeper` - determinism injection points
+  - `:clock`, `:id_generator`, `:sleeper` - determinism injection points;
+    the sleeper serves each committed retry park's wait, and the helpers
+    then treat the parked deadline as reached without re-reading the clock
   - `:max_supersteps` - runtime default when the graph declares no policy
   - `:max_steps` - stop driving after this many committed supersteps
   - `:run_id` - explicit run ID for the fresh run document
@@ -98,14 +100,23 @@ defmodule Docket.Test do
           {:ok, run, []}
 
         true ->
-          case tick(rtg, run, opts) do
-            {:continue, run, checkpoints} -> {:ok, run, checkpoints}
-            {:stop, run, checkpoints} -> {:ok, run, checkpoints}
-            {:error, error, checkpoints} -> {:error, error, checkpoints}
-          end
+          step_tick(rtg, run, opts, nil)
       end
     else
       {:error, %Error{} = error} -> {:error, error, []}
+    end
+  end
+
+  # Drives ticks until one committed transition (a barrier, retry park, or
+  # terminal commit) has happened. A retry wait commits nothing; keep going
+  # so step_inline always returns a commit.
+  defp step_tick(rtg, run, opts, resume_floor) do
+    case tick(rtg, run, opts, resume_floor) do
+      {:continue, run, checkpoints} -> {:ok, run, checkpoints}
+      {:continue_at, run, _resume_at, checkpoints} -> {:ok, run, checkpoints}
+      {:retry_wait, run, resume_at} -> step_tick(rtg, run, opts, resume_at)
+      {:stop, run, checkpoints} -> {:ok, run, checkpoints}
+      {:error, error, checkpoints} -> {:error, error, checkpoints}
     end
   end
 
@@ -138,7 +149,11 @@ defmodule Docket.Test do
     end
   end
 
-  defp drive(rtg, run, opts, checkpoints, steps) do
+  # `resume_floor` carries a served park deadline into the next plan: the
+  # sleeper call stands in for real waiting, so deadline checks must not
+  # depend on the wall clock having advanced. A retry park does not count
+  # toward `max_steps` - the graph step does not advance.
+  defp drive(rtg, run, opts, checkpoints, steps, resume_floor \\ nil) do
     max_steps = Keyword.get(opts, :max_steps)
 
     cond do
@@ -149,9 +164,15 @@ defmodule Docket.Test do
         {:ok, run, checkpoints}
 
       true ->
-        case tick(rtg, run, opts) do
+        case tick(rtg, run, opts, resume_floor) do
           {:continue, run, delivered} ->
             drive(rtg, run, opts, checkpoints ++ delivered, steps + 1)
+
+          {:continue_at, run, resume_at, delivered} ->
+            drive(rtg, run, opts, checkpoints ++ delivered, steps, resume_at)
+
+          {:retry_wait, run, resume_at} ->
+            drive(rtg, run, opts, checkpoints, steps, resume_at)
 
           {:stop, run, delivered} ->
             {:ok, run, checkpoints ++ delivered}
@@ -162,15 +183,31 @@ defmodule Docket.Test do
     end
   end
 
-  defp tick(rtg, run, opts) do
+  defp tick(rtg, run, opts, resume_floor) do
+    config = Config.resolve(opts)
+    opts = put_resume_floor(opts, resume_floor)
+
     case Loop.plan(rtg, run, opts) do
       {:execute, run, activations} ->
-        results = Dispatcher.dispatch(activations, rtg, run, Config.resolve(opts))
+        results = Dispatcher.dispatch(activations, rtg, run, config)
 
-        case Loop.apply_results(rtg, run, results, opts) do
-          {:ok, run, effects} -> {:continue, run, deliver(effects, opts)}
-          {:error, error} -> {:error, error, []}
+        case Loop.apply_results(rtg, run, activations, results, opts) do
+          {:ok, run, effects} ->
+            {:continue, run, deliver(effects, opts)}
+
+          {:park, run, park, effects} ->
+            config.sleeper.(park.wait_ms)
+            {:continue_at, run, park.resume_at, deliver(effects, opts)}
+
+          {:error, error} ->
+            {:error, error, []}
         end
+
+      # An uncommitted retry wait: nothing durable changed, the sleeper just
+      # served the remaining time to the earliest parked deadline.
+      {:park, run, park} ->
+        config.sleeper.(park.wait_ms)
+        {:retry_wait, run, park.resume_at}
 
       {:wait, run, _interrupt_ids} ->
         {:stop, run, []}
@@ -182,6 +219,9 @@ defmodule Docket.Test do
         {:error, error, []}
     end
   end
+
+  defp put_resume_floor(opts, nil), do: Keyword.delete(opts, :resume_floor)
+  defp put_resume_floor(opts, %DateTime{} = floor), do: Keyword.put(opts, :resume_floor, floor)
 
   # Sync checkpoints in effects were already accepted inside the loop; async
   # ones are drained here, in order, in the calling process.

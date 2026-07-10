@@ -934,14 +934,15 @@ Resolved v1 contract:
   duplicate. This invariant has a dedicated inline-execution test gate:
   re-planning a superstep after a failed checkpoint must produce
   byte-identical idempotency keys.
-- Post-v1 design space: persist successful sibling-node writes attached to the
-  previous checkpoint (LangGraph's `put_writes` pending-writes pattern) so a
-  re-executed superstep does not redo nodes that already succeeded. This
+- Persisted sibling writes: durable retry parking (transition spec revision 8)
+  retains completed sibling results as pending writes on the run document —
+  invisible to channels until the barrier — so recovery after a committed
+  retry park does not redo nodes that already succeeded (LangGraph's
+  `put_writes` pending-writes pattern, scoped to retry-park boundaries). This
   matters for Water Cooler because re-running an already-succeeded LLM node is
-  the expensive redo (latency, tokens, and provider cost), but pending writes
-  complicate the checkpoint contract with a second write path, so it is
-  deliberately deferred. v1 re-executes the whole superstep and relies on
-  idempotency keys for external-effect dedupe.
+  the expensive redo (latency, tokens, and provider cost). A superstep with no
+  committed control state still re-executes whole and relies on idempotency
+  keys for external-effect dedupe.
 
 ## 15. Interrupt Contract
 

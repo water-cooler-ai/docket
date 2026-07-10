@@ -2,11 +2,12 @@ defmodule Docket.Runtime.Dispatcher do
   @moduledoc false
 
   # Internal task dispatch mechanics: builds the node context, calls the
-  # configured executor for each activation, normalizes every outcome shape
-  # into a final `TaskResult`, and runs the mechanical retry loop resolved
-  # into each activation by planning. It does not evaluate guards, apply
-  # reducers, commit checkpoints, or make retry policy decisions beyond
-  # attempt mechanics.
+  # configured executor for each activation, and normalizes every outcome
+  # shape into a `TaskResult`. One dispatch executes exactly one attempt per
+  # activation - retry waiting is durable retry parking owned by the loop
+  # and its shells, never a sleep in here. The dispatcher does not evaluate
+  # guards, apply reducers, commit checkpoints, or make retry policy
+  # decisions beyond classifying whether attempt budget remains.
   #
   # Activations run serially in the calling process in v1; semantic
   # parallelism is guaranteed by barrier visibility, not scheduling.
@@ -19,59 +20,55 @@ defmodule Docket.Runtime.Dispatcher do
   def dispatch(activations, rtg, run, config) do
     Enum.map(activations, fn activation ->
       node = Map.fetch!(rtg.nodes, activation.runtime_node_id)
-      attempt(activation, node, run, config, activation.attempt, [])
+      attempt(activation, node, run, config)
     end)
   end
 
-  defp attempt(activation, node, run, config, attempt_number, failures) do
-    outcome = execute(activation, node, run, config, attempt_number)
+  defp attempt(activation, node, run, config) do
+    outcome = execute(activation, node, run, config)
 
     case classify(outcome) do
       {:final, status, value} ->
         %TaskResult{
           task_id: activation.task_id,
           node_id: activation.node_id,
-          attempt: attempt_number,
+          attempt: activation.attempt,
           status: status,
-          value: value,
-          failures: Enum.reverse(failures)
+          value: value
         }
 
       {:failure, retryable?, reason} ->
-        failures = [%{attempt: attempt_number, reason: reason} | failures]
+        status =
+          if retryable? and activation.attempt < activation.retry.max_attempts,
+            do: :retry,
+            else: :error
 
-        if retryable? and attempt_number < activation.retry.max_attempts do
-          config.sleeper.(activation.retry.backoff_ms)
-          attempt(activation, node, run, config, attempt_number + 1, failures)
-        else
-          %TaskResult{
-            task_id: activation.task_id,
-            node_id: activation.node_id,
-            attempt: attempt_number,
-            status: :error,
-            value: reason,
-            failures: Enum.reverse(failures)
-          }
-        end
+        %TaskResult{
+          task_id: activation.task_id,
+          node_id: activation.node_id,
+          attempt: activation.attempt,
+          status: status,
+          value: reason
+        }
     end
   end
 
-  defp execute(activation, node, run, config, attempt_number) do
+  defp execute(activation, node, run, config) do
     task = %TaskState{
       task_id: activation.task_id,
       node_id: activation.node_id,
       step: activation.step,
-      attempt: attempt_number,
+      attempt: activation.attempt,
       status: :running,
       input_hash: activation.input_hash,
-      idempotency_key: Activation.idempotency_key(activation, attempt_number)
+      idempotency_key: activation.idempotency_key
     }
 
     context = %{
       run_id: run.id,
       node_id: activation.node_id,
       step: activation.step,
-      attempt: attempt_number,
+      attempt: activation.attempt,
       source_versions: activation.source_versions,
       idempotency_key: task.idempotency_key,
       application: config.context

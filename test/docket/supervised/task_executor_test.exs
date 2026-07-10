@@ -47,11 +47,17 @@ defmodule Docket.Supervised.TaskExecutorTest do
     assert_receive {:checkpoint, %Checkpoint{type: :run_completed} = final}, 500
     assert final.run.output == %{"out" => "released"}
 
-    # The retried timeout is visible as a non-permanent node failure event in
-    # the step that eventually committed the node's write.
-    assert_receive {:checkpoint, %Checkpoint{type: :step_committed} = step}
-    timeout_failures = for event <- step.events, event.type == :node_failed, do: event.payload
+    # The retried timeout committed a retry park: the non-permanent failure
+    # event rides the sync :retry_scheduled checkpoint, whose run stays
+    # :running without advancing the graph step.
+    assert_receive {:checkpoint, %Checkpoint{type: :retry_scheduled} = park}
+    timeout_failures = for event <- park.events, event.type == :node_failed, do: event.payload
     assert [%{"attempt" => 1, "permanent" => false, "reason" => ":timeout"}] = timeout_failures
+    assert park.run.status == :running
+    assert park.run.step == 0
+
+    assert_receive {:checkpoint, %Checkpoint{type: :step_committed} = step}
+    refute Enum.any?(step.events, &(&1.type == :node_failed))
   end
 
   test "exhausted timeouts fail the run permanently" do

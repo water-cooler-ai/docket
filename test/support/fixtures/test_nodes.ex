@@ -258,6 +258,51 @@ defmodule Docket.Test.Fixtures.Nodes do
     end
   end
 
+  defmodule NotifyingFlaky do
+    @moduledoc false
+    # FlakyThenSucceeds that also reports every attempt - with its
+    # idempotency identity and the state snapshot it observed - to
+    # `context.application.notify`, so tests can assert attempt identity and
+    # snapshot stability across retry parks and crash-resume. Delegates the
+    # flaky contract itself so the two fixtures cannot drift.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: FlakyThenSucceeds.config_schema()
+
+    @impl true
+    def call(state, config, context) do
+      send(
+        Map.fetch!(context.application, :notify),
+        {:attempted, context.node_id, context.attempt, context.idempotency_key, state}
+      )
+
+      FlakyThenSucceeds.call(state, config, context)
+    end
+  end
+
+  defmodule NotifyingWrite do
+    @moduledoc false
+    # WriteStatic that reports every execution to
+    # `context.application.notify`, so tests can prove a committed sibling
+    # result is never re-executed across parks and recovery. Delegates the
+    # write itself so the two fixtures cannot drift.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: WriteStatic.config_schema()
+
+    @impl true
+    def call(state, config, context) do
+      send(
+        Map.fetch!(context.application, :notify),
+        {:executed, context.node_id, context.attempt}
+      )
+
+      WriteStatic.call(state, config, context)
+    end
+  end
+
   defmodule AlwaysFails do
     @moduledoc false
     @behaviour Docket.Node

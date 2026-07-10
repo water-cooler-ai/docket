@@ -10,17 +10,21 @@ defmodule Docket.Run.Serializer do
   # durable JSON-safe terms, "$"-prefixed map keys reserved, strict load
   # validation that never creates atoms.
   #
-  # `active_tasks`, `pending_writes`, and `timers` are always empty on
-  # committed runs and have no wire representation yet; the keys are
-  # reserved for async execution.
-  #
   # Version 2 adds the terminal `failure` payload and admits only the five
   # durable statuses: the private `:created` sentinel is rejected on dump
   # and load. Version-1 documents are not loadable; there is no released
   # userbase to migrate.
+  #
+  # Version 2 also carries the active superstep: `active_tasks` (parked
+  # attempts with their activation identity), `pending_writes` (completed
+  # sibling results held until the barrier), and `timers` (retry deadlines).
+  # The three keys share the failure bump's version rather than allocating
+  # another one; documents dumped without an active superstep omit them and
+  # load with the empty defaults, in both directions of the transition.
 
+  alias Docket.Interrupt
   alias Docket.Run
-  alias Docket.Run.{ChannelState, Failure, InterruptState}
+  alias Docket.Run.{ChannelState, Failure, InterruptState, PendingWrite, TaskState, TimerState}
   alias Docket.Wire
 
   @version 2
@@ -39,11 +43,23 @@ defmodule Docket.Run.Serializer do
 
   @run_keys ~w(version id graph_id graph_hash status step input output failure
                started_at updated_at finished_at channels changed_channels
-               pending_nodes interrupts checkpoint_seq event_seq metadata)
+               pending_nodes interrupts active_tasks pending_writes timers
+               checkpoint_seq event_seq metadata)
   @channel_keys ~w(value version barrier_seen)
   @interrupt_keys ~w(node_id status resume_channel prompt schema created_at
                      resolved_at metadata)
   @failure_keys ~w(code message node_id details)
+  @active_task_keys ~w(node_id attempt input_hash snapshot source_versions
+                       failures)
+  @task_failure_keys ~w(attempt reason)
+  @pending_update_keys ~w(task_id node_id attempt kind update)
+  @pending_interrupt_keys ~w(task_id node_id attempt kind interrupt)
+  @pending_interrupt_value_keys ~w(id node_id resume_channel prompt schema metadata)
+  @pending_kinds %{"update" => :update, "interrupt" => :interrupt}
+  @pending_kinds_out Map.new(@pending_kinds, fn {string, atom} -> {atom, string} end)
+  @timer_keys ~w(kind fires_at)
+  @timer_kinds %{"retry" => :retry}
+  @timer_kinds_out Map.new(@timer_kinds, fn {string, atom} -> {atom, string} end)
 
   # ---------------------------------------------------------------------------
   # Dump
@@ -52,6 +68,7 @@ defmodule Docket.Run.Serializer do
   @spec dump(Run.t(), keyword()) :: map()
   def dump(%Run{} = run, _opts \\ []) do
     validate_failure!(run)
+    validate_active_superstep!(run, :invalid_run)
 
     %{
       "version" => @version,
@@ -73,7 +90,337 @@ defmodule Docket.Run.Serializer do
     |> put_id_set("changed_channels", run.changed_channels)
     |> put_id_set("pending_nodes", run.pending_nodes)
     |> put_collection("interrupts", run.interrupts, &dump_interrupt/1)
+    |> put_active_tasks(run)
+    |> put_pending_writes(run)
+    |> put_timers(run)
     |> put_open_map("metadata", run.metadata, "run metadata")
+  end
+
+  # ---------------------------------------------------------------------------
+  # Active superstep
+  # ---------------------------------------------------------------------------
+
+  # Shared dump/load invariants for retry-parked execution state: only a
+  # `:running` run carries it, pending results require active tasks, every
+  # active task parks with exactly one retry timer, and a node contributes
+  # at most one result or parked attempt per superstep. The retry-timer
+  # coverage check is scoped by kind so future non-retry timers are not
+  # bound to active tasks.
+  defp validate_active_superstep!(%Run{} = run, error_type) do
+    retry_timer_ids = for {timer_id, %TimerState{kind: :retry}} <- run.timers, do: timer_id
+
+    cond do
+      map_size(run.active_tasks) == 0 and run.pending_writes == [] and retry_timer_ids == [] ->
+        :ok
+
+      map_size(run.active_tasks) == 0 ->
+        invalid!(
+          error_type,
+          "pending writes and retry timers are only durable while tasks are active"
+        )
+
+      run.status != :running ->
+        invalid!(
+          error_type,
+          "an active superstep is only durable on a running run, got status " <>
+            inspect(run.status)
+        )
+
+      Enum.sort(retry_timer_ids) != Enum.sort(Map.keys(run.active_tasks)) ->
+        invalid!(
+          error_type,
+          "active tasks and retry timers must cover the same task IDs",
+          %{
+            active_tasks: Enum.sort(Map.keys(run.active_tasks)),
+            timers: Enum.sort(retry_timer_ids)
+          }
+        )
+
+      true ->
+        node_ids = active_node_ids!(run, error_type) ++ pending_node_ids!(run, error_type)
+
+        case node_ids -- Enum.uniq(node_ids) do
+          [] ->
+            :ok
+
+          duplicated ->
+            invalid!(
+              error_type,
+              "a node has at most one result or parked attempt per superstep, got " <>
+                "duplicates for #{inspect(Enum.sort(Enum.uniq(duplicated)))}"
+            )
+        end
+    end
+  end
+
+  defp active_node_ids!(run, error_type) do
+    Enum.map(run.active_tasks, fn
+      {_task_id, %TaskState{node_id: node_id}} ->
+        node_id
+
+      {task_id, other} ->
+        invalid!(
+          error_type,
+          "active task #{inspect(task_id)} must be a Docket.Run.TaskState, got #{inspect(other)}"
+        )
+    end)
+  end
+
+  defp pending_node_ids!(run, error_type) do
+    Enum.map(run.pending_writes, fn
+      %PendingWrite{node_id: node_id} ->
+        node_id
+
+      other ->
+        invalid!(
+          error_type,
+          "pending write must be a Docket.Run.PendingWrite, got #{inspect(other)}"
+        )
+    end)
+  end
+
+  defp put_active_tasks(map, %Run{active_tasks: tasks}) when map_size(tasks) == 0, do: map
+
+  defp put_active_tasks(map, run) do
+    Map.put(
+      map,
+      "active_tasks",
+      Map.new(run.active_tasks, fn {task_id, task} ->
+        {task_id, dump_active_task(run, task_id, task)}
+      end)
+    )
+  end
+
+  # Dump enforces the same task-state consistency as load, so a checkpoint
+  # the host persists is always reloadable: an inconsistent in-memory task
+  # fails at the write boundary, never at recovery.
+  defp dump_active_task(run, task_id, %TaskState{} = task) do
+    location = "active task #{inspect(task_id)}"
+    failures = dump_task_failures(task.failures, location)
+
+    cond do
+      task.task_id != task_id ->
+        invalid!(
+          :invalid_run,
+          "#{location} is keyed by #{inspect(task_id)} but carries task_id " <>
+            inspect(task.task_id)
+        )
+
+      task.step != run.step ->
+        invalid!(
+          :invalid_run,
+          "#{location} step #{inspect(task.step)} does not match run step #{run.step}"
+        )
+
+      task_id != TaskState.task_id(run.id, run.step, task.node_id) ->
+        invalid!(
+          :invalid_run,
+          "#{location} does not carry the stable task identity for node " <>
+            inspect(task.node_id)
+        )
+
+      Enum.map(failures, & &1["attempt"]) != Enum.to_list(1..length(failures)) ->
+        invalid!(
+          :invalid_run,
+          "#{location} failures must record attempts 1..n in order"
+        )
+
+      task.attempt != length(failures) + 1 ->
+        invalid!(
+          :invalid_run,
+          "#{location} attempt #{inspect(task.attempt)} does not follow its " <>
+            "#{length(failures)} recorded failed attempt(s)"
+        )
+
+      TaskState.snapshot_hash(task.snapshot || %{}) !=
+          required_string!(task.input_hash, "#{location} input_hash") ->
+        invalid!(
+          :invalid_run,
+          "#{location} snapshot does not match its recorded input_hash"
+        )
+
+      true ->
+        %{
+          "node_id" => required_string!(task.node_id, "#{location} node_id"),
+          "attempt" => task.attempt,
+          "input_hash" => task.input_hash,
+          "failures" => failures
+        }
+        |> put_open_map("snapshot", task.snapshot || %{}, "#{location} snapshot")
+        |> put_source_versions(task.source_versions || %{}, location)
+    end
+  end
+
+  defp dump_active_task(_run, task_id, other) do
+    invalid!(
+      :invalid_run,
+      "active task #{inspect(task_id)} must be a Docket.Run.TaskState, got #{inspect(other)}"
+    )
+  end
+
+  defp dump_task_failures(failures, location) when is_list(failures) and failures != [] do
+    Enum.map(failures, fn
+      %{attempt: attempt, reason: reason} when is_integer(attempt) and attempt >= 1 ->
+        %{
+          "attempt" => attempt,
+          "reason" => required_string!(reason, "#{location} failure reason")
+        }
+
+      other ->
+        invalid!(
+          :invalid_run,
+          "#{location} failures must be %{attempt, reason} entries, got #{inspect(other)}"
+        )
+    end)
+  end
+
+  defp dump_task_failures(other, location) do
+    invalid!(
+      :invalid_run,
+      "#{location} must record at least one failed attempt, got #{inspect(other)}"
+    )
+  end
+
+  defp put_source_versions(map, versions, location)
+       when is_map(versions) and not is_struct(versions) do
+    case map_size(versions) do
+      0 ->
+        map
+
+      _present ->
+        Map.put(
+          map,
+          "source_versions",
+          Map.new(versions, fn
+            {key, value} when is_binary(key) and is_integer(value) and value >= 0 ->
+              {key, value}
+
+            {key, value} ->
+              invalid!(
+                :invalid_run,
+                "#{location} source_versions entries must map channel IDs to " <>
+                  "non-negative integers, got #{inspect({key, value})}"
+              )
+          end)
+        )
+    end
+  end
+
+  defp put_source_versions(_map, other, location) do
+    invalid!(:invalid_run, "#{location} source_versions must be a map, got #{inspect(other)}")
+  end
+
+  defp put_pending_writes(map, %Run{pending_writes: []}), do: map
+
+  defp put_pending_writes(map, run) do
+    Map.put(map, "pending_writes", Enum.map(run.pending_writes, &dump_pending_write(run, &1)))
+  end
+
+  defp dump_pending_write(run, %PendingWrite{} = pending) do
+    location = "pending write #{inspect(pending.node_id)}"
+
+    unless pending.task_id == TaskState.task_id(run.id, run.step, pending.node_id) do
+      invalid!(
+        :invalid_run,
+        "#{location} does not carry the stable task identity, got #{inspect(pending.task_id)}"
+      )
+    end
+
+    unless is_integer(pending.attempt) and pending.attempt >= 1 do
+      invalid!(
+        :invalid_run,
+        "#{location} attempt must be a positive integer, got #{inspect(pending.attempt)}"
+      )
+    end
+
+    base = %{
+      "task_id" => pending.task_id,
+      "node_id" => required_string!(pending.node_id, "#{location} node_id"),
+      "attempt" => pending.attempt
+    }
+
+    case {pending.kind, pending.value} do
+      {:update, value} when is_map(value) and not is_struct(value) ->
+        base
+        |> Map.put("kind", Map.fetch!(@pending_kinds_out, :update))
+        |> Map.put("update", Wire.dump_value!(value, "#{location} update"))
+
+      {:interrupt, %Interrupt{} = interrupt} ->
+        validate_pending_interrupt_node!(
+          interrupt.node_id,
+          pending.node_id,
+          location,
+          :invalid_run
+        )
+
+        base
+        |> Map.put("kind", Map.fetch!(@pending_kinds_out, :interrupt))
+        |> Map.put("interrupt", dump_pending_interrupt(interrupt, location))
+
+      {kind, value} ->
+        invalid!(
+          :invalid_run,
+          "#{location} must pair kind :update with an update map or kind :interrupt " <>
+            "with a Docket.Interrupt, got #{inspect({kind, value})}"
+        )
+    end
+  end
+
+  defp dump_pending_write(_run, other) do
+    invalid!(
+      :invalid_run,
+      "pending write must be a Docket.Run.PendingWrite, got #{inspect(other)}"
+    )
+  end
+
+  defp validate_pending_interrupt_node!(interrupt_node_id, node_id, location, error_type) do
+    unless interrupt_node_id in [nil, node_id] do
+      invalid!(
+        error_type,
+        "#{location} interrupt node_id #{inspect(interrupt_node_id)} does not match " <>
+          "the pending write's node"
+      )
+    end
+  end
+
+  defp dump_pending_interrupt(%Interrupt{} = interrupt, location) do
+    %{
+      "resume_channel" =>
+        required_string!(interrupt.resume_channel, "#{location} interrupt resume_channel")
+    }
+    |> put_present("id", optional_string!(interrupt.id, "#{location} interrupt id"))
+    |> put_present(
+      "node_id",
+      optional_string!(interrupt.node_id, "#{location} interrupt node_id")
+    )
+    |> put_present("prompt", optional_string!(interrupt.prompt, "#{location} interrupt prompt"))
+    |> put_present("schema", dump_schema(interrupt.schema))
+    |> put_open_map("metadata", interrupt.metadata || %{}, "#{location} interrupt metadata")
+  end
+
+  defp put_timers(map, %Run{timers: timers}) when map_size(timers) == 0, do: map
+
+  defp put_timers(map, run) do
+    Map.put(
+      map,
+      "timers",
+      Map.new(run.timers, fn {timer_id, timer} -> {timer_id, dump_timer(timer_id, timer)} end)
+    )
+  end
+
+  defp dump_timer(_timer_id, %TimerState{kind: :retry, fires_at: %DateTime{} = fires_at}) do
+    %{
+      "kind" => Map.fetch!(@timer_kinds_out, :retry),
+      "fires_at" => DateTime.to_iso8601(fires_at)
+    }
+  end
+
+  defp dump_timer(timer_id, other) do
+    invalid!(
+      :invalid_run,
+      "timer #{inspect(timer_id)} must be a retry Docket.Run.TimerState with a " <>
+        "DateTime deadline, got #{inspect(other)}"
+    )
   end
 
   defp dump_channel(%ChannelState{} = channel) do
@@ -175,6 +522,9 @@ defmodule Docket.Run.Serializer do
     invalid!(:invalid_run, "#{label} must be a string, got #{inspect(value)}")
   end
 
+  defp optional_string!(nil, _label), do: nil
+  defp optional_string!(value, label), do: required_string!(value, label)
+
   defp put_present(map, _key, nil), do: map
   defp put_present(map, key, value), do: Map.put(map, key, value)
 
@@ -215,12 +565,15 @@ defmodule Docket.Run.Serializer do
     load_version!(map)
     assert_known_keys!(map, @run_keys, "run")
 
+    id = load_required_string!(map, "id", "run")
+    step = load_non_neg_integer!(map, "step", "run")
+
     run = %Run{
-      id: load_required_string!(map, "id", "run"),
+      id: id,
       graph_id: load_required_string!(map, "graph_id", "run"),
       graph_hash: load_optional_string!(map, "graph_hash", "run"),
       status: load_enum!(map, "status", @statuses, "run status"),
-      step: load_non_neg_integer!(map, "step", "run"),
+      step: step,
       input: load_open_map!(map, "input", "run input"),
       output: load_output!(map),
       started_at: load_timestamp!(map, "started_at"),
@@ -230,17 +583,249 @@ defmodule Docket.Run.Serializer do
       changed_channels: load_id_set!(map, "changed_channels"),
       pending_nodes: load_id_set!(map, "pending_nodes"),
       interrupts: load_collection!(map, "interrupts", &load_interrupt!/2),
+      active_tasks: load_active_tasks!(map, id, step),
+      pending_writes: load_pending_writes!(map, id, step),
+      timers: load_timers!(map),
       checkpoint_seq: load_non_neg_integer!(map, "checkpoint_seq", "run"),
       event_seq: load_non_neg_integer!(map, "event_seq", "run"),
       metadata: load_open_map!(map, "metadata", "run metadata")
     }
 
     run = %{run | failure: load_failure!(map)}
+    validate_active_superstep!(run, :invalid_document)
 
     case Run.validate_failure(run) do
       :ok -> run
       {:error, %Docket.Error{message: message}} -> invalid!(:invalid_document, message)
     end
+  end
+
+  defp load_active_tasks!(map, run_id, run_step) do
+    load_collection!(map, "active_tasks", fn task_id, task_map ->
+      load_active_task!(task_id, task_map, run_id, run_step)
+    end)
+  end
+
+  defp load_active_task!(task_id, map, run_id, run_step) do
+    location = "active task #{inspect(task_id)}"
+    assert_string_keys!(map, location)
+    assert_known_keys!(map, @active_task_keys, location)
+
+    node_id = load_required_string!(map, "node_id", location)
+    attempt = load_pos_integer!(map, "attempt", location)
+    input_hash = load_required_string!(map, "input_hash", location)
+    snapshot = load_open_map!(map, "snapshot", "#{location} snapshot")
+    source_versions = load_source_versions!(map, location)
+    failures = load_task_failures!(map, location)
+
+    cond do
+      task_id != TaskState.task_id(run_id, run_step, node_id) ->
+        invalid!(
+          :invalid_document,
+          "#{location} is not the stable task identity for node #{inspect(node_id)}"
+        )
+
+      attempt != length(failures) + 1 ->
+        invalid!(
+          :invalid_document,
+          "#{location} attempt #{attempt} does not follow its #{length(failures)} " <>
+            "recorded failed attempt(s)"
+        )
+
+      TaskState.snapshot_hash(snapshot) != input_hash ->
+        invalid!(
+          :invalid_document,
+          "#{location} snapshot does not match its recorded input_hash"
+        )
+
+      true ->
+        %TaskState{
+          task_id: task_id,
+          node_id: node_id,
+          step: run_step,
+          attempt: attempt,
+          status: :retry_scheduled,
+          input_hash: input_hash,
+          idempotency_key: TaskState.idempotency_key(task_id, attempt),
+          snapshot: snapshot,
+          source_versions: source_versions,
+          failures: failures
+        }
+    end
+  end
+
+  defp load_task_failures!(map, location) do
+    case Map.get(map, "failures") do
+      failures when is_list(failures) and failures != [] ->
+        loaded =
+          Enum.map(failures, fn entry ->
+            unless is_map(entry) and not is_struct(entry) do
+              invalid!(
+                :invalid_document,
+                "#{location} failures entries must be maps, got #{inspect(entry)}"
+              )
+            end
+
+            assert_string_keys!(entry, "#{location} failure")
+            assert_known_keys!(entry, @task_failure_keys, "#{location} failure")
+
+            %{
+              attempt: load_pos_integer!(entry, "attempt", "#{location} failure"),
+              reason: load_required_string!(entry, "reason", "#{location} failure")
+            }
+          end)
+
+        unless Enum.map(loaded, & &1.attempt) == Enum.to_list(1..length(loaded)) do
+          invalid!(
+            :invalid_document,
+            "#{location} failures must record attempts 1..n in order"
+          )
+        end
+
+        loaded
+
+      other ->
+        invalid!(
+          :invalid_document,
+          "#{location} must record at least one failed attempt, got #{inspect(other)}"
+        )
+    end
+  end
+
+  defp load_source_versions!(map, location) do
+    case Map.get(map, "source_versions") do
+      nil ->
+        %{}
+
+      versions when is_map(versions) and not is_struct(versions) ->
+        Map.new(versions, fn
+          {key, value} when is_binary(key) and is_integer(value) and value >= 0 ->
+            {key, value}
+
+          {key, value} ->
+            invalid!(
+              :invalid_document,
+              "#{location} source_versions entries must map channel IDs to " <>
+                "non-negative integers, got #{inspect({key, value})}"
+            )
+        end)
+
+      other ->
+        invalid!(
+          :invalid_document,
+          "#{location} source_versions must be a map, got #{inspect(other)}"
+        )
+    end
+  end
+
+  defp load_pending_writes!(map, run_id, run_step) do
+    case Map.get(map, "pending_writes") do
+      nil ->
+        []
+
+      pending when is_list(pending) ->
+        Enum.map(pending, &load_pending_write!(&1, run_id, run_step))
+
+      other ->
+        invalid!(:invalid_document, "pending_writes must be a list, got #{inspect(other)}")
+    end
+  end
+
+  defp load_pending_write!(entry, run_id, run_step)
+       when is_map(entry) and not is_struct(entry) do
+    assert_string_keys!(entry, "pending write")
+
+    kind = load_enum!(entry, "kind", @pending_kinds, "pending write kind")
+    node_id = load_required_string!(entry, "node_id", "pending write")
+    location = "pending write #{inspect(node_id)}"
+    task_id = load_required_string!(entry, "task_id", location)
+    attempt = load_pos_integer!(entry, "attempt", location)
+
+    unless task_id == TaskState.task_id(run_id, run_step, node_id) do
+      invalid!(
+        :invalid_document,
+        "#{location} task_id is not the stable task identity for this run and step"
+      )
+    end
+
+    value =
+      case kind do
+        :update ->
+          assert_known_keys!(entry, @pending_update_keys, location)
+
+          case Map.fetch(entry, "update") do
+            {:ok, update} when is_map(update) and not is_struct(update) ->
+              Wire.load_value!(update, "#{location} update")
+
+            {:ok, other} ->
+              invalid!(
+                :invalid_document,
+                "#{location} update must be a map, got #{inspect(other)}"
+              )
+
+            :error ->
+              invalid!(:invalid_document, "#{location} is missing required key \"update\"")
+          end
+
+        :interrupt ->
+          assert_known_keys!(entry, @pending_interrupt_keys, location)
+          interrupt = load_pending_interrupt!(Map.get(entry, "interrupt"), location)
+
+          validate_pending_interrupt_node!(
+            interrupt.node_id,
+            node_id,
+            location,
+            :invalid_document
+          )
+
+          interrupt
+      end
+
+    %PendingWrite{task_id: task_id, node_id: node_id, attempt: attempt, kind: kind, value: value}
+  end
+
+  defp load_pending_write!(other, _run_id, _run_step) do
+    invalid!(:invalid_document, "pending write entries must be maps, got #{inspect(other)}")
+  end
+
+  defp load_pending_interrupt!(value, location) when is_map(value) and not is_struct(value) do
+    interrupt_location = "#{location} interrupt"
+    assert_string_keys!(value, interrupt_location)
+    assert_known_keys!(value, @pending_interrupt_value_keys, interrupt_location)
+
+    %Interrupt{
+      id: load_optional_string!(value, "id", interrupt_location),
+      node_id: load_optional_string!(value, "node_id", interrupt_location),
+      resume_channel: load_required_string!(value, "resume_channel", interrupt_location),
+      prompt: load_optional_string!(value, "prompt", interrupt_location),
+      schema: load_schema!(Map.get(value, "schema"), interrupt_location),
+      metadata: load_open_map!(value, "metadata", "#{interrupt_location} metadata")
+    }
+  end
+
+  defp load_pending_interrupt!(other, location) do
+    invalid!(:invalid_document, "#{location} interrupt must be a map, got #{inspect(other)}")
+  end
+
+  defp load_timers!(map) do
+    load_collection!(map, "timers", fn timer_id, timer_map ->
+      location = "timer #{inspect(timer_id)}"
+      assert_string_keys!(timer_map, location)
+      assert_known_keys!(timer_map, @timer_keys, location)
+
+      kind = load_enum!(timer_map, "kind", @timer_kinds, "#{location} kind")
+
+      fires_at =
+        case load_timestamp!(timer_map, "fires_at", location) do
+          %DateTime{} = fires_at ->
+            fires_at
+
+          nil ->
+            invalid!(:invalid_document, "#{location} is missing required key \"fires_at\"")
+        end
+
+      %TimerState{kind: kind, fires_at: fires_at}
+    end)
   end
 
   defp load_version!(map) do
@@ -348,7 +933,7 @@ defmodule Docket.Run.Serializer do
     end
   end
 
-  defp load_timestamp!(map, key) do
+  defp load_timestamp!(map, key, location \\ "run") do
     case Map.get(map, key) do
       nil ->
         nil
@@ -361,13 +946,13 @@ defmodule Docket.Run.Serializer do
           {:error, reason} ->
             invalid!(
               :invalid_document,
-              "run #{key} is not a valid ISO8601 timestamp: #{inspect(reason)}",
+              "#{location} #{key} is not a valid ISO8601 timestamp: #{inspect(reason)}",
               %{key: key, value: value}
             )
         end
 
       other ->
-        invalid!(:invalid_document, "run #{key} must be a string, got #{inspect(other)}")
+        invalid!(:invalid_document, "#{location} #{key} must be a string, got #{inspect(other)}")
     end
   end
 
@@ -488,6 +1073,16 @@ defmodule Docket.Run.Serializer do
           :invalid_document,
           "#{location} document is missing required key #{inspect(key)}"
         )
+    end
+  end
+
+  defp load_pos_integer!(map, key, location) do
+    case load_non_neg_integer!(map, key, location) do
+      0 ->
+        invalid!(:invalid_document, "#{location} #{key} must be a positive integer, got 0")
+
+      value ->
+        value
     end
   end
 

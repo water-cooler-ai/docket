@@ -2,8 +2,9 @@ defmodule Docket.Runtime.Config do
   @moduledoc false
 
   # Resolves loop/dispatcher options into one config map. All nondeterminism
-  # enters here: clock, ID generation, and retry backoff sleeping are
-  # injectable so inline tests stay deterministic.
+  # enters here: the clock, ID generation, and the sleeper the inline shell
+  # uses to serve committed retry-park waits are injectable so inline tests
+  # stay deterministic.
 
   @type t :: %{
           checkpoint: module(),

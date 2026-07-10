@@ -57,6 +57,20 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   `valid_transition?/2`: the five durable graph statuses and the locked
   transition matrix, with exhaustive transition/absorbing-state tests
   (DCKT-31, #17).
+- Durable retry parking: a retryable node failure commits exactly one sync
+  `:retry_scheduled` checkpoint at the boundary — graph status stays
+  `:running`, the graph step does not advance, and the run parks until the
+  retry deadline instead of sleeping in the dispatcher. Crash-resume
+  continues at the persisted attempt with the same task and idempotency
+  identity, never reruns committed sibling results, and only
+  permanent/exhausted failure becomes `:failed` with `Run.failure`
+  (DCKT-30, #18).
+- Durable active-superstep state on `Docket.Run`: `active_tasks` (parked
+  attempts via extended `Docket.Run.TaskState`: snapshot, source versions,
+  accumulated failures, stable identity helpers), `pending_writes`
+  (`Docket.Run.PendingWrite` — completed sibling results invisible until
+  the barrier), and `timers` (`Docket.Run.TimerState` retry deadlines)
+  (DCKT-30, #18).
 
 ### Changed
 
@@ -74,6 +88,22 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   version loads (no released userbase to migrate), and the private
   `:created` initialization sentinel is rejected by the wire format, durable
   insertion, and the Postgres row status enum (DCKT-31, #17).
+- Run wire version 2 extended (same version, coordinated with the DCKT-31
+  bump) with the reserved `active_tasks`, `pending_writes`, and `timers`
+  keys: documents without them load with an empty active superstep, and
+  both directions strictly validate parked state — cross-checked task
+  identity, snapshot-vs-input-hash integrity, attempt/failure agreement,
+  retry-timer coverage, and one result per node per superstep — so an
+  inconsistent document fails at the write boundary, never at recovery.
+  The barrier re-validates parked pending results, so corrupted durable
+  state fails the run through the typed permanent path (DCKT-30, #18).
+- The dispatcher executes exactly one node attempt per invocation; retry
+  waiting moved out of the durable path into shell parking (supervised
+  Runtime: timer wake that keeps serving reads during backoff; inline test
+  runtime: the injected `:sleeper` serves each committed park's wait).
+  Retried attempts' `:node_failed` events now ride the `:retry_scheduled`
+  checkpoint that recorded them instead of the eventual barrier checkpoint
+  (DCKT-30, #18).
 
 ### Removed
 
