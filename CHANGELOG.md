@@ -102,8 +102,9 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
 - Pure `Docket.Runtime.RunMutation.resolve_interrupt/5` and `cancel_run/2`
   graph mutations produce deterministic pre-commit moments with explicit
   immediate or terminal dispositions. Cancellation adds the sync
-  `:run_cancelled` checkpoint/event fact; repeated cancellation returns the
-  stored run without consuming sequences (DCKT-9).
+  `:run_cancelled` checkpoint/event fact; repeated cancellation returns an
+  explicit unchanged result with the stored run and consumes no sequences
+  (DCKT-9).
 
 ### Changed
 

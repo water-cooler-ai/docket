@@ -67,6 +67,14 @@ defmodule Docket.Runtime.RunMutationTest do
       end
     end
 
+    test "rejects the private created sentinel before interrupt lookup" do
+      {rtg, run} = waiting_run()
+      created = %{run | status: :created, interrupts: %{}}
+
+      assert {:error, %Docket.Error{type: :invalid_run}} =
+               RunMutation.resolve_interrupt(rtg, created, "unknown", "value", @now)
+    end
+
     test "retains interrupt schema and durable-value validation" do
       {rtg, run} = waiting_run()
       [interrupt_id] = Map.keys(run.interrupts)
@@ -122,7 +130,8 @@ defmodule Docket.Runtime.RunMutationTest do
       {_rtg, run} = waiting_run()
       cancelled = %{run | status: :cancelled, finished_at: @now, updated_at: @now}
 
-      assert {:ok, ^cancelled} = RunMutation.cancel_run(cancelled, DateTime.add(@now, 1, :hour))
+      assert {:unchanged, ^cancelled} =
+               RunMutation.cancel_run(cancelled, DateTime.add(@now, 1, :hour))
     end
 
     test "rejects done, failed, and the private created sentinel" do

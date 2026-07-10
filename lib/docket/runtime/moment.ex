@@ -62,6 +62,15 @@ defmodule Docket.Runtime.Moment do
 
   @type disposition :: :continue | {:park, park_kind(), term()}
 
+  @type event_entry :: %{
+          type: Event.type(),
+          step: non_neg_integer(),
+          node_id: String.t() | nil,
+          channel_id: String.t() | nil,
+          task_id: String.t() | nil,
+          payload: map()
+        }
+
   @type t :: %__MODULE__{
           run: Docket.Run.t(),
           events: [Docket.Event.t()],
@@ -76,7 +85,7 @@ defmodule Docket.Runtime.Moment do
   @spec propose(
           Run.t(),
           Checkpoint.type(),
-          [map()],
+          [event_entry()],
           disposition(),
           DateTime.t(),
           keyword()
@@ -122,6 +131,19 @@ defmodule Docket.Runtime.Moment do
       pending_attempts: pending_attempts,
       disposition: disposition,
       proposed_at: now
+    }
+  end
+
+  @doc false
+  @spec event_entry(Event.type(), non_neg_integer(), keyword()) :: event_entry()
+  def event_entry(type, step, opts \\ []) do
+    %{
+      type: type,
+      step: step,
+      node_id: Keyword.get(opts, :node_id),
+      channel_id: Keyword.get(opts, :channel_id),
+      task_id: Keyword.get(opts, :task_id),
+      payload: Keyword.get(opts, :payload, %{})
     }
   end
 

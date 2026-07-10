@@ -13,9 +13,10 @@ defmodule Docket.Runtime.RunMutation do
 
   alias Docket.{Error, Run, Schema, Wire}
   alias Docket.Run.InterruptState
-  alias Docket.Runtime.{Algorithm, Moment}
+  alias Docket.Runtime.{Algorithm, Graph, Moment}
 
-  @type result :: {:ok, Moment.t() | Run.t()} | {:error, Error.t()}
+  @type mutation_result :: {:ok, Moment.t()} | {:error, Error.t()}
+  @type cancellation_result :: mutation_result() | {:unchanged, Run.t()}
 
   @doc """
   Resolves an open interrupt and proposes an immediate wake.
@@ -24,11 +25,19 @@ defmodule Docket.Runtime.RunMutation do
   distinguished from an unknown interrupt, and the stored schema plus graph
   field contract both validate the resolution value.
   """
-  @spec resolve_interrupt(term(), Run.t(), String.t(), term(), DateTime.t()) :: result()
+  @spec resolve_interrupt(Graph.t(), Run.t(), String.t(), term(), DateTime.t()) ::
+          mutation_result()
   def resolve_interrupt(rtg, %Run{} = run, interrupt_id, value, %DateTime{} = now) do
     cond do
       Run.terminal?(run) ->
         inactive_run(run, "resumed")
+
+      run.status not in [:running, :waiting] ->
+        {:error,
+         Error.new(
+           :invalid_run,
+           "run #{inspect(run.id)} has non-durable status #{inspect(run.status)}"
+         )}
 
       match?({:ok, %InterruptState{status: :resolved}}, Map.fetch(run.interrupts, interrupt_id)) ->
         {:error, Error.new(:already_resolved, "interrupt #{inspect(interrupt_id)} is resolved")}
@@ -93,8 +102,8 @@ defmodule Docket.Runtime.RunMutation do
   Cancellation absorbs any parked superstep. Calling this again for the
   resulting run returns that exact run without consuming sequences.
   """
-  @spec cancel_run(Run.t(), DateTime.t()) :: result()
-  def cancel_run(%Run{status: :cancelled} = run, %DateTime{}), do: {:ok, run}
+  @spec cancel_run(Run.t(), DateTime.t()) :: cancellation_result()
+  def cancel_run(%Run{status: :cancelled} = run, %DateTime{}), do: {:unchanged, run}
 
   def cancel_run(%Run{status: status} = run, %DateTime{} = now)
       when status in [:running, :waiting] do
@@ -166,14 +175,7 @@ defmodule Docket.Runtime.RunMutation do
   end
 
   defp entry(type, step, opts) do
-    %{
-      type: type,
-      step: step,
-      node_id: Keyword.get(opts, :node_id),
-      channel_id: Keyword.get(opts, :channel_id),
-      task_id: Keyword.get(opts, :task_id),
-      payload: Keyword.get(opts, :payload, %{})
-    }
+    Moment.event_entry(type, step, opts)
   end
 
   defp moment(run, type, entries, disposition, now) do

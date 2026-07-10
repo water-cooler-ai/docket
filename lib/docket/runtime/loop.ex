@@ -1009,14 +1009,7 @@ defmodule Docket.Runtime.Loop do
   # ---------------------------------------------------------------------------
 
   defp entry(type, step, opts) do
-    %{
-      type: type,
-      step: step,
-      node_id: Keyword.get(opts, :node_id),
-      channel_id: Keyword.get(opts, :channel_id),
-      task_id: Keyword.get(opts, :task_id),
-      payload: Keyword.get(opts, :payload, %{})
-    }
+    Moment.event_entry(type, step, opts)
   end
 
   defp guard_error(edge_id, reasons, phase) do
