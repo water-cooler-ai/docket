@@ -4,6 +4,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     use Ecto.Migration
 
+    @run_checks [
+      {"docket_runs_status_check",
+       "status IN ('running', 'waiting', 'done', 'failed', 'cancelled')"},
+      {"docket_runs_finished_at_check",
+       "(status IN ('done', 'failed', 'cancelled')) = (finished_at IS NOT NULL)"},
+      {"docket_runs_failure_check", "(status = 'failed') = (failure IS NOT NULL)"},
+      {"docket_runs_output_check", "output IS NULL OR status = 'done'"},
+      {"docket_runs_claim_pair_check", "(claim_token IS NULL) = (claimed_at IS NULL)"},
+      {"docket_runs_poison_pair_check", "(poisoned_at IS NULL) = (poison_reason IS NULL)"},
+      {"docket_runs_waiting_terminal_idle_check",
+       "status = 'running' OR (claim_token IS NULL AND wake_at IS NULL AND poisoned_at IS NULL)"},
+      {"docket_runs_poisoned_shape_check",
+       "poisoned_at IS NULL OR (status = 'running' AND claim_token IS NULL AND wake_at IS NULL)"},
+      {"docket_runs_running_schedule_check",
+       "status <> 'running' OR poisoned_at IS NOT NULL OR " <>
+         "((wake_at IS NOT NULL) <> (claim_token IS NOT NULL))"},
+      {"docket_runs_counters_check", "step >= 0 AND checkpoint_seq >= 0 AND claim_attempts >= 0"}
+    ]
+
     def up(%{prefix: prefix}) do
       create_if_not_exists table(:docket_graph_versions, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
@@ -22,11 +41,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         add(:run_id, :text, null: false)
         add(:tenant_id, :text)
         add(:graph_id, :text, null: false)
-        add(:graph_hash, :text, null: false)
+
+        add(
+          :graph_hash,
+          references(:docket_graph_versions,
+            column: :graph_hash,
+            with: [graph_id: :graph_id],
+            type: :text,
+            on_delete: :restrict,
+            prefix: prefix
+          ),
+          null: false
+        )
+
         add(:status, :text, null: false)
         add(:step, :integer, null: false, default: 0)
         add(:input, :jsonb, null: false)
         add(:output, :jsonb)
+        add(:failure, :jsonb)
         add(:metadata, :jsonb, null: false, default: fragment("'{}'::jsonb"))
         add(:state, :jsonb, null: false)
         add(:checkpoint_seq, :bigint, null: false, default: 0)
@@ -34,13 +66,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         add(:claim_token, :uuid)
         add(:claimed_at, :timestamptz)
         add(:wake_at, :timestamptz)
-        add(:attempts, :integer, null: false, default: 0)
-        add(:operational_status, :text, null: false, default: "active")
-        add(:operational_error, :jsonb)
+        add(:claim_attempts, :integer, null: false, default: 0)
+        add(:poisoned_at, :timestamptz)
+        add(:poison_reason, :jsonb)
         add(:inserted_at, :timestamptz, null: false)
-        add(:started_at, :timestamptz)
+        add(:started_at, :timestamptz, null: false)
         add(:updated_at, :timestamptz, null: false)
         add(:finished_at, :timestamptz)
+      end
+
+      for {name, check} <- @run_checks do
+        create(constraint(:docket_runs, name, check: check, prefix: prefix))
       end
 
       create_if_not_exists(unique_index(:docket_runs, [:run_id], prefix: prefix))
@@ -60,21 +96,41 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
 
       create_if_not_exists(
-        index(:docket_runs, [:wake_at], where: "wake_at IS NOT NULL", prefix: prefix)
+        index(:docket_runs, [:wake_at, :id],
+          where:
+            "status = 'running' AND poisoned_at IS NULL AND " <>
+              "claim_token IS NULL AND wake_at IS NOT NULL",
+          prefix: prefix
+        )
       )
 
       create_if_not_exists(
-        index(:docket_runs, [:operational_status],
-          where: "operational_status <> 'active'",
+        index(:docket_runs, [:claimed_at, :id],
+          where: "status = 'running' AND poisoned_at IS NULL AND claim_token IS NOT NULL",
           prefix: prefix
         )
+      )
+
+      create_if_not_exists(
+        index(:docket_runs, [:poisoned_at], where: "poisoned_at IS NOT NULL", prefix: prefix)
       )
 
       create_if_not_exists(index(:docket_runs, [:status, :updated_at], prefix: prefix))
 
       create_if_not_exists table(:docket_events, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
-        add(:run_id, :text, null: false)
+
+        add(
+          :run_id,
+          references(:docket_runs,
+            column: :run_id,
+            type: :text,
+            on_delete: :delete_all,
+            prefix: prefix
+          ),
+          null: false
+        )
+
         add(:seq, :bigint, null: false)
         add(:type, :text, null: false)
         add(:step, :integer, null: false)
