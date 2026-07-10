@@ -665,7 +665,11 @@ defmodule Docket.Runtime.Loop do
     park = park_info(parked.timers, now)
     entries = attempt_failure_entries(parked.step, retries)
     disposition = {:park, {:at, park.resume_at}, :retry_backoff}
-    {:moment, propose(parked, :retry_scheduled, entries, disposition, config), park}
+
+    {:moment,
+     propose(parked, :retry_scheduled, entries, disposition, config,
+       pending_attempts: new_pending
+     ), park}
   end
 
   defp pending_write(result, kind, value) do
@@ -825,7 +829,9 @@ defmodule Docket.Runtime.Loop do
       {:ok, %{channels: channels, triggered: triggered, finish: finish}} ->
         now = config.clock.()
         channels = clear_consumed_activations(rtg, channels, run.changed_channels)
-        {interrupts, interrupt_node_ids} = build_interrupts(run, config, interrupt_specs, now)
+
+        {interrupts, interrupt_node_ids, interrupt_results} =
+          build_interrupts(config, interrupt_specs, now)
 
         changed_channels =
           MapSet.new(
@@ -858,7 +864,8 @@ defmodule Docket.Runtime.Loop do
           commit_entries(rtg, run.step, results, validated_writes, changed_fields, writers,
             triggered: triggered,
             finish: finish,
-            interrupts: interrupts
+            interrupts: interrupts,
+            interrupt_results: interrupt_results
           )
 
         type = if map_size(interrupts) == 0, do: :step_committed, else: :interrupt_requested
@@ -876,8 +883,9 @@ defmodule Docket.Runtime.Loop do
     end
   end
 
-  defp build_interrupts(run, config, interrupt_specs, now) do
-    Enum.reduce(interrupt_specs, {%{}, []}, fn {result, interrupt}, {states, node_ids} ->
+  defp build_interrupts(config, interrupt_specs, now) do
+    Enum.reduce(interrupt_specs, {%{}, [], %{}}, fn {result, interrupt},
+                                                    {states, node_ids, results} ->
       id = interrupt.id || config.id_generator.(:interrupt)
 
       state = %InterruptState{
@@ -891,10 +899,15 @@ defmodule Docket.Runtime.Loop do
         metadata: interrupt.metadata || %{}
       }
 
-      _ = run
-      {Map.put(states, id, state), [result.node_id | node_ids]}
+      {
+        Map.put(states, id, state),
+        [result.node_id | node_ids],
+        Map.put(results, id, result)
+      }
     end)
-    |> then(fn {states, node_ids} -> {states, Enum.reverse(node_ids)} end)
+    |> then(fn {states, node_ids, results} ->
+      {states, Enum.reverse(node_ids), results}
+    end)
   end
 
   # Edge activation channels are visible for one step: values consumed by
@@ -939,9 +952,16 @@ defmodule Docket.Runtime.Loop do
         )
       end) ++
       Enum.map(Enum.sort(Keyword.fetch!(extra, :interrupts)), fn {id, state} ->
+        result = Map.fetch!(Keyword.fetch!(extra, :interrupt_results), id)
+
         entry(:interrupt_requested, step,
           node_id: state.node_id,
-          payload: %{"interrupt_id" => id, "resume_channel" => state.resume_channel}
+          task_id: result.task_id,
+          payload: %{
+            "attempt" => result.attempt,
+            "interrupt_id" => id,
+            "resume_channel" => state.resume_channel
+          }
         )
       end)
   end
@@ -1106,10 +1126,11 @@ defmodule Docket.Runtime.Loop do
   # and builds the one pre-commit moment for the transition. Pure
   # calculation: no storage write, no checkpoint delivery, no telemetry;
   # no executor work is ever in flight when it runs.
-  defp propose(run, type, entries, disposition, config) do
+  defp propose(run, type, entries, disposition, config, identity_opts \\ []) do
     now = config.clock.()
+    run = %{run | checkpoint_seq: run.checkpoint_seq + 1}
 
-    {events, event_seq} =
+    {runtime_events, event_seq} =
       Enum.map_reduce(entries, run.event_seq, fn entry, seq ->
         seq = seq + 1
 
@@ -1126,12 +1147,31 @@ defmodule Docket.Runtime.Loop do
          }, seq}
       end)
 
-    run = %{run | event_seq: event_seq, checkpoint_seq: run.checkpoint_seq + 1}
+    pending_attempts = Keyword.get(identity_opts, :pending_attempts, [])
+
+    checkpoint_metadata =
+      Moment.checkpoint_metadata(run, runtime_events, type, disposition, pending_attempts)
+
+    checkpoint_event_seq = event_seq + 1
+
+    checkpoint_event = %Event{
+      run_id: run.id,
+      seq: checkpoint_event_seq,
+      type: :checkpoint_committed,
+      step: run.step,
+      timestamp: now,
+      metadata: checkpoint_metadata
+    }
+
+    events = runtime_events ++ [checkpoint_event]
+    run = %{run | event_seq: checkpoint_event_seq}
 
     %Moment{
       run: run,
       events: events,
       checkpoint_type: type,
+      checkpoint_metadata: checkpoint_metadata,
+      pending_attempts: pending_attempts,
       disposition: disposition,
       proposed_at: now
     }

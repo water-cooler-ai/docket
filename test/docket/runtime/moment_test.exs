@@ -100,6 +100,18 @@ defmodule Docket.Runtime.MomentTest do
       assert Enum.map(moment.events, & &1.seq) == Enum.to_list(1..length(moment.events))
       assert moment.run.event_seq == length(moment.events)
 
+      assert %Docket.Event{type: :checkpoint_committed, metadata: metadata} =
+               List.last(moment.events)
+
+      assert metadata == moment.checkpoint_metadata
+      assert metadata["checkpoint_seq"] == 1
+      assert metadata["checkpoint_type"] == "run_initialized"
+      assert metadata["graph_step"] == 0
+      assert metadata["park_reason"] == nil
+      assert metadata["wake_disposition"] == "continue"
+      assert metadata["active_superstep"] == nil
+      assert metadata["node_attempts"] == []
+
       refute_received {:telemetry, _name}
     end
 
@@ -174,12 +186,92 @@ defmodule Docket.Runtime.MomentTest do
       assert task.attempt == 2
       assert %Docket.Run.TimerState{kind: :retry} = retry_moment.run.timers[task_id]
 
+      context = Moment.context(retry_moment)
+      assert context.checkpoint_seq == retry_moment.run.checkpoint_seq
+      assert context.graph_step == 0
+
+      assert context.active_superstep == %{
+               step: 0,
+               tasks: [
+                 %{
+                   task_id: task_id,
+                   node_id: "flaky",
+                   scheduled_attempt: 2,
+                   idempotency_key: "#{task_id}:2"
+                 }
+               ],
+               pending_attempts: []
+             }
+
+      assert context.node_attempts == [
+               %{
+                 task_id: task_id,
+                 node_id: "flaky",
+                 attempted: 1,
+                 outcome: :failed,
+                 next_scheduled_attempt: 2
+               }
+             ]
+
+      assert retry_moment.checkpoint_metadata["active_superstep"] == %{
+               "graph_step" => 0,
+               "tasks" => [
+                 %{
+                   "task_id" => task_id,
+                   "node_id" => "flaky",
+                   "scheduled_attempt" => 2,
+                   "idempotency_key" => "#{task_id}:2"
+                 }
+               ],
+               "pending_attempts" => []
+             }
+
+      assert retry_moment.checkpoint_metadata["node_attempts"] == [
+               %{
+                 "task_id" => task_id,
+                 "node_id" => "flaky",
+                 "attempted" => 1,
+                 "outcome" => "failed",
+                 "next_scheduled_attempt" => 2
+               }
+             ]
+
+      assert retry_moment.checkpoint_metadata["checkpoint_type"] == "retry_scheduled"
+      assert retry_moment.checkpoint_metadata["graph_step"] == 0
+      assert retry_moment.checkpoint_metadata["park_reason"] == "retry_backoff"
+      assert retry_moment.checkpoint_metadata["wake_disposition"] == "at"
+
       moments = drain(rtg, retry_moment.run, opts)
 
       assert Enum.map(moments, & &1.checkpoint_type) ==
                [:retry_scheduled, :step_committed, :run_completed]
 
       assert List.last(moments).run.status == :done
+    end
+
+    test "every moment appends exactly one checkpoint fact after its runtime facts" do
+      rtg = compile!(Graphs.minimal_linear())
+      init_moment = propose_init!(rtg, %{"value" => "hello"}, opts())
+      moments = [init_moment | drain(rtg, init_moment.run, opts())]
+
+      for moment <- moments do
+        checkpoint_facts = Enum.filter(moment.events, &(&1.type == :checkpoint_committed))
+        assert [checkpoint_fact] = checkpoint_facts
+        assert checkpoint_fact == List.last(moment.events)
+        assert checkpoint_fact.timestamp == moment.proposed_at
+        assert checkpoint_fact.seq == moment.run.event_seq
+        assert checkpoint_fact.metadata["checkpoint_seq"] == moment.run.checkpoint_seq
+        assert checkpoint_fact.metadata["graph_step"] == moment.run.step
+      end
+
+      all_events = Enum.flat_map(moments, & &1.events)
+      assert Enum.map(all_events, & &1.seq) == Enum.to_list(1..length(all_events))
+      assert Enum.map(moments, & &1.run.checkpoint_seq) == [1, 2, 3]
+
+      expected_event_seqs =
+        Enum.scan(moments, 0, fn moment, prior_seq -> prior_seq + length(moment.events) end)
+
+      assert Enum.map(moments, & &1.run.event_seq) == expected_event_seqs
     end
 
     test "an active superstep with no attempt due parks uncommitted" do
@@ -228,6 +320,30 @@ defmodule Docket.Runtime.MomentTest do
       assert waiting_moment.checkpoint_type == :interrupt_requested
       assert waiting_moment.run.status == :waiting
       assert waiting_moment.disposition == {:park, :external, :awaiting_interrupts}
+
+      interrupt_event = Enum.find(waiting_moment.events, &(&1.type == :interrupt_requested))
+      assert is_binary(interrupt_event.task_id)
+      assert interrupt_event.payload["attempt"] == 1
+
+      assert Moment.context(waiting_moment).node_attempts == [
+               %{
+                 task_id: interrupt_event.task_id,
+                 node_id: interrupt_event.node_id,
+                 attempted: 1,
+                 outcome: :interrupted,
+                 next_scheduled_attempt: nil
+               }
+             ]
+
+      assert waiting_moment.checkpoint_metadata["node_attempts"] == [
+               %{
+                 "task_id" => interrupt_event.task_id,
+                 "node_id" => interrupt_event.node_id,
+                 "attempted" => 1,
+                 "outcome" => "interrupted",
+                 "next_scheduled_attempt" => nil
+               }
+             ]
 
       assert {:wait, run, [interrupt_id]} = Loop.propose_advance(rtg, waiting_moment.run, opts)
       assert run.interrupts[interrupt_id].status == :open

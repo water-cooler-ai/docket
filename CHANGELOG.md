@@ -92,6 +92,13 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   drain. Retry moments ride DCKT-30's durable control state: graph status
   stays `:running` under the `:retry_scheduled` checkpoint type with a
   `{:park, {:at, deadline}, :retry_backoff}` disposition (DCKT-10).
+- Runtime checkpoint identity and history allocation: every moment appends
+  exactly one metadata-only `:checkpoint_committed` fact after its runtime
+  facts, allocating all event identities from `Run.event_seq` independently
+  of the `checkpoint_seq` run fence. Checkpoint context and metadata expose
+  the committed graph step plus stable multi-task retry/attempt identity,
+  and committed checkpoint facts emit `[:docket, :checkpoint, :committed]`
+  telemetry (DCKT-11).
 
 ### Changed
 

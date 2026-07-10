@@ -87,6 +87,32 @@ defmodule Docket.Runtime.RetryParkingTest do
       assert completed == [{"flaky", 2}, {"steady", 1}]
     end
 
+    test "carried pending siblings stay in the superstep snapshot without repeating as moment attempts" do
+      assert {:ok, _run, checkpoints} =
+               Docket.Test.run_inline(parallel_retry_graph(failures: 2.0), %{},
+                 context: %{notify: self()}
+               )
+
+      assert [park1, park2] = Enum.filter(checkpoints, &(&1.type == :retry_scheduled))
+
+      assert Enum.map(park1.metadata["node_attempts"], &{&1["node_id"], &1["outcome"]}) ==
+               [{"flaky", "failed"}, {"steady", "pending_update"}]
+
+      assert park2.metadata["node_attempts"] == [
+               %{
+                 "task_id" => "#{park2.run.id}:0:flaky",
+                 "node_id" => "flaky",
+                 "attempted" => 2,
+                 "outcome" => "failed",
+                 "next_scheduled_attempt" => 3
+               }
+             ]
+
+      assert [steady] = park2.metadata["active_superstep"]["pending_attempts"]
+      assert steady["node_id"] == "steady"
+      assert steady["attempted"] == 1
+    end
+
     test "a crash during backoff resumes the persisted attempt without rerunning siblings" do
       graph = parallel_retry_graph()
       opts = [graph: graph, context: %{notify: self()}]
@@ -285,11 +311,46 @@ defmodule Docket.Runtime.RetryParkingTest do
       assert park1.run.pending_writes == []
 
       # Second park commits fast's completed retry as a pending write while
-      # slow's deadline is still outstanding; no attempt failed, so it
-      # carries no events.
-      assert park2.events == []
-      assert [%PendingWrite{node_id: "fast", attempt: 2}] = park2.run.pending_writes
-      assert [%TaskState{node_id: "slow", attempt: 2}] = Map.values(park2.run.active_tasks)
+      # slow's deadline is still outstanding; no attempt failed, so the only
+      # event is the checkpoint-history fact.
+      assert [%Docket.Event{type: :checkpoint_committed}] = park2.events
+
+      assert [%PendingWrite{task_id: fast_task_id, node_id: "fast", attempt: 2}] =
+               park2.run.pending_writes
+
+      assert [%TaskState{task_id: slow_task_id, node_id: "slow", attempt: 2}] =
+               Map.values(park2.run.active_tasks)
+
+      assert park2.metadata["active_superstep"] == %{
+               "graph_step" => 0,
+               "tasks" => [
+                 %{
+                   "task_id" => slow_task_id,
+                   "node_id" => "slow",
+                   "scheduled_attempt" => 2,
+                   "idempotency_key" => "#{slow_task_id}:2"
+                 }
+               ],
+               "pending_attempts" => [
+                 %{
+                   "task_id" => fast_task_id,
+                   "node_id" => "fast",
+                   "attempted" => 2,
+                   "kind" => "update",
+                   "idempotency_key" => "#{fast_task_id}:2"
+                 }
+               ]
+             }
+
+      assert park2.metadata["node_attempts"] == [
+               %{
+                 "task_id" => fast_task_id,
+                 "node_id" => "fast",
+                 "attempted" => 2,
+                 "outcome" => "pending_update",
+                 "next_scheduled_attempt" => nil
+               }
+             ]
     end
   end
 
