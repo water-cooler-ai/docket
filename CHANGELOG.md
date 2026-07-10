@@ -91,9 +91,12 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
 - Run wire version 2 extended (same version, coordinated with the DCKT-31
   bump) with the reserved `active_tasks`, `pending_writes`, and `timers`
   keys: documents without them load with an empty active superstep, and
-  loading strictly validates parked state — cross-checked task identity,
-  snapshot-vs-input-hash integrity, attempt/failure agreement, timer
-  coverage, and one result per node per superstep (DCKT-30, #18).
+  both directions strictly validate parked state — cross-checked task
+  identity, snapshot-vs-input-hash integrity, attempt/failure agreement,
+  retry-timer coverage, and one result per node per superstep — so an
+  inconsistent document fails at the write boundary, never at recovery.
+  The barrier re-validates parked pending results, so corrupted durable
+  state fails the run through the typed permanent path (DCKT-30, #18).
 - The dispatcher executes exactly one node attempt per invocation; retry
   waiting moved out of the durable path into shell parking (supervised
   Runtime: timer wake that keeps serving reads during backoff; inline test

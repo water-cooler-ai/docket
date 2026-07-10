@@ -151,6 +151,62 @@ defmodule Docket.Runtime.RetryParkingTest do
       assert_received {:executed, "steady", 1}
     end
 
+    test "permanent failure after a park discards parked sibling results" do
+      graph = parallel_retry_graph(failures: 5.0, max_attempts: 2)
+
+      assert {:ok, run, checkpoints} =
+               Docket.Test.run_inline(graph, %{}, context: %{notify: self()})
+
+      assert run.status == :failed
+      assert %Docket.Run.Failure{code: "node_failed", node_id: "flaky"} = run.failure
+      assert run.active_tasks == %{}
+      assert run.pending_writes == []
+      assert run.timers == %{}
+
+      # The parked sibling result never committed - and was never rerun.
+      assert field_value(run, "steady_out") == :unwritten
+      assert_received {:executed, "steady", 1}
+      refute_received {:executed, "steady", _}
+
+      assert checkpoint_types(checkpoints) == [:run_initialized, :retry_scheduled, :run_failed]
+
+      run_failed = List.last(checkpoints)
+      refute Enum.any?(run_failed.events, &(&1.type == :node_completed))
+    end
+
+    test "a corrupted pending write fails the run through the typed failure path" do
+      graph = parallel_retry_graph()
+      opts = [graph: graph, context: %{notify: self()}]
+
+      {:ok, initialized, _} =
+        Docket.Test.run_inline(graph, %{}, max_steps: 0, context: %{notify: self()})
+
+      assert {:ok, parked, _} = Docket.Test.step_inline(initialized, opts)
+
+      # Corrupt the durable document so the parked sibling write targets an
+      # undeclared field; the codec is graph-agnostic, so this loads.
+      corrupted =
+        parked
+        |> Docket.Run.to_map()
+        |> update_in(["pending_writes"], fn pending ->
+          Enum.map(pending, fn
+            %{"kind" => "update"} = entry -> Map.put(entry, "update", %{"ghost" => "x"})
+            entry -> entry
+          end)
+        end)
+
+      restored = Docket.Run.from_map!(corrupted)
+
+      # The barrier re-validates parked results: the corrupted write fails
+      # the run through the typed permanent path instead of crashing.
+      assert {:ok, failed, _} =
+               Docket.Test.resume_inline(graph, restored, context: %{notify: self()})
+
+      assert failed.status == :failed
+      assert %Docket.Run.Failure{code: "node_failed"} = failed.failure
+      assert failed.failure.details["errors"]["steady"] =~ "unknown field"
+    end
+
     test "retry backoff consumes the injected sleeper only after the park commits" do
       test_pid = self()
 

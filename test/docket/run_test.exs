@@ -236,7 +236,6 @@ defmodule Docket.RunTest do
 
       assert %{
                "node_id" => "flaky",
-               "step" => 2,
                "attempt" => 2,
                "failures" => [%{"attempt" => 1, "reason" => "{:flaky, 1}"}]
              } = map["active_tasks"]["run_1:2:flaky"]
@@ -324,12 +323,39 @@ defmodule Docket.RunTest do
       assert message =~ "snapshot does not match its recorded input_hash"
     end
 
+    test "dump rejects inconsistent parked task state" do
+      run = parked_run()
+      [task_id] = Map.keys(run.active_tasks)
+      task = run.active_tasks[task_id]
+
+      tampered_snapshot = %{task | snapshot: Map.put(task.snapshot, "draft", "tampered")}
+      tampered = %{run | active_tasks: %{task_id => tampered_snapshot}}
+
+      assert_raise Docket.Error, ~r/snapshot does not match its recorded input_hash/, fn ->
+        Run.to_map(tampered)
+      end
+
+      skipped = %{run | active_tasks: %{task_id => %{task | attempt: 4}}}
+
+      assert_raise Docket.Error, ~r/does not follow its 1 recorded failed attempt/, fn ->
+        Run.to_map(skipped)
+      end
+
+      [write, pending_interrupt] = run.pending_writes
+      mismatched_value = %{pending_interrupt.value | node_id: "someone_else"}
+
+      mismatched = %{
+        run
+        | pending_writes: [write, %{pending_interrupt | value: mismatched_value}]
+      }
+
+      assert_raise Docket.Error, ~r/does not match the pending write's node/, fn ->
+        Run.to_map(mismatched)
+      end
+    end
+
     test "load rejects a task identity that does not match run, step, and node" do
       base = Run.to_map(parked_run())
-
-      wrong_step = put_in(base, ["active_tasks", "run_1:2:flaky", "step"], 1)
-      assert {:error, %Docket.Error{message: message}} = Run.from_map(wrong_step)
-      assert message =~ "does not match run step"
 
       {entry, active} = Map.pop(base["active_tasks"], "run_1:2:flaky")
 

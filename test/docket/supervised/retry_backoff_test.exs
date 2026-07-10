@@ -46,4 +46,30 @@ defmodule Docket.Supervised.RetryBackoffTest do
     assert_receive {:checkpoint, %Checkpoint{type: :step_committed} = step}
     assert Enum.any?(step.events, &(&1.type == :node_completed and &1.payload["attempt"] == 2))
   end
+
+  test "a frozen injected clock still retries at the scheduled wake" do
+    graph =
+      Graph.new!(id: "frozen-clock-retry")
+      |> Graph.put_field!("out", schema: Docket.Schema.string())
+      |> Graph.put_node!("flaky",
+        implementation: Nodes.FlakyThenSucceeds,
+        config: %{failures: 1.0, field: "out", value: "done"},
+        policies: %{"retry" => %{"max_attempts" => 2, "backoff_ms" => 50}}
+      )
+      |> Graph.put_edge!("edge_start_flaky", from: "$start", to: "flaky")
+      |> Graph.put_edge!("edge_flaky_finish", from: "flaky", to: "$finish")
+      |> Graph.put_output!("out", [])
+
+    # The park timer message carries the deadline it served, so planning
+    # does not depend on the (frozen) clock having advanced past it.
+    assert {:ok, _run} =
+             Docket.run(@runtime, graph, %{},
+               context: %{notify: self()},
+               clock: fn -> ~U[2026-07-09 12:00:00.000000Z] end
+             )
+
+    assert_receive {:checkpoint, %Checkpoint{type: :retry_scheduled}}, 500
+    assert_receive {:checkpoint, %Checkpoint{type: :run_completed} = final}, 1_000
+    assert final.run.output == %{"out" => "done"}
+  end
 end

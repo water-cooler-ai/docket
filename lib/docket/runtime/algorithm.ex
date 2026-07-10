@@ -109,32 +109,22 @@ defmodule Docket.Runtime.Algorithm do
     |> Enum.reduce_while({:ok, []}, fn node_id, {:ok, acc} ->
       node = Map.fetch!(rtg.nodes, "node:" <> node_id)
 
-      case Policies.node_policies(node.policies) do
-        {:ok, %{timeout_ms: timeout_ms, retry: retry}} ->
-          task_id = TaskState.task_id(run.id, run.step, node_id)
-
-          activation = %Activation{
-            task_id: task_id,
-            node_id: node_id,
-            runtime_node_id: node.id,
-            step: run.step,
-            attempt: 1,
-            input_hash: input_hash,
-            idempotency_key: TaskState.idempotency_key(task_id, 1),
-            snapshot: snapshot,
-            source_versions: versions,
-            config: node.config,
-            timeout_ms: timeout_ms,
-            retry: retry
-          }
+      case resolved_policies(node, node_id) do
+        {:ok, policies} ->
+          activation =
+            activation(node, policies, %{
+              task_id: TaskState.task_id(run.id, run.step, node_id),
+              step: run.step,
+              attempt: 1,
+              input_hash: input_hash,
+              snapshot: snapshot,
+              source_versions: versions
+            })
 
           {:cont, {:ok, [activation | acc]}}
 
-        {:error, errors} ->
-          message = Enum.map_join(errors, "; ", fn {_key, message} -> message end)
-
-          {:halt,
-           {:error, Docket.Error.new(:invalid_policy, message, node_id: node_id, phase: :plan)}}
+        {:error, %Docket.Error{} = error} ->
+          {:halt, {:error, error}}
       end
     end)
     |> case do
@@ -162,21 +152,16 @@ defmodule Docket.Runtime.Algorithm do
     |> Enum.sort_by(fn {_task_id, task} -> task.node_id end)
     |> Enum.reduce_while({:ok, []}, fn {task_id, task}, {:ok, acc} ->
       with {:ok, node} <- fetch_task_node(rtg, task),
-           {:ok, %{timeout_ms: timeout_ms, retry: retry}} <- task_policies(node, task) do
-        activation = %Activation{
-          task_id: task_id,
-          node_id: task.node_id,
-          runtime_node_id: node.id,
-          step: task.step,
-          attempt: task.attempt,
-          input_hash: task.input_hash,
-          idempotency_key: TaskState.idempotency_key(task_id, task.attempt),
-          snapshot: task.snapshot,
-          source_versions: task.source_versions,
-          config: node.config,
-          timeout_ms: timeout_ms,
-          retry: retry
-        }
+           {:ok, policies} <- resolved_policies(node, task.node_id) do
+        activation =
+          activation(node, policies, %{
+            task_id: task_id,
+            step: task.step,
+            attempt: task.attempt,
+            input_hash: task.input_hash,
+            snapshot: task.snapshot,
+            source_versions: task.source_versions
+          })
 
         {:cont, {:ok, [activation | acc]}}
       else
@@ -187,6 +172,25 @@ defmodule Docket.Runtime.Algorithm do
       {:ok, activations} -> {:ok, Enum.reverse(activations)}
       error -> error
     end
+  end
+
+  # One constructor for both planning paths, so a fresh attempt and a
+  # resumed attempt cannot drift in identity shape.
+  defp activation(node, policies, identity) do
+    %Activation{
+      task_id: identity.task_id,
+      node_id: node.public_id,
+      runtime_node_id: node.id,
+      step: identity.step,
+      attempt: identity.attempt,
+      input_hash: identity.input_hash,
+      idempotency_key: TaskState.idempotency_key(identity.task_id, identity.attempt),
+      snapshot: identity.snapshot,
+      source_versions: identity.source_versions,
+      config: node.config,
+      timeout_ms: policies.timeout_ms,
+      retry: policies.retry
+    }
   end
 
   defp fetch_task_node(rtg, task) do
@@ -205,14 +209,14 @@ defmodule Docket.Runtime.Algorithm do
     end
   end
 
-  defp task_policies(node, task) do
+  defp resolved_policies(node, node_id) do
     case Policies.node_policies(node.policies) do
       {:ok, policies} ->
         {:ok, policies}
 
       {:error, errors} ->
         message = Enum.map_join(errors, "; ", fn {_key, message} -> message end)
-        {:error, Docket.Error.new(:invalid_policy, message, node_id: task.node_id, phase: :plan)}
+        {:error, Docket.Error.new(:invalid_policy, message, node_id: node_id, phase: :plan)}
     end
   end
 

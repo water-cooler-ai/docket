@@ -104,7 +104,18 @@ defmodule Docket.Runtime do
     if Run.terminal?(state.run) do
       finish(state)
     else
-      tick(state)
+      tick(state, nil)
+    end
+  end
+
+  # A park timer fired: this wake served the park deadline it was scheduled
+  # for, so planning may treat that instant as reached even when the
+  # configured clock lags (or is injected and frozen).
+  def handle_info({:tick, %DateTime{} = resume_at}, state) do
+    if Run.terminal?(state.run) do
+      finish(state)
+    else
+      tick(state, resume_at)
     end
   end
 
@@ -137,8 +148,14 @@ defmodule Docket.Runtime do
   # Tick loop
   # ---------------------------------------------------------------------------
 
-  defp tick(state) do
-    case Loop.plan(state.rtg, state.run, state.opts) do
+  defp tick(state, resume_floor) do
+    plan_opts =
+      case resume_floor do
+        nil -> state.opts
+        %DateTime{} = floor -> Keyword.put(state.opts, :resume_floor, floor)
+      end
+
+    case Loop.plan(state.rtg, state.run, plan_opts) do
       {:execute, run, activations} ->
         results = Dispatcher.dispatch(activations, state.rtg, run, state.config)
 
@@ -155,7 +172,7 @@ defmodule Docket.Runtime do
 
           {:park, run, park, effects} ->
             state = deliver_effects(%{state | run: run}, effects)
-            schedule_tick_after(park.wait_ms)
+            schedule_park_wake(park)
             {:noreply, state}
 
           {:error, %Error{} = error} ->
@@ -173,7 +190,7 @@ defmodule Docket.Runtime do
         # Parked mid-superstep for a retry deadline. The mailbox stays live:
         # get_run and resolve_interrupt are served during backoff, and an
         # early tick simply parks again with the remaining wait.
-        schedule_tick_after(park.wait_ms)
+        schedule_park_wake(park)
         {:noreply, %{state | run: run}}
 
       {:terminal, run, effects} ->
@@ -186,14 +203,21 @@ defmodule Docket.Runtime do
 
   defp schedule_tick, do: send(self(), :tick)
 
-  # Erlang timers cap out below extreme retry deadlines; a clamped early
-  # tick just parks again with the remaining wait.
+  # Erlang timers cap out below extreme retry deadlines. A clamped wake
+  # fires early, so it must not claim the park deadline was served; it
+  # simply parks again with the remaining wait.
   @max_timer_ms 4_294_967_295
 
-  defp schedule_tick_after(0), do: schedule_tick()
+  defp schedule_park_wake(%{wait_ms: 0, resume_at: resume_at}) do
+    send(self(), {:tick, resume_at})
+  end
 
-  defp schedule_tick_after(ms) do
-    Process.send_after(self(), :tick, min(ms, @max_timer_ms))
+  defp schedule_park_wake(%{wait_ms: wait_ms}) when wait_ms > @max_timer_ms do
+    Process.send_after(self(), :tick, @max_timer_ms)
+  end
+
+  defp schedule_park_wake(%{wait_ms: wait_ms, resume_at: resume_at}) do
+    Process.send_after(self(), {:tick, resume_at}, wait_ms)
   end
 
   # Terminal run: exit normally once every async delivery has settled, so the

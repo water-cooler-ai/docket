@@ -108,13 +108,13 @@ defmodule Docket.Test do
   end
 
   # Drives ticks until one committed transition (a barrier, retry park, or
-  # terminal commit) has happened. A park that committed nothing only served
-  # a retry wait; keep going so step_inline always returns a commit.
+  # terminal commit) has happened. A retry wait commits nothing; keep going
+  # so step_inline always returns a commit.
   defp step_tick(rtg, run, opts, resume_floor) do
     case tick(rtg, run, opts, resume_floor) do
       {:continue, run, checkpoints} -> {:ok, run, checkpoints}
-      {:continue_at, run, resume_at, []} -> step_tick(rtg, run, opts, resume_at)
       {:continue_at, run, _resume_at, checkpoints} -> {:ok, run, checkpoints}
+      {:retry_wait, run, resume_at} -> step_tick(rtg, run, opts, resume_at)
       {:stop, run, checkpoints} -> {:ok, run, checkpoints}
       {:error, error, checkpoints} -> {:error, error, checkpoints}
     end
@@ -171,6 +171,9 @@ defmodule Docket.Test do
           {:continue_at, run, resume_at, delivered} ->
             drive(rtg, run, opts, checkpoints ++ delivered, steps, resume_at)
 
+          {:retry_wait, run, resume_at} ->
+            drive(rtg, run, opts, checkpoints, steps, resume_at)
+
           {:stop, run, delivered} ->
             {:ok, run, checkpoints ++ delivered}
 
@@ -200,9 +203,11 @@ defmodule Docket.Test do
             {:error, error, []}
         end
 
+      # An uncommitted retry wait: nothing durable changed, the sleeper just
+      # served the remaining time to the earliest parked deadline.
       {:park, run, park} ->
         config.sleeper.(park.wait_ms)
-        {:continue_at, run, park.resume_at, []}
+        {:retry_wait, run, park.resume_at}
 
       {:wait, run, _interrupt_ids} ->
         {:stop, run, []}

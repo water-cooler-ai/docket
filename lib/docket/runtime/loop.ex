@@ -229,7 +229,9 @@ defmodule Docket.Runtime.Loop do
   Shells that have already served a park's wait pass the park's `resume_at`
   as `:resume_floor` in `opts`, so deadline checks do not depend on the
   wall clock having advanced (deterministic inline tests inject `:sleeper`
-  instead of sleeping).
+  instead of sleeping). The floor must be the served park's `resume_at` and
+  never a later instant: flooring at the wake deadline makes exactly the
+  due attempts eligible while later deadlines stay parked.
   """
   def plan(rtg, %Run{} = run, opts) do
     config = Config.resolve(opts)
@@ -288,19 +290,22 @@ defmodule Docket.Runtime.Loop do
   # does.
   defp resume_superstep(rtg, run, opts, config) do
     now = resume_now(config, opts)
+    due_ids = run.active_tasks |> Map.keys() |> Enum.filter(&due?(run.timers, &1, now))
 
-    case Algorithm.resume_activations(rtg, run) do
-      {:ok, activations} ->
-        case Enum.filter(activations, &due?(run.timers, &1.task_id, now)) do
-          [] -> {:park, run, park_info(run.timers, now)}
-          due -> {:execute, run, due}
-        end
+    if due_ids == [] do
+      {:park, run, park_info(run.timers, now)}
+    else
+      case Algorithm.resume_activations(rtg, run) do
+        {:ok, activations} ->
+          due_set = MapSet.new(due_ids)
+          {:execute, run, Enum.filter(activations, &MapSet.member?(due_set, &1.task_id))}
 
-      {:error, %Error{} = error} ->
-        terminal_fail(run, config, [],
-          failure: Failure.new(Atom.to_string(error.type), error.message),
-          payload: %{"reason" => Atom.to_string(error.type), "message" => error.message}
-        )
+        {:error, %Error{} = error} ->
+          terminal_fail(run, config, [],
+            failure: Failure.new(Atom.to_string(error.type), error.message),
+            payload: %{"reason" => Atom.to_string(error.type), "message" => error.message}
+          )
+      end
     end
   end
 
@@ -379,7 +384,7 @@ defmodule Docket.Runtime.Loop do
   end
 
   # ---------------------------------------------------------------------------
-  # apply_results/4
+  # apply_results/5
   # ---------------------------------------------------------------------------
 
   @doc """
@@ -415,36 +420,64 @@ defmodule Docket.Runtime.Loop do
 
     cond do
       permanent != [] ->
-        entries =
-          attempt_failure_entries(run.step, results) ++
-            Enum.map(permanent, fn failure ->
-              entry(:node_failed, run.step,
-                node_id: failure.node_id,
-                task_id: failure.task_id,
-                payload: %{
-                  "attempt" => failure.attempt,
-                  "reason" => inspect(failure.reason),
-                  "permanent" => true
-                }
-              )
-            end)
-
-        failed_nodes = permanent |> Enum.map(& &1.node_id) |> Enum.uniq() |> Enum.sort()
-
-        fail(run, config, entries,
-          failure: node_failure(permanent, failed_nodes),
-          payload: %{"reason" => "node_failed", "nodes" => failed_nodes}
-        )
+        fail_superstep(run, config, results, permanent)
 
       retries != [] or remaining_active?(run, results) ->
         park(run, config, activations, retries, validated_writes, interrupt_specs)
 
       true ->
-        {validated_writes, interrupt_specs} =
-          merge_pending(run, validated_writes, interrupt_specs)
+        barrier(rtg, run, config, results, validated_writes, interrupt_specs)
+    end
+  end
+
+  # The update barrier: pending sibling results parked by earlier retry
+  # commits pass through the same validators as this dispatch's results.
+  # Validation is deterministic, so runtime-produced pending state validates
+  # identically to when it was parked; only corrupted durable state can
+  # fail here, and it fails the run through the typed permanent path
+  # instead of crashing the commit.
+  defp barrier(rtg, run, config, results, validated_writes, interrupt_specs) do
+    pending_results = rehydrate_pending(run)
+    {pending_oks, pending_interrupts, [], []} = partition_results(pending_results)
+    {pending_writes, pending_write_errors} = validate_writes(rtg, pending_oks)
+    {pending_specs, pending_interrupt_errors} = validate_interrupts(rtg, run, pending_interrupts)
+
+    case pending_write_errors ++ pending_interrupt_errors do
+      [] ->
+        validated_writes =
+          Enum.sort_by(pending_writes ++ validated_writes, fn {result, _} -> result.node_id end)
+
+        interrupt_specs =
+          Enum.sort_by(pending_specs ++ interrupt_specs, fn {result, _} -> result.node_id end)
 
         commit(rtg, run, config, results, validated_writes, interrupt_specs)
+
+      permanent ->
+        fail_superstep(run, config, results, permanent)
     end
+  end
+
+  defp fail_superstep(run, config, results, permanent) do
+    entries =
+      attempt_failure_entries(run.step, results) ++
+        Enum.map(permanent, fn failure ->
+          entry(:node_failed, run.step,
+            node_id: failure.node_id,
+            task_id: failure.task_id,
+            payload: %{
+              "attempt" => failure.attempt,
+              "reason" => inspect(failure.reason),
+              "permanent" => true
+            }
+          )
+        end)
+
+    failed_nodes = permanent |> Enum.map(& &1.node_id) |> Enum.uniq() |> Enum.sort()
+
+    fail(run, config, entries,
+      failure: node_failure(permanent, failed_nodes),
+      payload: %{"reason" => "node_failed", "nodes" => failed_nodes}
+    )
   end
 
   # True when active tasks beyond this dispatch's results remain parked
@@ -532,29 +565,20 @@ defmodule Docket.Runtime.Loop do
     }
   end
 
-  # Rehydrates pending sibling results committed by earlier retry parks into
-  # the barrier's validated shape. Their writes were validated before they
-  # were parked; their retried attempts' failure events were emitted by the
-  # parks that recorded them, so they contribute no failure entries here.
-  defp merge_pending(run, validated_writes, interrupt_specs) do
-    {pending_writes, pending_interrupts} =
-      Enum.reduce(run.pending_writes, {[], []}, fn pending, {writes, interrupts} ->
-        result = %TaskResult{
-          task_id: pending.task_id,
-          node_id: pending.node_id,
-          attempt: pending.attempt,
-          status: if(pending.kind == :update, do: :ok, else: :interrupt),
-          value: pending.value
-        }
-
-        case pending.kind do
-          :update -> {[{result, pending.value} | writes], interrupts}
-          :interrupt -> {writes, [{result, pending.value} | interrupts]}
-        end
-      end)
-
-    {Enum.sort_by(pending_writes ++ validated_writes, fn {result, _} -> result.node_id end),
-     Enum.sort_by(pending_interrupts ++ interrupt_specs, fn {result, _} -> result.node_id end)}
+  # Rehydrates pending sibling results committed by earlier retry parks back
+  # into task results. Their retried attempts' failure events were emitted by
+  # the parks that recorded them, so they contribute no failure entries at
+  # the barrier.
+  defp rehydrate_pending(run) do
+    Enum.map(run.pending_writes, fn %PendingWrite{} = pending ->
+      %TaskResult{
+        task_id: pending.task_id,
+        node_id: pending.node_id,
+        attempt: pending.attempt,
+        status: if(pending.kind == :update, do: :ok, else: :interrupt),
+        value: pending.value
+      }
+    end)
   end
 
   defp failure(result, reason) do
@@ -809,27 +833,21 @@ defmodule Docket.Runtime.Loop do
       end)
   end
 
+  # One dispatch executes at most one attempt per task, so the only
+  # non-permanent failure to record is a :retry result's; an :error result's
+  # permanent failure is reported separately by the caller.
   defp attempt_failure_entries(step, results) do
-    Enum.flat_map(results, fn result ->
-      retried =
-        case result.status do
-          # The final permanent failure is reported separately by the caller.
-          :error -> Enum.drop(result.failures, -1)
-          _other -> result.failures
-        end
-
-      Enum.map(retried, fn failure ->
-        entry(:node_failed, step,
-          node_id: result.node_id,
-          task_id: result.task_id,
-          payload: %{
-            "attempt" => failure.attempt,
-            "reason" => inspect(failure.reason),
-            "permanent" => false
-          }
-        )
-      end)
-    end)
+    for result <- results, result.status == :retry do
+      entry(:node_failed, step,
+        node_id: result.node_id,
+        task_id: result.task_id,
+        payload: %{
+          "attempt" => result.attempt,
+          "reason" => inspect(result.value),
+          "permanent" => false
+        }
+      )
+    end
   end
 
   # ---------------------------------------------------------------------------

@@ -48,8 +48,7 @@ defmodule Docket.Runtime.Dispatcher do
           node_id: activation.node_id,
           attempt: activation.attempt,
           status: status,
-          value: reason,
-          failures: [%{attempt: activation.attempt, reason: reason}]
+          value: reason
         }
     end
   end

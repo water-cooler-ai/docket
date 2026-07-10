@@ -263,17 +263,12 @@ defmodule Docket.Test.Fixtures.Nodes do
     # FlakyThenSucceeds that also reports every attempt - with its
     # idempotency identity and the state snapshot it observed - to
     # `context.application.notify`, so tests can assert attempt identity and
-    # snapshot stability across retry parks and crash-resume.
+    # snapshot stability across retry parks and crash-resume. Delegates the
+    # flaky contract itself so the two fixtures cannot drift.
     @behaviour Docket.Node
 
     @impl true
-    def config_schema do
-      Docket.Schema.object(%{
-        "failures" => Docket.Schema.float(required: true),
-        "field" => Docket.Schema.string(required: true),
-        "value" => Docket.Schema.string(required: true)
-      })
-    end
+    def config_schema, do: FlakyThenSucceeds.config_schema()
 
     @impl true
     def call(state, config, context) do
@@ -282,11 +277,7 @@ defmodule Docket.Test.Fixtures.Nodes do
         {:attempted, context.node_id, context.attempt, context.idempotency_key, state}
       )
 
-      if context.attempt <= trunc(config["failures"]) do
-        {:error, {:flaky, context.attempt}}
-      else
-        {:ok, %{config["field"] => config["value"]}}
-      end
+      FlakyThenSucceeds.call(state, config, context)
     end
   end
 
@@ -294,25 +285,21 @@ defmodule Docket.Test.Fixtures.Nodes do
     @moduledoc false
     # WriteStatic that reports every execution to
     # `context.application.notify`, so tests can prove a committed sibling
-    # result is never re-executed across parks and recovery.
+    # result is never re-executed across parks and recovery. Delegates the
+    # write itself so the two fixtures cannot drift.
     @behaviour Docket.Node
 
     @impl true
-    def config_schema do
-      Docket.Schema.object(%{
-        "field" => Docket.Schema.string(required: true),
-        "value" => Docket.Schema.string(required: true)
-      })
-    end
+    def config_schema, do: WriteStatic.config_schema()
 
     @impl true
-    def call(_state, config, context) do
+    def call(state, config, context) do
       send(
         Map.fetch!(context.application, :notify),
         {:executed, context.node_id, context.attempt}
       )
 
-      {:ok, %{config["field"] => config["value"]}}
+      WriteStatic.call(state, config, context)
     end
   end
 

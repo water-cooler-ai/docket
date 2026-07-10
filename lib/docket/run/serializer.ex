@@ -49,7 +49,7 @@ defmodule Docket.Run.Serializer do
   @interrupt_keys ~w(node_id status resume_channel prompt schema created_at
                      resolved_at metadata)
   @failure_keys ~w(code message node_id details)
-  @active_task_keys ~w(node_id step attempt input_hash snapshot source_versions
+  @active_task_keys ~w(node_id attempt input_hash snapshot source_versions
                        failures)
   @task_failure_keys ~w(attempt reason)
   @pending_update_keys ~w(task_id node_id attempt kind update)
@@ -102,18 +102,21 @@ defmodule Docket.Run.Serializer do
 
   # Shared dump/load invariants for retry-parked execution state: only a
   # `:running` run carries it, pending results require active tasks, every
-  # active task parks with exactly one timer, and a node contributes at most
-  # one result or parked attempt per superstep.
+  # active task parks with exactly one retry timer, and a node contributes
+  # at most one result or parked attempt per superstep. The retry-timer
+  # coverage check is scoped by kind so future non-retry timers are not
+  # bound to active tasks.
   defp validate_active_superstep!(%Run{} = run, error_type) do
+    retry_timer_ids = for {timer_id, %TimerState{kind: :retry}} <- run.timers, do: timer_id
+
     cond do
-      map_size(run.active_tasks) == 0 and run.pending_writes == [] and
-          map_size(run.timers) == 0 ->
+      map_size(run.active_tasks) == 0 and run.pending_writes == [] and retry_timer_ids == [] ->
         :ok
 
       map_size(run.active_tasks) == 0 ->
         invalid!(
           error_type,
-          "pending writes and timers are only durable while tasks are active"
+          "pending writes and retry timers are only durable while tasks are active"
         )
 
       run.status != :running ->
@@ -123,13 +126,13 @@ defmodule Docket.Run.Serializer do
             inspect(run.status)
         )
 
-      Enum.sort(Map.keys(run.timers)) != Enum.sort(Map.keys(run.active_tasks)) ->
+      Enum.sort(retry_timer_ids) != Enum.sort(Map.keys(run.active_tasks)) ->
         invalid!(
           error_type,
-          "active tasks and timers must cover the same task IDs",
+          "active tasks and retry timers must cover the same task IDs",
           %{
             active_tasks: Enum.sort(Map.keys(run.active_tasks)),
-            timers: Enum.sort(Map.keys(run.timers))
+            timers: Enum.sort(retry_timer_ids)
           }
         )
 
@@ -188,8 +191,12 @@ defmodule Docket.Run.Serializer do
     )
   end
 
+  # Dump enforces the same task-state consistency as load, so a checkpoint
+  # the host persists is always reloadable: an inconsistent in-memory task
+  # fails at the write boundary, never at recovery.
   defp dump_active_task(run, task_id, %TaskState{} = task) do
     location = "active task #{inspect(task_id)}"
+    failures = dump_task_failures(task.failures, location)
 
     cond do
       task.task_id != task_id ->
@@ -212,19 +219,32 @@ defmodule Docket.Run.Serializer do
             inspect(task.node_id)
         )
 
-      not (is_integer(task.attempt) and task.attempt >= 1) ->
+      Enum.map(failures, & &1["attempt"]) != Enum.to_list(1..length(failures)) ->
         invalid!(
           :invalid_run,
-          "#{location} attempt must be a positive integer, got #{inspect(task.attempt)}"
+          "#{location} failures must record attempts 1..n in order"
+        )
+
+      task.attempt != length(failures) + 1 ->
+        invalid!(
+          :invalid_run,
+          "#{location} attempt #{inspect(task.attempt)} does not follow its " <>
+            "#{length(failures)} recorded failed attempt(s)"
+        )
+
+      TaskState.snapshot_hash(task.snapshot || %{}) !=
+          required_string!(task.input_hash, "#{location} input_hash") ->
+        invalid!(
+          :invalid_run,
+          "#{location} snapshot does not match its recorded input_hash"
         )
 
       true ->
         %{
           "node_id" => required_string!(task.node_id, "#{location} node_id"),
-          "step" => task.step,
           "attempt" => task.attempt,
-          "input_hash" => required_string!(task.input_hash, "#{location} input_hash"),
-          "failures" => dump_task_failures(task.failures, location)
+          "input_hash" => task.input_hash,
+          "failures" => failures
         }
         |> put_open_map("snapshot", task.snapshot || %{}, "#{location} snapshot")
         |> put_source_versions(task.source_versions || %{}, location)
@@ -326,6 +346,13 @@ defmodule Docket.Run.Serializer do
         |> Map.put("update", Wire.dump_value!(value, "#{location} update"))
 
       {:interrupt, %Interrupt{} = interrupt} ->
+        validate_pending_interrupt_node!(
+          interrupt.node_id,
+          pending.node_id,
+          location,
+          :invalid_run
+        )
+
         base
         |> Map.put("kind", Map.fetch!(@pending_kinds_out, :interrupt))
         |> Map.put("interrupt", dump_pending_interrupt(interrupt, location))
@@ -344,6 +371,16 @@ defmodule Docket.Run.Serializer do
       :invalid_run,
       "pending write must be a Docket.Run.PendingWrite, got #{inspect(other)}"
     )
+  end
+
+  defp validate_pending_interrupt_node!(interrupt_node_id, node_id, location, error_type) do
+    unless interrupt_node_id in [nil, node_id] do
+      invalid!(
+        error_type,
+        "#{location} interrupt node_id #{inspect(interrupt_node_id)} does not match " <>
+          "the pending write's node"
+      )
+    end
   end
 
   defp dump_pending_interrupt(%Interrupt{} = interrupt, location) do
@@ -575,7 +612,6 @@ defmodule Docket.Run.Serializer do
     assert_known_keys!(map, @active_task_keys, location)
 
     node_id = load_required_string!(map, "node_id", location)
-    step = load_non_neg_integer!(map, "step", location)
     attempt = load_pos_integer!(map, "attempt", location)
     input_hash = load_required_string!(map, "input_hash", location)
     snapshot = load_open_map!(map, "snapshot", "#{location} snapshot")
@@ -583,12 +619,6 @@ defmodule Docket.Run.Serializer do
     failures = load_task_failures!(map, location)
 
     cond do
-      step != run_step ->
-        invalid!(
-          :invalid_document,
-          "#{location} step #{step} does not match run step #{run_step}"
-        )
-
       task_id != TaskState.task_id(run_id, run_step, node_id) ->
         invalid!(
           :invalid_document,
@@ -612,7 +642,7 @@ defmodule Docket.Run.Serializer do
         %TaskState{
           task_id: task_id,
           node_id: node_id,
-          step: step,
+          step: run_step,
           attempt: attempt,
           status: :retry_scheduled,
           input_hash: input_hash,
@@ -739,7 +769,16 @@ defmodule Docket.Run.Serializer do
 
         :interrupt ->
           assert_known_keys!(entry, @pending_interrupt_keys, location)
-          load_pending_interrupt!(Map.get(entry, "interrupt"), location)
+          interrupt = load_pending_interrupt!(Map.get(entry, "interrupt"), location)
+
+          validate_pending_interrupt_node!(
+            interrupt.node_id,
+            node_id,
+            location,
+            :invalid_document
+          )
+
+          interrupt
       end
 
     %PendingWrite{task_id: task_id, node_id: node_id, attempt: attempt, kind: kind, value: value}
