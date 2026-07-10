@@ -39,6 +39,11 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   migrations (`Docket.Postgres.Migration`, v01), `docket_graph_versions` /
   `docket_runs` / `docket_events` schemas, and `mix docket.gen.migration`
   (DCKT-13, #10).
+- Postgres `Docket.Postgres.RunStore` atomic, demand-bounded claims over
+  separately indexed ready and expired paths, including `SKIP LOCKED`
+  dispatcher concurrency, exact claim-attempt poisoning, token-guarded
+  heartbeat/release, and the shared internal mandatory-commit token predicate
+  (DCKT-15, #20).
 - `Docket.Event`: metadata-only `:checkpoint_committed` event type and the
   `types/0` helper (DCKT-8, #12).
 - `docs/architecture/docket-operational-transition-spec.md` revision 8 and
@@ -120,6 +125,18 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   Retried attempts' `:node_failed` events now ride the `:retry_scheduled`
   checkpoint that recorded them instead of the eventual barrier checkpoint
   (DCKT-30, #18).
+- Postgres v01 schema finalized to spec revision 8 (amended in place —
+  0.1.0 is unreleased): `claim_attempts` / `poisoned_at` / `poison_reason`
+  replace `attempts` / `operational_status` / `operational_error`, `failure`
+  is promoted to a jsonb column, and `started_at` is non-null. Lifecycle
+  CHECK constraints make the status/failure/schedule/claim/poison tuple
+  authoritative even for raw claim SQL; a composite delete-restricted FK
+  keeps every retained run's exact graph version, and a delete-cascaded FK
+  keeps events from outliving their run. The single `wake_at` and
+  `operational_status` indexes become the ready-unclaimed `(wake_at, id)`,
+  expired-claim `(claimed_at, id)`, and poison-introspection partial
+  indexes behind positive dispatch eligibility (`status = 'running' AND
+  poisoned_at IS NULL`) (DCKT-29, #19).
 - The runtime loop's checkpoint emission is split into pure moment
   production plus a host-owned sync-committer adapter: the supervised and
   inline shells adapt the same `Docket.Runtime.Moment` a durable driver

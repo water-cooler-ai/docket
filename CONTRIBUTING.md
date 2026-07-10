@@ -60,13 +60,18 @@ DOCKET_CORE_ONLY=1 mix test
 
 ### Postgres-backed tests
 
-Tests tagged `:postgres` (the migration up/down round trip) need a live
-Postgres and are excluded by default. Opt in with:
+Tests tagged `:postgres` (migration round trips and RunStore claim/concurrency
+coverage) need PostgreSQL 13 or newer and are excluded by default. Opt in with:
 
 ```sh
 mix test --include postgres
 ```
 
-The connection defaults to `postgres://localhost:5432/docket_migration_test`
-(your OS username, no password); override with `DOCKET_TEST_DATABASE_URL`.
-The test database is dropped and recreated on every run.
+The isolated connections default to
+`postgres://localhost:5432/docket_migration_test` and
+`postgres://localhost:5432/docket_run_store_test` (your OS username, no
+password). Override them with `DOCKET_TEST_DATABASE_URL` and
+`DOCKET_RUN_STORE_TEST_DATABASE_URL`, respectively. Both test databases are
+dropped and recreated by their suites. PostgreSQL 13 is the implementation
+minimum because claim SQL uses materialized CTEs and the built-in
+`gen_random_uuid()`.

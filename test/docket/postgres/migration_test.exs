@@ -27,9 +27,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @tables ~w(docket_events docket_graph_versions docket_runs)
 
     @run_columns ~w(
-      id run_id tenant_id graph_id graph_hash status step input output
+      id run_id tenant_id graph_id graph_hash status step input output failure
       metadata state checkpoint_seq latest_checkpoint_type claim_token
-      claimed_at wake_at attempts operational_status operational_error
+      claimed_at wake_at claim_attempts poisoned_at poison_reason
       inserted_at started_at updated_at finished_at
     )
 
@@ -42,13 +42,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "migrates up, down, and back up cleanly on a fresh Postgres" do
-      assert :ok = Ecto.Migrator.up(TestRepo, @migration_version, InstallDocket, log: false)
+      install!()
 
       assert tables("public") == @tables
       assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
       assert columns("docket_runs") == Enum.sort(@run_columns)
 
       assert nullable?("docket_runs", "tenant_id")
+      refute nullable?("docket_runs", "started_at")
 
       indexes = indexes("docket_runs")
 
@@ -60,10 +61,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert indexes["docket_runs_tenant_id_graph_id_status_index"] =~
                "WHERE (tenant_id IS NOT NULL)"
 
-      assert indexes["docket_runs_wake_at_index"] =~ "WHERE (wake_at IS NOT NULL)"
+      ready = indexes["docket_runs_wake_at_id_index"]
 
-      assert indexes["docket_runs_operational_status_index"] =~
-               "WHERE (operational_status <> 'active'::text)"
+      assert ready =~ "btree (wake_at, id)"
+      assert ready =~ "status = 'running'"
+      assert ready =~ "poisoned_at IS NULL"
+      assert ready =~ "claim_token IS NULL"
+      assert ready =~ "wake_at IS NOT NULL"
+
+      expired = indexes["docket_runs_claimed_at_id_index"]
+
+      assert expired =~ "btree (claimed_at, id)"
+      assert expired =~ "status = 'running'"
+      assert expired =~ "poisoned_at IS NULL"
+      assert expired =~ "claim_token IS NOT NULL"
+
+      assert indexes["docket_runs_poisoned_at_index"] =~ "WHERE (poisoned_at IS NOT NULL)"
 
       assert indexes["docket_runs_status_updated_at_index"] =~ "(status, updated_at)"
 
@@ -103,6 +116,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                prefix: "docket_private"
              ) == 1
 
+      assert {:ok, _} = insert_run([], "docket_private")
+
       assert :ok =
                Ecto.Migrator.down(
                  TestRepo,
@@ -112,6 +127,190 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                )
 
       assert tables("docket_private") == []
+    end
+
+    test "accepts every valid lifecycle row shape" do
+      install!()
+
+      now = DateTime.utc_now()
+
+      valid_shapes = [
+        ready_running: [],
+        claimed_running: [wake_at: nil, claim_token: uuid(), claimed_at: now],
+        poisoned_running: [
+          wake_at: nil,
+          poisoned_at: now,
+          poison_reason: %{"kind" => "max_claim_attempts"}
+        ],
+        waiting: [status: "waiting", wake_at: nil],
+        done: [status: "done", wake_at: nil, finished_at: now, output: %{"answer" => 42}],
+        failed: [
+          status: "failed",
+          wake_at: nil,
+          finished_at: now,
+          failure: %{"code" => "node_failed", "message" => "boom"}
+        ],
+        cancelled: [status: "cancelled", wake_at: nil, finished_at: now]
+      ]
+
+      for {shape, overrides} <- valid_shapes do
+        assert {:ok, _} = insert_run(overrides), "expected valid shape #{shape} to insert"
+      end
+    end
+
+    test "rejects every invalid lifecycle tuple through raw SQL" do
+      install!()
+
+      now = DateTime.utc_now()
+
+      # Each case is one minimal mutation off a valid row, so exactly the
+      # named constraint fires. A non-running row carrying poison violates
+      # the waiting/terminal-idle and poisoned-shape constraints
+      # inseparably, so that case accepts either name.
+      invalid_tuples = [
+        {"unknown status", [status: "created", wake_at: nil], ~w(docket_runs_status_check)},
+        {"running with finished_at", [finished_at: now], ~w(docket_runs_finished_at_check)},
+        {"done without finished_at", [status: "done", wake_at: nil, output: %{"answer" => 42}],
+         ~w(docket_runs_finished_at_check)},
+        {"failed without failure", [status: "failed", wake_at: nil, finished_at: now],
+         ~w(docket_runs_failure_check)},
+        {"done with failure",
+         [status: "done", wake_at: nil, finished_at: now, failure: %{"code" => "boom"}],
+         ~w(docket_runs_failure_check)},
+        {"output on a non-done run", [output: %{"answer" => 42}], ~w(docket_runs_output_check)},
+        {"claim token without claimed_at", [wake_at: nil, claim_token: uuid()],
+         ~w(docket_runs_claim_pair_check)},
+        {"claimed_at without claim token", [claimed_at: now], ~w(docket_runs_claim_pair_check)},
+        {"poisoned_at without poison_reason", [wake_at: nil, poisoned_at: now],
+         ~w(docket_runs_poison_pair_check)},
+        {"poison_reason without poisoned_at", [poison_reason: %{"kind" => "stuck"}],
+         ~w(docket_runs_poison_pair_check)},
+        {"waiting with a wake", [status: "waiting"], ~w(docket_runs_waiting_terminal_idle_check)},
+        {"waiting with a claim",
+         [status: "waiting", wake_at: nil, claim_token: uuid(), claimed_at: now],
+         ~w(docket_runs_waiting_terminal_idle_check)},
+        {"waiting with poison",
+         [
+           status: "waiting",
+           wake_at: nil,
+           poisoned_at: now,
+           poison_reason: %{"kind" => "stuck"}
+         ], ~w(docket_runs_waiting_terminal_idle_check docket_runs_poisoned_shape_check)},
+        {"terminal with a wake", [status: "done", finished_at: now, output: %{"answer" => 42}],
+         ~w(docket_runs_waiting_terminal_idle_check)},
+        {"poisoned with a claim",
+         [
+           wake_at: nil,
+           poisoned_at: now,
+           poison_reason: %{"kind" => "stuck"},
+           claim_token: uuid(),
+           claimed_at: now
+         ], ~w(docket_runs_poisoned_shape_check)},
+        {"poisoned with a wake", [poisoned_at: now, poison_reason: %{"kind" => "stuck"}],
+         ~w(docket_runs_poisoned_shape_check)},
+        {"running with both wake and claim", [claim_token: uuid(), claimed_at: now],
+         ~w(docket_runs_running_schedule_check)},
+        {"running with neither wake nor claim", [wake_at: nil],
+         ~w(docket_runs_running_schedule_check)},
+        {"negative step", [step: -1], ~w(docket_runs_counters_check)},
+        {"negative checkpoint_seq", [checkpoint_seq: -1], ~w(docket_runs_counters_check)},
+        {"negative claim_attempts", [claim_attempts: -1], ~w(docket_runs_counters_check)}
+      ]
+
+      for {label, overrides, constraints} <- invalid_tuples do
+        assert {:error, %Postgrex.Error{postgres: %{code: :check_violation} = pg}} =
+                 insert_run(overrides),
+               "expected #{label} to raise a check violation"
+
+        assert pg.constraint in constraints,
+               "expected #{label} to violate one of #{inspect(constraints)}, " <>
+                 "got #{inspect(pg.constraint)}"
+      end
+
+      assert {:error, %Postgrex.Error{postgres: %{code: :not_null_violation} = pg}} =
+               insert_run(started_at: nil)
+
+      assert pg.column == "started_at"
+    end
+
+    test "referential integrity binds runs to graphs and events to runs" do
+      install!()
+
+      # A run cannot reference a graph version that was never published.
+      assert {:error, %Postgrex.Error{postgres: %{code: :foreign_key_violation} = pg}} =
+               insert_run(graph_hash: "unpublished")
+
+      assert pg.constraint == "docket_runs_graph_hash_fkey"
+
+      assert {:ok, _} = insert_run([])
+
+      # A referenced graph version cannot be deleted; an unreferenced one can.
+      insert_graph_version!("g_unused", "hash_unused")
+
+      assert {:error, %Postgrex.Error{postgres: %{code: :foreign_key_violation}}} =
+               TestRepo.query(
+                 "DELETE FROM docket_graph_versions WHERE graph_id = 'g1'",
+                 []
+               )
+
+      assert %{num_rows: 1} =
+               TestRepo.query!(
+                 "DELETE FROM docket_graph_versions WHERE graph_id = 'g_unused'",
+                 []
+               )
+
+      # An event cannot reference a missing run.
+      assert {:error, %Postgrex.Error{postgres: %{code: :foreign_key_violation} = pg}} =
+               insert_event("no_such_run", 1)
+
+      assert pg.constraint == "docket_events_run_id_fkey"
+
+      # Deleting a run cascades to its events.
+      {:ok, %{rows: [[run_id]]}} =
+        insert_run(status: "done", wake_at: nil, finished_at: DateTime.utc_now())
+
+      assert {:ok, _} = insert_event(run_id, 1)
+      assert {:ok, _} = insert_event(run_id, 2)
+
+      assert %{num_rows: 1} =
+               TestRepo.query!("DELETE FROM docket_runs WHERE run_id = $1", [run_id])
+
+      assert %{rows: [[0]]} =
+               TestRepo.query!("SELECT count(*) FROM docket_events WHERE run_id = $1", [run_id])
+    end
+
+    test "dispatch and poison-introspection scans use their partial indexes" do
+      install!()
+
+      ready_scan = """
+      SELECT id FROM docket_runs
+      WHERE status = 'running' AND poisoned_at IS NULL
+        AND claim_token IS NULL AND wake_at <= now()
+      ORDER BY wake_at, id
+      LIMIT 10
+      """
+
+      expired_scan = """
+      SELECT id FROM docket_runs
+      WHERE status = 'running' AND poisoned_at IS NULL
+        AND claim_token IS NOT NULL AND claimed_at < now() - interval '1 minute'
+      ORDER BY claimed_at, id
+      LIMIT 10
+      """
+
+      poison_scan = """
+      SELECT id FROM docket_runs
+      WHERE poisoned_at IS NOT NULL
+      ORDER BY poisoned_at
+      """
+
+      assert explain(ready_scan) =~ "docket_runs_wake_at_id_index"
+      assert explain(expired_scan) =~ "docket_runs_claimed_at_id_index"
+      assert explain(poison_scan) =~ "docket_runs_poisoned_at_index"
+    end
+
+    defp install! do
+      assert :ok = Ecto.Migrator.up(TestRepo, @migration_version, InstallDocket, log: false)
     end
 
     defp assert_row_round_trip do
@@ -129,18 +328,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  graph_hash: "abc123",
                  status: :running,
                  input: %{"prompt" => "hello"},
-                 state: %{"channels" => %{}, "version" => 1}
+                 state: %{"channels" => %{}, "version" => 1},
+                 started_at: now,
+                 wake_at: now
                }
                |> Docket.Postgres.Schemas.Run.changeset()
                |> TestRepo.insert()
 
-      assert run.operational_status == :active
       assert run.metadata == %{}
       assert run.step == 0
       assert run.checkpoint_seq == 0
-      assert run.attempts == 0
+      assert run.claim_attempts == 0
+      assert run.poisoned_at == nil
+      assert run.poison_reason == nil
       assert run.tenant_id == nil
       assert run.output == nil
+      assert run.failure == nil
 
       assert {:error, changeset} =
                %{
@@ -149,7 +352,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  graph_hash: "abc123",
                  status: :running,
                  input: %{"prompt" => "hello"},
-                 state: %{"channels" => %{}, "version" => 1}
+                 state: %{"channels" => %{}, "version" => 1},
+                 started_at: now,
+                 wake_at: now
                }
                |> Docket.Postgres.Schemas.Run.changeset()
                |> TestRepo.insert()
@@ -166,6 +371,100 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                }
                |> Docket.Postgres.Schemas.Event.changeset()
                |> TestRepo.insert()
+    end
+
+    # Inserts a docket_runs row through raw SQL — bypassing changesets on
+    # purpose — as a ready `running` row unless overridden. Publishes the
+    # referenced graph version on first use. Returns the run_id row on
+    # success.
+    defp insert_run(overrides, prefix \\ "public") do
+      now = DateTime.utc_now()
+      ensure_graph_version(prefix)
+
+      base = %{
+        run_id: "run_#{System.unique_integer([:positive])}",
+        tenant_id: nil,
+        graph_id: "g1",
+        graph_hash: "abc123",
+        status: "running",
+        step: 0,
+        input: %{},
+        output: nil,
+        failure: nil,
+        metadata: %{},
+        state: %{"channels" => %{}, "version" => 1},
+        checkpoint_seq: 0,
+        latest_checkpoint_type: nil,
+        claim_token: nil,
+        claimed_at: nil,
+        wake_at: now,
+        claim_attempts: 0,
+        poisoned_at: nil,
+        poison_reason: nil,
+        inserted_at: now,
+        started_at: now,
+        updated_at: now,
+        finished_at: nil
+      }
+
+      row = Map.merge(base, Map.new(overrides))
+      columns = Map.keys(base)
+      placeholders = Enum.map_join(1..length(columns), ", ", &"$#{&1}")
+
+      TestRepo.query(
+        """
+        INSERT INTO #{prefix}.docket_runs (#{Enum.join(columns, ", ")})
+        VALUES (#{placeholders})
+        RETURNING run_id
+        """,
+        Enum.map(columns, &Map.fetch!(row, &1))
+      )
+    end
+
+    defp insert_event(run_id, seq) do
+      now = DateTime.utc_now()
+
+      TestRepo.query(
+        """
+        INSERT INTO docket_events
+          (run_id, seq, type, step, payload, metadata, occurred_at, inserted_at)
+        VALUES ($1, $2, 'node_completed', 0, '{}', '{}', $3, $3)
+        """,
+        [run_id, seq, now]
+      )
+    end
+
+    defp ensure_graph_version(prefix) do
+      insert_graph_version!("g1", "abc123", prefix)
+    end
+
+    defp insert_graph_version!(graph_id, graph_hash, prefix \\ "public") do
+      TestRepo.query!(
+        """
+        INSERT INTO #{prefix}.docket_graph_versions (graph_id, graph_hash, graph, inserted_at)
+        VALUES ($1, $2, '{}', $3)
+        ON CONFLICT DO NOTHING
+        """,
+        [graph_id, graph_hash, DateTime.utc_now()]
+      )
+    end
+
+    defp uuid, do: Ecto.UUID.dump!(Ecto.UUID.generate())
+
+    # SET LOCAL and EXPLAIN must run on the same pooled connection, so both
+    # happen inside one transaction. Seq scans are disabled because the
+    # planner never picks an index on an empty table otherwise.
+    defp explain(sql) do
+      {:ok, plan} =
+        TestRepo.transaction(fn ->
+          TestRepo.query!("SET LOCAL enable_seqscan = off")
+
+          %{rows: rows} = TestRepo.query!("EXPLAIN #{sql}")
+
+          Enum.map_join(rows, "\n", &List.first/1)
+        end)
+
+      plan
     end
 
     defp tables(schema) do
