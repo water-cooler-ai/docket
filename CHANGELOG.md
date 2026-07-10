@@ -104,6 +104,18 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   Retried attempts' `:node_failed` events now ride the `:retry_scheduled`
   checkpoint that recorded them instead of the eventual barrier checkpoint
   (DCKT-30, #18).
+- Postgres v01 schema finalized to spec revision 8 (amended in place —
+  0.1.0 is unreleased): `claim_attempts` / `poisoned_at` / `poison_reason`
+  replace `attempts` / `operational_status` / `operational_error`, `failure`
+  is promoted to a jsonb column, and `started_at` is non-null. Lifecycle
+  CHECK constraints make the status/failure/schedule/claim/poison tuple
+  authoritative even for raw claim SQL; a composite delete-restricted FK
+  keeps every retained run's exact graph version, and a delete-cascaded FK
+  keeps events from outliving their run. The single `wake_at` and
+  `operational_status` indexes become the ready-unclaimed `(wake_at, id)`,
+  expired-claim `(claimed_at, id)`, and poison-introspection partial
+  indexes behind positive dispatch eligibility (`status = 'running' AND
+  poisoned_at IS NULL`) (DCKT-29).
 
 ### Removed
 
