@@ -2,6 +2,18 @@
 
 Date: 2026-07-09
 
+Amended: 2026-07-10 by operational spec lock amendment 1. Durable identity is
+`{graph_id, graph_hash}` over an effective canonical graph with node schema
+defaults materialized before hashing. Compiled runtime graphs are node-local,
+ephemeral values compiled once per vehicle claim and reused for that drain;
+compiler ABI and distributed compiled artifacts are not run identity.
+Local compilation validates an effective document but never adds defaults
+introduced after publication; those require a new publication and graph hash.
+`max_supersteps` remains optional: unbounded cyclic jobs are valid. A graph
+policy limit changes graph identity; a host runtime limit does not. DCKT-34 owns the
+amendment and DCKT-35 owns the unresolved pre-execution compilation-failure
+claim disposition.
+
 Scope: DCKT-1 and all 29 descendant issues, the operational transition spec,
 the active DCKT-8 branch, the v0.1 migration/schema, runtime lifecycle code,
 and the storage conformance backend.
@@ -57,15 +69,18 @@ eligibility, attempt accounting, or a second poison mutation.
 
 ### One lifecycle composer
 
-`Docket.Lifecycle` owns the three transaction recipes:
+`Docket.Lifecycle` owns the three run/event transaction recipes:
 
-- start: graph save + initialized run insert + retained events;
+- start: initialized run insert + retained events;
 - advance: fenced run commit + retained events; and
 - signal: serialized run mutation + retained events.
 
 Stores never call other stores. Facades, vehicles, and durable test drivers
 delegate to the same composer. `Docket.Postgres.Storage` remains a transaction
 boundary only.
+
+Graph publication is a separate explicit transaction before start. It stores
+the effective canonical graph document; lifecycle never writes graph data.
 
 ### Runtime produces moments, not committed checkpoints
 
@@ -267,8 +282,8 @@ transactional conformance under overlap.
 
 - **DCKT-12:** one backend bundle and named `Docket.Lifecycle`; explicit scope;
   separate committer/observer configuration; `inspect_run`/poisoned await.
-- **DCKT-14:** stores/codecs only; no start-orchestration ownership and no
-  compiled graph cache. Document/measure input-channel duplication for v0.1.
+- **DCKT-14:** stores/codecs only; no start-orchestration or compilation
+  ownership. Document/measure input-channel duplication for v0.1.
 - **DCKT-15:** fold into RunStore claim aggregate (or rename as the full claim
   capability); atomically return claimed versus poisoned leases.
 - **DCKT-16:** consume runtime moments; mandatory token; assigned event
@@ -279,7 +294,9 @@ transactional conformance under overlap.
   composer owns signal transaction.
 - **DCKT-19:** RunStore issues transactional `pg_notify`; PostgreSQL delivers
   after commit. Poll remains correctness.
-- **DCKT-20:** vehicle owns propose/commit/continue loop and runtime graph cache.
+- **DCKT-20:** vehicle fetches and compiles the effective document once per
+  claim, then owns propose/commit/continue and reuses that runtime graph for
+  the drain. A release-scoped node-local cache is optional only.
 - **DCKT-21:** events cannot outlive runs; event retention is capped by run
   retention; graph pruning follows run deletion.
 - **DCKT-24:** each moment uses the production logical transaction boundary;
