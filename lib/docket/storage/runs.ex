@@ -124,11 +124,6 @@ defmodule Docket.Storage.Runs do
   Reads the last committed graph-run document under an explicit scope.
 
   An unknown run or scope mismatch returns `{:error, :not_found}`.
-
-  Proposal shape and exact-next-sequence validation happen before storage
-  lookup. A malformed proposal therefore returns `:invalid_commit` even when
-  its run id would not be visible under the supplied scope; valid proposals
-  still return `:not_found` for an unknown or out-of-scope run.
   """
   @callback fetch_run(ctx(), scope(), run_id :: String.t()) ::
               {:ok, Docket.Run.t()} | {:error, :not_found}
@@ -215,7 +210,12 @@ defmodule Docket.Storage.Runs do
   code appends the proposal's already-assigned events through
   `Docket.Storage.Events` in the same outer transaction.
 
-  An unknown run or scope mismatch returns `{:error, :not_found}`.
+  An unknown run or scope mismatch returns `{:error, :not_found}`. Proposal
+  shape and exact-next-sequence validation happen before any run lookup, so
+  `:invalid_commit` precedes `:not_found`: a malformed proposal returns
+  `:invalid_commit` even when its run id would not be visible under the
+  supplied scope, and only valid proposals return `:not_found` for an unknown
+  or out-of-scope run.
   """
   @callback commit(ctx(), scope(), commit_proposal()) ::
               {:ok, Docket.Run.t()}
