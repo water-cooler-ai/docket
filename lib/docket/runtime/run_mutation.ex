@@ -18,6 +18,8 @@ defmodule Docket.Runtime.RunMutation do
   @type mutation_result :: {:ok, Moment.t()} | {:error, Error.t()}
   @type cancellation_result :: mutation_result() | {:unchanged, Run.t()}
 
+  @durable_active [:running, :waiting]
+
   @doc """
   Resolves an open interrupt and proposes an immediate wake.
 
@@ -32,12 +34,8 @@ defmodule Docket.Runtime.RunMutation do
       Run.terminal?(run) ->
         inactive_run(run, "resumed")
 
-      run.status not in [:running, :waiting] ->
-        {:error,
-         Error.new(
-           :invalid_run,
-           "run #{inspect(run.id)} has non-durable status #{inspect(run.status)}"
-         )}
+      run.status not in @durable_active ->
+        non_durable_run(run)
 
       match?({:ok, %InterruptState{status: :resolved}}, Map.fetch(run.interrupts, interrupt_id)) ->
         {:error, Error.new(:already_resolved, "interrupt #{inspect(interrupt_id)} is resolved")}
@@ -85,7 +83,7 @@ defmodule Docket.Runtime.RunMutation do
               end)
 
           {:ok,
-           moment(
+           Moment.propose(
              proposed,
              :interrupt_resolved,
              entries,
@@ -106,11 +104,10 @@ defmodule Docket.Runtime.RunMutation do
   def cancel_run(%Run{status: :cancelled} = run, %DateTime{}), do: {:unchanged, run}
 
   def cancel_run(%Run{status: status} = run, %DateTime{} = now)
-      when status in [:running, :waiting] do
+      when status in @durable_active do
     proposed = %{
       run
       | status: :cancelled,
-        failure: nil,
         finished_at: now,
         updated_at: now,
         active_tasks: %{},
@@ -120,19 +117,14 @@ defmodule Docket.Runtime.RunMutation do
 
     entries = [entry(:run_cancelled, proposed.step, payload: %{})]
 
-    {:ok, moment(proposed, :run_cancelled, entries, {:park, :terminal, :run_cancelled}, now)}
+    {:ok,
+     Moment.propose(proposed, :run_cancelled, entries, {:park, :terminal, :run_cancelled}, now)}
   end
 
   def cancel_run(%Run{status: status} = run, %DateTime{}) when status in [:done, :failed],
     do: inactive_run(run, "cancelled")
 
-  def cancel_run(%Run{} = run, %DateTime{}) do
-    {:error,
-     Error.new(
-       :invalid_run,
-       "run #{inspect(run.id)} has non-durable status #{inspect(run.status)}"
-     )}
-  end
+  def cancel_run(%Run{} = run, %DateTime{}), do: non_durable_run(run)
 
   defp durable_resolution(value) do
     case Wire.dump_value(value) do
@@ -174,11 +166,15 @@ defmodule Docket.Runtime.RunMutation do
      Error.new(:inactive_run, "run #{inspect(run.id)} is #{run.status} and cannot be #{action}")}
   end
 
-  defp entry(type, step, opts) do
-    Moment.event_entry(type, step, opts)
+  defp non_durable_run(run) do
+    {:error,
+     Error.new(
+       :invalid_run,
+       "run #{inspect(run.id)} has non-durable status #{inspect(run.status)}"
+     )}
   end
 
-  defp moment(run, type, entries, disposition, now) do
-    Moment.propose(run, type, entries, disposition, now)
+  defp entry(type, step, opts) do
+    Moment.event_entry(type, step, opts)
   end
 end
