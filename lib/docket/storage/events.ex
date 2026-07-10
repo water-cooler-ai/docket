@@ -19,8 +19,8 @@ defmodule Docket.Storage.Events do
   event rather than storing it under the supplied run.
 
   Event identities are assigned before this callback. The store never derives
-  a sequence with `MAX(seq)`, never substitutes the run's checkpoint sequence,
-  and accepts gaps left by persistence filtering. In particular,
+  a sequence from the maximum already-stored sequence, never substitutes the
+  run's checkpoint sequence, and accepts gaps left by persistence filtering. In particular,
   `:checkpoint_committed` is an ordinary assigned event at this boundary.
 
   For a non-empty append, `scope` is checked through the owning run and a
