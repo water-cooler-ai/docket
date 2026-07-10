@@ -8,6 +8,7 @@ defmodule Docket.TelemetryTest do
     [:docket, :run, :initialized],
     [:docket, :run, :completed],
     [:docket, :run, :failed],
+    [:docket, :checkpoint, :committed],
     [:docket, :node, :completed],
     [:docket, :node, :failed],
     [:docket, :channel, :updated],
@@ -51,7 +52,7 @@ defmodule Docket.TelemetryTest do
     end
   end
 
-  test "a completed run emits lifecycle, node, channel, and edge events" do
+  test "a completed run emits lifecycle, checkpoint, node, channel, and edge events" do
     assert {:ok, run, _checkpoints} =
              Docket.Test.run_inline(Graphs.minimal_linear(), %{"value" => "x"})
 
@@ -60,10 +61,11 @@ defmodule Docket.TelemetryTest do
     names = Enum.map(events, fn {name, _measurements, _metadata} -> name end)
 
     assert [:docket, :run, :initialized] == hd(names)
-    assert List.last(names) == [:docket, :run, :completed]
+    assert List.last(names) == [:docket, :checkpoint, :committed]
     assert [:docket, :node, :completed] in names
     assert [:docket, :channel, :updated] in names
     assert [:docket, :edge, :triggered] in names
+    assert Enum.count(names, &(&1 == [:docket, :checkpoint, :committed])) == 3
 
     {_name, measurements, metadata} =
       Enum.find(events, fn {name, _m, _md} -> name == [:docket, :node, :completed] end)
@@ -75,6 +77,15 @@ defmodule Docket.TelemetryTest do
     assert metadata.graph_hash == run.graph_hash
     assert metadata.node_id == "copy"
     assert %Docket.Event{type: :node_completed} = metadata.event
+
+    {_name, checkpoint_measurements, checkpoint_metadata} =
+      Enum.find(events, fn {name, _m, _md} ->
+        name == [:docket, :checkpoint, :committed]
+      end)
+
+    assert checkpoint_measurements.seq == checkpoint_metadata.event.seq
+    assert checkpoint_metadata.event.metadata["checkpoint_seq"] == 1
+    assert checkpoint_metadata.event.metadata["checkpoint_type"] == "run_initialized"
   end
 
   test "failed runs and interrupts emit their events" do
@@ -83,7 +94,8 @@ defmodule Docket.TelemetryTest do
 
     names = Enum.map(received_events(run.id), fn {name, _m, _md} -> name end)
     assert [:docket, :node, :failed] in names
-    assert List.last(names) == [:docket, :run, :failed]
+    assert [:docket, :run, :failed] in names
+    assert List.last(names) == [:docket, :checkpoint, :committed]
 
     assert {:ok, run, _} = Docket.Test.run_inline(Graphs.interrupt_review(), %{})
     assert run.status == :waiting
@@ -103,7 +115,8 @@ defmodule Docket.TelemetryTest do
 
     names = Enum.map(received_events(run.id), fn {name, _m, _md} -> name end)
     assert [:docket, :interrupt, :resolved] in names
-    assert List.last(names) == [:docket, :run, :completed]
+    assert [:docket, :run, :completed] in names
+    assert List.last(names) == [:docket, :checkpoint, :committed]
   end
 
   test "channel events never carry channel values" do

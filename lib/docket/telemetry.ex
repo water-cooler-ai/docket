@@ -16,6 +16,7 @@ defmodule Docket.Telemetry do
   | `[:docket, :run, :initialized]`     | `:run_initialized`     |
   | `[:docket, :run, :completed]`       | `:run_completed`       |
   | `[:docket, :run, :failed]`          | `:run_failed`          |
+  | `[:docket, :checkpoint, :committed]`| `:checkpoint_committed`|
   | `[:docket, :node, :completed]`      | `:node_completed`      |
   | `[:docket, :node, :failed]`         | `:node_failed`         |
   | `[:docket, :channel, :updated]`     | `:channel_updated`     |
@@ -35,6 +36,7 @@ defmodule Docket.Telemetry do
     run_initialized: [:docket, :run, :initialized],
     run_completed: [:docket, :run, :completed],
     run_failed: [:docket, :run, :failed],
+    checkpoint_committed: [:docket, :checkpoint, :committed],
     node_completed: [:docket, :node, :completed],
     node_failed: [:docket, :node, :failed],
     channel_updated: [:docket, :channel, :updated],

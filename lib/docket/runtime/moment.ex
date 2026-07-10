@@ -34,8 +34,12 @@ defmodule Docket.Runtime.Moment do
   | `{:park, :terminal, reason}` | the run is terminal; it never wakes again |
 
   `{:park, :immediate, reason}` is reserved for driver yield boundaries and
-  graph signals; no core transition produces it today. `checkpoint_metadata`
-  is likewise reserved and currently always empty.
+  graph signals; no core transition produces it today.
+
+  `checkpoint_metadata` is the JSON-safe identity envelope shared with the
+  moment's `:checkpoint_committed` event. It records the checkpoint fence,
+  checkpoint type, committed graph step, park reason, wake disposition, and
+  any active retry-superstep/attempt identity.
 
   Disposition is decided by the runtime core; storage contracts receive
   only the schedule effect a lifecycle composer derives from it.
@@ -50,6 +54,7 @@ defmodule Docket.Runtime.Moment do
     :checkpoint_type,
     :disposition,
     :proposed_at,
+    pending_attempts: [],
     checkpoint_metadata: %{}
   ]
 
@@ -63,7 +68,8 @@ defmodule Docket.Runtime.Moment do
           checkpoint_type: Checkpoint.type(),
           checkpoint_metadata: map(),
           disposition: disposition(),
-          proposed_at: DateTime.t()
+          proposed_at: DateTime.t(),
+          pending_attempts: [Docket.Run.PendingWrite.t()]
         }
 
   @doc """
@@ -93,11 +99,190 @@ defmodule Docket.Runtime.Moment do
   """
   @spec context(t(), map()) :: Checkpoint.Context.t()
   def context(%__MODULE__{} = moment, application \\ %{}) do
+    identity = identity(moment.run, moment.events, moment.pending_attempts)
+
     %Checkpoint.Context{
       run_id: moment.run.id,
       graph_id: moment.run.graph_id,
       graph_hash: moment.run.graph_hash,
+      checkpoint_seq: moment.run.checkpoint_seq,
+      graph_step: moment.run.step,
+      active_superstep: identity.active_superstep,
+      node_attempts: identity.node_attempts,
       application: application
+    }
+  end
+
+  @doc false
+  @spec checkpoint_metadata(
+          Docket.Run.t(),
+          [Docket.Event.t()],
+          Checkpoint.type(),
+          disposition(),
+          [Docket.Run.PendingWrite.t()]
+        ) :: map()
+  def checkpoint_metadata(
+        run,
+        runtime_events,
+        checkpoint_type,
+        disposition,
+        new_pending_attempts \\ []
+      ) do
+    identity = identity(run, runtime_events, new_pending_attempts)
+    {wake_disposition, park_reason} = disposition_metadata(disposition)
+
+    %{
+      "checkpoint_seq" => run.checkpoint_seq,
+      "checkpoint_type" => Atom.to_string(checkpoint_type),
+      "graph_step" => run.step,
+      "park_reason" => park_reason,
+      "wake_disposition" => wake_disposition,
+      "active_superstep" => dump_active_superstep(identity.active_superstep),
+      "node_attempts" => Enum.map(identity.node_attempts, &dump_node_attempt/1)
+    }
+  end
+
+  defp identity(run, events, new_pending_writes) do
+    active_tasks = active_tasks(run)
+    pending_attempts = pending_attempts(run.pending_writes)
+    new_pending_attempts = pending_attempts(new_pending_writes)
+
+    %{
+      active_superstep:
+        case {active_tasks, pending_attempts} do
+          {[], []} -> nil
+          {tasks, pending} -> %{step: run.step, tasks: tasks, pending_attempts: pending}
+        end,
+      node_attempts: node_attempts(events, active_tasks, new_pending_attempts)
+    }
+  end
+
+  defp active_tasks(run) do
+    run.active_tasks
+    |> Map.values()
+    |> Enum.sort_by(&{&1.node_id, &1.task_id})
+    |> Enum.map(fn task ->
+      %{
+        task_id: task.task_id,
+        node_id: task.node_id,
+        scheduled_attempt: task.attempt,
+        idempotency_key: task.idempotency_key
+      }
+    end)
+  end
+
+  defp pending_attempts(pending_writes) do
+    pending_writes
+    |> Enum.sort_by(&{&1.node_id, &1.task_id})
+    |> Enum.map(fn pending ->
+      %{
+        task_id: pending.task_id,
+        node_id: pending.node_id,
+        attempted: pending.attempt,
+        kind: pending.kind,
+        idempotency_key: Docket.Run.TaskState.idempotency_key(pending.task_id, pending.attempt)
+      }
+    end)
+  end
+
+  defp node_attempts(events, active_tasks, pending_attempts) do
+    scheduled = Map.new(active_tasks, &{&1.task_id, &1.scheduled_attempt})
+
+    committed =
+      events
+      |> Enum.filter(&(&1.type in [:node_completed, :node_failed, :interrupt_requested]))
+      |> Enum.flat_map(fn event ->
+        case event.payload do
+          %{"attempt" => attempt} when is_integer(attempt) and attempt > 0 ->
+            [
+              %{
+                task_id: event.task_id,
+                node_id: event.node_id,
+                attempted: attempt,
+                outcome: attempt_outcome(event.type),
+                next_scheduled_attempt: Map.get(scheduled, event.task_id)
+              }
+            ]
+
+          _other ->
+            []
+        end
+      end)
+
+    committed_ids = MapSet.new(committed, & &1.task_id)
+
+    pending =
+      pending_attempts
+      |> Enum.reject(&MapSet.member?(committed_ids, &1.task_id))
+      |> Enum.map(fn pending ->
+        %{
+          task_id: pending.task_id,
+          node_id: pending.node_id,
+          attempted: pending.attempted,
+          outcome: if(pending.kind == :update, do: :pending_update, else: :pending_interrupt),
+          next_scheduled_attempt: nil
+        }
+      end)
+
+    committed ++ pending
+  end
+
+  defp attempt_outcome(:node_completed), do: :completed
+  defp attempt_outcome(:node_failed), do: :failed
+  defp attempt_outcome(:interrupt_requested), do: :interrupted
+
+  defp disposition_metadata(:continue), do: {"continue", nil}
+
+  defp disposition_metadata({:park, :immediate, reason}),
+    do: {"immediate", metadata_reason(reason)}
+
+  defp disposition_metadata({:park, :external, reason}),
+    do: {"external", metadata_reason(reason)}
+
+  defp disposition_metadata({:park, {:at, %DateTime{}}, reason}),
+    do: {"at", metadata_reason(reason)}
+
+  defp disposition_metadata({:park, :terminal, reason}),
+    do: {"terminal", metadata_reason(reason)}
+
+  defp metadata_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp metadata_reason(reason) when is_binary(reason), do: reason
+  defp metadata_reason(reason), do: inspect(reason)
+
+  defp dump_active_superstep(nil), do: nil
+
+  defp dump_active_superstep(%{step: step, tasks: tasks, pending_attempts: pending_attempts}) do
+    %{
+      "graph_step" => step,
+      "tasks" =>
+        Enum.map(tasks, fn task ->
+          %{
+            "task_id" => task.task_id,
+            "node_id" => task.node_id,
+            "scheduled_attempt" => task.scheduled_attempt,
+            "idempotency_key" => task.idempotency_key
+          }
+        end),
+      "pending_attempts" =>
+        Enum.map(pending_attempts, fn pending ->
+          %{
+            "task_id" => pending.task_id,
+            "node_id" => pending.node_id,
+            "attempted" => pending.attempted,
+            "kind" => Atom.to_string(pending.kind),
+            "idempotency_key" => pending.idempotency_key
+          }
+        end)
+    }
+  end
+
+  defp dump_node_attempt(attempt) do
+    %{
+      "task_id" => attempt.task_id,
+      "node_id" => attempt.node_id,
+      "attempted" => attempt.attempted,
+      "outcome" => Atom.to_string(attempt.outcome),
+      "next_scheduled_attempt" => attempt.next_scheduled_attempt
     }
   end
 end

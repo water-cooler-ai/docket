@@ -48,6 +48,12 @@ defmodule Docket.Test.InlineRuntimeTest do
       for checkpoint <- checkpoints do
         assert %Docket.Run{} = checkpoint.run
         assert checkpoint.run.checkpoint_seq == checkpoint.seq
+
+        assert [%Docket.Event{type: :checkpoint_committed} = fact] =
+                 Enum.filter(checkpoint.events, &(&1.type == :checkpoint_committed))
+
+        assert fact == List.last(checkpoint.events)
+        assert fact.metadata == checkpoint.metadata
       end
     end
 
