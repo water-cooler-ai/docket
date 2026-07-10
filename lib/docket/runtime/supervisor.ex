@@ -13,7 +13,9 @@ defmodule Docket.Runtime.Supervisor do
 
   `:name` is required and becomes the runtime identity passed to
   `Docket.run/4` and friends. All other options are stored as the instance's
-  default run options and merged under per-call options.
+  default run options and merged under per-call options. A configured
+  `storage: BackendModule` contributes its own supervised child and is the
+  only public storage substitution point; individual stores cannot be mixed.
 
   The tree owns a unique registry (one active `Docket.Runtime` per run ID),
   a `Task.Supervisor` for node tasks and async checkpoint delivery, and a
@@ -42,17 +44,67 @@ defmodule Docket.Runtime.Supervisor do
 
   @impl true
   def init({name, defaults}) do
-    children = [
-      RuntimeRegistry.child_spec(name),
-      defaults_child(name, defaults),
-      {Task.Supervisor, name: task_supervisor(name)},
-      {DynamicSupervisor, name: run_supervisor(name), strategy: :one_for_one}
-    ]
+    {backend_children, defaults} = backend_children(name, defaults)
+
+    children =
+      [RuntimeRegistry.child_spec(name)] ++
+        backend_children ++
+        [
+          defaults_child(name, defaults),
+          {Task.Supervisor, name: task_supervisor(name)},
+          {DynamicSupervisor, name: run_supervisor(name), strategy: :one_for_one}
+        ]
 
     # If the registry dies, running Runtime processes are unreachable
     # orphans; restart the whole tree and let hosts resume runs from their
     # latest checkpoints.
     Supervisor.init(children, strategy: :one_for_all)
+  end
+
+  defp backend_children(name, defaults) do
+    reject_component_configuration!(defaults)
+
+    case Keyword.get(defaults, :storage) do
+      nil ->
+        {[], defaults}
+
+      backend when is_atom(backend) ->
+        validate_backend!(backend)
+        backend_opts = Keyword.put(defaults, :name, Module.concat(name, Storage))
+        context = Docket.Backend.resolve_context(backend, backend_opts)
+        {[backend.child_spec(backend_opts)], Keyword.put(defaults, :storage_context, context)}
+
+      other ->
+        raise ArgumentError, ":storage must be one Docket.Backend module, got: #{inspect(other)}"
+    end
+  end
+
+  defp reject_component_configuration!(defaults) do
+    forbidden =
+      [:transaction, :graph_store, :run_store, :event_store, :coordinator]
+      |> Enum.filter(&Keyword.has_key?(defaults, &1))
+
+    if forbidden != [] do
+      raise ArgumentError,
+            "configure one :storage backend bundle, not individual components: " <>
+              Enum.map_join(forbidden, ", ", &inspect/1)
+    end
+  end
+
+  defp validate_backend!(backend) do
+    Code.ensure_loaded?(backend) ||
+      raise ArgumentError, ":storage module #{inspect(backend)} could not be loaded"
+
+    missing =
+      for {name, arity} <- [storage: 0, graphs: 0, runs: 0, events: 0, child_spec: 1],
+          not function_exported?(backend, name, arity),
+          do: "#{name}/#{arity}"
+
+    if missing != [] do
+      raise ArgumentError,
+            ":storage module #{inspect(backend)} does not implement Docket.Backend; " <>
+              "missing #{Enum.join(missing, ", ")}"
+    end
   end
 
   # Stores the instance defaults as registry metadata synchronously during

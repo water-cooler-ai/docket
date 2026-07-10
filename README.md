@@ -140,6 +140,44 @@ run = Docket.Run.from_map!(stored_run_map)
 {:ok, run} = MyApp.Docket.resume(graph, run)
 ```
 
+### Durable backend facade
+
+A durable host configures one compatible backend bundle rather than mixing
+transaction and store modules:
+
+```elixir
+defmodule MyApp.DurableDocket do
+  use Docket,
+    storage: MyApp.DocketBackend,
+    tenant_mode: :required,
+    checkpoint_observers: [MyApp.DocketObserver]
+end
+
+{:ok, graph_ref} = MyApp.DurableDocket.save_graph(graph)
+
+{:ok, run} =
+  MyApp.DurableDocket.start_run(graph_ref, input,
+    tenant_id: account.id,
+    metadata: %{"workflow_id" => workflow.id}
+  )
+
+{:ok, run} = MyApp.DurableDocket.fetch_run(run.id, tenant_id: account.id)
+{:ok, info} = MyApp.DurableDocket.inspect_run(run.id, tenant_id: account.id)
+```
+
+`save_graph` validates and compiles the graph before storing its canonical,
+content-addressed document. `start_run` accepts only the returned stable
+reference, fetches the saved document, and compiles it for execution; starting
+a run never republishes the graph. The operational facade also provides
+`resolve_interrupt`, `cancel_run`,
+`retry_poisoned_run`, and bounded `await_run`. `tenant_mode: :none` permits
+only tenantless rows; `tenant_mode: :required` requires a non-empty
+`tenant_id` before storage access. Durable `checkpoint_observers:` run after
+commit, are best-effort, and cannot veto state. The legacy `checkpoint:`
+callback remains the veto-capable committer for the storage-free supervised
+driver. Durable consumers that cannot tolerate lost or duplicate delivery
+should consume retained events instead of observer callbacks.
+
 ## Human-in-the-loop interrupts
 
 A node pauses the run by returning an interrupt naming the state field the

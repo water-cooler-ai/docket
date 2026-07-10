@@ -140,8 +140,10 @@ capping llm work independently — is a post-v1 concern that arrives with
 Application code defines nodes and graphs, then starts or signals runs:
 
 ```elixir
+{:ok, graph_ref} = MyApp.Docket.save_graph(graph)
+
 {:ok, run} =
-  MyApp.Docket.start_run(graph, input,
+  MyApp.Docket.start_run(graph_ref, input,
     tenant_id: account.id,
     metadata: %{"workflow_id" => workflow.id}
   )
@@ -355,23 +357,24 @@ operation the release defines — publish upsert, recovery load, prune
 retention — is keyed by `(graph_id, graph_hash)` and touches only version
 rows. A parent table earns its place when graph-level data exists (a
 latest-version pointer, listing, graph-level ownership), which arrives with
-the explicit publish/version-management API post-`0.1.0`; adding it then is a
-purely additive migration.
+graph catalog/version-management APIs post-`0.1.0`; adding it then is a purely
+additive migration.
 
-Publishing is implicit and content-addressed. `start_run(graph, input)` calls
-the graph store's simple `save_graph` operation with the canonical
-`Docket.Graph.to_map/1` document keyed by `graph_id + graph_hash` (the hash
-already exists in core). It does so inside the same backend transaction in
-which the run store inserts the run and the event store appends initialization
-events. Postgres implements `save_graph` with `ON CONFLICT DO NOTHING`. Two
-nodes racing to publish the same version both succeed idempotently. If the
-existing document under that key is not structurally equal to the canonical
-JSON document, `save_graph` returns a
-graph-content conflict rather than treating the conflict clause as proof that
-the content matched. Recovery uses the corresponding `fetch_graph` operation.
-No separate publish workflow is required for `0.1.0`; an explicit
-publish/version-management API can arrive with graph tooling later without
-changing this contract.
+Publishing is explicit and content-addressed. `save_graph(graph)` validates
+and compiles the graph, then stores the canonical `Docket.Graph.to_map/1`
+document keyed by `graph_id + graph_hash` and returns a stable graph reference.
+Postgres implements `save_graph` with `ON CONFLICT DO NOTHING`. Two nodes racing
+to publish the same version both succeed idempotently. If the existing document
+under that key is not structurally equal to the canonical JSON document,
+`save_graph` returns a graph-content conflict rather than treating the conflict
+clause as proof that the content matched.
+
+`start_run(graph_ref, input)` fetches the already-saved canonical document and
+compiles it for execution before entering the run/event lifecycle transaction.
+It never writes the graph store. Recovery uses the same `fetch_graph`
+operation. The canonical document remains the portable storage contract; a
+vehicle/runtime graph cache may retain the derived `Docket.Runtime.Graph`, but
+the internal executable struct is not a graph-store document.
 
 ### `docket_runs`
 
@@ -1090,9 +1093,9 @@ separate best-effort `checkpoint_observers` configuration after commit.
 
 ```text
 validate tenant and graph access
+fetch the canonical graph by graph reference and compile/cache it
 Docket.Lifecycle.start(backend, scope, fn tx ->
   calculate initialized runtime moment without handler delivery
-  Graphs.save_graph(tx, canonical graph version)
   Runs.insert_run(tx, initialized run with :immediate disposition)
   Events.append_events(tx, assigned :run_initialized runtime fact +
     :checkpoint_committed metadata fact, subject to event policy)
@@ -1237,7 +1240,8 @@ The `0.1.0` operational API should introduce names that make durable lifecycle
 clear:
 
 ```elixir
-MyApp.Docket.start_run(graph, input, opts)
+MyApp.Docket.save_graph(graph, opts)
+MyApp.Docket.start_run(graph_ref, input, opts)
 MyApp.Docket.resolve_interrupt(run_id, interrupt_id, value, opts)
 MyApp.Docket.cancel_run(run_id, opts)
 MyApp.Docket.retry_poisoned_run(run_id, opts)
@@ -1364,10 +1368,12 @@ The 0.1.0 implementation should include:
   its transaction context. The run row codec maps promoted columns plus
   `state` to `Docket.Run`. `GraphStore` returns canonical documents only; a
   vehicle/runtime graph cache owns compilation.
-- `Docket.Lifecycle` start orchestration that composes `Graphs.save_graph`,
-  `Runs.insert_run`, and `Events.append_events` inside one storage transaction,
-  verifying/inserting the canonical graph, initialized run, initial
-  assigned initialization and `:checkpoint_committed` events, and wake atomically.
+- An explicit `save_graph` facade that validates/compiles and stores the
+  canonical content-addressed graph document, returning a stable reference.
+- `Docket.Lifecycle` start orchestration that composes `Runs.insert_run` and
+  `Events.append_events` inside one storage transaction, inserting the
+  initialized run, assigned initialization and `:checkpoint_committed` events,
+  and wake atomically. Lifecycle never publishes a graph document.
 - RunStore atomic batched `claim_due` for separately ordered ready and expired
   paths, including a fenced candidate LIMIT, combined demand bound,
   claim-attempt accounting, poison disposition, refresh, and token-guarded

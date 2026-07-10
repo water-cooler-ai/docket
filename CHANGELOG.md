@@ -105,6 +105,21 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   `:run_cancelled` checkpoint/event fact; repeated cancellation returns an
   explicit unchanged result with the stored run and consumes no sequences
   (DCKT-9).
+- `Docket.Lifecycle`, the substrate-neutral owner of atomic run/event start,
+  claim-fenced moment commit, and serialized signal/event transaction recipes,
+  including the complete runtime-disposition to storage-schedule mapping
+  (DCKT-12).
+- Explicit content-addressed graph publication through `save_graph`, returning
+  a `Docket.GraphRef`; `start_run` accepts only that saved reference and never
+  writes the graph store (DCKT-12).
+- Durable operational facade functions: `start_run`, `fetch_run`,
+  `inspect_run`, `resolve_interrupt`, `cancel_run`, `retry_poisoned_run`, and
+  bounded `await_run`, with strict tenantless/required scope resolution and a
+  poisoned-run operational halt (DCKT-12).
+- `Docket.Checkpoint.Observer`, configured through separate
+  `checkpoint_observers:`, for isolated best-effort notification only after a
+  durable commit; the legacy `checkpoint:` callback remains the host-owned
+  veto-capable committer (DCKT-12).
 
 ### Changed
 

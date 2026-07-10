@@ -31,7 +31,7 @@ defmodule Docket.Runtime.Loop do
   # `Docket.run/4` and `Docket.Test.run_inline/3` so both entry points create
   # byte-identical initial runs.
   def build_initial_run(rtg, input, opts) do
-    config = Config.resolve(opts)
+    config = Config.resolve_moment(opts)
 
     %Run{
       id: Keyword.get(opts, :run_id) || config.id_generator.(:run),
@@ -77,7 +77,7 @@ defmodule Docket.Runtime.Loop do
   for an already-terminal run (nothing to commit), or `{:error, error}`.
   """
   def propose_init(rtg, %Run{} = run, opts) do
-    do_propose_init(rtg, run, Config.resolve(opts))
+    do_propose_init(rtg, run, Config.resolve_moment(opts))
   end
 
   defp do_propose_init(rtg, run, config) do
@@ -316,7 +316,7 @@ defmodule Docket.Runtime.Loop do
   Accepts the same `:resume_floor` option as `plan/3`.
   """
   def propose_advance(rtg, %Run{} = run, opts) do
-    config = Config.resolve(opts)
+    config = Config.resolve_moment(opts)
 
     case do_propose_plan(rtg, run, opts, config) do
       {:execute, run, activations} ->

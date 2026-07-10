@@ -30,6 +30,10 @@ defmodule Docket.Checkpoint do
   committed or the related public API reports success. Async checkpoints are
   delivered after the in-memory transition commits; their failure is
   observable but does not roll back the active run.
+
+  Durable `Docket.Checkpoint.Observer` callbacks receive checkpoints whose
+  delivery is `:observer`. They run only after a backend commit, are isolated
+  from the command result, and cannot veto state.
   """
 
   defstruct [:type, :delivery, :seq, :run, :created_at, events: [], metadata: %{}]
@@ -44,7 +48,7 @@ defmodule Docket.Checkpoint do
           | :run_failed
           | :run_cancelled
 
-  @type delivery :: :sync | :async
+  @type delivery :: :sync | :async | :observer
 
   @type t :: %__MODULE__{
           type: type(),

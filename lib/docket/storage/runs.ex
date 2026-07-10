@@ -9,8 +9,9 @@ defmodule Docket.Storage.Runs do
   independently configured stores because they mutate and fence the same
   aggregate.
 
-  Lifecycle code composes run writes with graph and event writes inside
-  `Docket.Storage.transaction/2`. This contract deliberately accepts neutral
+  Lifecycle code composes run and event writes inside
+  `Docket.Storage.transaction/2`; graph versions are saved separately before
+  a run can reference them. This contract deliberately accepts neutral
   run proposals and schedule effects, never `Docket.Checkpoint` or
   `Docket.Runtime.Moment` values. A successful outer transaction is the point
   at which the transition becomes durable.
@@ -98,9 +99,9 @@ defmodule Docket.Storage.Runs do
   That type becomes the latest checkpoint metadata, and `wake_at` is the
   run's first explicit schedule.
 
-  This callback writes only the run aggregate. `Docket.Lifecycle` saves the
-  graph and appends assigned initialization events in the same outer
-  transaction.
+  This callback writes only the run aggregate. `Docket.Lifecycle` appends
+  assigned initialization events in the same outer transaction; it never
+  publishes the already-saved graph version.
   """
   @callback insert_run(
               ctx(),

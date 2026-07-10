@@ -16,6 +16,17 @@ defmodule Docket do
       {:ok, run} = MyApp.Docket.run(graph, %{"topic" => "Durable graphs"})
       {:ok, current} = MyApp.Docket.get_run(run.id)
 
+  Durable hosts instead configure one backend bundle, save graph versions
+  explicitly, and use the operational API (`start_run`, storage-backed reads,
+  named signals, and `await_run`):
+
+      defmodule MyApp.DurableDocket do
+        use Docket,
+          storage: MyApp.DocketBackend,
+          tenant_mode: :required,
+          checkpoint_observers: [MyApp.DocketObserver]
+      end
+
   All run operations address the runtime instance plus `run_id`; Runtime
   PIDs never leave the library. `run/4` is a start barrier, not a completion
   barrier: it returns once the run is durably initialized through the
@@ -27,13 +38,17 @@ defmodule Docket do
   (see `Docket.Test` for the full list: `:checkpoint`, `:executor`,
   `:context`, determinism injection points, limits) plus `:run_id` /
   `:metadata` for fresh runs. Options given to the runtime instance at
-  startup act as defaults; per-call options win.
+  startup act as defaults; per-call options win except for the instance-owned
+  `:storage` and `:tenant_mode` boundaries. Public durable calls resolve only
+  `:tenantless` or an explicit `{:tenant, id}`; `:system` is reserved for
+  internal dispatch/recovery.
 
   For processless in-test execution of the same loop, use `Docket.Test`.
   """
 
-  alias Docket.{Error, Graph, Run}
+  alias Docket.{Error, Graph, GraphRef, Lifecycle, Run, RunInfo}
   alias Docket.Runtime.Loop
+  alias Docket.Runtime.RunMutation
   alias Docket.Runtime.Registry, as: RuntimeRegistry
 
   @doc """
@@ -62,10 +77,81 @@ defmodule Docket do
   """
   def run(runtime, graph, input, opts \\ []) do
     with {:ok, opts} <- instance_opts(runtime, opts),
+         :ok <- legacy_driver(opts),
          {:ok, rtg} <- ensure_compiled(graph, opts) do
       run = Loop.build_initial_run(rtg, input, opts)
       start_runtime(runtime, rtg, run, opts)
     end
+  end
+
+  @doc """
+  Saves one canonical, content-addressed graph version.
+
+  The graph is compiled first so invalid graphs never publish. Storage keeps
+  the canonical graph document; `start_run/4` loads and compiles that document
+  for execution.
+  """
+  def save_graph(runtime, graph, opts \\ [])
+
+  def save_graph(runtime, %Graph{} = graph, opts) do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, {backend, context}} <- configured_backend(opts),
+         {:ok, rtg} <- ensure_compiled(graph, opts),
+         {:ok, :saved} <-
+           backend.storage().transaction(context, fn tx ->
+             case backend.graphs().save_graph(
+                    tx,
+                    rtg.graph_id,
+                    rtg.graph_hash,
+                    Graph.to_map(graph)
+                  ) do
+               :ok -> {:ok, :saved}
+               {:error, reason} -> {:error, reason}
+             end
+           end) do
+      {:ok, %GraphRef{graph_id: rtg.graph_id, graph_hash: rtg.graph_hash}}
+    end
+  end
+
+  def save_graph(_runtime, graph, _opts) do
+    {:error, Error.new(:invalid_graph, "expected a Docket.Graph, got #{inspect(graph)}")}
+  end
+
+  @doc """
+  Starts a run from a previously saved graph reference.
+
+  The graph is fetched and compiled before the initialized run and assigned
+  events commit atomically. Durable checkpoint observers run only after that
+  commit; starting a run never publishes or changes a graph document.
+  """
+  def start_run(runtime, graph_ref, input, opts \\ [])
+
+  def start_run(runtime, %GraphRef{} = graph_ref, input, opts) do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, {backend, context} = backend_ref, scope} <- durable_access(opts),
+         {:ok, document} <-
+           backend.graphs().fetch_graph(
+             context,
+             graph_ref.graph_id,
+             graph_ref.graph_hash
+           ),
+         {:ok, graph} <- Graph.from_map(document),
+         {:ok, rtg} <- ensure_compiled(graph, opts),
+         :ok <- check_graph_ref(rtg, graph_ref),
+         run = Loop.build_initial_run(rtg, input, opts),
+         {:ok, moment} <- Loop.propose_init(rtg, run, opts),
+         {:ok, moment} <- Lifecycle.start(backend_ref, scope, moment) do
+      :ok = Lifecycle.after_commit(moment, opts)
+      {:ok, moment.run}
+    end
+  end
+
+  def start_run(_runtime, graph_ref, _input, _opts) do
+    {:error,
+     Error.new(
+       :invalid_graph_reference,
+       "durable start requires a Docket.GraphRef, got #{inspect(graph_ref)}"
+     )}
   end
 
   @doc """
@@ -80,6 +166,7 @@ defmodule Docket do
   """
   def resume(runtime, graph, %Run{} = run, opts \\ []) do
     with {:ok, opts} <- instance_opts(runtime, opts),
+         :ok <- legacy_driver(opts),
          {:ok, rtg} <- ensure_compiled(graph, opts),
          :ok <- check_graph_match(rtg, run) do
       if Run.terminal?(run) do
@@ -105,19 +192,85 @@ defmodule Docket do
   end
 
   @doc """
-  Resolves an open interrupt on an active run and schedules the next tick.
+  Resolves an open interrupt and schedules the next tick or durable wake.
 
   Returns `{:ok, run}` after the sync `:interrupt_resolved` checkpoint is
   accepted. Unknown or already-resolved interrupts return
   `{:error, %Docket.Error{type: :not_found}}`; so do runs with no active
-  Runtime. Authorization is host-owned and must happen before this call.
+  Runtime. With `storage:` configured, the stored canonical graph is loaded,
+  the pure mutation and its events commit atomically, and tenant scope is
+  enforced before storage access. Authorization remains host-owned.
   """
   def resolve_interrupt(runtime, run_id, interrupt_id, value, opts \\ []) do
-    _ = opts
+    case RuntimeRegistry.defaults(runtime) do
+      {:ok, defaults} when is_list(defaults) ->
+        if Keyword.has_key?(defaults, :storage) do
+          with {:ok, resolved} <- instance_opts(runtime, opts) do
+            durable_resolve_interrupt(resolved, run_id, interrupt_id, value)
+          end
+        else
+          call_active(runtime, run_id, fn pid ->
+            Docket.Runtime.resolve_interrupt(pid, interrupt_id, value)
+          end)
+        end
 
-    call_active(runtime, run_id, fn pid ->
-      Docket.Runtime.resolve_interrupt(pid, interrupt_id, value)
-    end)
+      :error ->
+        call_active(runtime, run_id, fn pid ->
+          Docket.Runtime.resolve_interrupt(pid, interrupt_id, value)
+        end)
+    end
+  end
+
+  @doc "Cancels a durable active run and confirms the committed terminal state."
+  def cancel_run(runtime, run_id, opts \\ []) do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, backend, scope} <- durable_access(opts),
+         now = operation_now(opts),
+         result <-
+           Lifecycle.signal(backend, scope, run_id, fn run ->
+             RunMutation.cancel_run(run, now)
+           end) do
+      finish_signal(result, opts)
+    end
+  end
+
+  @doc "Clears a non-terminal run's poison state and schedules it immediately."
+  def retry_poisoned_run(runtime, run_id, opts \\ []) do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, {backend, context}, scope} <- durable_access(opts) do
+      backend.runs().retry_poisoned_run(context, scope, run_id, operation_now(opts))
+    end
+  end
+
+  @doc "Reads the last committed durable `Docket.Run`."
+  def fetch_run(runtime, run_id, opts \\ []) do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, {backend, context}, scope} <- durable_access(opts) do
+      backend.runs().fetch_run(context, scope, run_id)
+    end
+  end
+
+  @doc "Reads a durable run plus token-free operational state."
+  def inspect_run(runtime, run_id, opts \\ []) do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, {backend, context}, scope} <- durable_access(opts) do
+      backend.runs().inspect_run(context, scope, run_id)
+    end
+  end
+
+  @doc """
+  Polls durable operational state until waiting, terminal, poisoned, or timeout.
+
+  `:timeout` is required and expressed in milliseconds. `:poll_interval`
+  defaults to 50 milliseconds.
+  """
+  def await_run(runtime, run_id, opts \\ []) do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, backend, scope} <- durable_access(opts),
+         {:ok, timeout, poll_interval} <- await_options(opts) do
+      deadline = System.monotonic_time(:millisecond) + timeout
+      do_await_run(backend, scope, run_id, deadline, poll_interval)
+    end
   end
 
   @doc """
@@ -152,6 +305,12 @@ defmodule Docket do
 
       def run(graph, input, opts \\ []), do: Docket.run(__MODULE__, graph, input, opts)
 
+      def start_run(graph_ref, input, opts \\ []) do
+        Docket.start_run(__MODULE__, graph_ref, input, opts)
+      end
+
+      def save_graph(graph, opts \\ []), do: Docket.save_graph(__MODULE__, graph, opts)
+
       def resume(graph, run, opts \\ []), do: Docket.resume(__MODULE__, graph, run, opts)
 
       def get_run(run_id, opts \\ []), do: Docket.get_run(__MODULE__, run_id, opts)
@@ -159,6 +318,16 @@ defmodule Docket do
       def resolve_interrupt(run_id, interrupt_id, value, opts \\ []) do
         Docket.resolve_interrupt(__MODULE__, run_id, interrupt_id, value, opts)
       end
+
+      def cancel_run(run_id, opts \\ []), do: Docket.cancel_run(__MODULE__, run_id, opts)
+
+      def retry_poisoned_run(run_id, opts \\ []) do
+        Docket.retry_poisoned_run(__MODULE__, run_id, opts)
+      end
+
+      def fetch_run(run_id, opts \\ []), do: Docket.fetch_run(__MODULE__, run_id, opts)
+      def inspect_run(run_id, opts \\ []), do: Docket.inspect_run(__MODULE__, run_id, opts)
+      def await_run(run_id, opts \\ []), do: Docket.await_run(__MODULE__, run_id, opts)
     end
   end
 
@@ -207,6 +376,9 @@ defmodule Docket do
         merged =
           defaults
           |> Keyword.merge(opts)
+          |> preserve_instance_option(defaults, :storage)
+          |> preserve_instance_option(defaults, :storage_context)
+          |> preserve_instance_option(defaults, :tenant_mode)
           |> Keyword.put(:task_supervisor, task_supervisor)
           |> Keyword.update(
             :executor_opts,
@@ -225,6 +397,133 @@ defmodule Docket do
     end
   end
 
+  defp preserve_instance_option(opts, defaults, key) do
+    case Keyword.fetch(defaults, key) do
+      {:ok, value} -> Keyword.put(opts, key, value)
+      :error -> Keyword.delete(opts, key)
+    end
+  end
+
+  defp durable_access(opts) do
+    with {:ok, backend} <- configured_backend(opts),
+         {:ok, scope} <- public_scope(opts) do
+      {:ok, backend, scope}
+    end
+  end
+
+  defp legacy_driver(opts) do
+    if Keyword.has_key?(opts, :storage) do
+      {:error,
+       Error.new(
+         :invalid_operation,
+         "run/resume are storage-free driver operations; use save_graph/start_run " <>
+           "with a durable backend"
+       )}
+    else
+      :ok
+    end
+  end
+
+  defp configured_backend(opts) do
+    case {Keyword.get(opts, :storage), Keyword.fetch(opts, :storage_context)} do
+      {backend, {:ok, context}} when is_atom(backend) ->
+        {:ok, {backend, context}}
+
+      {nil, _} ->
+        {:error,
+         Error.new(:storage_unavailable, "runtime instance has no durable storage backend")}
+
+      _ ->
+        {:error,
+         Error.new(:invalid_storage, "runtime instance has an invalid durable backend context")}
+    end
+  end
+
+  defp public_scope(opts) do
+    case {Keyword.get(opts, :tenant_mode, :none), Keyword.fetch(opts, :tenant_id)} do
+      {:none, :error} ->
+        {:ok, :tenantless}
+
+      {:none, {:ok, _tenant_id}} ->
+        invalid_tenant("tenant_id is not accepted in :none mode")
+
+      {:required, {:ok, tenant_id}} when is_binary(tenant_id) and byte_size(tenant_id) > 0 ->
+        {:ok, {:tenant, tenant_id}}
+
+      {:required, _} ->
+        invalid_tenant("tenant_mode :required needs a non-empty tenant_id")
+
+      {mode, _} ->
+        invalid_tenant("unknown tenant_mode #{inspect(mode)}")
+    end
+  end
+
+  defp invalid_tenant(message), do: {:error, Error.new(:invalid_tenant, message)}
+
+  defp durable_resolve_interrupt(opts, run_id, interrupt_id, value) do
+    with {:ok, {backend, context} = backend_ref, scope} <- durable_access(opts),
+         {:ok, run} <- backend.runs().fetch_run(context, scope, run_id),
+         {:ok, document} <- backend.graphs().fetch_graph(context, run.graph_id, run.graph_hash),
+         {:ok, graph} <- Graph.from_map(document),
+         {:ok, rtg} <- ensure_compiled(graph, opts),
+         now = operation_now(opts),
+         result <-
+           Lifecycle.signal(backend_ref, scope, run_id, fn current ->
+             RunMutation.resolve_interrupt(rtg, current, interrupt_id, value, now)
+           end) do
+      finish_signal(result, opts)
+    end
+  end
+
+  defp finish_signal({:ok, %Docket.Runtime.Moment{} = moment}, opts) do
+    :ok = Lifecycle.after_commit(moment, opts)
+    {:ok, moment.run}
+  end
+
+  defp finish_signal({:ok, %Run{} = run}, _opts), do: {:ok, run}
+  defp finish_signal({:error, reason}, _opts), do: {:error, reason}
+
+  defp operation_now(opts), do: Keyword.get(opts, :clock, &DateTime.utc_now/0).()
+
+  defp await_options(opts) do
+    timeout = Keyword.get(opts, :timeout)
+    poll_interval = Keyword.get(opts, :poll_interval, 50)
+
+    if is_integer(timeout) and timeout >= 0 and is_integer(poll_interval) and poll_interval > 0 do
+      {:ok, timeout, poll_interval}
+    else
+      {:error,
+       Error.new(
+         :invalid_options,
+         "await_run requires a non-negative :timeout and positive :poll_interval"
+       )}
+    end
+  end
+
+  defp do_await_run({backend, context} = backend_ref, scope, run_id, deadline, poll_interval) do
+    case backend.runs().inspect_run(context, scope, run_id) do
+      {:ok, %RunInfo{} = info} ->
+        cond do
+          RunInfo.poisoned?(info) ->
+            {:error, {:poisoned, info}}
+
+          info.run.status == :waiting or Run.terminal?(info.run) ->
+            {:ok, info.run}
+
+          System.monotonic_time(:millisecond) >= deadline ->
+            {:error, :timeout}
+
+          true ->
+            remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+            Process.sleep(min(poll_interval, remaining))
+            do_await_run(backend_ref, scope, run_id, deadline, poll_interval)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp check_graph_match(rtg, run) do
     if run.graph_id == rtg.graph_id and run.graph_hash == rtg.graph_hash do
       :ok
@@ -234,6 +533,22 @@ defmodule Docket do
          details: %{
            run_graph_id: run.graph_id,
            run_graph_hash: run.graph_hash,
+           graph_id: rtg.graph_id,
+           graph_hash: rtg.graph_hash
+         }
+       )}
+    end
+  end
+
+  defp check_graph_ref(rtg, %GraphRef{} = reference) do
+    if rtg.graph_id == reference.graph_id and rtg.graph_hash == reference.graph_hash do
+      :ok
+    else
+      {:error,
+       Error.new(:graph_mismatch, "saved graph document does not match its reference",
+         details: %{
+           reference_graph_id: reference.graph_id,
+           reference_graph_hash: reference.graph_hash,
            graph_id: rtg.graph_id,
            graph_hash: rtg.graph_hash
          }
