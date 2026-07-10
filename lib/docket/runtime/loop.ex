@@ -22,9 +22,9 @@ defmodule Docket.Runtime.Loop do
   # async delivery belongs to the shell (inline: drained synchronously;
   # supervised Runtime: background task).
 
-  alias Docket.{Checkpoint, Error, Event, Run, Schema, Wire}
+  alias Docket.{Checkpoint, Error, Run, Schema, Wire}
   alias Docket.Run.{ChannelState, Failure, InterruptState, PendingWrite, TaskState, TimerState}
-  alias Docket.Runtime.{Algorithm, Config, Dispatcher, Moment, TaskResult}
+  alias Docket.Runtime.{Algorithm, Config, Dispatcher, Moment, RunMutation, TaskResult}
 
   @doc false
   # Builds the fresh `:created` run document consumed by `init/3`. Shared by
@@ -998,106 +998,10 @@ defmodule Docket.Runtime.Loop do
   def resolve_interrupt(rtg, %Run{} = run, interrupt_id, value, opts) do
     config = Config.resolve(opts)
 
-    cond do
-      Run.terminal?(run) ->
-        {:error,
-         Error.new(:inactive_run, "run #{inspect(run.id)} is #{run.status} and cannot be resumed")}
-
-      not match?({:ok, %InterruptState{status: :open}}, Map.fetch(run.interrupts, interrupt_id)) ->
-        {:error, Error.new(:not_found, "no open interrupt #{inspect(interrupt_id)}")}
-
-      true ->
-        interrupt = Map.fetch!(run.interrupts, interrupt_id)
-
-        case do_resolve_interrupt(rtg, run, interrupt, value, config) do
-          {:moment, %Moment{} = moment} -> accept(moment, config)
-          {:error, error} -> {:error, error}
-        end
+    case RunMutation.resolve_interrupt(rtg, run, interrupt_id, value, config.clock.()) do
+      {:ok, %Moment{} = moment} -> accept(moment, config)
+      {:error, error} -> {:error, error}
     end
-  end
-
-  defp do_resolve_interrupt(rtg, run, interrupt, value, config) do
-    with {:ok, value} <- durable_resolution(value),
-         :ok <- validate_resolution_schema(interrupt, value),
-         {:ok, update} <- validate_resolution_write(rtg, interrupt, value) do
-      now = config.clock.()
-
-      {channels, changed_fields, _writers} =
-        Algorithm.apply_state_writes(rtg, run.channels, [{interrupt.node_id, update}])
-
-      resolved = %{interrupt | status: :resolved, resolved_at: now}
-      changed_channel_ids = Enum.map(changed_fields, &("state:" <> &1))
-
-      run = %{
-        run
-        | channels: channels,
-          changed_channels:
-            Enum.reduce(changed_channel_ids, run.changed_channels, &MapSet.put(&2, &1)),
-          interrupts: Map.put(run.interrupts, interrupt.id, resolved),
-          status: :running,
-          updated_at: now
-      }
-
-      entries =
-        [
-          entry(:interrupt_resolved, run.step,
-            node_id: interrupt.node_id,
-            payload: %{
-              "interrupt_id" => interrupt.id,
-              "resume_channel" => interrupt.resume_channel
-            }
-          )
-        ] ++
-          Enum.map(changed_channel_ids, fn channel_id ->
-            entry(:channel_updated, run.step,
-              channel_id: channel_id,
-              payload: %{"writers" => [interrupt.node_id]}
-            )
-          end)
-
-      {:moment, propose(run, :interrupt_resolved, entries, :continue, config)}
-    end
-  end
-
-  defp durable_resolution(value) do
-    case Wire.dump_value(value) do
-      {:ok, coerced} ->
-        {:ok, coerced}
-
-      {:error, reason} ->
-        {:error,
-         Error.new(:invalid_input, "interrupt resolution value is not durable: #{reason}")}
-    end
-  end
-
-  defp validate_resolution_schema(%InterruptState{schema: nil}, _value), do: :ok
-
-  defp validate_resolution_schema(%InterruptState{schema: schema}, value) do
-    case Schema.validate(schema, value) do
-      :ok ->
-        :ok
-
-      {:error, reasons} ->
-        {:error, invalid_resolution(reasons)}
-    end
-  end
-
-  defp validate_resolution_write(rtg, interrupt, value) do
-    case Algorithm.validate_state_update(rtg, interrupt.node_id, %{
-           interrupt.resume_channel => value
-         }) do
-      {:ok, update} ->
-        {:ok, update}
-
-      {:error, reasons} ->
-        {:error, invalid_resolution(reasons)}
-    end
-  end
-
-  defp invalid_resolution(reasons) do
-    Error.new(:invalid_input, "interrupt resolution value is invalid",
-      details: %{reasons: reasons}
-    )
   end
 
   # ---------------------------------------------------------------------------
@@ -1105,14 +1009,7 @@ defmodule Docket.Runtime.Loop do
   # ---------------------------------------------------------------------------
 
   defp entry(type, step, opts) do
-    %{
-      type: type,
-      step: step,
-      node_id: Keyword.get(opts, :node_id),
-      channel_id: Keyword.get(opts, :channel_id),
-      task_id: Keyword.get(opts, :task_id),
-      payload: Keyword.get(opts, :payload, %{})
-    }
+    Moment.event_entry(type, step, opts)
   end
 
   defp guard_error(edge_id, reasons, phase) do
@@ -1127,54 +1024,7 @@ defmodule Docket.Runtime.Loop do
   # calculation: no storage write, no checkpoint delivery, no telemetry;
   # no executor work is ever in flight when it runs.
   defp propose(run, type, entries, disposition, config, identity_opts \\ []) do
-    now = config.clock.()
-    run = %{run | checkpoint_seq: run.checkpoint_seq + 1}
-
-    {runtime_events, event_seq} =
-      Enum.map_reduce(entries, run.event_seq, fn entry, seq ->
-        seq = seq + 1
-
-        {%Event{
-           run_id: run.id,
-           seq: seq,
-           type: entry.type,
-           step: entry.step,
-           node_id: entry.node_id,
-           channel_id: entry.channel_id,
-           task_id: entry.task_id,
-           timestamp: now,
-           payload: entry.payload
-         }, seq}
-      end)
-
-    pending_attempts = Keyword.get(identity_opts, :pending_attempts, [])
-
-    checkpoint_metadata =
-      Moment.checkpoint_metadata(run, runtime_events, type, disposition, pending_attempts)
-
-    checkpoint_event_seq = event_seq + 1
-
-    checkpoint_event = %Event{
-      run_id: run.id,
-      seq: checkpoint_event_seq,
-      type: :checkpoint_committed,
-      step: run.step,
-      timestamp: now,
-      metadata: checkpoint_metadata
-    }
-
-    events = runtime_events ++ [checkpoint_event]
-    run = %{run | event_seq: checkpoint_event_seq}
-
-    %Moment{
-      run: run,
-      events: events,
-      checkpoint_type: type,
-      checkpoint_metadata: checkpoint_metadata,
-      pending_attempts: pending_attempts,
-      disposition: disposition,
-      proposed_at: now
-    }
+    Moment.propose(run, type, entries, disposition, config.clock.(), identity_opts)
   end
 
   # Adapts one moment through the host-owned committer: a sync checkpoint

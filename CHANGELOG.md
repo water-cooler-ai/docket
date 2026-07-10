@@ -99,6 +99,12 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   the committed graph step plus stable multi-task retry/attempt identity,
   and committed checkpoint facts emit `[:docket, :checkpoint, :committed]`
   telemetry (DCKT-11, #22).
+- Pure `Docket.Runtime.RunMutation.resolve_interrupt/5` and `cancel_run/2`
+  graph mutations produce deterministic pre-commit moments with explicit
+  immediate or terminal dispositions. Cancellation adds the sync
+  `:run_cancelled` checkpoint/event fact; repeated cancellation returns an
+  explicit unchanged result with the stored run and consumes no sequences
+  (DCKT-9).
 
 ### Changed
 

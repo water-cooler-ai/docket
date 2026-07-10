@@ -34,7 +34,7 @@ defmodule Docket.Runtime.Moment do
   | `{:park, :terminal, reason}` | the run is terminal; it never wakes again |
 
   `{:park, :immediate, reason}` is reserved for driver yield boundaries and
-  graph signals; no core transition produces it today.
+  graph signals; resolving an interrupt produces this disposition.
 
   `checkpoint_metadata` is the JSON-safe identity envelope shared with the
   moment's `:checkpoint_committed` event. It records the checkpoint fence,
@@ -45,7 +45,7 @@ defmodule Docket.Runtime.Moment do
   only the schedule effect a lifecycle composer derives from it.
   """
 
-  alias Docket.Checkpoint
+  alias Docket.{Checkpoint, Event, Run}
 
   @enforce_keys [:run, :events, :checkpoint_type, :disposition, :proposed_at]
   defstruct [
@@ -62,6 +62,15 @@ defmodule Docket.Runtime.Moment do
 
   @type disposition :: :continue | {:park, park_kind(), term()}
 
+  @type event_entry :: %{
+          type: Event.type(),
+          step: non_neg_integer(),
+          node_id: String.t() | nil,
+          channel_id: String.t() | nil,
+          task_id: String.t() | nil,
+          payload: map()
+        }
+
   @type t :: %__MODULE__{
           run: Docket.Run.t(),
           events: [Docket.Event.t()],
@@ -71,6 +80,72 @@ defmodule Docket.Runtime.Moment do
           proposed_at: DateTime.t(),
           pending_attempts: [Docket.Run.PendingWrite.t()]
         }
+
+  @doc false
+  @spec propose(
+          Run.t(),
+          Checkpoint.type(),
+          [event_entry()],
+          disposition(),
+          DateTime.t(),
+          keyword()
+        ) :: t()
+  def propose(%Run{} = run, type, entries, disposition, %DateTime{} = now, opts \\ []) do
+    run = %{run | checkpoint_seq: run.checkpoint_seq + 1}
+
+    {runtime_events, event_seq} =
+      Enum.map_reduce(entries, run.event_seq, fn entry, seq ->
+        seq = seq + 1
+
+        {%Event{
+           run_id: run.id,
+           seq: seq,
+           type: entry.type,
+           step: entry.step,
+           node_id: entry.node_id,
+           channel_id: entry.channel_id,
+           task_id: entry.task_id,
+           timestamp: now,
+           payload: entry.payload
+         }, seq}
+      end)
+
+    pending_attempts = Keyword.get(opts, :pending_attempts, [])
+    metadata = checkpoint_metadata(run, runtime_events, type, disposition, pending_attempts)
+    checkpoint_event_seq = event_seq + 1
+
+    checkpoint_event = %Event{
+      run_id: run.id,
+      seq: checkpoint_event_seq,
+      type: :checkpoint_committed,
+      step: run.step,
+      timestamp: now,
+      metadata: metadata
+    }
+
+    %__MODULE__{
+      run: %{run | event_seq: checkpoint_event_seq},
+      events: runtime_events ++ [checkpoint_event],
+      checkpoint_type: type,
+      checkpoint_metadata: metadata,
+      pending_attempts: pending_attempts,
+      disposition: disposition,
+      proposed_at: now
+    }
+  end
+
+  @doc false
+  @spec event_entry(Event.type(), non_neg_integer(), keyword()) :: event_entry()
+  def event_entry(type, step, opts \\ []) do
+    %{
+      type: type,
+      step: step,
+      node_id: Keyword.get(opts, :node_id),
+      channel_id: Keyword.get(opts, :channel_id),
+      task_id: Keyword.get(opts, :task_id),
+      payload: Keyword.get(opts, :payload, %{})
+    }
+  end
 
   @doc """
   Builds the committed `Docket.Checkpoint` value for a moment.
