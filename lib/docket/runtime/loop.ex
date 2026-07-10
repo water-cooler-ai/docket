@@ -4,11 +4,16 @@ defmodule Docket.Runtime.Loop do
   # Processless transition functions over `Docket.Runtime.Graph` and
   # `Docket.Run`, shared by the supervised Runtime and `Docket.Test`.
   #
-  # Every transition takes the runtime graph, the current committed run, and
-  # options, and returns a new committed run plus checkpoint effects - or a
-  # typed error with the previous run untouched. The loop owns checkpoint
-  # emission and barrier semantics; deterministic execution logic lives in
-  # `Docket.Runtime.Algorithm`.
+  # Every transition calculates exactly one pre-commit
+  # `Docket.Runtime.Moment`: the proposed run, its assigned events, the
+  # checkpoint type, and an explicit disposition. Calculation delivers no
+  # checkpoint and emits no telemetry. `propose_init/3` and
+  # `propose_advance/3` expose the raw moments to drivers that commit
+  # externally; the legacy entrypoints (`init/3`, `plan/3`,
+  # `apply_results/5`, `resolve_interrupt/5`) adapt the same moments through
+  # the host-owned sync committer and return a new committed run plus
+  # checkpoint effects - or a typed error with the previous run untouched.
+  # Deterministic execution logic lives in `Docket.Runtime.Algorithm`.
   #
   # Checkpoint effects are `{:checkpoint, checkpoint, context, :accepted}`
   # for sync checkpoints already delivered inside the transition, and
@@ -19,7 +24,7 @@ defmodule Docket.Runtime.Loop do
 
   alias Docket.{Checkpoint, Error, Event, Run, Schema, Wire}
   alias Docket.Run.{ChannelState, Failure, InterruptState, PendingWrite, TaskState, TimerState}
-  alias Docket.Runtime.{Algorithm, Config, TaskResult}
+  alias Docket.Runtime.{Algorithm, Config, Dispatcher, Moment, TaskResult}
 
   @doc false
   # Builds the fresh `:created` run document consumed by `init/3`. Shared by
@@ -56,6 +61,26 @@ defmodule Docket.Runtime.Loop do
   def init(rtg, %Run{} = run, opts) do
     config = Config.resolve(opts)
 
+    case do_propose_init(rtg, run, config) do
+      {:ok, %Moment{} = moment} -> accept(moment, config)
+      {:terminal, run} -> {:ok, run, []}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  @doc """
+  Calculates the initialization moment without delivering anything.
+
+  Same run-status inference as `init/3`, but the transition is returned as
+  one pre-commit `Docket.Runtime.Moment`: no checkpoint handler is invoked
+  and no telemetry is emitted. Returns `{:ok, moment}`, `{:terminal, run}`
+  for an already-terminal run (nothing to commit), or `{:error, error}`.
+  """
+  def propose_init(rtg, %Run{} = run, opts) do
+    do_propose_init(rtg, run, Config.resolve(opts))
+  end
+
+  defp do_propose_init(rtg, run, config) do
     cond do
       run.graph_id != rtg.graph_id or run.graph_hash != rtg.graph_hash ->
         {:error,
@@ -72,7 +97,7 @@ defmodule Docket.Runtime.Loop do
         init_fresh(rtg, run, config)
 
       Run.terminal?(run) ->
-        {:ok, run, []}
+        {:terminal, run}
 
       run.status in [:running, :waiting] ->
         init_saved(rtg, run, config)
@@ -115,7 +140,7 @@ defmodule Docket.Runtime.Loop do
             )
           end)
 
-      emit(run, :run_initialized, entries, config)
+      {:ok, propose(run, :run_initialized, entries, :continue, config)}
     end
   end
 
@@ -123,8 +148,14 @@ defmodule Docket.Runtime.Loop do
     _ = rtg
     run = %{run | updated_at: config.clock.()}
     entries = [entry(:run_initialized, run.step, payload: %{"resumed" => true})]
-    emit(run, :run_initialized, entries, config)
+    {:ok, propose(run, :run_initialized, entries, run_disposition(run), config)}
   end
+
+  # The disposition a committed non-terminal run needs next: a `:waiting`
+  # run is parked on its open interrupts; a `:running` run has dispatchable
+  # work (planning decides what, including re-parking on retry deadlines).
+  defp run_disposition(%Run{status: :waiting}), do: {:park, :external, :awaiting_interrupts}
+  defp run_disposition(%Run{status: :running}), do: :continue
 
   defp validate_input(rtg, input) when is_nil(input) or input == %{} do
     validate_input_map(rtg, %{})
@@ -236,13 +267,82 @@ defmodule Docket.Runtime.Loop do
   def plan(rtg, %Run{} = run, opts) do
     config = Config.resolve(opts)
 
+    case do_propose_plan(rtg, run, opts, config) do
+      {:moment, %Moment{} = moment} ->
+        case accept(moment, config) do
+          {:ok, run, effects} -> {:terminal, run, effects}
+          {:error, error} -> {:error, error}
+        end
+
+      {:already_terminal, run} ->
+        {:terminal, run, []}
+
+      other ->
+        other
+    end
+  end
+
+  @doc """
+  Calculates the next commit-boundary moment for one advancement.
+
+  Plans, dispatches, and applies exactly one superstep attempt, returning
+  its commit boundary as one pre-commit `Docket.Runtime.Moment` - a
+  barrier, retry park, or terminal commit. Calculation never delivers a
+  checkpoint, never emits telemetry, and never speculatively drains a
+  second uncommitted step: the caller commits each moment before asking
+  for the next.
+
+  Returns:
+
+  - `{:ok, moment}` - one commit-boundary moment; `moment.disposition`
+    says what the run needs after the commit
+  - `{:wait, run, interrupt_ids}` - blocked on open interrupts; nothing
+    to commit (the `:waiting` status was committed at its barrier)
+  - `{:park, run, park}` - the active superstep has no attempt due yet;
+    nothing to commit
+  - `{:terminal, run}` - the run is already terminal; nothing to commit
+  - `{:error, error}` - the run cannot advance (uninitialized or unknown
+    status); nothing was calculated
+
+  Accepts the same `:resume_floor` option as `plan/3`.
+  """
+  def propose_advance(rtg, %Run{} = run, opts) do
+    config = Config.resolve(opts)
+
+    case do_propose_plan(rtg, run, opts, config) do
+      {:execute, run, activations} ->
+        results = Dispatcher.dispatch(activations, rtg, run, config)
+
+        case do_propose_results(rtg, run, config, activations, results) do
+          {:moment, moment} -> {:ok, moment}
+          {:moment, moment, _park} -> {:ok, moment}
+        end
+
+      {:moment, moment} ->
+        {:ok, moment}
+
+      {:wait, run, interrupt_ids} ->
+        {:wait, run, interrupt_ids}
+
+      {:park, run, park} ->
+        {:park, run, park}
+
+      {:already_terminal, run} ->
+        {:terminal, run}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  defp do_propose_plan(rtg, run, opts, config) do
     cond do
       run.status == :created ->
         {:error,
          Error.new(:invalid_run, "run #{inspect(run.id)} must be initialized before planning")}
 
       Run.terminal?(run) ->
-        {:terminal, run, []}
+        {:already_terminal, run}
 
       map_size(run.active_tasks) > 0 ->
         resume_superstep(rtg, run, opts, config)
@@ -258,7 +358,7 @@ defmodule Docket.Runtime.Loop do
           {:failed, :max_supersteps_exceeded} ->
             limit = Algorithm.max_supersteps(rtg, config)
 
-            terminal_fail(run, config, [],
+            fail(run, config, [],
               failure:
                 Failure.new(
                   "max_supersteps_exceeded",
@@ -274,7 +374,7 @@ defmodule Docket.Runtime.Loop do
                 {:execute, run, activations}
 
               {:error, %Error{} = error} ->
-                terminal_fail(run, config, [],
+                fail(run, config, [],
                   failure: Failure.new(Atom.to_string(error.type), error.message),
                   payload: %{"reason" => Atom.to_string(error.type), "message" => error.message}
                 )
@@ -301,7 +401,7 @@ defmodule Docket.Runtime.Loop do
           {:execute, run, Enum.filter(activations, &MapSet.member?(due_set, &1.task_id))}
 
         {:error, %Error{} = error} ->
-          terminal_fail(run, config, [],
+          fail(run, config, [],
             failure: Failure.new(Atom.to_string(error.type), error.message),
             payload: %{"reason" => Atom.to_string(error.type), "message" => error.message}
           )
@@ -347,17 +447,7 @@ defmodule Docket.Runtime.Loop do
       entry(:run_completed, run.step, payload: %{"outputs" => Enum.sort(Map.keys(output))})
     ]
 
-    case emit(run, :run_completed, entries, config) do
-      {:ok, run, effects} -> {:terminal, run, effects}
-      {:error, error} -> {:error, error}
-    end
-  end
-
-  defp terminal_fail(run, config, extra_entries, opts) do
-    case fail(run, config, extra_entries, opts) do
-      {:ok, run, effects} -> {:terminal, run, effects}
-      {:error, error} -> {:error, error}
-    end
+    {:moment, propose(run, :run_completed, entries, {:park, :terminal, :run_completed}, config)}
   end
 
   # Terminal failure absorbs the active superstep: no parked attempt, pending
@@ -380,7 +470,7 @@ defmodule Docket.Runtime.Loop do
     entries =
       extra_entries ++ [entry(:run_failed, run.step, payload: Keyword.fetch!(opts, :payload))]
 
-    emit(run, :run_failed, entries, config)
+    {:moment, propose(run, :run_failed, entries, {:park, :terminal, :run_failed}, config)}
   end
 
   # ---------------------------------------------------------------------------
@@ -411,6 +501,20 @@ defmodule Docket.Runtime.Loop do
   """
   def apply_results(rtg, %Run{} = run, activations, results, opts) do
     config = Config.resolve(opts)
+
+    case do_propose_results(rtg, run, config, activations, results) do
+      {:moment, %Moment{} = moment} ->
+        accept(moment, config)
+
+      {:moment, %Moment{} = moment, park} ->
+        case accept(moment, config) do
+          {:ok, run, effects} -> {:park, run, park, effects}
+          {:error, error} -> {:error, error}
+        end
+    end
+  end
+
+  defp do_propose_results(rtg, run, config, activations, results) do
     results = Enum.sort_by(results, & &1.node_id)
 
     {oks, interrupt_results, retries, errors} = partition_results(results)
@@ -549,10 +653,10 @@ defmodule Docket.Runtime.Loop do
         updated_at: now
     }
 
-    case emit(parked, :retry_scheduled, attempt_failure_entries(parked.step, retries), config) do
-      {:ok, parked, effects} -> {:park, parked, park_info(parked.timers, now), effects}
-      {:error, error} -> {:error, error}
-    end
+    park = park_info(parked.timers, now)
+    entries = attempt_failure_entries(parked.step, retries)
+    disposition = {:park, {:at, park.resume_at}, :retry_backoff}
+    {:moment, propose(parked, :retry_scheduled, entries, disposition, config), park}
   end
 
   defp pending_write(result, kind, value) do
@@ -749,7 +853,7 @@ defmodule Docket.Runtime.Loop do
           )
 
         type = if map_size(interrupts) == 0, do: :step_committed, else: :interrupt_requested
-        emit(committed, type, entries, config)
+        {:moment, propose(committed, type, entries, run_disposition(committed), config)}
     end
   end
 
@@ -875,7 +979,11 @@ defmodule Docket.Runtime.Loop do
 
       true ->
         interrupt = Map.fetch!(run.interrupts, interrupt_id)
-        do_resolve_interrupt(rtg, run, interrupt, value, config)
+
+        case do_resolve_interrupt(rtg, run, interrupt, value, config) do
+          {:moment, %Moment{} = moment} -> accept(moment, config)
+          {:error, error} -> {:error, error}
+        end
     end
   end
 
@@ -918,7 +1026,7 @@ defmodule Docket.Runtime.Loop do
             )
           end)
 
-      emit(run, :interrupt_resolved, entries, config)
+      {:moment, propose(run, :interrupt_resolved, entries, :continue, config)}
     end
   end
 
@@ -964,7 +1072,7 @@ defmodule Docket.Runtime.Loop do
   end
 
   # ---------------------------------------------------------------------------
-  # Events and checkpoint emission
+  # Moment production and legacy adaptation
   # ---------------------------------------------------------------------------
 
   defp entry(type, step, opts) do
@@ -985,10 +1093,11 @@ defmodule Docket.Runtime.Loop do
     )
   end
 
-  # Builds events with sequential seqs, bumps the run's counters, and emits
-  # the checkpoint. Only this function constructs and delivers checkpoints;
+  # Assigns event identities from the run's sequences, bumps its counters,
+  # and builds the one pre-commit moment for the transition. Pure
+  # calculation: no storage write, no checkpoint delivery, no telemetry;
   # no executor work is ever in flight when it runs.
-  defp emit(run, type, entries, config) do
+  defp propose(run, type, entries, disposition, config) do
     now = config.clock.()
 
     {events, event_seq} =
@@ -1009,42 +1118,46 @@ defmodule Docket.Runtime.Loop do
       end)
 
     run = %{run | event_seq: event_seq, checkpoint_seq: run.checkpoint_seq + 1}
-    delivery = Checkpoint.delivery(type, config.checkpoint_overrides)
 
-    checkpoint = %Checkpoint{
-      type: type,
-      delivery: delivery,
-      seq: run.checkpoint_seq,
+    %Moment{
       run: run,
       events: events,
-      created_at: now
+      checkpoint_type: type,
+      disposition: disposition,
+      proposed_at: now
     }
+  end
 
-    context = %Checkpoint.Context{
-      run_id: run.id,
-      graph_id: run.graph_id,
-      graph_hash: run.graph_hash,
-      application: config.context
-    }
+  # Adapts one moment through the host-owned committer: a sync checkpoint
+  # must be accepted before the proposed run becomes the shell's truth; an
+  # async checkpoint is returned as a pending effect alongside the already
+  # accepted run. Only this function turns moments into committed
+  # checkpoints and telemetry.
+  defp accept(%Moment{} = moment, config) do
+    delivery = Checkpoint.delivery(moment.checkpoint_type, config.checkpoint_overrides)
+    checkpoint = Moment.checkpoint(moment, delivery)
+    context = Moment.context(moment, config.context)
 
     case delivery do
       :sync ->
         case deliver_checkpoint(config.checkpoint, checkpoint, context) do
           :ok ->
-            Docket.Telemetry.emit_events(run, events)
-            {:ok, run, [{:checkpoint, checkpoint, context, :accepted}]}
+            Docket.Telemetry.emit_events(moment.run, moment.events)
+            {:ok, moment.run, [{:checkpoint, checkpoint, context, :accepted}]}
 
           {:error, reason} ->
             {:error,
-             Error.new(:checkpoint_failed, "sync #{type} checkpoint was not accepted",
-               phase: type,
+             Error.new(
+               :checkpoint_failed,
+               "sync #{moment.checkpoint_type} checkpoint was not accepted",
+               phase: moment.checkpoint_type,
                reason: reason
              )}
         end
 
       :async ->
-        Docket.Telemetry.emit_events(run, events)
-        {:ok, run, [{:checkpoint, checkpoint, context, :pending}]}
+        Docket.Telemetry.emit_events(moment.run, moment.events)
+        {:ok, moment.run, [{:checkpoint, checkpoint, context, :pending}]}
     end
   end
 
