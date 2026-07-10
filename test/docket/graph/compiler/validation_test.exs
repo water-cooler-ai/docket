@@ -371,6 +371,29 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       assert_diagnostic(failed, :invalid_node_config_schema, public_id: "stateful")
     end
 
+    test "one schema snapshot is shared by nodes using the same module" do
+      key = {Nodes.StatefulConfigSchema, :calls}
+      Process.delete(key)
+
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_node!("stateful-one",
+          implementation: Nodes.StatefulConfigSchema,
+          config: %{}
+        )
+        |> Graph.put_node!("stateful-two",
+          implementation: Nodes.StatefulConfigSchema,
+          config: %{}
+        )
+        |> Graph.put_edge!("edge_copy_stateful_one", from: "copy", to: "stateful-one")
+        |> Graph.put_edge!("edge_copy_stateful_two", from: "copy", to: "stateful-two")
+
+      assert {:ok, _effective, %Docket.Runtime.Graph{}} =
+               Compiler.compile_for_publication(graph)
+
+      assert Process.get(key) == 1
+    end
+
     test "returns diagnostics for node records that are not structs" do
       graph = Graphs.minimal_linear()
 
@@ -380,6 +403,16 @@ defmodule Docket.Graph.Compiler.ValidationTest do
         path: [:nodes, "junk"],
         public_id: "junk"
       )
+    end
+
+    test "nil node config schemas are diagnostics rather than compiler crashes" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_node!("nil-schema", implementation: Nodes.NilConfigSchema, config: %{})
+        |> Graph.put_edge!("edge_copy_nil_schema", from: "copy", to: "nil-schema")
+
+      assert {:error, failed} = Compiler.compile_for_publication(graph)
+      assert_diagnostic(failed, :invalid_node_config_schema, public_id: "nil-schema")
     end
   end
 

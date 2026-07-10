@@ -2,7 +2,7 @@ defmodule Docket.Graph.Compiler.LoweringTest do
   use Docket.Test.Case, async: true
 
   alias Docket.Runtime
-  alias Docket.{Reducer, Schema}
+  alias Docket.{Graph, Reducer, Schema}
 
   describe "channel lowering" do
     test "inputs lower to last-value input channels" do
@@ -119,6 +119,39 @@ defmodule Docket.Graph.Compiler.LoweringTest do
       # The public document keeps its free-form in-memory shape; string keys
       # and defaults only appear in the derived runtime graph.
       assert graph.nodes["styled"].config == %{tone: "warm"}
+    end
+
+    test "publication returns an effective canonical graph with defaults in its hash" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_node!("styled", implementation: Nodes.WithDefaults, config: %{tone: "warm"})
+        |> Graph.put_edge!("edge_copy_styled", from: "copy", to: "styled")
+
+      assert {:ok, effective, runtime} =
+               Docket.Graph.Compiler.compile_for_publication(graph)
+
+      assert graph.nodes["styled"].config == %{tone: "warm"}
+
+      assert effective.nodes["styled"].config == %{
+               "tone" => "warm",
+               "temperature" => 0.5
+             }
+
+      assert runtime.graph_hash == Graph.hash(effective)
+      assert runtime.nodes["node:styled"].config == effective.nodes["styled"].config
+    end
+
+    test "publication canonicalizes atom enum values and defaults from node schemas" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_node!("classified", implementation: Nodes.AtomEnumDefault, config: %{})
+        |> Graph.put_edge!("edge_copy_classified", from: "copy", to: "classified")
+
+      assert {:ok, effective, runtime} =
+               Docket.Graph.Compiler.compile_for_publication(graph)
+
+      assert effective.nodes["classified"].config == %{"level" => "low"}
+      assert runtime.nodes["node:classified"].config == %{"level" => "low"}
     end
 
     test "targets subscribe to their incoming activation channels" do

@@ -1,12 +1,11 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.Schemas.GraphVersion do
     @moduledoc """
-    Row schema for `docket_graph_versions` — canonical graph documents,
+    Row schema for `docket_graph_versions` — effective canonical graph documents,
     content-addressed by `graph_id` + `graph_hash`.
 
     `graph` holds the JSON-safe wire map produced by
-    `Docket.Graph.Serializer`. Compiled plans live in
-    `docket_graph_artifacts`; both row types are immutable once inserted.
+    `Docket.Graph.Serializer`. Rows are immutable once inserted.
     """
 
     use Ecto.Schema

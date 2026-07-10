@@ -10,11 +10,7 @@ defmodule Docket.Run.Serializer do
   # durable JSON-safe terms, "$"-prefixed map keys reserved, strict load
   # validation that never creates atoms.
   #
-  # Version 3 adds `graph_compiler_abi`, binding durable operational runs to
-  # the exact published execution-artifact ABI. It remains optional for the
-  # storage-free legacy driver.
-  #
-  # Version 2 added the terminal `failure` payload and admitted only the five
+  # Version 2 adds the terminal `failure` payload and admits only the five
   # durable statuses: the private `:created` sentinel is rejected on dump
   # and load. Version-1 documents are not loadable; there is no released
   # userbase to migrate.
@@ -31,7 +27,7 @@ defmodule Docket.Run.Serializer do
   alias Docket.Run.{ChannelState, Failure, InterruptState, PendingWrite, TaskState, TimerState}
   alias Docket.Wire
 
-  @version 3
+  @version 2
 
   @statuses %{
     "running" => :running,
@@ -45,7 +41,7 @@ defmodule Docket.Run.Serializer do
   @interrupt_statuses %{"open" => :open, "resolved" => :resolved}
   @interrupt_statuses_out Map.new(@interrupt_statuses, fn {string, atom} -> {atom, string} end)
 
-  @run_keys ~w(version id graph_id graph_hash graph_compiler_abi status step input output failure
+  @run_keys ~w(version id graph_id graph_hash status step input output failure
                started_at updated_at finished_at channels changed_channels
                pending_nodes interrupts active_tasks pending_writes timers
                checkpoint_seq event_seq metadata)
@@ -84,7 +80,6 @@ defmodule Docket.Run.Serializer do
       "event_seq" => run.event_seq
     }
     |> put_present("graph_hash", run.graph_hash)
-    |> put_present("graph_compiler_abi", run.graph_compiler_abi)
     |> put_open_map("input", run.input || %{}, "run input")
     |> put_present("output", dump_output(run.output))
     |> put_present("failure", dump_failure(run.failure))
@@ -577,7 +572,6 @@ defmodule Docket.Run.Serializer do
       id: id,
       graph_id: load_required_string!(map, "graph_id", "run"),
       graph_hash: load_optional_string!(map, "graph_hash", "run"),
-      graph_compiler_abi: load_optional_string!(map, "graph_compiler_abi", "run"),
       status: load_enum!(map, "status", @statuses, "run status"),
       step: step,
       input: load_open_map!(map, "input", "run input"),

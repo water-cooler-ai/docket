@@ -4,23 +4,6 @@ defmodule Docket.LifecycleTest do
   alias Docket.Runtime.{Loop, Moment}
   alias Docket.Test.MemoryBackend
 
-  defmodule CompileOnceNode do
-    @behaviour Docket.Node
-
-    @impl true
-    def config_schema do
-      key = {__MODULE__, :compile_count}
-      count = Process.get(key, 0) + 1
-      Process.put(key, count)
-
-      if count > 1, do: raise("graph was compiled more than once")
-      Docket.Schema.object(%{})
-    end
-
-    @impl true
-    def call(_state, _config, _context), do: {:ok, %{}}
-  end
-
   defmodule RecordingObserver do
     @behaviour Docket.Checkpoint.Observer
 
@@ -58,6 +41,27 @@ defmodule Docket.LifecycleTest do
     end
   end
 
+  defmodule MutableDefaultsNode do
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      calls = Process.get({__MODULE__, :calls}, 0)
+      Process.put({__MODULE__, :calls}, calls + 1)
+
+      Docket.Schema.object(%{
+        "from" => Docket.Schema.string(required: true),
+        "to" => Docket.Schema.string(required: true),
+        "tone" => Docket.Schema.string(default: Process.get({__MODULE__, :tone}, "calm"))
+      })
+    end
+
+    @impl true
+    def call(state, config, _context) do
+      {:ok, %{config["to"] => Map.get(state, config["from"])}}
+    end
+  end
+
   defmodule Host do
     use Docket,
       storage: Docket.Test.MemoryBackend,
@@ -90,7 +94,6 @@ defmodule Docket.LifecycleTest do
              Host.start_run(reference, %{"value" => "hello"}, context: %{notify: self()})
 
     assert started.status == :running
-    assert started.graph_compiler_abi == reference.compiler_abi
     assert {:ok, ^started} = Host.fetch_run(started.id)
 
     assert {:ok, %Docket.RunInfo{run: ^started, wake_at: %DateTime{}}} =
@@ -105,6 +108,63 @@ defmodule Docket.LifecycleTest do
     assert {:ok, ^cancelled} = Host.await_run(started.id, timeout: 0)
     assert_receive {:observed, %Docket.Checkpoint{type: :run_cancelled}}
     assert_receive :failing_observer_called
+  end
+
+  test "publication materializes schema defaults before hashing and local compilation" do
+    graph = graph_with_mutable_default()
+    {backend, context} = backend_ref(Host)
+
+    Process.put({MutableDefaultsNode, :tone}, "calm")
+    Process.put({MutableDefaultsNode, :calls}, 0)
+    assert {:ok, calm_ref} = Host.save_graph(graph)
+    assert Process.get({MutableDefaultsNode, :calls}) == 1
+
+    assert {:ok, calm_document} =
+             backend.graphs().fetch_graph(context, calm_ref.graph_id, calm_ref.graph_hash)
+
+    calm_graph = Docket.Graph.from_map!(calm_document)
+    assert calm_graph.nodes["copy"].config["tone"] == "calm"
+    assert Docket.Graph.hash(calm_graph) == calm_ref.graph_hash
+
+    Process.put({MutableDefaultsNode, :tone}, "bright")
+    assert {:ok, bright_ref} = Host.save_graph(graph)
+    refute bright_ref.graph_hash == calm_ref.graph_hash
+
+    assert {:ok, calm_runtime} = Docket.ensure_compiled(calm_graph, [])
+    assert calm_runtime.nodes["node:copy"].config["tone"] == "calm"
+
+    Process.put({MutableDefaultsNode, :calls}, 0)
+    assert {:ok, _started} = Host.start_run(calm_ref, %{"value" => "hello"})
+    assert Process.get({MutableDefaultsNode, :calls}) == 1
+  end
+
+  test "explicit config wins over changing schema defaults" do
+    graph =
+      graph_with_mutable_default()
+      |> update_in(
+        [Access.key!(:nodes), "copy", Access.key!(:config)],
+        &Map.put(&1, :tone, "fixed")
+      )
+
+    Process.put({MutableDefaultsNode, :tone}, "calm")
+    assert {:ok, first} = Host.save_graph(graph)
+    Process.put({MutableDefaultsNode, :tone}, "bright")
+    assert {:ok, second} = Host.save_graph(graph)
+
+    assert first == second
+  end
+
+  test "invalid materialized defaults fail before graph storage" do
+    {_backend, context} = backend_ref(Host)
+
+    for invalid_default <- [123, {:not, :json}] do
+      Process.put({MutableDefaultsNode, :tone}, invalid_default)
+
+      assert {:error, %Docket.Error{type: :invalid_graph}} =
+               Host.save_graph(graph_with_mutable_default())
+    end
+
+    assert Agent.get(context, & &1.graphs) == %{}
   end
 
   test "durable resolve loads the stored graph and commits mutation plus events" do
@@ -194,55 +254,10 @@ defmodule Docket.LifecycleTest do
     assert {:ok, ^first} = Host.save_graph(graph)
 
     forged = %{first | graph_hash: String.duplicate("0", 64)}
-
-    assert {:error, %Docket.Error{type: :graph_artifact_not_found}} =
-             Host.start_run(forged, %{"value" => "x"})
-
-    wrong_abi = %{first | compiler_abi: "unsupported"}
-
-    assert {:error, %Docket.Error{type: :graph_artifact_not_found}} =
-             Host.start_run(wrong_abi, %{"value" => "x"})
+    assert {:error, :not_found} = Host.start_run(forged, %{"value" => "x"})
 
     assert {:error, %Docket.Error{type: :invalid_operation}} =
              Host.run(graph, %{"value" => "x"})
-  end
-
-  test "graph publication rolls canonical source back when artifact save conflicts" do
-    graph = Graphs.minimal_linear()
-    graph_hash = Docket.Graph.hash(graph)
-    {backend, context} = backend_ref(Host)
-
-    assert :ok =
-             backend.graphs().save_artifact(
-               context,
-               graph.id,
-               graph_hash,
-               Docket.Runtime.Graph.Artifact.compiler_abi(),
-               %{"conflict" => true}
-             )
-
-    assert {:error, :artifact_content_conflict} = Host.save_graph(graph)
-    assert {:error, :not_found} = backend.graphs().fetch_graph(context, graph.id, graph_hash)
-  end
-
-  test "full compilation happens at publication and not at start" do
-    key = {CompileOnceNode, :compile_count}
-    Process.delete(key)
-
-    try do
-      graph =
-        Docket.Graph.new!(id: "compile-once")
-        |> Docket.Graph.put_node!("node", implementation: CompileOnceNode)
-        |> Docket.Graph.put_edge!("start", from: "$start", to: "node")
-        |> Docket.Graph.put_edge!("finish", from: "node", to: "$finish")
-
-      assert {:ok, reference} = Host.save_graph(graph)
-      assert Process.get(key) == 1
-      assert {:ok, _run} = Host.start_run(reference, %{})
-      assert Process.get(key) == 1
-    after
-      Process.delete(key)
-    end
   end
 
   test "a blocking observer cannot delay a committed API result" do
@@ -295,12 +310,7 @@ defmodule Docket.LifecycleTest do
     {:ok, rtg} = Docket.ensure_compiled(graph, [])
     {backend, context} = backend_ref(Host)
 
-    fresh =
-      Loop.build_initial_run(rtg, %{"value" => "x"},
-        run_id: "bad-start",
-        graph_compiler_abi: Docket.Runtime.Graph.Artifact.compiler_abi()
-      )
-
+    fresh = Loop.build_initial_run(rtg, %{"value" => "x"}, run_id: "bad-start")
     {:ok, start_moment} = Loop.propose_init(rtg, fresh, [])
     [first | rest] = start_moment.events
     invalid_start = %{start_moment | events: [%{first | run_id: "other"} | rest]}
@@ -332,5 +342,10 @@ defmodule Docket.LifecycleTest do
   defp backend_ref(host) do
     {:ok, defaults} = Docket.Runtime.Registry.defaults(host)
     {Keyword.fetch!(defaults, :storage), Keyword.fetch!(defaults, :storage_context)}
+  end
+
+  defp graph_with_mutable_default do
+    graph = Graphs.minimal_linear()
+    put_in(graph.nodes["copy"].implementation.module, MutableDefaultsNode)
   end
 end

@@ -24,7 +24,6 @@ defmodule Docket.Test.MemoryBackend do
 
   defstruct runs: %{},
             graphs: %{},
-            artifacts: %{},
             clock: nil,
             token_generator: nil
 
@@ -116,29 +115,6 @@ defmodule Docket.Test.MemoryBackend do
     state_get(backend, fn state ->
       case Map.fetch(state.graphs, {graph_id, graph_hash}) do
         {:ok, document} -> {:ok, document}
-        :error -> {:error, :not_found}
-      end
-    end)
-  end
-
-  @impl Docket.Storage.Graphs
-  def save_artifact(backend, graph_id, graph_hash, compiler_abi, artifact) do
-    state_get_and_update(backend, fn state ->
-      key = {graph_id, graph_hash, compiler_abi}
-
-      case Map.fetch(state.artifacts, key) do
-        :error -> {:ok, put_in(state.artifacts[key], artifact)}
-        {:ok, ^artifact} -> {:ok, state}
-        {:ok, _other} -> {{:error, :artifact_content_conflict}, state}
-      end
-    end)
-  end
-
-  @impl Docket.Storage.Graphs
-  def fetch_artifact(backend, graph_id, graph_hash, compiler_abi) do
-    state_get(backend, fn state ->
-      case Map.fetch(state.artifacts, {graph_id, graph_hash, compiler_abi}) do
-        {:ok, artifact} -> {:ok, artifact}
         :error -> {:error, :not_found}
       end
     end)
@@ -462,7 +438,6 @@ defmodule Docket.Test.MemoryBackend do
             run_id: run_id,
             graph_id: record.run.graph_id,
             graph_hash: record.run.graph_hash,
-            graph_compiler_abi: record.run.graph_compiler_abi,
             checkpoint_seq: record.run.checkpoint_seq,
             claim_token: claim_token,
             claimed_at: policy.now,
@@ -495,9 +470,7 @@ defmodule Docket.Test.MemoryBackend do
   end
 
   defp claim_candidate?(record, policy) do
-    record.run.status == :running and
-      record.run.graph_compiler_abi == Docket.Runtime.Graph.Artifact.compiler_abi() and
-      is_nil(record.poisoned_at) and
+    record.run.status == :running and is_nil(record.poisoned_at) and
       (ready?(record, policy.now) or expired?(record, policy.now, policy.orphan_ttl_ms))
   end
 
@@ -563,8 +536,7 @@ defmodule Docket.Test.MemoryBackend do
 
   defp validate_immutable_binding(stored_run, proposed_run) do
     if stored_run.id == proposed_run.id and stored_run.graph_id == proposed_run.graph_id and
-         stored_run.graph_hash == proposed_run.graph_hash and
-         stored_run.graph_compiler_abi == proposed_run.graph_compiler_abi do
+         stored_run.graph_hash == proposed_run.graph_hash do
       :ok
     else
       {:error, :invalid_commit}
@@ -643,7 +615,6 @@ defmodule Docket.Test.MemoryBackend do
       proposed_run.id == record.run.id and
       proposed_run.graph_id == record.run.graph_id and
       proposed_run.graph_hash == record.run.graph_hash and
-      proposed_run.graph_compiler_abi == record.run.graph_compiler_abi and
       proposed_run.checkpoint_seq == record.run.checkpoint_seq + 1 and
       is_atom(checkpoint_type) and not is_nil(checkpoint_type) and schedule != :retain_claim and
       valid_schedule?(schedule) and schedule_matches_status?(schedule, proposed_run.status) and
@@ -653,7 +624,6 @@ defmodule Docket.Test.MemoryBackend do
   defp valid_initialized_run?(run, checkpoint_type, wake_at) do
     is_struct(run, Docket.Run) and run.status == :running and nonempty_binary?(run.id) and
       nonempty_binary?(run.graph_id) and nonempty_binary?(run.graph_hash) and
-      nonempty_binary?(run.graph_compiler_abi) and
       is_integer(run.checkpoint_seq) and run.checkpoint_seq >= 1 and
       checkpoint_type == :run_initialized and
       is_struct(run.started_at, DateTime) and is_struct(wake_at, DateTime) and

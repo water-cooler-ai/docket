@@ -23,7 +23,7 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   - `Docket.Storage` — the shared backend transaction boundary
     (`transaction/2`);
   - `Docket.Storage.Graphs` — immutable, content-addressed canonical graph
-    save/fetch plus ABI-specific compiled artifact save/fetch;
+    save/fetch;
   - `Docket.Storage.Runs` — the run-row aggregate: insert/fetch/inspect,
     atomic batched due/expired claims with poison outcomes, token-guarded
     heartbeat/release, mandatory token-and-sequence fenced commit, serialized
@@ -109,11 +109,15 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   claim-fenced moment commit, and serialized signal/event transaction recipes,
   including the complete runtime-disposition to storage-schedule mapping
   (DCKT-12).
-- Explicit content-addressed graph publication through `save_graph`, atomically
-  storing canonical source plus a strict JSON-safe compiled artifact and
-  returning a compiler-ABI-bearing `Docket.GraphRef`; execution hydrates the
-  artifact and never compiles per start, signal, or claim (DCKT-12, lock
-  amendment 1).
+- Explicit content-addressed graph publication through `save_graph`, returning
+  a `Docket.GraphRef`; `start_run` accepts only that saved reference and never
+  writes the graph store (DCKT-12).
+- Locked versioning amendment: publication materializes node schema defaults
+  into the effective canonical graph before hashing. Runs pin only graph ID and
+  hash; the vehicle contract requires local compilation once per claim and
+  reuse for its drain. Compiler ABI and distributed artifacts are deliberately
+  not durable run identity; the vehicle shell lands in its dedicated ticket
+  (DCKT-12, DCKT-20).
 - Durable operational facade functions: `start_run`, `fetch_run`,
   `inspect_run`, `resolve_interrupt`, `cancel_run`, `retry_poisoned_run`, and
   bounded `await_run`, with strict tenantless/required scope resolution and a
@@ -146,10 +150,6 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   identity, snapshot-vs-input-hash integrity, attempt/failure agreement,
   retry-timer coverage, and one result per node per superstep — so an
   inconsistent document fails at the write boundary, never at recovery.
-- Run wire format bumped to version 3 with optional `graph_compiler_abi`;
-  durable operational runs require it so every claim, recovery, and signal
-  selects the exact published execution-artifact ABI. Storage-free legacy
-  runs may omit it (lock amendment 1).
   The barrier re-validates parked pending results, so corrupted durable
   state fails the run through the typed permanent path (DCKT-30, #18).
 - The dispatcher executes exactly one node attempt per invocation; retry
@@ -182,10 +182,7 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
 
 - `docket_checkpoints` table and its Ecto schema: `docket_runs.checkpoint_seq`
   is the run fence, recovery reads the run row, and retained events provide
-  history. DCKT-28 originally locked three operational tables; lock amendment
-  1 adds `docket_graph_artifacts` as a fourth table so compiler ABIs can
-  coexist without mutating canonical graph-version rows (DCKT-28, #11;
-  DCKT-12 amendment 1).
+  history. Exactly three operational tables remain (DCKT-28, #11).
 - Loader acceptance of version-1 run documents and the serialized `created`
   status (DCKT-31, #17).
 

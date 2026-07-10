@@ -1,12 +1,12 @@
 defmodule Docket.Runtime.Graph do
   @moduledoc """
-  Internal executable graph materialization produced by compilation or artifact hydration.
+  Internal executable graph materialization produced by `Docket.Graph.Compiler`.
 
-  A runtime graph is derived and never stored as a raw struct. Durable graph
-  publication encodes it through `Docket.Runtime.Graph.Artifact`; execution
-  hydrates that versioned JSON-safe IR. The canonical `Docket.Graph` remains
-  the editable source format. Every runtime ID maps back to public graph intent
-  through `lowering`.
+  A runtime graph is ephemeral node-local derived state, never a durable graph
+  format. The operational vehicle will fetch the effective canonical
+  `Docket.Graph`, compile it once on the executing node, and reuse this
+  structure for its claim drain. Every runtime ID maps back to public graph
+  intent through `lowering`.
   """
 
   alias Docket.Runtime.Graph.{Channel, Lowering, Node}

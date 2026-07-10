@@ -4,7 +4,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Row schema for `docket_runs`.
 
     The public `Docket.Run` fields (`run_id`, `graph_id`, `graph_hash`,
-    `graph_compiler_abi`,
     `status`, `step`, `input`, `output`, `failure`, `metadata`, timestamps)
     are columns; `state` holds the Docket-owned execution internals and must
     not be interpreted by hosts.
@@ -38,7 +37,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             tenant_id: String.t() | nil,
             graph_id: String.t() | nil,
             graph_hash: String.t() | nil,
-            graph_compiler_abi: String.t() | nil,
             status: Docket.Run.durable_status() | nil,
             step: non_neg_integer(),
             input: map() | nil,
@@ -65,7 +63,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       field(:tenant_id, :string)
       field(:graph_id, :string)
       field(:graph_hash, :string)
-      field(:graph_compiler_abi, :string)
       field(:status, Ecto.Enum, values: Docket.Run.durable_statuses())
       field(:step, :integer, default: 0)
       field(:input, :map)
@@ -92,7 +89,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :tenant_id,
       :graph_id,
       :graph_hash,
-      :graph_compiler_abi,
       :status,
       :step,
       :input,
@@ -112,16 +108,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :finished_at
     ]
 
-    @required [
-      :run_id,
-      :graph_id,
-      :graph_hash,
-      :graph_compiler_abi,
-      :status,
-      :input,
-      :state,
-      :started_at
-    ]
+    @required [:run_id, :graph_id, :graph_hash, :status, :input, :state, :started_at]
 
     @doc """
     Builds a changeset for inserting or updating a run row.

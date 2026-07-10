@@ -1,44 +1,53 @@
 # Docket Operational Transition Spec
 
-Status: transition spec (rev 8 + lock amendment 1)
-Date: 2026-07-09; amendment 1: 2026-07-10
+Status: transition spec (rev 8 + lock amendments 1–2; amendment 2 is current)
+Date: 2026-07-09; amendments: 2026-07-10
 Target: move from core runtime library to an Oban-shaped durable runtime
 
-## Lock Amendment 1 — Compile At Publication, Hydrate At Execution
+## Lock Amendment 2 — Effective Graphs, Node-Local Compilation
 
-This dated amendment supersedes revision 8 wherever it says that `start_run`
-or a claimed vehicle fetches a canonical graph and invokes the full compiler,
-or that a node-local runtime-graph cache owns compilation.
+This amendment supersedes lock amendment 1's compiler-ABI-pinned durable
+artifact design before `0.1.0` release. Durable runs and graph references pin
+only `{graph_id, graph_hash}`. The hash identifies the canonical **effective**
+graph document: publication snapshots node `config_schema/0` contracts once,
+materializes omitted defaults into node configuration, canonicalizes again,
+then hashes, validates, compiles, and stores that document.
 
-`save_graph` is the only durable publication boundary. It canonicalizes and
-hashes the source graph, runs the full compiler once, encodes a strict
-JSON-safe execution artifact, and atomically stores the canonical version plus
-the artifact selected by compiler ABI. `start_run`, durable signals, recovery,
-and claimed vehicles never invoke `Docket.Graph.Compiler`; they fetch and
-hydrate the exact published artifact. A missing, corrupt, or unsupported
-artifact is a typed failure and is never regenerated opportunistically during
-execution.
+Compiled `%Docket.Runtime.Graph{}` values are ephemeral node-local state. A
+start, signal operation, recovery, or claimed vehicle fetches the exact
+canonical document and compiles it with the Docket and application code
+installed on that node. A claimed vehicle compiles once, then reuses that
+runtime graph while draining multiple supersteps under its claim. An optional
+local cache may avoid later compilation on the same release, but cache loss
+affects performance only and its key must include both graph identity and a
+local release/compiler generation.
 
-The canonical `Docket.Graph` remains the editable source of truth. The
-compiled artifact is immutable derived data, not an Erlang external term or a
-raw `%Docket.Runtime.Graph{}`. A local cache may retain hydrated graphs keyed
-by `{graph_id, graph_hash, compiler_abi}`, but cache loss or node placement can
-affect only hydration latency, never correctness or whether compilation is
-required. Canonical versions and ABI-specific artifacts use separate tables
-so rolling deployments and future artifact backfills do not mutate source
-rows.
+There is no compiler ABI in `Docket.GraphRef`, `Docket.Run`, leases, claim
+routing, scheduling indexes, or relational identity, and no distributed
+compiled-artifact table. Compiler ABI could select a lowered plan but could
+not freeze the referenced application modules: a module atom still resolves
+to whatever code is installed on the executing node. An honest historical
+execution guarantee would require a future execution-package identity plus
+version-routed application releases, not an artifact ABI alone.
 
-Dispatch is ABI-aware during rolling deployments: each dispatcher claims only
-runs whose `graph_compiler_abi` it supports. Old- and new-ABI workers may
-coexist, and an unsupported run is left untouched rather than consuming claim
-attempts or being poisoned. Shipping a new ABI therefore requires its hydrator
-and routing support; it never falls back to claim-time compilation.
+A run may therefore cross compatible application releases at claim/yield
+boundaries. Whole-node replacement or graceful vehicle drain is the expected
+deployment model; hot replacement of node modules while a vehicle is running
+is host-owned and cannot be frozen by graph compilation. Applications must
+keep retained checkpoints compatible, migrate them explicitly, or use
+versioned node modules when behavior must remain stable.
 
-Why the lock changed: compile-per-claim charges validation and lowering to
-every cold dispatch, wake, retry, steal, scale-out node, and deployment. ETS
-can hide that cost only on one warm BEAM and therefore is not a distributed
-performance contract. Docket already owns immutable publication, so that is
-the deterministic boundary at which to pay compilation once.
+Compilation incompatibility is operational, not an execution failure. A
+future vehicle that cannot compile a claimed graph must not advance or poison
+the run through normal attempt accounting; the vehicle/claim work must define
+a fenced pre-launch abandon or equivalent administrative-halt path. That
+vehicle shell is outside DCKT-12 and is not yet implemented.
+
+Why the lock changed: a distributed artifact was derived using one node's
+application contracts but executed against potentially different module code
+on another node, creating a stronger-looking guarantee than Docket could
+enforce. Node-local compilation makes the actual deployment boundary explicit
+while durable effective configuration keeps omitted defaults content-addressed.
 
 ## 1. Purpose
 
@@ -132,8 +141,7 @@ It should include:
 - A first-class `Docket.Postgres` backend inside the `docket` package,
   enabled by optional `ecto_sql` and `postgrex` dependencies — one package to
   install, no version pair to manage.
-- Ecto migrations for Docket-owned operational tables, including canonical
-  graph versions and ABI-specific compiled artifacts.
+- Ecto migrations for Docket-owned operational tables.
 - Durable run store and graph store.
 - Per-run claim and optimistic commit fence for one durable state winner.
 - Synchronous, serialized signal application with confirmed results.
@@ -361,7 +369,6 @@ Recommended baseline:
 
 ```text
 docket_graph_versions
-docket_graph_artifacts
 docket_runs
 docket_events
 ```
@@ -377,21 +384,11 @@ concepts should not.
 picking up a recovered run on another node must be able to load the exact
 graph content by `graph_id + graph_hash` with no host call in the loop. Graph
 content that any retained run references must outlive that run. A composite
-foreign key from
-`docket_runs(graph_id, graph_hash, graph_compiler_abi)` to the exact artifact,
-and the artifact's foreign key to the canonical version, enforce this
-relationship. The pruner deletes a graph version only when no run-bound
-artifact is referenced — not merely when no active run references it. This
-preserves inspection and operator retry of retained failed runs and closes
-start-versus-prune races.
-
-`docket_graph_artifacts` stores immutable JSON-safe execution plans under
-`(graph_id, graph_hash, compiler_abi)`. A composite foreign key to the
-canonical version uses delete cascade, so pruning a graph version removes all
-derived ABIs while canonical retention remains controlled by run references.
-Artifact rows are separate so a new compiler ABI can be published or backfilled
-without mutating canonical source or preventing rolling nodes from selecting
-the ABI they understand.
+foreign key from `docket_runs(graph_id, graph_hash)` to
+`docket_graph_versions(graph_id, graph_hash)` enforces this relationship. The
+pruner deletes a graph version only when no run row references it — not merely
+when no active run references it. This preserves inspection and operator retry
+of retained failed runs and closes start-versus-prune races.
 
 Retained events do not outlive their run in `0.1.0`. A foreign key from
 `docket_events.run_id` to the unique `docket_runs.run_id` uses delete cascade.
@@ -408,21 +405,24 @@ latest-version pointer, listing, graph-level ownership), which arrives with
 graph catalog/version-management APIs post-`0.1.0`; adding it then is a purely
 additive migration.
 
-Publishing is explicit and content-addressed. `save_graph(graph)` validates
-and compiles the canonical graph once, then atomically stores its
-`Docket.Graph.to_map/1` document plus a versioned JSON-safe execution artifact
-and returns a stable graph reference containing the compiler ABI.
+Publishing is explicit and content-addressed. `save_graph(graph)` snapshots
+node configuration schemas once, materializes their defaults, validates and
+compiles that effective graph, then stores its canonical
+`Docket.Graph.to_map/1` document keyed by `graph_id + graph_hash` and returns a
+stable graph reference.
 Postgres implements `save_graph` with `ON CONFLICT DO NOTHING`. Two nodes racing
 to publish the same version both succeed idempotently. If the existing document
 under that key is not structurally equal to the canonical JSON document,
 `save_graph` returns a graph-content conflict rather than treating the conflict
 clause as proof that the content matched.
 
-`start_run(graph_ref, input)` fetches and hydrates the already-saved execution
-artifact before entering the run/event lifecycle transaction. It never writes
-the graph store and never invokes the compiler. Recovery and durable signals
-use the same artifact path. The canonical document remains the portable source
-contract; the artifact is a separate portable derived IR.
+`start_run(graph_ref, input)` fetches the already-saved effective canonical
+document and compiles it locally before entering the run/event lifecycle
+transaction. It never writes the graph store. Recovery uses the same
+`fetch_graph` operation. A vehicle compiles once per claim and reuses the
+derived runtime graph across its drain loop. The canonical document remains
+the portable storage contract; an optional release-scoped local cache is not a
+correctness boundary.
 
 ### `docket_runs`
 
@@ -432,7 +432,7 @@ execution internals — channels, interrupts, pending nodes and writes, active
 tasks, timers, internal counters — live in a single `state` jsonb column. The
 line between the two is not new; it is the contract `Docket.Run` already
 declares: hosts may inspect the top-level fields (`id`, `graph_id`,
-`graph_hash`, `graph_compiler_abi`, `status`, `step`, `input`, `output`, timestamps) and must never
+`graph_hash`, `status`, `step`, `input`, `output`, timestamps) and must never
 interpret the internals. Columns are that inspectable surface plus what the
 operational layer itself reads and writes; `state` is exactly the
 "do not interpret" blob, versioned internally by the document's own `version`
@@ -453,7 +453,6 @@ tenant_id
 run_id
 graph_id
 graph_hash
-graph_compiler_abi
 status
 step
 input
@@ -590,9 +589,9 @@ Important indexes:
 unique (run_id)
 partial (tenant_id, status) WHERE tenant_id IS NOT NULL
 partial (tenant_id, graph_id, status) WHERE tenant_id IS NOT NULL
-partial (graph_compiler_abi, wake_at, id) WHERE status = 'running' AND poisoned_at IS NULL
+partial (wake_at, id) WHERE status = 'running' AND poisoned_at IS NULL
                       AND claim_token IS NULL AND wake_at IS NOT NULL
-partial (graph_compiler_abi, claimed_at, id) WHERE status = 'running' AND poisoned_at IS NULL
+partial (claimed_at, id) WHERE status = 'running' AND poisoned_at IS NULL
                          AND claim_token IS NOT NULL
 partial (poisoned_at) WHERE poisoned_at IS NOT NULL
 (status, updated_at)                              -- ops introspection
@@ -1142,7 +1141,7 @@ separate best-effort `checkpoint_observers` configuration after commit.
 
 ```text
 validate tenant and graph access
-fetch and hydrate the exact compiled artifact selected by graph reference
+fetch the effective canonical graph by graph reference and compile it locally
 Docket.Lifecycle.start(backend, scope, fn tx ->
   calculate initialized runtime moment without handler delivery
   Runs.insert_run(tx, initialized run with :immediate disposition)
@@ -1160,8 +1159,8 @@ return initialized run
 the dispatcher asks RunStore.claim_due for demand
   each launched claim atomically increments claim_attempts and clears wake_at
   an exhausted candidate is poisoned atomically and is not launched
-release the connection; load committed Docket.Run and its exact ABI-specific artifact
-hydrate the persisted runtime artifact outside the claim transaction
+release the connection; load committed Docket.Run and effective graph document
+compile once on this node outside GraphStore; reuse it for the whole claim drain
 if the run is not runnable (terminal, or waiting with no input),
   report an invariant violation, release the current token, and stop
 the vehicle loops: propose one moment -> Docket.Lifecycle.commit_moment -> continue
@@ -1409,18 +1408,17 @@ runtime be owned by a durable backend without weakening the execution model.
 The 0.1.0 implementation should include:
 
 - `mix docket.gen.migration` or documented migration copy path.
-- Migrations for runs, graph versions, compiled graph artifacts, and events.
+- Migrations for runs, graph versions, and events.
 - `Docket.Postgres` implementing the backend bundle and supervision boundary;
   `Docket.Postgres.Storage` implementing the shared transaction boundary, with
   `Docket.Postgres.GraphStore`, `Docket.Postgres.RunStore`, and
   `Docket.Postgres.EventStore` implementing the three store behaviours against
   its transaction context. The run row codec maps promoted columns plus
-  `state` to `Docket.Run`. `GraphStore` persists canonical documents and
-  ABI-specific compiled artifacts; execution paths hydrate artifacts and an
-  optional vehicle cache retains only hydrated values.
-- An explicit `save_graph` facade that validates/compiles and atomically stores
-  the canonical content-addressed graph document plus ABI-specific artifact,
-  returning a stable reference.
+  `state` to `Docket.Run`. `GraphStore` returns canonical effective documents
+  only; vehicles own node-local compilation and may use a release-scoped cache.
+- An explicit `save_graph` facade that materializes node configuration
+  defaults, validates/compiles, and stores the canonical content-addressed
+  effective graph document, returning a stable reference.
 - `Docket.Lifecycle` start orchestration that composes `Runs.insert_run` and
   `Events.append_events` inside one storage transaction, inserting the
   initialized run, assigned initialization and `:checkpoint_committed` events,
@@ -1522,8 +1520,7 @@ Substrate-independent.
 
 ### Milestone C - `Docket.Postgres` MVP
 
-- Add the four-table migration and Postgres storage (including graph
-  artifacts, `wake_at`,
+- Add the three-table migration and Postgres storage (including `wake_at`,
   `claim_attempts`, poison/failure facts, run-to-graph and event-to-run foreign
   keys, lifecycle CHECK constraints, and metadata-only checkpoint history events).
 - Implement the Postgres transaction boundary and graph, run, and event stores.

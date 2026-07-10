@@ -48,7 +48,6 @@ defmodule Docket do
 
   alias Docket.{Error, Graph, GraphRef, Lifecycle, Run, RunInfo}
   alias Docket.Runtime.Loop
-  alias Docket.Runtime.Graph.Artifact
   alias Docket.Runtime.RunMutation
   alias Docket.Runtime.Registry, as: RuntimeRegistry
 
@@ -86,48 +85,32 @@ defmodule Docket do
   end
 
   @doc """
-  Publishes one canonical, content-addressed graph version.
+  Saves one effective, canonical, content-addressed graph version.
 
-  The full compiler runs once against the canonicalized source. Publication
-  atomically saves that document and a versioned JSON-safe execution artifact;
-  `start_run/4` and durable signals hydrate the artifact without compiling.
+  Publication snapshots each node implementation's configuration schema once
+  and materializes its defaults into the canonical document before hashing.
+  Storage keeps that effective document; execution loads and compiles it on
+  the node that performs the work.
   """
   def save_graph(runtime, graph, opts \\ [])
 
   def save_graph(runtime, %Graph{} = graph, opts) do
-    document = Graph.to_map(graph)
-
-    with {:ok, canonical} <- Graph.from_map(document),
-         {:ok, opts} <- instance_opts(runtime, opts),
+    with {:ok, opts} <- instance_opts(runtime, opts),
          {:ok, {backend, context}} <- configured_backend(opts),
-         {:ok, rtg} <- ensure_compiled(canonical, Keyword.delete(opts, :max_supersteps)),
-         artifact = Artifact.dump(rtg),
+         {:ok, effective, rtg} <- compile_for_publication(graph),
          {:ok, :saved} <-
            backend.storage().transaction(context, fn tx ->
-             with :ok <-
-                    backend.graphs().save_graph(
-                      tx,
-                      rtg.graph_id,
-                      rtg.graph_hash,
-                      document
-                    ),
-                  :ok <-
-                    backend.graphs().save_artifact(
-                      tx,
-                      rtg.graph_id,
-                      rtg.graph_hash,
-                      Artifact.compiler_abi(),
-                      artifact
-                    ) do
-               {:ok, :saved}
+             case backend.graphs().save_graph(
+                    tx,
+                    rtg.graph_id,
+                    rtg.graph_hash,
+                    Graph.to_map(effective)
+                  ) do
+               :ok -> {:ok, :saved}
+               {:error, reason} -> {:error, reason}
              end
            end) do
-      {:ok,
-       %GraphRef{
-         graph_id: rtg.graph_id,
-         graph_hash: rtg.graph_hash,
-         compiler_abi: Artifact.compiler_abi()
-       }}
+      {:ok, %GraphRef{graph_id: rtg.graph_id, graph_hash: rtg.graph_hash}}
     end
   end
 
@@ -135,23 +118,40 @@ defmodule Docket do
     {:error, Error.new(:invalid_graph, "expected a Docket.Graph, got #{inspect(graph)}")}
   end
 
+  defp compile_for_publication(graph) do
+    case Docket.Graph.Compiler.compile_for_publication(graph, profile: :publish) do
+      {:ok, effective, rtg} ->
+        {:ok, effective, rtg}
+
+      {:error, %Graph{} = failed} ->
+        {:error,
+         Error.new(:invalid_graph, "graph #{inspect(graph.id)} failed verification",
+           details: %{diagnostics: failed.diagnostics}
+         )}
+    end
+  end
+
   @doc """
   Starts a run from a previously saved graph reference.
 
-  The exact ABI-specific execution artifact is fetched and hydrated before the
-  initialized run and assigned events commit atomically. Durable checkpoint
-  observers run only after that commit; starting a run never publishes,
-  changes, or compiles a graph.
+  The graph is fetched and compiled before the initialized run and assigned
+  events commit atomically. Durable checkpoint observers run only after that
+  commit; starting a run never publishes or changes a graph document.
   """
   def start_run(runtime, graph_ref, input, opts \\ [])
 
   def start_run(runtime, %GraphRef{} = graph_ref, input, opts) do
     with {:ok, opts} <- instance_opts(runtime, opts),
          {:ok, {backend, context} = backend_ref, scope} <- durable_access(opts),
-         {:ok, artifact} <- fetch_artifact(backend, context, graph_ref),
-         {:ok, rtg} <- Artifact.load(artifact, graph_ref.graph_id, graph_ref.graph_hash),
+         {:ok, document} <-
+           backend.graphs().fetch_graph(
+             context,
+             graph_ref.graph_id,
+             graph_ref.graph_hash
+           ),
+         {:ok, graph} <- Graph.from_map(document),
+         {:ok, rtg} <- ensure_compiled(graph, opts),
          :ok <- check_graph_ref(rtg, graph_ref),
-         opts = Keyword.put(opts, :graph_compiler_abi, graph_ref.compiler_abi),
          run = Loop.build_initial_run(rtg, input, opts),
          {:ok, moment} <- Loop.propose_init(rtg, run, opts),
          {:ok, moment} <- Lifecycle.start(backend_ref, scope, moment) do
@@ -211,10 +211,10 @@ defmodule Docket do
   Returns `{:ok, run}` after the sync `:interrupt_resolved` checkpoint is
   accepted. Unknown or already-resolved interrupts return
   `{:error, %Docket.Error{type: :not_found}}`; so do runs with no active
-  Runtime. With `storage:` configured, the run's exact compiled artifact is
-  loaded and hydrated without invoking the compiler, the pure mutation and
-  its events commit atomically, and tenant scope is enforced before storage
-  access. Authorization remains host-owned.
+  Runtime. With `storage:` configured, the stored effective canonical graph is
+  loaded and compiled on the executing node, the pure mutation and its events
+  commit atomically, and tenant scope is enforced before storage access.
+  Authorization remains host-owned.
   """
   def resolve_interrupt(runtime, run_id, interrupt_id, value, opts \\ []) do
     case RuntimeRegistry.defaults(runtime) do
@@ -478,17 +478,9 @@ defmodule Docket do
   defp durable_resolve_interrupt(opts, run_id, interrupt_id, value) do
     with {:ok, {backend, context} = backend_ref, scope} <- durable_access(opts),
          {:ok, run} <- backend.runs().fetch_run(context, scope, run_id),
-         {:ok, artifact} <-
-           fetch_artifact(
-             backend,
-             context,
-             %GraphRef{
-               graph_id: run.graph_id,
-               graph_hash: run.graph_hash,
-               compiler_abi: run.graph_compiler_abi
-             }
-           ),
-         {:ok, rtg} <- Artifact.load(artifact, run.graph_id, run.graph_hash),
+         {:ok, document} <- backend.graphs().fetch_graph(context, run.graph_id, run.graph_hash),
+         {:ok, graph} <- Graph.from_map(document),
+         {:ok, rtg} <- ensure_compiled(graph, opts),
          now = operation_now(opts),
          result <-
            Lifecycle.signal(backend_ref, scope, run_id, fn current ->
@@ -505,31 +497,6 @@ defmodule Docket do
 
   defp finish_signal({:ok, %Run{} = run}, _opts), do: {:ok, run}
   defp finish_signal({:error, reason}, _opts), do: {:error, reason}
-
-  defp fetch_artifact(backend, context, %GraphRef{} = reference) do
-    case backend.graphs().fetch_artifact(
-           context,
-           reference.graph_id,
-           reference.graph_hash,
-           reference.compiler_abi
-         ) do
-      {:ok, artifact} ->
-        {:ok, artifact}
-
-      {:error, :not_found} ->
-        {:error,
-         Error.new(:graph_artifact_not_found, "published graph artifact was not found",
-           details: %{
-             graph_id: reference.graph_id,
-             graph_hash: reference.graph_hash,
-             compiler_abi: reference.compiler_abi
-           }
-         )}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
 
   defp operation_now(opts), do: Keyword.get(opts, :clock, &DateTime.utc_now/0).()
 
@@ -589,8 +556,7 @@ defmodule Docket do
   end
 
   defp check_graph_ref(rtg, %GraphRef{} = reference) do
-    if rtg.graph_id == reference.graph_id and rtg.graph_hash == reference.graph_hash and
-         reference.compiler_abi == Artifact.compiler_abi() do
+    if rtg.graph_id == reference.graph_id and rtg.graph_hash == reference.graph_hash do
       :ok
     else
       {:error,
@@ -598,10 +564,8 @@ defmodule Docket do
          details: %{
            reference_graph_id: reference.graph_id,
            reference_graph_hash: reference.graph_hash,
-           reference_compiler_abi: reference.compiler_abi,
            graph_id: rtg.graph_id,
-           graph_hash: rtg.graph_hash,
-           supported_compiler_abi: Artifact.compiler_abi()
+           graph_hash: rtg.graph_hash
          }
        )}
     end

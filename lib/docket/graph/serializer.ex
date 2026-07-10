@@ -286,29 +286,27 @@ defmodule Docket.Graph.Serializer do
     invalid!(:invalid_schema, "schema values must be a list, got #{inspect(other)}")
   end
 
-  @doc false
-  def dump_reducer(nil), do: nil
+  defp dump_reducer(nil), do: nil
 
-  def dump_reducer(%Reducer{} = reducer) do
+  defp dump_reducer(%Reducer{} = reducer) do
     type = lookup!(@reducer_types_out, reducer.type, :invalid_reducer, "reducer type")
 
     %{"type" => type}
     |> put_open_map("opts", reducer.opts)
   end
 
-  def dump_reducer(other) do
+  defp dump_reducer(other) do
     invalid!(:invalid_reducer, "reducer must be a Docket.Reducer or nil, got #{inspect(other)}")
   end
 
-  @doc false
-  def dump_guard(nil), do: nil
+  defp dump_guard(nil), do: nil
 
-  def dump_guard(%Guard{op: op, args: args}) when is_list(args) do
+  defp dump_guard(%Guard{op: op, args: args}) when is_list(args) do
     op_string = lookup!(@guard_ops_out, op, :invalid_guard, "guard op")
     %{"op" => op_string, "args" => dump_guard_args(op, args)}
   end
 
-  def dump_guard(other) do
+  defp dump_guard(other) do
     invalid!(:invalid_guard, "guard must be a Docket.Guard or nil, got #{inspect(other)}")
   end
 
@@ -544,10 +542,9 @@ defmodule Docket.Graph.Serializer do
     end
   end
 
-  @doc false
-  def load_reducer!(nil, _location), do: nil
+  defp load_reducer!(nil, _location), do: nil
 
-  def load_reducer!(map, location) when is_map(map) and not is_struct(map) do
+  defp load_reducer!(map, location) when is_map(map) and not is_struct(map) do
     assert_string_keys!(map, "reducer in #{location}")
     assert_known_keys!(map, @reducer_keys, "reducer in #{location}")
 
@@ -565,14 +562,13 @@ defmodule Docket.Graph.Serializer do
     }
   end
 
-  def load_reducer!(other, location) do
+  defp load_reducer!(other, location) do
     invalid!(:invalid_document, "reducer in #{location} must be a map, got #{inspect(other)}")
   end
 
-  @doc false
-  def load_guard!(nil, _location), do: nil
+  defp load_guard!(nil, _location), do: nil
 
-  def load_guard!(map, location) when is_map(map) and not is_struct(map) do
+  defp load_guard!(map, location) when is_map(map) and not is_struct(map) do
     assert_string_keys!(map, "guard in #{location}")
     assert_known_keys!(map, @guard_keys, "guard in #{location}")
     op = lookup!(@guard_ops, fetch_required!(map, "op", "guard"), :invalid_document, "guard op")
@@ -588,7 +584,7 @@ defmodule Docket.Graph.Serializer do
     %Guard{op: op, args: load_guard_args!(op, args, location)}
   end
 
-  def load_guard!(other, location) do
+  defp load_guard!(other, location) do
     invalid!(:invalid_document, "guard in #{location} must be a map, got #{inspect(other)}")
   end
 

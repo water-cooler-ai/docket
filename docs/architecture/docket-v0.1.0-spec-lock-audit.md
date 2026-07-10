@@ -2,11 +2,11 @@
 
 Date: 2026-07-09
 
-Amended: 2026-07-10 by operational spec lock amendment 1. The original audit
-correctly recorded revision 8's compile/cache ownership, but that decision is
-now explicitly superseded: full compilation occurs once at graph publication;
-execution hydrates a persisted ABI-specific artifact. This historical audit is
-otherwise retained rather than rewritten as though it always made that choice.
+Amended: 2026-07-10 by operational spec lock amendment 2. Durable identity is
+`{graph_id, graph_hash}` over an effective canonical graph with node schema
+defaults materialized before hashing. Compiled runtime graphs are node-local,
+ephemeral values compiled once per vehicle claim and reused for that drain;
+compiler ABI and distributed compiled artifacts are not run identity.
 
 Scope: DCKT-1 and all 29 descendant issues, the operational transition spec,
 the active DCKT-8 branch, the v0.1 migration/schema, runtime lifecycle code,
@@ -63,19 +63,18 @@ eligibility, attempt accounting, or a second poison mutation.
 
 ### One lifecycle composer
 
-`Docket.Lifecycle` owns the three transaction recipes:
+`Docket.Lifecycle` owns the three run/event transaction recipes:
 
 - start: initialized run insert + retained events;
 - advance: fenced run commit + retained events; and
 - signal: serialized run mutation + retained events.
 
-Graph publication is a separate transaction that atomically saves the
-canonical source plus its compiler-versioned artifact. Lifecycle never writes
-either graph table.
-
 Stores never call other stores. Facades, vehicles, and durable test drivers
 delegate to the same composer. `Docket.Postgres.Storage` remains a transaction
 boundary only.
+
+Graph publication is a separate explicit transaction before start. It stores
+the effective canonical graph document; lifecycle never writes graph data.
 
 ### Runtime produces moments, not committed checkpoints
 
@@ -228,9 +227,7 @@ status = 'running' AND poisoned_at IS NULL
 
 Add both relational safety edges:
 
-- artifacts `(graph_id, graph_hash)` -> graph versions, delete cascaded;
-- runs `(graph_id, graph_hash, graph_compiler_abi)` -> exact artifacts,
-  delete restricted;
+- runs `(graph_id, graph_hash)` -> graph versions, delete restricted;
 - events `run_id` -> runs `run_id`, delete cascaded.
 
 For v0.1, events may be pruned earlier than their run but never outlive it;
@@ -273,16 +270,14 @@ transactional conformance under overlap.
 - **New core slice:** durable five-state vocabulary, `Run.failure`, transition
   matrix, and `RunInfo` inspection. No current ticket fully owns this work.
 - **DCKT-29:** failure/poison fields, full lifecycle CHECKs, event FK, positive
-  eligibility shape, and amendment-1 graph-artifact DDL.
+  eligibility shape.
 
 ### P1 implementation alignment
 
 - **DCKT-12:** one backend bundle and named `Docket.Lifecycle`; explicit scope;
-  separate committer/observer configuration; `inspect_run`/poisoned await;
-  compile/encode at publication and hydrate on public execution paths.
-- **DCKT-14:** stores/codecs only; persist canonical graph versions and
-  ABI-specific artifact envelopes, with no start-orchestration ownership.
-  Document/measure input-channel duplication for v0.1.
+  separate committer/observer configuration; `inspect_run`/poisoned await.
+- **DCKT-14:** stores/codecs only; no start-orchestration or compilation
+  ownership. Document/measure input-channel duplication for v0.1.
 - **DCKT-15:** fold into RunStore claim aggregate (or rename as the full claim
   capability); atomically return claimed versus poisoned leases.
 - **DCKT-16:** consume runtime moments; mandatory token; assigned event
@@ -293,8 +288,9 @@ transactional conformance under overlap.
   composer owns signal transaction.
 - **DCKT-19:** RunStore issues transactional `pg_notify`; PostgreSQL delivers
   after commit. Poll remains correctness.
-- **DCKT-20:** vehicle owns propose/commit/continue plus artifact
-  load/hydration; a local hydrated-value cache is optional and never compiles.
+- **DCKT-20:** vehicle fetches and compiles the effective document once per
+  claim, then owns propose/commit/continue and reuses that runtime graph for
+  the drain. A release-scoped node-local cache is optional only.
 - **DCKT-21:** events cannot outlive runs; event retention is capped by run
   retention; graph pruning follows run deletion.
 - **DCKT-24:** each moment uses the production logical transaction boundary;
