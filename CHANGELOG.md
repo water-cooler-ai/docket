@@ -43,7 +43,7 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   separately indexed ready and expired paths, including `SKIP LOCKED`
   dispatcher concurrency, exact claim-attempt poisoning, token-guarded
   heartbeat/release, and the shared internal mandatory-commit token predicate
-  (DCKT-15).
+  (DCKT-15, #20).
 - `Docket.Event`: metadata-only `:checkpoint_committed` event type and the
   `types/0` helper (DCKT-8, #12).
 - `docs/architecture/docket-operational-transition-spec.md` revision 8 and
