@@ -115,7 +115,7 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   `operational_status` indexes become the ready-unclaimed `(wake_at, id)`,
   expired-claim `(claimed_at, id)`, and poison-introspection partial
   indexes behind positive dispatch eligibility (`status = 'running' AND
-  poisoned_at IS NULL`) (DCKT-29).
+  poisoned_at IS NULL`) (DCKT-29, #19).
 
 ### Removed
 
