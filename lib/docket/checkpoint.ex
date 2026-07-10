@@ -14,10 +14,16 @@ defmodule Docket.Checkpoint do
   | --- | --- |
   | `:run_initialized` | `:sync` |
   | `:step_committed` | `:async` |
+  | `:retry_scheduled` | `:sync` |
   | `:interrupt_requested` | `:sync` |
   | `:interrupt_resolved` | `:sync` |
   | `:run_completed` | `:sync` |
   | `:run_failed` | `:sync` |
+
+  `:retry_scheduled` commits retry-park control state mid-superstep: the
+  graph step does not advance and the run stays `:running`, parked until the
+  earliest retry deadline. It is sync so a crash during backoff resumes from
+  the parked attempt instead of resetting the node's retry budget.
 
   Sync checkpoints must be accepted (`:ok`) before the state transition is
   committed or the related public API reports success. Async checkpoints are
@@ -30,6 +36,7 @@ defmodule Docket.Checkpoint do
   @type type ::
           :run_initialized
           | :step_committed
+          | :retry_scheduled
           | :interrupt_requested
           | :interrupt_resolved
           | :run_completed
@@ -53,6 +60,7 @@ defmodule Docket.Checkpoint do
   @types [
     :run_initialized,
     :step_committed,
+    :retry_scheduled,
     :interrupt_requested,
     :interrupt_resolved,
     :run_completed,
@@ -62,6 +70,7 @@ defmodule Docket.Checkpoint do
   @default_deliveries %{
     run_initialized: :sync,
     step_committed: :async,
+    retry_scheduled: :sync,
     interrupt_requested: :sync,
     interrupt_resolved: :sync,
     run_completed: :sync,

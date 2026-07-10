@@ -9,9 +9,8 @@ defmodule Docket.Runtime.Algorithm do
   # public ID so identical inputs produce identical outputs.
 
   alias Docket.Graph.Compiler.Policies
-  alias Docket.Graph.Serializer
   alias Docket.Guard
-  alias Docket.Run.ChannelState
+  alias Docket.Run.{ChannelState, TaskState}
   alias Docket.Runtime.Activation
   alias Docket.{Reducer, Schema, Wire}
 
@@ -103,7 +102,7 @@ defmodule Docket.Runtime.Algorithm do
   def prepare_activations(rtg, run, node_ids, _config) do
     snapshot = state_snapshot(rtg, run)
     versions = state_versions(rtg, run)
-    input_hash = hash_snapshot(snapshot)
+    input_hash = TaskState.snapshot_hash(snapshot)
 
     node_ids
     |> Enum.sort()
@@ -112,7 +111,7 @@ defmodule Docket.Runtime.Algorithm do
 
       case Policies.node_policies(node.policies) do
         {:ok, %{timeout_ms: timeout_ms, retry: retry}} ->
-          task_id = "#{run.id}:#{run.step}:#{node_id}"
+          task_id = TaskState.task_id(run.id, run.step, node_id)
 
           activation = %Activation{
             task_id: task_id,
@@ -121,7 +120,7 @@ defmodule Docket.Runtime.Algorithm do
             step: run.step,
             attempt: 1,
             input_hash: input_hash,
-            idempotency_key: "#{task_id}:1",
+            idempotency_key: TaskState.idempotency_key(task_id, 1),
             snapshot: snapshot,
             source_versions: versions,
             config: node.config,
@@ -141,6 +140,79 @@ defmodule Docket.Runtime.Algorithm do
     |> case do
       {:ok, activations} -> {:ok, Enum.reverse(activations)}
       error -> error
+    end
+  end
+
+  @doc """
+  Rebuilds the active superstep's activations from the durable task state
+  parked on the committed run.
+
+  Identity is preserved exactly: task IDs, attempt numbers, snapshots, and
+  source versions come from `run.active_tasks`, so a resumed attempt carries
+  the same idempotency identity the parked superstep committed. Node config
+  and policies are re-resolved from the runtime graph, which the loop has
+  already matched by graph ID and hash.
+
+  Returns `{:ok, [activation]}` sorted by node ID, or
+  `{:error, Docket.Error.t()}` when a task references an unknown node or the
+  node declares an invalid v1 policy.
+  """
+  def resume_activations(rtg, run) do
+    run.active_tasks
+    |> Enum.sort_by(fn {_task_id, task} -> task.node_id end)
+    |> Enum.reduce_while({:ok, []}, fn {task_id, task}, {:ok, acc} ->
+      with {:ok, node} <- fetch_task_node(rtg, task),
+           {:ok, %{timeout_ms: timeout_ms, retry: retry}} <- task_policies(node, task) do
+        activation = %Activation{
+          task_id: task_id,
+          node_id: task.node_id,
+          runtime_node_id: node.id,
+          step: task.step,
+          attempt: task.attempt,
+          input_hash: task.input_hash,
+          idempotency_key: TaskState.idempotency_key(task_id, task.attempt),
+          snapshot: task.snapshot,
+          source_versions: task.source_versions,
+          config: node.config,
+          timeout_ms: timeout_ms,
+          retry: retry
+        }
+
+        {:cont, {:ok, [activation | acc]}}
+      else
+        {:error, %Docket.Error{} = error} -> {:halt, {:error, error}}
+      end
+    end)
+    |> case do
+      {:ok, activations} -> {:ok, Enum.reverse(activations)}
+      error -> error
+    end
+  end
+
+  defp fetch_task_node(rtg, task) do
+    case Map.fetch(rtg.nodes, "node:" <> task.node_id) do
+      {:ok, node} ->
+        {:ok, node}
+
+      :error ->
+        {:error,
+         Docket.Error.new(
+           :invalid_run,
+           "active task #{inspect(task.task_id)} references unknown node #{inspect(task.node_id)}",
+           node_id: task.node_id,
+           phase: :plan
+         )}
+    end
+  end
+
+  defp task_policies(node, task) do
+    case Policies.node_policies(node.policies) do
+      {:ok, policies} ->
+        {:ok, policies}
+
+      {:error, errors} ->
+        message = Enum.map_join(errors, "; ", fn {_key, message} -> message end)
+        {:error, Docket.Error.new(:invalid_policy, message, node_id: task.node_id, phase: :plan)}
     end
   end
 
@@ -183,14 +255,6 @@ defmodule Docket.Runtime.Algorithm do
         :error -> {public_id, 0}
       end
     end
-  end
-
-  @doc false
-  def hash_snapshot(snapshot) do
-    snapshot
-    |> Serializer.canonical_json_encode()
-    |> then(&:crypto.hash(:sha256, &1))
-    |> Base.encode16(case: :lower)
   end
 
   # ---------------------------------------------------------------------------

@@ -258,6 +258,64 @@ defmodule Docket.Test.Fixtures.Nodes do
     end
   end
 
+  defmodule NotifyingFlaky do
+    @moduledoc false
+    # FlakyThenSucceeds that also reports every attempt - with its
+    # idempotency identity and the state snapshot it observed - to
+    # `context.application.notify`, so tests can assert attempt identity and
+    # snapshot stability across retry parks and crash-resume.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{
+        "failures" => Docket.Schema.float(required: true),
+        "field" => Docket.Schema.string(required: true),
+        "value" => Docket.Schema.string(required: true)
+      })
+    end
+
+    @impl true
+    def call(state, config, context) do
+      send(
+        Map.fetch!(context.application, :notify),
+        {:attempted, context.node_id, context.attempt, context.idempotency_key, state}
+      )
+
+      if context.attempt <= trunc(config["failures"]) do
+        {:error, {:flaky, context.attempt}}
+      else
+        {:ok, %{config["field"] => config["value"]}}
+      end
+    end
+  end
+
+  defmodule NotifyingWrite do
+    @moduledoc false
+    # WriteStatic that reports every execution to
+    # `context.application.notify`, so tests can prove a committed sibling
+    # result is never re-executed across parks and recovery.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{
+        "field" => Docket.Schema.string(required: true),
+        "value" => Docket.Schema.string(required: true)
+      })
+    end
+
+    @impl true
+    def call(_state, config, context) do
+      send(
+        Map.fetch!(context.application, :notify),
+        {:executed, context.node_id, context.attempt}
+      )
+
+      {:ok, %{config["field"] => config["value"]}}
+    end
+  end
+
   defmodule AlwaysFails do
     @moduledoc false
     @behaviour Docket.Node

@@ -110,16 +110,50 @@ defmodule Docket.Runtime.FailureRetryTest do
 
       assert run.status == :done
       assert run.output == %{"out" => "done"}
-      assert checkpoint_types(checkpoints) == [:run_initialized, :step_committed, :run_completed]
+      assert run.active_tasks == %{}
+      assert run.pending_writes == []
+      assert run.timers == %{}
 
-      step = Enum.at(checkpoints, 1)
+      # Each retryable failure yields exactly one retry park; the barrier
+      # then commits the whole superstep in one step.
+      assert checkpoint_types(checkpoints) ==
+               [
+                 :run_initialized,
+                 :retry_scheduled,
+                 :retry_scheduled,
+                 :step_committed,
+                 :run_completed
+               ]
 
       retried =
-        for event <- step.events, event.type == :node_failed do
+        for checkpoint <- checkpoints,
+            checkpoint.type == :retry_scheduled,
+            event <- checkpoint.events,
+            event.type == :node_failed do
           {event.payload["attempt"], event.payload["permanent"]}
         end
 
       assert retried == [{1, false}, {2, false}]
+
+      # A retry park is sync, keeps graph status :running, and does not
+      # advance the graph step; the parked control state carries the next
+      # attempt and the accumulated failures.
+      for {park, index} <-
+            checkpoints |> Enum.filter(&(&1.type == :retry_scheduled)) |> Enum.with_index(1) do
+        assert park.delivery == :sync
+        assert park.run.status == :running
+        assert park.run.step == 0
+
+        assert [{task_id, task}] = Map.to_list(park.run.active_tasks)
+        assert task_id == "#{park.run.id}:0:flaky"
+        assert task.attempt == index + 1
+        assert task.idempotency_key == "#{task_id}:#{index + 1}"
+        assert Enum.map(task.failures, & &1.attempt) == Enum.to_list(1..index)
+        assert %Docket.Run.TimerState{kind: :retry} = park.run.timers[task_id]
+      end
+
+      step = Enum.find(checkpoints, &(&1.type == :step_committed))
+      refute Enum.any?(step.events, &(&1.type == :node_failed))
 
       assert Enum.any?(
                step.events,
@@ -138,6 +172,22 @@ defmodule Docket.Runtime.FailureRetryTest do
       assert run.status == :failed
       assert %Docket.Run.Failure{code: "node_failed", node_id: "flaky"} = run.failure
 
+      # Terminal failure absorbs the active superstep.
+      assert run.active_tasks == %{}
+      assert run.pending_writes == []
+      assert run.timers == %{}
+
+      assert checkpoint_types(checkpoints) == [:run_initialized, :retry_scheduled, :run_failed]
+
+      park = Enum.find(checkpoints, &(&1.type == :retry_scheduled))
+
+      parked_attempts =
+        for event <- park.events, event.type == :node_failed do
+          {event.payload["attempt"], event.payload["permanent"]}
+        end
+
+      assert parked_attempts == [{1, false}]
+
       run_failed = List.last(checkpoints)
 
       attempts =
@@ -145,7 +195,7 @@ defmodule Docket.Runtime.FailureRetryTest do
           {event.payload["attempt"], event.payload["permanent"]}
         end
 
-      assert attempts == [{1, false}, {2, true}]
+      assert attempts == [{2, true}]
     end
 
     test "retry backoff uses the injected sleeper" do

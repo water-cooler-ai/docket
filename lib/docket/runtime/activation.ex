@@ -1,9 +1,11 @@
 defmodule Docket.Runtime.Activation do
   @moduledoc false
 
-  # One planned node execution for a superstep. Everything here is derived
+  # One planned node attempt for a superstep. Everything here is derived
   # from the previous committed `Docket.Run` only (execution contract §14):
-  # a superstep that never commits re-plans with byte-identical task IDs and
+  # a fresh superstep derives identity from committed channels, and a parked
+  # superstep resumes it from `Docket.Run.active_tasks`. Either way, an
+  # attempt that never commits re-plans with byte-identical task IDs and
   # idempotency keys, so cooperating integrations can deduplicate external
   # effects across crash-resume re-execution.
 
@@ -38,8 +40,4 @@ defmodule Docket.Runtime.Activation do
           timeout_ms: pos_integer() | nil,
           retry: retry()
         }
-
-  @doc false
-  @spec idempotency_key(t(), pos_integer()) :: String.t()
-  def idempotency_key(%__MODULE__{task_id: task_id}, attempt), do: "#{task_id}:#{attempt}"
 end

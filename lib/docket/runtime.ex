@@ -142,7 +142,7 @@ defmodule Docket.Runtime do
       {:execute, run, activations} ->
         results = Dispatcher.dispatch(activations, state.rtg, run, state.config)
 
-        case Loop.apply_results(state.rtg, run, results, state.opts) do
+        case Loop.apply_results(state.rtg, run, activations, results, state.opts) do
           {:ok, run, effects} ->
             state = deliver_effects(%{state | run: run}, effects)
 
@@ -152,6 +152,11 @@ defmodule Docket.Runtime do
               schedule_tick()
               {:noreply, state}
             end
+
+          {:park, run, park, effects} ->
+            state = deliver_effects(%{state | run: run}, effects)
+            schedule_tick_after(park.wait_ms)
+            {:noreply, state}
 
           {:error, %Error{} = error} ->
             # Sync checkpoint failure: the previous committed run remains the
@@ -164,6 +169,13 @@ defmodule Docket.Runtime do
         # Blocked on open interrupts; resolve_interrupt schedules the next tick.
         {:noreply, %{state | run: run}}
 
+      {:park, run, park} ->
+        # Parked mid-superstep for a retry deadline. The mailbox stays live:
+        # get_run and resolve_interrupt are served during backoff, and an
+        # early tick simply parks again with the remaining wait.
+        schedule_tick_after(park.wait_ms)
+        {:noreply, %{state | run: run}}
+
       {:terminal, run, effects} ->
         finish(deliver_effects(%{state | run: run}, effects))
 
@@ -173,6 +185,16 @@ defmodule Docket.Runtime do
   end
 
   defp schedule_tick, do: send(self(), :tick)
+
+  # Erlang timers cap out below extreme retry deadlines; a clamped early
+  # tick just parks again with the remaining wait.
+  @max_timer_ms 4_294_967_295
+
+  defp schedule_tick_after(0), do: schedule_tick()
+
+  defp schedule_tick_after(ms) do
+    Process.send_after(self(), :tick, min(ms, @max_timer_ms))
+  end
 
   # Terminal run: exit normally once every async delivery has settled, so the
   # final checkpoints are never abandoned mid-flight.
