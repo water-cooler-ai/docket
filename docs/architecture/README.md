@@ -11,20 +11,23 @@ when you want to understand *why* the contracts are shaped the way they are.
      `0.1.0` operational runtime with the `Docket.Postgres` backend —
      Oban-like in shape, one package, self-contained on optional Ecto and
      Postgres dependencies.
-2. `docket-graph-construction-design.md`
+2. `docket-v0.1.0-spec-lock-audit.md`
+   - The final DCKT-1 architecture, pluggability, lifecycle-status, ticket,
+     and dependency audit that produced transition-spec revision 8.
+3. `docket-graph-construction-design.md`
    - The public `Docket.Graph` document: editing API, serialization and hash
      contract, ID rules, and the host storage boundary.
-3. `docket-compiler-design.md`
+4. `docket-compiler-design.md`
    - Compiler verification, diagnostics, and lowering from the public graph
      to the internal runtime graph.
-4. `docket-graph-execution-contract-design.md`
+5. `docket-graph-execution-contract-design.md`
    - The execution contract: runtime loop, public run APIs, checkpoints,
      executors, guards, failures, and interrupts.
-5. `docket-reducers-design.md`
+6. `docket-reducers-design.md`
    - Why the v1.1 reducer contract folds the prior committed value, and the
      rationale behind list-write concatenation, natural zeros, and
      reducer-aware write validation.
-6. `docket-runtime-design.md`
+7. `docket-runtime-design.md`
    - Long-form research and background: goals, alternatives considered
      (Pregel, LangGraph, Temporal), and future design space.
 
