@@ -459,10 +459,56 @@ retry-backoff positions; those positions are derived from schedule, claim, and
 active-superstep facts. `waiting` means no autonomous work can proceed and an
 external graph mutation is required. The three terminal values are retained
 because success, graph failure, and intentional cancellation have different
-API, retry, and operational semantics. Collapsing them into `finished` would
-only require a second outcome discriminator. `finished_at` records when any
-terminal outcome occurred; separate `done_at` / `failed_at` / `cancelled_at`
-columns would create a weaker three-null encoding of the same sum type.
+API, retry, and operational semantics. `finished_at` records when any terminal
+outcome occurred. Every smaller vocabulary was audited and rejected — see the
+decision record below.
+
+#### Decision record: why five flat values survive the trim audit (2026-07-09)
+
+A dedicated audit steelmanned each smaller status model before the `v0.1.0`
+lock. All of them lost, for the same underlying reason: minimalism must be
+measured as total moving parts across the system — CHECK constraints, partial
+indexes, signal preconditions, await/inspect shapes, and every consumer's
+render path — not as enum length. Each trim saves at most one token while
+relocating a currently SQL-enforceable or typed-column invariant into opaque
+JSON or application-only derivation.
+
+- **Fold `cancelled` into `failed` + cause.** Removes no column (`failure`
+  already exists) and relocates three typed contracts into JSON:
+  `cancel_run`'s three-way idempotency branch would read `failure->>'kind'`
+  instead of one indexed status comparison; the "`failure` present exactly for
+  `failed`" CHECK dies, because a cancelled run has no failure to describe and
+  a synthetic payload would have to be fabricated; and the reserved
+  graph-semantic `retry_failed` must never auto-retry an intentional
+  cancellation, which a folded encoding can only express as a negative JSON
+  predicate carried by every retry and dashboard query.
+- **Fold `waiting` into `running`.** Relaxes the lost-run detector — "a
+  non-poisoned `running` row has exactly one of a wake or a claim" — to "at
+  most one", making a stuck advanced row (no wake, no claim, no open
+  interrupt) a legal row and demoting that invariant from SQL-enforced to
+  application-only. `await_run` and operational inspection would re-derive
+  "blocked on input" from interrupt JSON that hosts must not interpret.
+- **Replace the enum with outcome timestamps** (`done_at` / `failed_at` /
+  `cancelled_at`). A weaker three-null encoding of the same sum type: it
+  admits two-outcomes-set and terminal-with-no-outcome rows that the enum
+  forbids structurally, turns "not terminal" into a negative three-column
+  predicate, and cannot back the positive dispatch-eligibility index.
+- **Split into two fields** (`status ∈ running | waiting | finished` plus
+  `outcome ∈ done | failed | cancelled`, GitHub-Actions-style). The strongest
+  alternative — dispatch eligibility and the partial indexes survive — but it
+  expands rather than trims: six tokens across two columns instead of five in
+  one, a `finished` value that duplicates what `finished_at` already encodes,
+  a new coupling CHECK (`outcome` present exactly when `finished`), and a
+  fresh class of illegal combinations the flat enum cannot even express.
+
+Mature precedent agrees with the flat model, weighted by similarity to the
+run-row-is-the-queue design: Oban keeps intentional `cancelled` distinct from
+exhausted `discarded` on the job row; Temporal, Step Functions, and GitHub
+Actions all keep operator stop distinct from failure. No surveyed system folds
+cancellation into failure. Where Docket deliberately departs from Oban —
+queue position derived from `wake_at`/claim columns rather than fused into
+status — the derived facts carry no invariant of their own, which is exactly
+why they may be derived while the five semantic values may not.
 
 `:created` remains only as the private fresh-run sentinel needed by the legacy
 in-process initializer. It is never a durable/public operational status, never
@@ -690,7 +736,9 @@ Two wake paths feed the loop:
 - **Notify.** `Docket.Postgres.RunStore` issues `pg_notify` inside the same
   transaction whenever one of its writes records an immediate wake (start,
   park, signal, or poison recovery). PostgreSQL makes the notification visible
-  only after commit and suppresses it on rollback. Dispatchers listen and
+  only after commit and suppresses it on rollback. A matching claim release
+  also records an immediate wake but is a rare failure path and deliberately
+  relies on the scheduled poll rather than a notification site. Dispatchers listen and
   request an immediate poll, so the common park-to-resume hop is milliseconds,
   not a poll interval. Immediate requests are coalesced: a dispatcher runs at
   most one claim poll at a time and a notification burst cannot build an
@@ -762,21 +810,32 @@ loop.
 If this affects zero rows, someone else already committed past `$seq`, the
 worker lost its claim, or a signal changed the run first. An advance worker
 discards its uncommitted work, **releases its claim, and stops**. The release
-is its own small UPDATE fenced on `claim_token` alone (it does not touch
-`checkpoint_seq` or `wake_at`, which the winning commit already set
-correctly):
+is its own small UPDATE fenced on `claim_token` alone; it never touches
+`checkpoint_seq`. A matching release clears the claim **and records an
+immediate wake** (`wake_at = now()`):
 
 ```sql
 UPDATE docket_runs
-SET claim_token = NULL, claimed_at = NULL, updated_at = now()
+SET claim_token = NULL, claimed_at = NULL, wake_at = now(), updated_at = now()
 WHERE run_id = $run_id AND claim_token = $claim_token
 ```
 
-The same release runs when a claimed run turns out not to be runnable. This
-matters: a signal that cancels or resolves an interrupt mid-drain schedules the next
-wake immediately, and without the release that wake would stall behind a claim
-whose holder has already given up, waiting out `$orphan_ttl` for no reason. The
-fence is checked only at commit time; nothing is held during execution.
+The recorded wake is required, not a courtesy. Claim acquisition cleared
+`wake_at`, so a release that only cleared the token would leave a non-poisoned
+`running` row with neither claim nor wake — stranded from both the ready and
+expired-claim dispatch paths and forbidden by the section 5 CHECK ("exactly
+one of a wake or a claim"). With the wake recorded, the row re-enters the
+ready path and its next claim either makes committed progress or drives
+`claim_attempts` toward the poison threshold, which is exactly how a run that
+repeatedly cannot advance becomes an explicit operator concern. The same
+release runs when a claimed run turns out not to be runnable and on the
+event-append rollback path where no commit won. When the fence was lost
+because another writer won — a steal, or a serialized signal mutation, both of
+which clear or replace the live claim and set the schedule themselves — the
+release matches zero rows and is a no-op, so it can never disturb a schedule a
+winning commit chose. A matching release can never hit a `waiting` or terminal
+row, because those rows carry no claim to match. The fence is checked only at
+commit time; nothing is held during execution.
 
 Losing the fence has a real cost, and the docs should state it plainly: the
 vehicle discards an uncommitted superstep, which may include completed
@@ -848,8 +907,10 @@ persistence.
 Advancing is idempotent because a vehicle drives from committed state, not a
 fixed target. A recovered run — its vehicle crashed mid-drain — is re-claimed
 and resumes from the last committed superstep; there is nothing stale to skip.
-A claimed run that turns out not to be runnable (already terminal, or parked
-waiting for input) releases its claim without driving. A crash before a
+Eligible selection cannot produce a claim on a terminal or waiting row, so a
+vehicle holding a current claim on a run that turns out not to be runnable
+reports an invariant violation, releases its claim, and does not drive; it is
+never a routine release-and-ignore path. A crash before a
 superstep commits re-executes only that superstep, with the same idempotency
 keys available to cooperating integrations.
 
@@ -959,7 +1020,7 @@ violation, not a state that needs a generic resume signal.
 
 | Operation | Allowed current state | Repeated call | Durable result |
 | --- | --- | --- | --- |
-| `resolve_interrupt` | non-terminal run with the named open interrupt | unknown returns `:not_found`; resolved returns `:already_resolved`; a different value is never silently accepted | write resolution, mark interrupt resolved, status `running`, `:interrupt_resolved`, release claim, `wake_at = now` |
+| `resolve_interrupt` | `running` or `waiting` with the named open interrupt | terminal (`done` / `failed` / `cancelled`) returns `:inactive_run`, checked before the interrupt lookup; unknown returns `:not_found`; resolved returns `:already_resolved`; a different value is never silently accepted | write resolution, mark interrupt resolved, status `running`, `:interrupt_resolved`, release claim, clear current poison, `wake_at = now` |
 | `cancel_run` | `running` or `waiting` | already `cancelled` returns the stored run; `done` / `failed` returns `:inactive_run` | status `cancelled`, finished timestamp, `:run_cancelled`, release claim, clear current poison, no wake |
 | `retry_poisoned_run` | non-terminal run with `poisoned_at` | terminal always returns `:inactive_run`; an already-unpoisoned non-terminal run returns the stored run | clear `poisoned_at` / `poison_reason`, reset `claim_attempts`, clear claim, immediate wake, operational telemetry |
 
@@ -981,6 +1042,18 @@ Signal application rules:
   its next fence after the signal clears its claim and increments the sequence.
   There is no bounded retry loop that can make confirmed cancellation fail
   merely because the run is committing quickly.
+- Precondition ordering is terminal-first: a terminal run returns
+  `:inactive_run` before any interrupt lookup, matching `cancel_run`, so a
+  terminal run that still carries an open interrupt reports `:inactive_run`
+  rather than `:not_found`, and a resolution can never resurrect a finished
+  run.
+- A successful graph-signal mutation clears current poison facts. The signal
+  is a deliberate operator or graph intervention that supersedes the
+  stalled-claim history the poison recorded, and a poisoned row may not carry
+  a wake (section 5 CHECK), so healing is required for `resolve_interrupt`'s
+  immediate wake to be committable. `cancel_run` and `resolve_interrupt`
+  therefore both clear poison; `retry_poisoned_run` remains the explicit
+  operational recovery for a poisoned run nobody is mutating.
 
 There is no signal struct, no signal behaviour, and no generic
 `signal(run_id, type, opts)` dispatch. Core defines each graph signal as a pure
@@ -1111,7 +1184,7 @@ yield costs one dispatch hop, never lost progress.
 in the caller's process, Docket.Lifecycle.signal(backend, scope, fn tx ->
   Runs.mutate_run(tx, fn current_run ->
     validate signal and produce one pure runtime moment
-    increment checkpoint_seq and clear any live claim
+    increment checkpoint_seq, clear any live claim, and clear current poison
     map the moment's explicit schedule disposition
   end)
   Events.append_events(tx, assigned runtime + :checkpoint_committed events)
