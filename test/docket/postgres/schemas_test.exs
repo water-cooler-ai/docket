@@ -51,12 +51,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end
       end
 
-      test "status values mirror Docket.Run.statuses/0" do
-        assert Ecto.Enum.values(Run, :status) == Docket.Run.statuses()
+      test "status values mirror Docket.Run.durable_statuses/0" do
+        assert Ecto.Enum.values(Run, :status) == Docket.Run.durable_statuses()
 
-        changeset = Run.changeset(Map.put(@valid_run, :status, :sideways))
+        for status <- [:sideways, :created] do
+          changeset = Run.changeset(Map.put(@valid_run, :status, status))
 
-        refute changeset.valid?
+          refute changeset.valid?
+        end
       end
 
       test "latest_checkpoint_type values mirror Docket.Checkpoint.types/0" do

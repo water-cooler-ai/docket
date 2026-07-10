@@ -18,7 +18,7 @@ defmodule Docket.Runtime.Loop do
   # supervised Runtime: background task).
 
   alias Docket.{Checkpoint, Error, Event, Run, Schema, Wire}
-  alias Docket.Run.{ChannelState, InterruptState}
+  alias Docket.Run.{ChannelState, Failure, InterruptState}
   alias Docket.Runtime.{Algorithm, Config}
 
   @doc false
@@ -242,7 +242,12 @@ defmodule Docket.Runtime.Loop do
             limit = Algorithm.max_supersteps(rtg, config)
 
             terminal_fail(run, config, [],
-              reason: :max_supersteps_exceeded,
+              failure:
+                Failure.new(
+                  "max_supersteps_exceeded",
+                  "run exceeded the superstep limit of #{limit}",
+                  details: %{"limit" => limit}
+                ),
               payload: %{"reason" => "max_supersteps_exceeded", "limit" => limit}
             )
 
@@ -253,7 +258,7 @@ defmodule Docket.Runtime.Loop do
 
               {:error, %Error{} = error} ->
                 terminal_fail(run, config, [],
-                  reason: error.type,
+                  failure: Failure.new(Atom.to_string(error.type), error.message),
                   payload: %{"reason" => Atom.to_string(error.type), "message" => error.message}
                 )
             end
@@ -285,7 +290,8 @@ defmodule Docket.Runtime.Loop do
 
   defp fail(run, config, extra_entries, opts) do
     now = config.clock.()
-    run = %{run | status: :failed, finished_at: now, updated_at: now}
+    failure = Keyword.fetch!(opts, :failure)
+    run = %{run | status: :failed, failure: failure, finished_at: now, updated_at: now}
 
     entries =
       extra_entries ++ [entry(:run_failed, run.step, payload: Keyword.fetch!(opts, :payload))]
@@ -337,7 +343,7 @@ defmodule Docket.Runtime.Loop do
         failed_nodes = permanent |> Enum.map(& &1.node_id) |> Enum.uniq() |> Enum.sort()
 
         fail(run, config, entries,
-          reason: :node_failed,
+          failure: node_failure(permanent, failed_nodes),
           payload: %{"reason" => "node_failed", "nodes" => failed_nodes}
         )
     end
@@ -350,6 +356,23 @@ defmodule Docket.Runtime.Loop do
       attempt: result.attempt,
       reason: reason
     }
+  end
+
+  # The durable cause for a permanent node failure. Per-node reasons ride in
+  # details so a failed run keeps them even when event persistence is off.
+  defp node_failure(permanent, failed_nodes) do
+    errors = Map.new(permanent, fn failure -> {failure.node_id, inspect(failure.reason)} end)
+
+    node_id =
+      case failed_nodes do
+        [node_id] -> node_id
+        _multiple -> nil
+      end
+
+    Failure.new("node_failed", "node(s) #{Enum.join(failed_nodes, ", ")} failed permanently",
+      node_id: node_id,
+      details: %{"nodes" => failed_nodes, "errors" => errors}
+    )
   end
 
   defp partition_results(results) do
@@ -438,7 +461,12 @@ defmodule Docket.Runtime.Loop do
     case Algorithm.evaluate_edge_triggers(rtg, channels, ok_node_ids, changed_fields) do
       {:error, {edge_id, reasons}} ->
         fail(run, config, [],
-          reason: :guard_evaluation_failed,
+          failure:
+            Failure.new(
+              "guard_evaluation_failed",
+              "edge #{edge_id} guard evaluation failed",
+              details: %{"edge_id" => edge_id, "reasons" => reasons}
+            ),
           payload: %{
             "reason" => "guard_evaluation_failed",
             "edge_id" => edge_id,

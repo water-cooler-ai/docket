@@ -177,6 +177,9 @@ defmodule Docket.Runtime.InlineExecutionTest do
       assert run.step == 3
       assert List.last(checkpoint_types(checkpoints)) == :run_failed
 
+      assert %Docket.Run.Failure{code: "max_supersteps_exceeded", details: %{"limit" => 3}} =
+               run.failure
+
       run_failed = List.last(checkpoints)
       assert Enum.any?(run_failed.events, &(&1.payload["reason"] == "max_supersteps_exceeded"))
     end

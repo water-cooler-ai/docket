@@ -43,6 +43,20 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   `types/0` helper (DCKT-8, #12).
 - `docs/architecture/docket-operational-transition-spec.md` revision 8 and
   the v0.1.0 spec-lock audit (DCKT-32, #13).
+- `Docket.Run.Failure`: durable, JSON-safe terminal failure payload
+  (`code`, `message`, optional `node_id`/`details`), present exactly when a
+  run is `:failed` (`Run.validate_failure/1`, enforced at the wire boundary
+  and conformance commits) and populated by every runtime terminal-failure
+  path, so a failed run retains its cause with event persistence off
+  (DCKT-31, #17).
+- `Docket.RunInfo`: token-free operational projection (`run`, `wake_at`,
+  `claimed_at`, `claim_attempts`, paired poison facts) returned by
+  `Docket.Storage.Runs.inspect_run`, documenting the `inspect_run` contract
+  and the poisoned `await_run` typed operational halt (DCKT-31, #17).
+- `Docket.Run.durable_statuses/0`, `durable_status?/1`, and
+  `valid_transition?/2`: the five durable graph statuses and the locked
+  transition matrix, with exhaustive transition/absorbing-state tests
+  (DCKT-31, #17).
 
 ### Changed
 
@@ -56,11 +70,18 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
 - `Docket.Node` documentation clarifies the four failure-signaling forms and
   their identical normalization (DCKT-8, #12).
 
+- Run wire format bumped to version 2 to carry `failure`; only the current
+  version loads (no released userbase to migrate), and the private
+  `:created` initialization sentinel is rejected by the wire format, durable
+  insertion, and the Postgres row status enum (DCKT-31, #17).
+
 ### Removed
 
 - `docket_checkpoints` table and its Ecto schema: `docket_runs.checkpoint_seq`
   is the run fence, recovery reads the run row, and retained events provide
   history. Exactly three operational tables remain (DCKT-28, #11).
+- Loader acceptance of version-1 run documents and the serialized `created`
+  status (DCKT-31, #17).
 
 ## 0.0.1 — 2026-07-08
 

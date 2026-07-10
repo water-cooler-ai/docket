@@ -394,14 +394,14 @@ defmodule Docket.Test.MemoryBackend do
   end
 
   defp run_info(record) do
-    %{
+    Docket.RunInfo.new!(
       run: record.run,
       wake_at: record.wake_at,
       claimed_at: record.claimed_at,
       claim_attempts: record.claim_attempts,
       poisoned_at: record.poisoned_at,
       poison_reason: record.poison_reason
-    }
+    )
   end
 
   defp claim_due_records(state, policy) do
@@ -507,6 +507,7 @@ defmodule Docket.Test.MemoryBackend do
       not is_atom(checkpoint_type) or is_nil(checkpoint_type) -> {:error, :invalid_commit}
       not valid_schedule?(schedule) -> {:error, :invalid_commit}
       not schedule_matches_status?(schedule, run.status) -> {:error, :invalid_commit}
+      Docket.Run.validate_failure(run) != :ok -> {:error, :invalid_commit}
       true -> :ok
     end
   end
@@ -613,7 +614,8 @@ defmodule Docket.Test.MemoryBackend do
       proposed_run.graph_hash == record.run.graph_hash and
       proposed_run.checkpoint_seq == record.run.checkpoint_seq + 1 and
       is_atom(checkpoint_type) and not is_nil(checkpoint_type) and schedule != :retain_claim and
-      valid_schedule?(schedule) and schedule_matches_status?(schedule, proposed_run.status)
+      valid_schedule?(schedule) and schedule_matches_status?(schedule, proposed_run.status) and
+      Docket.Run.validate_failure(proposed_run) == :ok
   end
 
   defp valid_initialized_run?(run, checkpoint_type, wake_at) do
@@ -621,7 +623,8 @@ defmodule Docket.Test.MemoryBackend do
       nonempty_binary?(run.graph_id) and nonempty_binary?(run.graph_hash) and
       is_integer(run.checkpoint_seq) and run.checkpoint_seq >= 1 and
       checkpoint_type == :run_initialized and
-      is_struct(run.started_at, DateTime) and is_struct(wake_at, DateTime)
+      is_struct(run.started_at, DateTime) and is_struct(wake_at, DateTime) and
+      Docket.Run.validate_failure(run) == :ok
   end
 
   defp nonempty_binary?(value), do: is_binary(value) and byte_size(value) > 0
