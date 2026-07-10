@@ -98,7 +98,7 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   of the `checkpoint_seq` run fence. Checkpoint context and metadata expose
   the committed graph step plus stable multi-task retry/attempt identity,
   and committed checkpoint facts emit `[:docket, :checkpoint, :committed]`
-  telemetry (DCKT-11).
+  telemetry (DCKT-11, #22).
 
 ### Changed
 
