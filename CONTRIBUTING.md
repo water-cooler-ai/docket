@@ -72,10 +72,15 @@ password) so destructive migration setup cannot race another suite. Generated
 databases are removed after the test invocation; explicitly configured
 databases are left in place. The defaults are
 `docket_migration_test_<os-pid>`, `docket_run_store_test_<os-pid>`,
-`docket_storage_test_<os-pid>`, `docket_graph_store_test_<os-pid>`, and
-`docket_lifecycle_storage_test_<os-pid>`. Override them with the corresponding
-`DOCKET_TEST_DATABASE_URL`, `DOCKET_RUN_STORE_TEST_DATABASE_URL`,
-`DOCKET_STORAGE_TEST_DATABASE_URL`, `DOCKET_GRAPH_STORE_TEST_DATABASE_URL`,
-and `DOCKET_LIFECYCLE_STORAGE_TEST_DATABASE_URL`. PostgreSQL 13 is the
+`docket_storage_test_<os-pid>`, `docket_graph_store_test_<os-pid>`,
+`docket_lifecycle_storage_test_<os-pid>`, `docket_event_store_test_<os-pid>`,
+`docket_vehicle_storage_test_<os-pid>`, and `docket_notifier_test_<os-pid>`.
+Override them with the corresponding `DOCKET_TEST_DATABASE_URL`,
+`DOCKET_RUN_STORE_TEST_DATABASE_URL`, `DOCKET_STORAGE_TEST_DATABASE_URL`,
+`DOCKET_GRAPH_STORE_TEST_DATABASE_URL`,
+`DOCKET_LIFECYCLE_STORAGE_TEST_DATABASE_URL`,
+`DOCKET_EVENT_STORE_TEST_DATABASE_URL`,
+`DOCKET_VEHICLE_STORAGE_TEST_DATABASE_URL`, and
+`DOCKET_NOTIFIER_TEST_DATABASE_URL`. PostgreSQL 13 is the
 implementation minimum because claim SQL uses materialized CTEs and the
 built-in `gen_random_uuid()`.

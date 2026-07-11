@@ -24,6 +24,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     refresh/release queries disable Ecto's ordinary SQL query log. Repo
     telemetry remains a trusted instrumentation boundary and may observe bind
     parameters, like any other database telemetry subscriber.
+
+    Run insertion, moment commit, signal mutation, and poison recovery
+    announce a wake due at or before the database clock with `pg_notify` on
+    the `docket_wake` channel, carrying the context prefix (empty string when
+    unprefixed) as payload. The notification runs on the write's connection
+    and joins any transaction the write executes in, so PostgreSQL exposes it
+    only after that transaction commits and drops it on rollback. Claim
+    release and abandonment record their wakes without a notification, so the
+    dispatcher's poll interval alone bounds their redispatch latency.
     """
 
     import Ecto.Query
@@ -32,6 +41,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Schemas.Run
 
     @type ctx :: module() | %{required(:repo) => module(), optional(:prefix) => String.t() | nil}
+
+    @wake_channel "docket_wake"
+
+    @doc false
+    @spec wake_channel() :: String.t()
+    def wake_channel, do: @wake_channel
 
     @doc """
     Inserts one initialized running run under its explicit owner scope.
@@ -73,9 +88,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         if changeset.valid? do
           case repo.insert(changeset, prefix: prefix) do
-            {:ok, _row} -> {:ok, run}
-            {:error, %Ecto.Changeset{} = changeset} -> insert_error(changeset)
-            {:error, reason} -> {:error, reason}
+            {:ok, _row} ->
+              notify_due_wake(repo, prefix, wake_at)
+              {:ok, run}
+
+            {:error, %Ecto.Changeset{} = changeset} ->
+              insert_error(changeset)
+
+            {:error, reason} ->
+              {:error, reason}
           end
         else
           {:error, :invalid_run}
@@ -337,8 +358,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         updates = commit_updates(attrs, proposal.checkpoint_type, proposal.schedule)
 
         case repo.update_all(query, updates, log: false) do
-          {1, _} -> {:ok, proposal.run}
-          {0, _} -> commit_miss(repo, prefix, scope, proposal.run.id)
+          {1, _} ->
+            notify_wake(repo, prefix, proposal.schedule)
+            {:ok, proposal.run}
+
+          {0, _} ->
+            commit_miss(repo, prefix, scope, proposal.run.id)
         end
       else
         {:error, :not_found} -> {:error, :not_found}
@@ -404,8 +429,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    ]
 
                    case repo.update_all(scoped_row_query(row, scope, prefix), updates, log: false) do
-                     {1, _} -> {:ok, run}
-                     {0, _} -> {:error, :not_found}
+                     {1, _} ->
+                       notify_wake(repo, prefix)
+                       {:ok, run}
+
+                     {0, _} ->
+                       {:error, :not_found}
                    end
                end
              end
@@ -581,8 +610,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                commit_updates(attrs, checkpoint_type, schedule),
                log: false
              ) do
-          {1, _} -> {:ok, {:committed, opaque}}
-          {0, _} -> {:error, :stale_fence}
+          {1, _} ->
+            notify_wake(repo, prefix, schedule)
+            {:ok, {:committed, opaque}}
+
+          {0, _} ->
+            {:error, :stale_fence}
         end
       else
         _ -> {:error, :invalid_mutation}
@@ -868,6 +901,37 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       raise ArgumentError,
             "abandon policy requires non-negative expected_checkpoint_seq, DateTime now " <>
               "and retry_at, and positive max_claim_abandons, got: #{inspect(policy)}"
+    end
+
+    defp notify_wake(repo, prefix, {:release_claim, :immediate}), do: notify_wake(repo, prefix)
+
+    defp notify_wake(repo, prefix, {:release_claim, {:at, %DateTime{} = at}}),
+      do: notify_due_wake(repo, prefix, at)
+
+    defp notify_wake(_repo, _prefix, _schedule), do: :ok
+
+    defp notify_wake(repo, prefix) do
+      _ =
+        Ecto.Adapters.SQL.query!(
+          repo,
+          "SELECT pg_notify($1, $2)",
+          [@wake_channel, prefix || ""],
+          log: false
+        )
+
+      :ok
+    end
+
+    defp notify_due_wake(repo, prefix, %DateTime{} = wake_at) do
+      _ =
+        Ecto.Adapters.SQL.query!(
+          repo,
+          "SELECT pg_notify($1, $2) WHERE $3::timestamptz <= clock_timestamp()",
+          [@wake_channel, prefix || "", normalize_database_datetime(wake_at)],
+          log: false
+        )
+
+      :ok
     end
 
     defp normalize_database_datetime(%DateTime{} = datetime) do

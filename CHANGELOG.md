@@ -17,6 +17,20 @@ what has landed so far.
 
 ### Added
 
+- `Docket.Postgres.Notifier`: the LISTEN fast path for immediate wakes. The
+  Postgres RunStore announces every committed wake due at or before the
+  database clock with `pg_notify` on the `docket_wake` channel (payload:
+  schema prefix, empty when unprefixed) inside the recording transaction, so
+  PostgreSQL exposes the notification only after commit and drops it on
+  rollback. The notifier holds one dedicated LISTEN connection outside the
+  Repo pool, reconnects and re-subscribes on its own, and turns each
+  prefix-matching notification into one `Docket.Postgres.Dispatcher`
+  immediate poll. Polling remains correctness: a lost notification or dead
+  listener only costs latency, and omitting the child is poll-only operation
+  whose wake latency is bounded by the dispatcher poll interval alone. LISTEN
+  needs a session-scoped connection, so behind PgBouncer transaction or
+  statement pooling the notifier's `:connection` must target a direct or
+  session-pooled endpoint (DCKT-19).
 - `Docket.Postgres.Vehicle`: the Task-per-claim execution shell that turns a
   dispatcher lease into runtime progress. A drain fetches the committed run
   under the lease fence, loads and compiles the exact effective graph version
@@ -191,6 +205,11 @@ what has landed so far.
 
 ### Changed
 
+- Postgres run insertion, moment commit, signal mutation, and poison recovery
+  emit `pg_notify` on `docket_wake` within the same transaction whenever the
+  recorded wake is due at or before the database clock. Claim release and
+  abandonment stay silent so launch-failure retries keep the poll interval as
+  their backoff (DCKT-19).
 - Postgres claim, heartbeat, release, steal, and poison operations no longer
   rewrite promoted `Docket.Run.updated_at`. Dedicated operational timestamps
   now carry those transitions, so `fetch_run` remains the exact last committed
