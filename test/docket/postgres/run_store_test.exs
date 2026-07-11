@@ -856,6 +856,141 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
     end
 
+    test "serialized mutation validates scope before SQL and preserves no-change rows" do
+      run = initialized_run("mutation", checkpoint_seq: 7)
+
+      assert {:ok, ^run} =
+               RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+
+      before = row!(run.id)
+
+      assert {:ok, {:unchanged, :same}} =
+               RunStore.mutate_run(TestRepo, :tenantless, run.id, fn current ->
+                 assert current == run
+                 {:no_change, :same}
+               end)
+
+      assert row!(run.id) == before
+
+      assert_raise ArgumentError, ~r/scope must be/, fn ->
+        RunStore.mutate_run(TestRepo, {:tenant, nil}, run.id, fn _ ->
+          flunk("an invalid scope must not invoke the mutation")
+        end)
+      end
+
+      assert row!(run.id) == before
+    end
+
+    test "serialized mutation rejects malformed proposals without changing the row" do
+      run = initialized_run("invalid-mutation", checkpoint_seq: 7)
+      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+      before = row!(run.id)
+
+      assert {:error, :invalid_mutation} =
+               RunStore.mutate_run(TestRepo, :tenantless, run.id, fn current ->
+                 {:commit, current, :step_committed, :retain_claim, :bad}
+               end)
+
+      assert row!(run.id) == before
+    end
+
+    test "serialized mutation holds the row lock while the pure decision runs" do
+      run = initialized_run("locked-mutation", checkpoint_seq: 7)
+      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+      parent = self()
+
+      mutation =
+        Task.async(fn ->
+          RunStore.mutate_run(TestRepo, :tenantless, run.id, fn current ->
+            send(parent, :mutation_locked)
+
+            receive do
+              :continue -> {:no_change, current.checkpoint_seq}
+            end
+          end)
+        end)
+
+      assert_receive :mutation_locked
+
+      # claim_due uses SKIP LOCKED, so it must not claim the row whose signal
+      # decision is currently serialized.
+      assert {:ok, %{leases: [], poisoned: []}} = claim_due(@now)
+
+      send(mutation.pid, :continue)
+      assert {:ok, {:unchanged, 7}} = Task.await(mutation, 1_000)
+
+      assert {:ok, %{leases: [%{run_id: "locked-mutation"}], poisoned: []}} =
+               claim_due(@now)
+    end
+
+    test "poison recovery is exact, idempotent, scoped, and terminal-first" do
+      run = initialized_run("recover", checkpoint_seq: 7)
+      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+
+      poisoned_at = DateTime.add(@now, 1, :second)
+
+      TestRepo.update_all(
+        from(stored in Run, where: stored.run_id == ^run.id),
+        set: [
+          wake_at: nil,
+          claim_attempts: 3,
+          poisoned_at: poisoned_at,
+          poison_reason: "max_claim_attempts_exceeded"
+        ]
+      )
+
+      recovered_at = DateTime.add(@now, 2, :second)
+
+      assert {:ok, ^run} =
+               RunStore.retry_poisoned_run(TestRepo, :tenantless, run.id, recovered_at)
+
+      recovered = row!(run.id)
+      assert recovered.wake_at == recovered_at
+      assert recovered.claim_attempts == 0
+      assert recovered.poisoned_at == nil
+      assert recovered.poison_reason == nil
+      assert recovered.checkpoint_seq == run.checkpoint_seq
+      assert recovered.latest_checkpoint_type == :run_initialized
+
+      assert {:ok, ^run} =
+               RunStore.retry_poisoned_run(
+                 TestRepo,
+                 :tenantless,
+                 run.id,
+                 DateTime.add(recovered_at, 1, :hour)
+               )
+
+      assert row!(run.id) == recovered
+
+      assert {:error, :not_found} =
+               RunStore.retry_poisoned_run(TestRepo, {:tenant, "x"}, run.id, @now)
+
+      terminal_source = initialized_run("terminal-recovery", checkpoint_seq: 7)
+
+      {:ok, terminal_moment} =
+        Docket.Runtime.RunMutation.cancel_run(terminal_source, recovered_at)
+
+      terminal = terminal_moment.run
+      {:ok, attrs} = RunCodec.dump(terminal)
+
+      attrs
+      |> Map.merge(%{
+        tenant_id: nil,
+        latest_checkpoint_type: :run_cancelled,
+        wake_at: nil,
+        claim_attempts: 0
+      })
+      |> Run.changeset()
+      |> TestRepo.insert!()
+
+      terminal_before = row!(terminal.id)
+
+      assert {:error, :inactive_run} =
+               RunStore.retry_poisoned_run(TestRepo, :tenantless, terminal.id, @now)
+
+      assert row!(terminal.id) == terminal_before
+    end
+
     defp claim_due(now, overrides \\ []) do
       RunStore.claim_due(TestRepo, :system, policy(now, overrides))
     end

@@ -252,6 +252,78 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    @doc "Serializes and applies one pure run mutation without requiring a claim fence."
+    @spec mutate_run(ctx(), Docket.Storage.scope(), String.t(), Docket.Storage.Runs.mutation()) ::
+            Docket.Storage.Runs.mutation_result()
+    def mutate_run(ctx, scope, run_id, mutation) when is_function(mutation, 1) do
+      {repo, prefix} = Storage.context!(ctx)
+      validate_scope!(scope)
+
+      case repo.transaction(fn ->
+             with {:ok, row} <- fetch_locked_scoped_row(repo, prefix, scope, run_id) do
+               run = RunCodec.load!(row)
+
+               # Evaluate this pure, bounded decision while holding the row lock.
+               # Moving it before the lock requires callback re-entry on a lost
+               # compare-and-swap and breaks serialized signals.
+               apply_mutation(repo, prefix, scope, row, run, mutation.(run))
+             end
+           end) do
+        {:ok, result} -> result
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    @doc "Clears poison from a non-terminal run and records an immediate wake."
+    @spec retry_poisoned_run(
+            ctx(),
+            Docket.Storage.scope(),
+            String.t(),
+            DateTime.t()
+          ) :: {:ok, Docket.Run.t()} | {:error, :not_found | :inactive_run}
+    def retry_poisoned_run(ctx, scope, run_id, %DateTime{} = now) do
+      {repo, prefix} = Storage.context!(ctx)
+      validate_scope!(scope)
+
+      case repo.transaction(fn ->
+             with {:ok, row} <- fetch_locked_scoped_row(repo, prefix, scope, run_id) do
+               run = RunCodec.load!(row)
+
+               cond do
+                 Docket.Run.terminal?(run) ->
+                   {:error, :inactive_run}
+
+                 is_nil(row.poisoned_at) ->
+                   {:ok, run}
+
+                 true ->
+                   updates = [
+                     set: [
+                       claim_token: nil,
+                       claimed_at: nil,
+                       wake_at: normalize_database_datetime(now),
+                       claim_attempts: 0,
+                       poisoned_at: nil,
+                       poison_reason: nil
+                     ]
+                   ]
+
+                   case repo.update_all(scoped_row_query(row, scope, prefix), updates, log: false) do
+                     {1, _} -> {:ok, run}
+                     {0, _} -> {:error, :not_found}
+                   end
+               end
+             end
+           end) do
+        {:ok, result} -> result
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    def retry_poisoned_run(_ctx, _scope, _run_id, now) do
+      raise ArgumentError, "retry_poisoned_run now must be a DateTime, got: #{inspect(now)}"
+    end
+
     @doc false
     @spec current_claim(String.t(), Docket.Storage.Runs.claim_token()) ::
             Ecto.Query.dynamic_expr()
@@ -399,6 +471,53 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp validate_commit(_proposal), do: {:error, :invalid_commit}
 
+    defp apply_mutation(
+           repo,
+           prefix,
+           scope,
+           row,
+           stored_run,
+           {:commit, proposed_run, checkpoint_type, schedule, opaque}
+         ) do
+      with :ok <- validate_mutation(stored_run, proposed_run, checkpoint_type, schedule),
+           {:ok, attrs} <- RunCodec.dump(proposed_run) do
+        case repo.update_all(
+               scoped_row_query(row, scope, prefix),
+               commit_updates(attrs, checkpoint_type, schedule),
+               log: false
+             ) do
+          {1, _} -> {:ok, {:committed, opaque}}
+          {0, _} -> {:error, :stale_fence}
+        end
+      else
+        _ -> {:error, :invalid_mutation}
+      end
+    end
+
+    defp apply_mutation(_repo, _prefix, _scope, _row, _run, {:no_change, opaque}),
+      do: {:ok, {:unchanged, opaque}}
+
+    defp apply_mutation(_repo, _prefix, _scope, _row, _run, {:error, reason}),
+      do: {:error, reason}
+
+    defp apply_mutation(_repo, _prefix, _scope, _row, _run, _decision),
+      do: {:error, :invalid_mutation}
+
+    defp validate_mutation(stored, proposed, checkpoint_type, schedule) do
+      cond do
+        not is_struct(proposed, Docket.Run) -> {:error, :invalid_mutation}
+        proposed.id != stored.id -> {:error, :invalid_mutation}
+        proposed.graph_id != stored.graph_id -> {:error, :invalid_mutation}
+        proposed.graph_hash != stored.graph_hash -> {:error, :invalid_mutation}
+        proposed.checkpoint_seq != stored.checkpoint_seq + 1 -> {:error, :invalid_mutation}
+        checkpoint_type not in Docket.Checkpoint.types() -> {:error, :invalid_mutation}
+        schedule == :retain_claim -> {:error, :invalid_mutation}
+        not valid_schedule?(schedule) -> {:error, :invalid_mutation}
+        not schedule_matches_status?(schedule, proposed.status) -> {:error, :invalid_mutation}
+        true -> Docket.Run.validate_failure(proposed)
+      end
+    end
+
     defp validate_immutable_binding(stored, proposed) do
       if stored.graph_id == proposed.graph_id and stored.graph_hash == proposed.graph_hash,
         do: :ok,
@@ -470,6 +589,36 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    defp fetch_locked_scoped_row(repo, prefix, scope, run_id) do
+      query =
+        Run
+        |> where([run], run.run_id == ^run_id)
+        |> scope_query(scope)
+        |> lock("FOR UPDATE")
+        |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
+
+      case repo.one(query) do
+        nil -> {:error, :not_found}
+        row -> {:ok, row}
+      end
+    end
+
+    defp scoped_row_query(row, scope, prefix) do
+      Run
+      |> where([run], run.id == ^row.id)
+      |> scope_query(scope)
+      |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
+    end
+
+    defp validate_scope!(:system), do: :ok
+    defp validate_scope!(:tenantless), do: :ok
+    defp validate_scope!({:tenant, tenant_id}) when is_binary(tenant_id), do: :ok
+
+    defp validate_scope!(scope) do
+      raise ArgumentError,
+            "scope must be :system, :tenantless, or {:tenant, tenant_id}, got: #{inspect(scope)}"
+    end
+
     defp scope_query(query, :system), do: query
     defp scope_query(query, :tenantless), do: where(query, [run], is_nil(run.tenant_id))
 
@@ -478,8 +627,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp scope_query(_query, scope) do
-      raise ArgumentError,
-            "scope must be :system, :tenantless, or {:tenant, tenant_id}, got: #{inspect(scope)}"
+      validate_scope!(scope)
     end
 
     defp owner_tenant_id!(:tenantless), do: nil

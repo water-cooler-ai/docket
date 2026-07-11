@@ -6,7 +6,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
-    alias Docket.Postgres.{EventStore, GraphStore, RunStore, Storage}
+    alias Docket.Postgres.{EventStore, GraphStore, RunCodec, RunStore, Storage}
     alias Docket.Postgres.LifecycleStorageTestRepo, as: TestRepo
     alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}
     alias Docket.Runtime.Moment
@@ -72,6 +72,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def storage, do: Docket.Postgres.Storage
       def runs, do: Docket.Postgres.RunStore
       def events, do: Docket.Postgres.EventStore
+    end
+
+    defmodule RecordingObserver do
+      @behaviour Docket.Checkpoint.Observer
+
+      @impl true
+      def observe(checkpoint, %{application: %{notify: pid}}) do
+        send(pid, {:committed_observer, checkpoint})
+        :ok
+      end
     end
 
     setup_all do
@@ -235,6 +245,374 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert TestRepo.aggregate(Event, :count) == 0
     end
 
+    test "serialized cancellation commits its events, revokes a claim, and clears poison" do
+      {graph_id, graph_hash, _document} = publish_graph!("signal-graph")
+      initial = initialization_moment("signal-run", graph_id, graph_hash)
+      backend = {RealBackend, %{repo: TestRepo}}
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
+
+      TestRepo.update_all(
+        from(run in Run, where: run.run_id == ^initial.run.id),
+        set: [
+          wake_at: nil,
+          claim_attempts: 3,
+          poisoned_at: @now,
+          poison_reason: "max_claim_attempts_exceeded"
+        ]
+      )
+
+      cancelled_at = DateTime.add(@now, 1, :second)
+
+      assert {:ok, %Moment{run: cancelled}} =
+               Docket.Lifecycle.signal(backend, :tenantless, initial.run.id, fn run ->
+                 Docket.Runtime.RunMutation.cancel_run(run, cancelled_at)
+               end)
+
+      assert cancelled.status == :cancelled
+      assert cancelled.checkpoint_seq == initial.run.checkpoint_seq + 1
+
+      assert {:ok,
+              %Docket.RunInfo{
+                run: ^cancelled,
+                wake_at: nil,
+                claimed_at: nil,
+                claim_attempts: 0,
+                poisoned_at: nil,
+                poison_reason: nil
+              }} = RunStore.inspect_run(TestRepo, :tenantless, initial.run.id)
+
+      assert Enum.map(TestRepo.all(from(event in Event, order_by: event.seq)), & &1.type) == [
+               :run_initialized,
+               :checkpoint_committed,
+               :run_cancelled,
+               :checkpoint_committed
+             ]
+    end
+
+    test "event failure rolls back the entire serialized signal mutation" do
+      {graph_id, graph_hash, _document} = publish_graph!("signal-rollback-graph")
+      initial = initialization_moment("signal-rollback-run", graph_id, graph_hash)
+      noop_backend = {NoopBackend, %{repo: TestRepo}}
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(noop_backend, :tenantless, initial)
+
+      lease =
+        RunStore.claim_due(TestRepo, :system, %{
+          now: @now,
+          limit: 1,
+          orphan_ttl_ms: 60_000,
+          max_claim_attempts: 3
+        })
+        |> then(fn {:ok, %{leases: [lease]}} -> lease end)
+
+      before = TestRepo.one!(from(run in Run, where: run.run_id == ^initial.run.id))
+
+      assert {:error, :injected_event_failure} =
+               Docket.Lifecycle.signal(
+                 {FailingBackend, %{repo: TestRepo}},
+                 :tenantless,
+                 initial.run.id,
+                 fn run ->
+                   Docket.Runtime.RunMutation.cancel_run(run, DateTime.add(@now, 1, :second))
+                 end
+               )
+
+      assert TestRepo.one!(from(run in Run, where: run.run_id == ^initial.run.id)) == before
+      current_claim = RunStore.current_claim(initial.run.id, lease.claim_token)
+      assert TestRepo.exists?(from(run in Run, where: ^current_claim))
+      assert TestRepo.aggregate(Event, :count) == 0
+    end
+
+    test "a committed signal makes previously claimed advance work lose its fence" do
+      {graph_id, graph_hash, _document} = publish_graph!("signal-fence-graph")
+      initial = initialization_moment("signal-fence-run", graph_id, graph_hash)
+      backend = {RealBackend, %{repo: TestRepo}}
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
+
+      assert {:ok, %{leases: [lease]}} =
+               RunStore.claim_due(TestRepo, :system, %{
+                 now: @now,
+                 limit: 1,
+                 orphan_ttl_ms: 60_000,
+                 max_claim_attempts: 3
+               })
+
+      advance =
+        Moment.propose(
+          initial.run,
+          :step_committed,
+          [],
+          :continue,
+          DateTime.add(@now, 1, :second)
+        )
+
+      parent = self()
+
+      cancellation =
+        Task.async(fn ->
+          Docket.Lifecycle.signal(backend, :tenantless, initial.run.id, fn run ->
+            send(parent, :cancellation_locked)
+
+            receive do
+              :commit_cancellation ->
+                Docket.Runtime.RunMutation.cancel_run(run, DateTime.add(@now, 2, :second))
+            end
+          end)
+        end)
+
+      assert_receive :cancellation_locked
+
+      handler_id = {__MODULE__, self(), :fence_loser}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:docket, :checkpoint, :committed],
+          fn name, measurements, metadata, pid ->
+            send(pid, {:committed_telemetry, name, measurements, metadata})
+          end,
+          self()
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      task_supervisor =
+        start_supervised!({Task.Supervisor, name: Module.concat(__MODULE__, Effects)})
+
+      advance_commit =
+        Task.async(fn ->
+          commit_moment_with_effects(
+            backend,
+            advance,
+            initial.run.checkpoint_seq,
+            lease.claim_token,
+            checkpoint_observers: [RecordingObserver],
+            task_supervisor: task_supervisor,
+            context: %{notify: parent}
+          )
+        end)
+
+      refute Task.yield(advance_commit, 50)
+      send(cancellation.pid, :commit_cancellation)
+
+      assert {:ok, %Moment{run: %{status: :cancelled} = cancelled}} =
+               Task.await(cancellation, 1_000)
+
+      assert {:error, :stale_fence} = Task.await(advance_commit, 1_000)
+
+      refute_receive {:committed_telemetry, _, _, _}
+      refute_receive {:committed_observer, _}
+      assert {:ok, ^cancelled} = RunStore.fetch_run(TestRepo, :tenantless, initial.run.id)
+      assert TestRepo.aggregate(Event, :count) == 4
+    end
+
+    test "interrupt resolution atomically persists events and wakes a poisoned run" do
+      authored = Docket.Test.Fixtures.Graphs.interrupt_review()
+      {:ok, document, rtg} = Docket.Graph.Compiler.compile_for_publication(authored)
+      {:ok, waiting, _checkpoints} = Docket.Test.run_inline(authored, %{})
+      [interrupt_id] = Map.keys(waiting.interrupts)
+      running = %{waiting | id: "resolve-poisoned", status: :running}
+
+      publish_document!(document, rtg)
+
+      insert_persisted_run!(running, :interrupt_requested,
+        wake_at: nil,
+        claim_attempts: 3,
+        poisoned_at: @now,
+        poison_reason: "max_claim_attempts_exceeded"
+      )
+
+      before = TestRepo.one!(from(run in Run, where: run.run_id == ^running.id))
+
+      assert {:error, %Docket.Error{type: :invalid_input}} =
+               Docket.Lifecycle.signal(
+                 {RealBackend, %{repo: TestRepo}},
+                 :tenantless,
+                 running.id,
+                 &Docket.Runtime.RunMutation.resolve_interrupt(
+                   rtg,
+                   &1,
+                   interrupt_id,
+                   42,
+                   DateTime.add(@now, 1, :second)
+                 )
+               )
+
+      assert TestRepo.one!(from(run in Run, where: run.run_id == ^running.id)) == before
+      assert TestRepo.aggregate(Event, :count) == 0
+
+      assert {:ok, %Moment{run: resolved}} =
+               Docket.Lifecycle.signal(
+                 {RealBackend, %{repo: TestRepo}},
+                 :tenantless,
+                 running.id,
+                 &Docket.Runtime.RunMutation.resolve_interrupt(
+                   rtg,
+                   &1,
+                   interrupt_id,
+                   "approved",
+                   DateTime.add(@now, 2, :second)
+                 )
+               )
+
+      assert resolved.status == :running
+      assert resolved.interrupts[interrupt_id].status == :resolved
+
+      assert {:ok,
+              %Docket.RunInfo{
+                run: ^resolved,
+                wake_at: %DateTime{},
+                claimed_at: nil,
+                claim_attempts: 0,
+                poisoned_at: nil,
+                poison_reason: nil
+              }} = RunStore.inspect_run(TestRepo, :tenantless, running.id)
+
+      assert Enum.map(TestRepo.all(from(event in Event, order_by: event.seq)), & &1.type) == [
+               :interrupt_resolved,
+               :channel_updated,
+               :checkpoint_committed
+             ]
+
+      assert {:error, %Docket.Error{type: :already_resolved}} =
+               Docket.Lifecycle.signal(
+                 {RealBackend, %{repo: TestRepo}},
+                 :tenantless,
+                 running.id,
+                 &Docket.Runtime.RunMutation.resolve_interrupt(
+                   rtg,
+                   &1,
+                   interrupt_id,
+                   "approved",
+                   DateTime.add(@now, 3, :second)
+                 )
+               )
+
+      assert TestRepo.aggregate(Event, :count) == 3
+    end
+
+    test "persisted terminal runs reject resolution before interrupt lookup" do
+      authored = Docket.Test.Fixtures.Graphs.interrupt_review()
+      {:ok, document, rtg} = Docket.Graph.Compiler.compile_for_publication(authored)
+      {:ok, waiting, _checkpoints} = Docket.Test.run_inline(authored, %{})
+      [interrupt_id] = Map.keys(waiting.interrupts)
+      running = %{waiting | id: "terminal-resolve", status: :running}
+      {:ok, cancelled_moment} = Docket.Runtime.RunMutation.cancel_run(running, @now)
+      cancelled = cancelled_moment.run
+
+      publish_document!(document, rtg)
+      insert_persisted_run!(cancelled, :run_cancelled, wake_at: nil)
+      before = TestRepo.one!(from(run in Run, where: run.run_id == ^cancelled.id))
+
+      assert {:error, %Docket.Error{type: :inactive_run}} =
+               Docket.Lifecycle.signal(
+                 {RealBackend, %{repo: TestRepo}},
+                 :tenantless,
+                 cancelled.id,
+                 &Docket.Runtime.RunMutation.resolve_interrupt(
+                   rtg,
+                   &1,
+                   interrupt_id,
+                   "approved",
+                   DateTime.add(@now, 1, :second)
+                 )
+               )
+
+      assert TestRepo.one!(from(run in Run, where: run.run_id == ^cancelled.id)) == before
+      assert TestRepo.aggregate(Event, :count) == 0
+    end
+
+    test "concurrent cancellations serialize to one committed checkpoint" do
+      {graph_id, graph_hash, _document} = publish_graph!("concurrent-cancel-graph")
+      initial = initialization_moment("concurrent-cancel-run", graph_id, graph_hash)
+      backend = {RealBackend, %{repo: TestRepo}}
+      parent = self()
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
+
+      first =
+        Task.async(fn ->
+          Docket.Lifecycle.signal(backend, :tenantless, initial.run.id, fn run ->
+            send(parent, :first_cancel_locked)
+
+            receive do
+              :commit_first_cancel ->
+                Docket.Runtime.RunMutation.cancel_run(run, DateTime.add(@now, 1, :second))
+            end
+          end)
+        end)
+
+      assert_receive :first_cancel_locked
+
+      second =
+        Task.async(fn ->
+          Docket.Lifecycle.signal(backend, :tenantless, initial.run.id, fn run ->
+            Docket.Runtime.RunMutation.cancel_run(run, DateTime.add(@now, 2, :second))
+          end)
+        end)
+
+      refute Task.yield(second, 50)
+      send(first.pid, :commit_first_cancel)
+
+      assert {:ok, %Moment{run: cancelled}} = Task.await(first, 1_000)
+      assert {:ok, ^cancelled} = Task.await(second, 1_000)
+      assert cancelled.status == :cancelled
+      assert cancelled.checkpoint_seq == initial.run.checkpoint_seq + 1
+
+      assert Enum.map(TestRepo.all(from(event in Event, order_by: event.seq)), & &1.type) == [
+               :run_initialized,
+               :checkpoint_committed,
+               :run_cancelled,
+               :checkpoint_committed
+             ]
+    end
+
+    test "an advance that commits first is observed by later cancellation" do
+      {graph_id, graph_hash, _document} = publish_graph!("advance-first-graph")
+      initial = initialization_moment("advance-first-run", graph_id, graph_hash)
+      backend = {RealBackend, %{repo: TestRepo}}
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
+
+      assert {:ok, %{leases: [lease]}} =
+               RunStore.claim_due(TestRepo, :system, %{
+                 now: @now,
+                 limit: 1,
+                 orphan_ttl_ms: 60_000,
+                 max_claim_attempts: 3
+               })
+
+      advanced =
+        Moment.propose(
+          initial.run,
+          :step_committed,
+          [],
+          :continue,
+          DateTime.add(@now, 1, :second)
+        )
+
+      assert {:ok, ^advanced} =
+               Docket.Lifecycle.commit_moment(
+                 backend,
+                 :tenantless,
+                 advanced,
+                 initial.run.checkpoint_seq,
+                 lease.claim_token
+               )
+
+      assert {:ok, %Moment{run: cancelled}} =
+               Docket.Lifecycle.signal(backend, :tenantless, initial.run.id, fn run ->
+                 assert run.checkpoint_seq == advanced.run.checkpoint_seq
+                 Docket.Runtime.RunMutation.cancel_run(run, DateTime.add(@now, 2, :second))
+               end)
+
+      assert cancelled.status == :cancelled
+      assert cancelled.checkpoint_seq == advanced.run.checkpoint_seq + 1
+      assert {:ok, ^cancelled} = RunStore.fetch_run(TestRepo, :tenantless, initial.run.id)
+    end
+
     defp publish_graph!(graph_id) do
       authored = Docket.Graph.new!(id: graph_id)
       {:ok, graph, runtime_graph} = Docket.Graph.Compiler.compile_for_publication(authored)
@@ -248,6 +626,51 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                end)
 
       {graph_id, graph_hash, graph}
+    end
+
+    defp publish_document!(document, rtg) do
+      assert {:ok, :published} =
+               Storage.transaction(TestRepo, fn ctx ->
+                 with :ok <- GraphStore.save_graph(ctx, document.id, rtg.graph_hash, document) do
+                   {:ok, :published}
+                 end
+               end)
+    end
+
+    defp insert_persisted_run!(run, checkpoint_type, overrides) do
+      {:ok, attrs} = RunCodec.dump(run)
+
+      attrs
+      |> Map.merge(%{
+        tenant_id: nil,
+        latest_checkpoint_type: checkpoint_type,
+        claim_token: nil,
+        claimed_at: nil,
+        wake_at: nil,
+        claim_attempts: 0,
+        poisoned_at: nil,
+        poison_reason: nil
+      })
+      |> Map.merge(Map.new(overrides))
+      |> Run.changeset()
+      |> TestRepo.insert!()
+    end
+
+    defp commit_moment_with_effects(backend, moment, expected_seq, claim_token, opts) do
+      case Docket.Lifecycle.commit_moment(
+             backend,
+             :tenantless,
+             moment,
+             expected_seq,
+             claim_token
+           ) do
+        {:ok, committed} = result ->
+          :ok = Docket.Lifecycle.after_commit(committed, opts)
+          result
+
+        {:error, _reason} = error ->
+          error
+      end
     end
 
     defp initialization_moment(run_id, graph_id, graph_hash) do
