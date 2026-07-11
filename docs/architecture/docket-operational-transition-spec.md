@@ -433,8 +433,10 @@ Publishing is explicit and content-addressed. `save_graph(graph)` snapshots
 node configuration schemas once, materializes their defaults, validates and
 compiles that effective graph, then stores the diagnostic-free graph through
 the private versioned deterministic ETF codec, keyed by
-`graph_id + graph_hash`, and returns a stable graph reference. The public
-`Docket.Graph.to_map/1` interchange format is not part of persistence.
+`graph_id + graph_hash`, and returns a stable graph reference.
+Graph identity is not a public operation: compiler publication computes it
+once from the final canonical effective graph's exact ETF bytes, and storage
+persists those same bytes. Authored graphs have no independent durable hash.
 Postgres implements `save_graph` with `ON CONFLICT DO NOTHING`. Two nodes racing
 to publish the same version both succeed idempotently. If the existing document
 under that key is not byte-identical to the deterministic ETF projection,
@@ -465,6 +467,14 @@ terms. There is no legacy JSON decoder. The codec version changes whenever the
 private durable projection becomes incompatible; deterministic bytes are
 scoped to one OTP major, so a deployment must not mix OTP majors for one codec
 version.
+
+Graph-domain canonicalization is deliberately outside the generic codec.
+`Docket.Graph.Compiler.Canonical` normalizes open graph content and validates
+structural graph collections; recovered collections must be plain maps with
+binary keys and exact `Field`, `Output`, `Node`, or `Edge` values as
+appropriate. `Docket.DurableCodec` validates the generic ETF envelope, durable
+term safety, known structs, and decoded root. Decoding fails closed instead of
+repairing non-canonical or malformed stored graphs.
 
 This shape means every fact is stored once. `status`, `step`, and the fence
 sequence are not denormalized copies of fields inside a document blob — they

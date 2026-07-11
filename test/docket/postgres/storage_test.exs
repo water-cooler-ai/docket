@@ -191,6 +191,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp document(id), do: Docket.Graph.new!(id: id)
-    defp hash(graph), do: Docket.Graph.hash(graph)
+
+    defp hash(graph) do
+      graph
+      |> then(&Docket.DurableCodec.encode!(:graph, &1))
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+    end
   end
 end

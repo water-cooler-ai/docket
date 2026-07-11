@@ -545,7 +545,7 @@ runtime remains substrate-neutral behind `Docket.Backend` and
 `Docket.Lifecycle`.
 
 **Intentional compatibility break:** Node modules and graph definitions carry
-over unchanged, including public Graph interchange. Host-owned Run
+over unchanged. Host-owned Run
 serialization does not: `Docket.Run.to_map/from_map` and the old Run wire
 version are removed. Adopters remove their checkpoint committer and host run
 tables, install Docket's migration, configure `repo:`/`backend:`, publish
@@ -557,6 +557,22 @@ migration is an explicit drain-and-cut-over rather than a universal automatic
 database migration or indefinite old-wire compatibility. Retained events are
 the durable integration path; checkpoint observers are best-effort
 after-commit notifications only.
+
+## Post-Lock Amendment (2026-07-10): Private Effective-Graph Codec
+
+**Decision:** DCKT-14 stores the final effective graph directly as private,
+versioned deterministic ETF in `bytea`. The compiler owns graph-specific
+canonicalization and strict structural validation. The generic durable codec
+owns the ETF envelope, deterministic encoding, safe recovery, and durable-term
+validation. Graph identity is computed privately once from the exact final ETF
+bytes and is not exposed as `Docket.Graph.hash/1`.
+
+The graph JSON serializer and public `Docket.Graph.to_map/1`, `from_map/1`,
+`from_map!/1`, and `hash/1` APIs are removed. Recovery requires graph
+collections to have binary keys and exact expected struct values and rejects
+malformed or non-canonical stored terms rather than normalizing them on read.
+These decisions supersede DCKT-14 acceptance language that requires a JSON
+graph projection, public graph hashing, or host-side hash recomputation.
 
 **Landing and blockers:** DCKT-37 owns the removal and migration-doc changes.
 It is blocked by DCKT-25 (assembled operational facade/backend) and DCKT-24

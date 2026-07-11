@@ -1,12 +1,9 @@
 defmodule Docket.Wire do
   @moduledoc false
 
-  # Durable-value coercion for runtime-side open content: run input payloads,
-  # node state writes, interrupt resolution values, and run metadata. Mirrors
-  # the graph serializer's durability rules (which stay self-contained inside
-  # `Docket.Graph.Serializer`): atoms coerce to strings (map keys and values),
-  # terms with no JSON representation are rejected, and "$"-prefixed map keys
-  # are reserved for wire-format tags.
+  # Durable-value coercion for open runtime and graph content: atoms coerce to
+  # strings (map keys and values), terms outside Docket's portable open-value
+  # contract are rejected, and "$"-prefixed map keys are reserved.
   #
   # `dump_value/1` is non-raising so the update barrier can turn durability
   # failures into typed node errors instead of exceptions.

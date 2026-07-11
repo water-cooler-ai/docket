@@ -1151,15 +1151,13 @@ canonical graph it started with:
 - graph ID
 - SHA-256 graph content hash
 
-On runtime start, the host passes a canonical `Docket.Graph` document to Docket.
-Docket hashes that graph and stores the digest on `Docket.Run.graph_hash`. On
-resume, retry, replay, and time travel, the host passes both the graph document
-and the `Docket.Run` document or historical checkpoint/event document it wants
-Docket to hydrate from. Docket hashes the supplied graph, compares it with
-`run.graph_hash`, then materializes the internal `Docket.Runtime.Graph` value
-and initializes or continues the run through `Docket.Runtime.Loop.init/3`. A live
-Runtime keeps that materialized runtime graph in memory. It does not recompile
-the graph on every superstep.
+Publication returns a `GraphRef` containing the private identity computed once
+from the effective graph's exact stored ETF bytes. Runtime start, recovery,
+retry, replay, and inspection resolve that immutable published graph through
+the reference and compare its stored identity with `run.graph_hash`; hosts do
+not hash editable graph documents. Docket then materializes the internal
+`Docket.Runtime.Graph` value. A live Runtime keeps that materialized runtime
+graph in memory and does not recompile it on every superstep.
 
 The canonical graph document stores the metadata needed to understand how it was
 produced and how it should be interpreted:

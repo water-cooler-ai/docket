@@ -18,8 +18,7 @@ defmodule Docket.Graph do
   records back through the same editing API.
   """
 
-  alias Docket.DurableCodec
-  alias Docket.Graph.{Diagnostic, Edge, Error, Field, Node, Output, Serializer}
+  alias Docket.Graph.{Diagnostic, Edge, Error, Field, Node, Output}
 
   @id_pattern ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
   @start_id "$start"
@@ -278,62 +277,6 @@ defmodule Docket.Graph do
   @spec diagnostics(t(), keyword()) :: [Diagnostic.t()]
   def diagnostics(%__MODULE__{} = graph, _opts \\ []) do
     graph.diagnostics
-  end
-
-  @doc """
-  Dumps the graph to a plain, JSON-safe map (the v1 wire format).
-
-  Keys are strings and values are durable JSON-safe terms. Compiler diagnostics
-  are transient and are never serialized.
-
-  Graphs are free-form in memory. Open content (metadata, policies, config,
-  defaults, enum values, guard arguments, branch groups) is normalized at
-  interchange and publication: atom keys and values become strings. Terms
-  with no portable representation—tuples, keyword lists, pids, refs,
-  functions, structs—raise `Docket.Graph.Error` (`:non_durable_value` and
-  friends) here.
-
-  This map is for public interchange only; durable persistence and graph
-  hashing use Docket's private ETF codec directly. Graphs whose open content
-  is already canonical (string keys and values) round-trip on struct equality:
-  `from_map!(to_map(graph)) == graph`.
-  """
-  @spec to_map(t(), keyword()) :: map()
-  def to_map(%__MODULE__{} = graph, opts \\ []) do
-    Serializer.dump(graph, opts)
-  end
-
-  @doc """
-  Loads a graph from a v1 wire map.
-  """
-  @spec from_map(map(), keyword()) :: edit_result()
-  def from_map(map, opts \\ []) do
-    edit_result(fn -> Serializer.load!(map, opts) end)
-  end
-
-  @doc """
-  Loads a graph from a v1 wire map, raising `Docket.Graph.Error` on invalid input.
-  """
-  @spec from_map!(map(), keyword()) :: t()
-  def from_map!(map, opts \\ []) do
-    Serializer.load!(map, opts)
-  end
-
-  @doc """
-  Computes the SHA-256 graph hash used to bind runs to graph content.
-
-  The hash is a SHA-256 digest over the private codec's versioned,
-  deterministic ETF projection of the graph. The codec normalizes only open
-  runtime values—without a public map serialization round trip—and excludes
-  compiler diagnostics. Byte stability is scoped to the codec version and OTP
-  major version, matching Erlang's deterministic ETF guarantee. Node module
-  atoms must exist on a recovery node before safe ETF decoding.
-  """
-  @spec hash(t(), keyword()) :: String.t()
-  def hash(%__MODULE__{} = graph, _opts \\ []) do
-    DurableCodec.encode!(:graph, graph)
-    |> then(&:crypto.hash(:sha256, &1))
-    |> Base.encode16(case: :lower)
   end
 
   @doc """
@@ -848,7 +791,7 @@ defmodule Docket.Graph do
   defp existing_kind(_field), do: "state"
 
   defp node_from_attrs(%Node{} = node, _id) do
-    Map.update!(node, :implementation, &Serializer.normalize_implementation/1)
+    Map.update!(node, :implementation, &normalize_implementation/1)
   end
 
   defp node_from_attrs(attrs, id) do
@@ -856,7 +799,31 @@ defmodule Docket.Graph do
     |> attrs_to_map()
     |> Map.put_new(:id, id)
     |> then(&struct(Node, &1))
-    |> Map.update!(:implementation, &Serializer.normalize_implementation/1)
+    |> Map.update!(:implementation, &normalize_implementation/1)
+  end
+
+  defp normalize_implementation(nil), do: nil
+
+  defp normalize_implementation(module) when is_atom(module) do
+    %{type: :module, module: module, function: :call}
+  end
+
+  defp normalize_implementation({module, function})
+       when is_atom(module) and is_atom(function) do
+    %{type: :module, module: module, function: function}
+  end
+
+  defp normalize_implementation(%{type: :module} = implementation) do
+    Map.put_new(implementation, :function, :call)
+  end
+
+  defp normalize_implementation(%{} = implementation), do: implementation
+
+  defp normalize_implementation(other) do
+    invalid!(
+      :invalid_implementation,
+      "implementation must be a module atom, {module, function}, map, or nil, got #{inspect(other)}"
+    )
   end
 
   defp edge_from_attrs(%Edge{} = edge, _id), do: edge

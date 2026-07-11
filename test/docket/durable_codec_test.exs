@@ -2,6 +2,7 @@ defmodule Docket.DurableCodecTest do
   use Docket.Test.Case, async: true
 
   alias Docket.{DurableCodec, Graph}
+  alias Docket.Graph.Compiler.Canonical
 
   defp etf(term, opts \\ []) do
     :erlang.term_to_binary(term, [:deterministic, {:minor_version, 2} | opts])
@@ -28,12 +29,13 @@ defmodule Docket.DurableCodecTest do
     assert {:ok, ^run_state} = DurableCodec.decode(run_bytes, :run)
   end
 
-  test "drops transient graph diagnostics before encoding" do
+  test "compiler canonicalization drops transient graph diagnostics before encoding" do
     diagnostic = %Docket.Graph.Diagnostic{severity: :warning, code: :ignored, message: "ignored"}
     graph = %{Graph.new!(id: "g") | diagnostics: [diagnostic]}
 
-    assert DurableCodec.encode!(:graph, graph) ==
-             DurableCodec.encode!(:graph, %{graph | diagnostics: []})
+    assert_raise Docket.Error, fn -> DurableCodec.encode!(:graph, graph) end
+
+    graph = Canonical.normalize!(graph)
 
     assert {:ok, %Graph{diagnostics: []}} =
              DurableCodec.encode!(:graph, graph) |> DurableCodec.decode(:graph)
@@ -49,7 +51,7 @@ defmodule Docket.DurableCodecTest do
         guard: Docket.Guard.equals("priority", :high)
       )
 
-    {normalized, _bytes} = DurableCodec.encode_graph!(graph)
+    normalized = Canonical.normalize!(graph)
 
     assert normalized.metadata == %{"owner" => "operations"}
     assert normalized.inputs["priority"].schema.values == ["low", "high"]
@@ -115,6 +117,27 @@ defmodule Docket.DurableCodecTest do
     end
   end
 
+  test "rejects malformed structural graph collections during recovery" do
+    base = Graph.new!(id: "g")
+
+    malformed = [
+      %{base | inputs: %{"x" => %{not: :field}}},
+      %{base | fields: %{field: %Docket.Graph.Field{id: "field"}}},
+      %{base | outputs: %{"x" => %Docket.Graph.Node{id: "x"}}},
+      %{base | nodes: %{"x" => %Docket.Graph.Edge{id: "x"}}},
+      %{base | edges: %{"x" => %Docket.Graph.Output{id: "x"}}}
+    ]
+
+    for graph <- malformed do
+      bytes = etf({:docket, 1, :graph, graph})
+
+      assert {:error, %Docket.Error{type: :invalid_durable_state}} =
+               DurableCodec.decode(bytes, :graph)
+
+      assert_raise Docket.Error, fn -> Canonical.normalize!(graph) end
+    end
+  end
+
   test "safe-decodes parked task atoms in a fresh VM" do
     state = %{
       active_tasks: %{"task" => %Docket.Run.TaskState{status: :retry_scheduled}},
@@ -163,7 +186,12 @@ defmodule Docket.DurableCodecTest do
         }
       )
 
-    encoded = DurableCodec.encode!(:graph, graph) |> Base.encode64()
+    encoded =
+      graph
+      |> Canonical.normalize!()
+      |> then(&DurableCodec.encode!(:graph, &1))
+      |> Base.encode64()
+
     ebin = Path.expand("_build/test/lib/docket/ebin")
 
     script = """

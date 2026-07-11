@@ -56,17 +56,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert TestRepo.aggregate(GraphVersion, :count) == 1
     end
 
-    test "durable graph storage does not pass through public JSON interchange" do
-      {graph, _hash} = effective_graph()
-      graph = %{graph | metadata: %{"direct_term" => {"tuple", 1}}}
-      graph_hash = Graph.hash(graph)
-
-      assert_raise Docket.Graph.Error, fn -> Graph.to_map(graph) end
-      assert :ok = GraphStore.save_graph(TestRepo, graph.id, graph_hash, graph)
-      assert {:ok, ^graph} = GraphStore.fetch_graph(TestRepo, graph.id, graph_hash)
-    end
-
-    test "a fetched graph compiles without public map serialization" do
+    test "a fetched graph compiles directly from durable storage" do
       {graph, graph_hash} = effective_graph()
       :ok = GraphStore.save_graph(TestRepo, graph.id, graph_hash, graph)
 
@@ -112,6 +102,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                GraphStore.fetch_graph(TestRepo, "corrupt", graph_hash)
 
       assert {:error, :not_found} = GraphStore.fetch_graph(TestRepo, "missing", graph_hash)
+    end
+
+    test "structurally malformed graph ETF fails closed" do
+      graph = %{Graph.new!(id: "malformed") | inputs: %{"x" => %{not: :field}}}
+
+      bytes =
+        :erlang.term_to_binary(
+          {:docket, 1, :graph, graph},
+          [:deterministic, minor_version: 2]
+        )
+
+      graph_hash = digest(bytes)
+      insert_raw!(graph.id, graph_hash, bytes)
+
+      assert {:error, :corrupt_graph} =
+               GraphStore.fetch_graph(TestRepo, graph.id, graph_hash)
     end
 
     test "repo prefixes isolate graph versions" do

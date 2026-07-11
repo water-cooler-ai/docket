@@ -42,10 +42,10 @@ defmodule Docket.Graph.Compiler.DeterminismTest do
     assert %{verified | diagnostics: []} == %{graph | diagnostics: []}
   end
 
-  test "graph hash is independent of diagnostics attached by verify" do
+  test "compile identity is independent of diagnostics attached by verify" do
     graph = Graphs.minimal_linear()
     {:ok, verified} = Graph.verify(graph)
 
-    assert Graph.hash(verified) == Graph.hash(graph)
+    assert compile!(verified).graph_hash == compile!(graph).graph_hash
   end
 end

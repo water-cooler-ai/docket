@@ -16,8 +16,8 @@ when you want to understand *why* the contracts are shaped the way they are.
    - The final DCKT-1 architecture, pluggability, lifecycle-status, ticket,
      and dependency audit that produced transition-spec revision 8.
 3. `docket-graph-construction-design.md`
-   - The public `Docket.Graph` document: editing API, serialization and hash
-     contract, ID rules, and the host storage boundary.
+   - The public `Docket.Graph` editing API, ID rules, publication boundary,
+     and private effective-graph identity contract.
 4. `docket-compiler-design.md`
    - Compiler verification, diagnostics, and lowering from the public graph
      to the internal runtime graph.

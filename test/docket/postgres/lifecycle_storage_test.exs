@@ -114,8 +114,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp publish_graph!(graph_id) do
-      graph = Docket.Graph.new!(id: graph_id)
-      graph_hash = Docket.Graph.hash(graph)
+      authored = Docket.Graph.new!(id: graph_id)
+      {:ok, graph, runtime_graph} = Docket.Graph.Compiler.compile_for_publication(authored)
+      graph_hash = runtime_graph.graph_hash
 
       assert {:ok, :published} =
                Storage.transaction(TestRepo, fn ctx ->

@@ -24,6 +24,7 @@ defmodule Docket.Graph.Compiler do
 
   alias Docket.Graph.Compiler.{
     Diagnostics,
+    Canonical,
     Lowering,
     NodeContracts,
     RuntimeValidation,
@@ -89,23 +90,23 @@ defmodule Docket.Graph.Compiler do
   end
 
   defp run_pipeline(graph, opts, mode) do
-    {canonical, ingest_diagnostics} = ingest(graph)
+    {canonical, canonical_bytes, ingest_diagnostics} = ingest(graph)
 
     if Diagnostics.blocking?(ingest_diagnostics) do
       {:error, ingest_diagnostics}
     else
-      run_canonical_pipeline(canonical, ingest_diagnostics, opts, mode)
+      run_canonical_pipeline(canonical, canonical_bytes, ingest_diagnostics, opts, mode)
     end
   end
 
-  defp run_canonical_pipeline(canonical, ingest_diagnostics, opts, mode) do
+  defp run_canonical_pipeline(canonical, canonical_bytes, ingest_diagnostics, opts, mode) do
     # Config schemas are fetched exactly once per compile; validation and
     # lowering must see the same result even when config_schema/0 callbacks
     # are stateful, and lowering must never re-enter user code.
     config_schemas = NodeContracts.config_schemas(canonical)
 
-    {effective, materialization_diagnostics} =
-      materialize(canonical, config_schemas, mode != :effective_document)
+    {effective, effective_bytes, materialization_diagnostics} =
+      materialize(canonical, canonical_bytes, config_schemas, mode != :effective_document)
 
     diagnostics = ingest_diagnostics ++ materialization_diagnostics
 
@@ -117,13 +118,14 @@ defmodule Docket.Graph.Compiler do
       if Diagnostics.blocking?(diagnostics) do
         {:error, diagnostics}
       else
-        lower(effective, opts, diagnostics)
+        lower(effective, effective_bytes, opts, diagnostics)
       end
     end
   end
 
-  defp lower(effective, opts, diagnostics) do
-    runtime_graph = Lowering.run(effective, opts)
+  defp lower(effective, effective_bytes, opts, diagnostics) do
+    graph_hash = digest(effective_bytes)
+    runtime_graph = Lowering.run(effective, graph_hash, opts)
     diagnostics = diagnostics ++ RuntimeValidation.run(runtime_graph, effective)
 
     if Diagnostics.blocking?(diagnostics) do
@@ -133,23 +135,23 @@ defmodule Docket.Graph.Compiler do
     end
   end
 
-  defp materialize(graph, _config_schemas, false), do: {graph, []}
+  defp materialize(graph, bytes, _config_schemas, false), do: {graph, bytes, []}
 
-  defp materialize(graph, config_schemas, true) do
+  defp materialize(graph, _bytes, config_schemas, true) do
     graph
     |> NodeContracts.materialize_defaults(config_schemas)
     |> ingest()
   end
 
   # Compilation normalizes only open runtime values through Docket.Wire, then
-  # validates the direct durable term. Public JSON interchange is deliberately
-  # not part of persistence, hashing, or compiler ingest.
+  # validates the direct durable term.
   defp ingest(graph) do
-    {graph, _bytes} = DurableCodec.encode_graph!(graph)
-    {graph, []}
+    graph = Canonical.normalize!(graph)
+    bytes = DurableCodec.encode!(:graph, graph)
+    {graph, bytes, []}
   rescue
     exception in Docket.Error ->
-      {graph,
+      {graph, nil,
        [
          Diagnostics.error(
            :non_durable_graph_value,
@@ -157,6 +159,12 @@ defmodule Docket.Graph.Compiler do
            metadata: %{error: exception.message, details: exception.details}
          )
        ]}
+  end
+
+  defp digest(bytes) do
+    bytes
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   defp validate_opts!(opts) do

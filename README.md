@@ -224,10 +224,11 @@ guarded branches (durable, serializable guard expressions over state), and
 cycles (optionally bounded by a graph or host `max_supersteps` policy). Node failures retry per node
 policy; a permanently failed superstep commits none of its writes.
 
-Public graph interchange remains a JSON-safe document API. Durable graphs and
-run state use a private versioned deterministic ETF codec; graph hashes cover
-the exact stored ETF projection, and every run records the graph ID and hash it
-was started from.
+Durable graphs and run state use a private versioned deterministic ETF codec;
+the compiler canonicalizes and validates the effective graph before its exact
+ETF bytes are hashed once and stored. Graph hashing is private, and every run
+records the published graph ID and hash it was started from. Recovery validates
+strict collection key/value shapes and fails closed on malformed stored terms.
 
 ## 0.0.1 resident-process architecture
 

@@ -5,7 +5,10 @@ defmodule Docket.MemoryBackendTest do
   alias Docket.Test.MemoryBackend
 
   @graph %Docket.Graph{id: "g"}
-  @graph_hash Docket.Graph.hash(@graph)
+  @graph_hash @graph
+              |> then(&Docket.DurableCodec.encode!(:graph, &1))
+              |> then(&:crypto.hash(:sha256, &1))
+              |> Base.encode16(case: :lower)
   @initial_wake ~U[2026-07-09 11:00:00Z]
   @now ~U[2026-07-09 12:00:00Z]
   @commit_now ~U[2026-07-09 12:30:00Z]
@@ -179,7 +182,7 @@ defmodule Docket.MemoryBackendTest do
     first = %{@graph | metadata: %{"a" => 1, "b" => 2}}
     equal = %{@graph | metadata: %{"b" => 2, "a" => 1}}
     different = %{@graph | metadata: %{"a" => 2}}
-    graph_hash = Docket.Graph.hash(first)
+    graph_hash = durable_hash(first)
 
     assert :ok = MemoryBackend.save_graph(b, "g", graph_hash, first)
     assert :ok = MemoryBackend.save_graph(b, "g", graph_hash, equal)
@@ -188,6 +191,13 @@ defmodule Docket.MemoryBackendTest do
              MemoryBackend.save_graph(b, "g", graph_hash, different)
 
     assert {:ok, ^first} = MemoryBackend.fetch_graph(b, "g", graph_hash)
+  end
+
+  defp durable_hash(graph) do
+    graph
+    |> then(&Docket.DurableCodec.encode!(:graph, &1))
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   test "failed event append rolls graph and run initialization back", %{backend: b} do

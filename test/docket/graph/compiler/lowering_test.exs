@@ -157,7 +157,7 @@ defmodule Docket.Graph.Compiler.LoweringTest do
                "temperature" => 0.5
              }
 
-      assert runtime.graph_hash == Graph.hash(effective)
+      assert runtime.graph_hash == durable_hash(effective)
       assert runtime.nodes["node:styled"].config == effective.nodes["styled"].config
     end
 
@@ -306,7 +306,7 @@ defmodule Docket.Graph.Compiler.LoweringTest do
                Docket.Graph.Compiler.compile_for_publication(graph)
 
       assert runtime_graph.graph_id == "minimal-linear"
-      assert runtime_graph.graph_hash == Graph.hash(effective)
+      assert runtime_graph.graph_hash == durable_hash(effective)
 
       assert runtime_graph.id ==
                "minimal-linear@" <> String.slice(runtime_graph.graph_hash, 0, 12)
@@ -338,7 +338,7 @@ defmodule Docket.Graph.Compiler.LoweringTest do
 
       refute Map.has_key?(effective.policies, "max_supersteps")
       refute Map.has_key?(runtime_graph.policies, "max_supersteps")
-      assert runtime_graph.graph_hash == Graph.hash(effective)
+      assert runtime_graph.graph_hash == durable_hash(effective)
     end
 
     test "an explicit nil policy is replaced by the opts runtime default" do
@@ -360,5 +360,12 @@ defmodule Docket.Graph.Compiler.LoweringTest do
 
       refute Map.has_key?(runtime_graph.policies, "max_supersteps")
     end
+  end
+
+  defp durable_hash(graph) do
+    graph
+    |> then(&Docket.DurableCodec.encode!(:graph, &1))
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 end

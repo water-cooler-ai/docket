@@ -8,8 +8,8 @@ composition) remain open design space, recorded below.
 
 The v1.1 theme: **make building graphs feel natural without adding a second
 canonical model.** Every proposal below is sugar or extension over the existing
-document contract — the graph stays a flat, JSON-safe, content-hashed document,
-and everything a helper does must be expressible as plain `put_*` calls.
+graph contract, and everything a helper does must be expressible as plain
+`put_*` calls.
 
 ---
 
@@ -111,8 +111,8 @@ Docket.Schema.object(%{
 ```
 
 Why this tier first: it is plain data, so it works identically for
-hand-written Elixir, UI payloads coming through `from_map`, and compilers —
-no new concepts, no macro layer to keep in sync. A macro `config do ... end`
+hand-written Elixir and compilers—no new concepts, no macro layer to keep in
+sync. A macro `config do ... end`
 DSL for `Docket.Node.config_schema/0` can sit on top later if the shorthand
 still feels heavy (see Theme 6).
 

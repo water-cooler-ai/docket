@@ -97,7 +97,10 @@ defmodule Docket.Test.MemoryBackend do
   @impl Docket.Storage.Graphs
   def save_graph(backend, graph_id, graph_hash, %Docket.Graph{id: id, diagnostics: []} = graph)
       when id == graph_id do
-    if Docket.Graph.hash(graph) == graph_hash do
+    bytes = Docket.DurableCodec.encode!(:graph, graph)
+    actual_hash = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+
+    if actual_hash == graph_hash do
       state_get_and_update(backend, fn state ->
         case Map.fetch(state.graphs, {graph_id, graph_hash}) do
           :error ->

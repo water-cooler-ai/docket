@@ -132,13 +132,13 @@ defmodule Docket.LifecycleTest do
              backend.graphs().fetch_graph(context, calm_ref.graph_id, calm_ref.graph_hash)
 
     assert calm_graph.nodes["copy"].config["tone"] == "calm"
-    assert Docket.Graph.hash(calm_graph) == calm_ref.graph_hash
+    assert {:ok, calm_runtime} = Docket.ensure_compiled_effective(calm_graph, [])
+    assert calm_runtime.graph_hash == calm_ref.graph_hash
 
     Process.put({MutableDefaultsNode, :tone}, "bright")
     assert {:ok, bright_ref} = Host.save_graph(graph)
     refute bright_ref.graph_hash == calm_ref.graph_hash
 
-    assert {:ok, calm_runtime} = Docket.ensure_compiled(calm_graph, [])
     assert calm_runtime.nodes["node:copy"].config["tone"] == "calm"
 
     Process.put({MutableDefaultsNode, :calls}, 0)

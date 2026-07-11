@@ -113,8 +113,9 @@ Docket-owned execution internals.
    publish/run.
 8. Keep published host graph artifacts append-only and immutable.
 9. Preserve stable public IDs for graph, node, edge, field, and output records.
-10. Compute a SHA-256 graph hash at run/resume boundaries so Docket can verify
-    compatibility without owning host version IDs.
+10. Compute private SHA-256 graph identity once from the published effective
+    graph bytes so Docket can verify compatibility without owning host version
+    IDs.
 11. Keep generated channels hidden from normal users but inspectable in runtime
     debug tools.
 
@@ -228,16 +229,20 @@ This is not a temporary builder. The bang functional API returns updated
 attribute shapes) is documented in the `Docket.Graph` module docs
 (`lib/docket/graph.ex`).
 
-### 6.1 Computed Graph Hash
+### 6.1 Private Effective-Graph Identity
 
-Docket computes a full SHA-256 digest of the canonical graph content at
-run/resume boundaries. It is a fingerprint for change detection and run
-compatibility, not a host-owned version ID. Hosts may still maintain their own
-graph version numbers, slugs, revision IDs, or publishing records.
+During publication, Docket computes a full SHA-256 digest of the effective
+graph's canonical durable bytes. It is a private content identity used by
+storage and run compatibility, not a host-owned version ID or a public graph
+operation. Hosts may still maintain their own graph version numbers, slugs,
+revision IDs, or publishing records.
 
-The hash is not stored on `Docket.Graph`. `Docket.run/4` hashes the supplied
-graph and stores the digest on the new `Docket.Run`. `Docket.resume/4` hashes
-the supplied graph and compares the digest with `run.graph_hash`.
+There is no public `Docket.Graph.hash/1`. Authored graphs are not hashable
+publication identities: compiler ingest canonicalizes their durable content,
+schema materialization applies defaults, and the final effective graph is
+canonicalized once more. Only then does the compiler encode the graph and
+compute its private digest from those exact bytes. The same effective graph,
+bytes, and digest flow into lowering and storage without a second projection.
 
 Hash contract:
 
@@ -253,37 +258,36 @@ identical; there is no second canonical digest format. Deterministic ETF byte
 stability is scoped to one codec version and OTP major, so incompatible struct
 or OTP changes require a codec-version bump and controlled rewrite.
 
+`Docket.Graph.Compiler.Canonical` owns graph-specific normalization and
+structural validation. In particular, every recovered graph collection must
+be a plain map with binary keys and values of the exact expected graph struct
+type. `Docket.DurableCodec` owns only the generic versioned ETF envelope,
+deterministic encoding, safe/full decoding, known durable-term validation, and
+root validation. Recovery either returns an already-canonical effective graph
+or fails closed; it never repairs malformed stored graph structure.
+
 The durable projection excludes compiler diagnostics and includes the public
 graph structure and semantics: input/state/output definitions, nodes, node
 names or labels, node branch groups, edges, edge guards, policies, and
-metadata. `Docket.Graph.to_map/1` remains a JSON-safe UI/interchange format but
-does not participate in persistence or hashing.
-
-Public graph interchange is JSON-safe by contract: binaries, numbers, booleans,
-nil, lists, and string-keyed maps. Graphs remain free-form while being edited,
-but public interchange and publication share the runtime open-value rule: atom
-keys and values normalize to strings and non-portable resources are rejected.
-The private persistence path applies that rule directly to the graph structs;
-it does not route through `to_map/2`, construct a JSON-shaped projection, or
-retain a second persistence codec. Graphs whose open content is already
-canonical round-trip through the public map interchange on struct equality.
-Map keys starting with `$` remain reserved for wire-format tags.
+metadata. Graphs remain free-form while being edited; publication normalizes
+atom keys and values in open content to strings and rejects non-portable
+resources before encoding the graph directly with the private codec.
 
 The one caveat of boundary coercion: an authored graph may still contain atom
 keys before publication, while its effective published graph uses strings.
 Host-facing docs should state the rule of thumb: treat open content (config,
 metadata, policies, defaults) as string-keyed data on both write and read.
 
-Public node IDs are stable and meaningful in v1, so the canonical dump hashes
+Public node IDs are stable and meaningful in v1, so the durable encoding hashes
 node and edge references directly. A node name or label change is considered a
 graph content change.
 
-`Docket.Run.graph_hash` stores the digest captured when the run is created.
-Resume compatibility is:
+`Docket.Run.graph_hash` stores the private digest captured from the effective
+graph at publication. Resume compatibility is:
 
 ```text
 graph.id == run.graph_id
-Docket.Graph.hash(graph) == run.graph_hash
+compiled_effective_graph.graph_hash == run.graph_hash
 ```
 
 Store the full SHA-256 digest. UI and logs may display a short prefix, but
@@ -703,8 +707,8 @@ Docket.Graph.put_edge!(graph, "edge_start_writer", from: "$start", to: "writer")
 ```
 
 The full editing API (put/update/delete helpers for inputs, fields, outputs,
-nodes, and edges, plus policy/metadata helpers, `diagnostics/2`, `to_map/2`,
-`from_map/2`, `hash/2`, and `verify/2`) is documented in the `Docket.Graph`
+nodes, and edges, plus policy/metadata helpers, `diagnostics/2` and `verify/2`)
+is documented in the `Docket.Graph`
 module docs (`lib/docket/graph.ex`).
 
 Compiler API:
@@ -824,9 +828,8 @@ the normal editing path.
 
 ## 12. Public Documents And Durable Persistence
 
-`Docket.Graph` remains the editable public graph document. Its `to_map/2` and
-`from_map/2` functions provide JSON-safe UI/import/export interchange, but that
-map is not the durable backend format and does not define graph identity.
+`Docket.Graph` remains the editable public graph document. Docket intentionally
+does not maintain a second generic map representation of that document.
 
 Publishing compiles an effective diagnostic-free `%Docket.Graph{}`, stores it
 through Docket's private versioned deterministic ETF codec, and returns a
@@ -844,8 +847,7 @@ Rules:
   `fetch_run`/`inspect_run` under an explicit tenant scope.
 - Graph hashes cover the exact private ETF projection stored by the backend,
   excluding compiler diagnostics.
-- The codec version and OTP-major deployment boundary are backend concerns,
-  not a public interchange compatibility promise.
+- The codec version and OTP-major deployment boundary are backend concerns.
 
 ## 13. UI Projection Boundary
 
@@ -884,9 +886,10 @@ live run overlay:
   Run events/checkpoints/channel versions -> overlay data keyed by public IDs
 ```
 
-The inspector can load a canonical graph by host-owned identity, recompute its
-graph hash, compare it with `run.graph_hash`, project it to the app's UI shape,
-then stream committed run events and apply overlay updates.
+The inspector loads the published graph through its `GraphRef`, whose private
+hash is already recorded on the run, projects the graph to the app's UI shape,
+then streams committed run events and applies overlay updates. Applications do
+not recompute graph hashes from editable graph values.
 
 Runtime events refer to runtime channels and runtime node IDs. The runtime
 lowering map maps those IDs back to public node, edge, and field IDs for UI overlays.

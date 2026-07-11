@@ -15,10 +15,8 @@ defmodule Docket.Graph.Compiler.Lowering do
 
   @hash_prefix_length 12
 
-  @spec run(Graph.t(), keyword()) :: Runtime.Graph.t()
-  def run(%Graph{} = graph, opts) do
-    graph_hash = Graph.hash(graph)
-
+  @spec run(Graph.t(), String.t(), keyword()) :: Runtime.Graph.t()
+  def run(%Graph{} = graph, graph_hash, opts) do
     %Runtime.Graph{
       id: "#{graph.id}@#{String.slice(graph_hash, 0, @hash_prefix_length)}",
       graph_id: graph.id,

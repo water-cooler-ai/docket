@@ -319,12 +319,12 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       assert {:ok, _verified} = Graph.verify(graph)
     end
 
-    test "returns diagnostics for output records that are not structs" do
+    test "rejects output records that are not durable structs" do
       graph = Graphs.minimal_linear()
 
       %{graph | outputs: Map.put(graph.outputs, "junk", %{})}
       |> verify_error!()
-      |> assert_diagnostic(:unknown_output_source, path: [:outputs, "junk"], public_id: "junk")
+      |> assert_diagnostic(:non_durable_graph_value)
     end
   end
 
@@ -465,15 +465,12 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       assert Process.get(key) == 1
     end
 
-    test "returns diagnostics for node records that are not structs" do
+    test "rejects node records that are not durable structs" do
       graph = Graphs.minimal_linear()
 
       %{graph | nodes: Map.put(graph.nodes, "junk", %{"not" => "a node"})}
       |> verify_error!()
-      |> assert_diagnostic(:missing_node_implementation,
-        path: [:nodes, "junk"],
-        public_id: "junk"
-      )
+      |> assert_diagnostic(:non_durable_graph_value)
     end
 
     test "nil node config schemas are diagnostics rather than compiler crashes" do

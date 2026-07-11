@@ -55,8 +55,14 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   deterministic ETF codec and PostgreSQL `bytea`. Graph identity hashes the
   exact stored ETF projection; relational columns retain the facts needed for
   claiming, scheduling, inspection, retention, and constraints. The
-  persistence-only Run map codec/version were removed with no v0.0.1 decoder
-  or dual-write path (DCKT-14, #26).
+  graph JSON serializer and public `Docket.Graph.to_map/from_map` and
+  `Docket.Graph.hash` APIs, along with the persistence-only Run map
+  codec/version, were removed with no v0.0.1 decoder or dual-write path.
+  Graph identity is now computed privately only from effective graph bytes
+  produced by compiler ingest. Graph-specific canonicalization and strict
+  recovered collection validation live at the compiler boundary; the generic
+  durable codec owns only ETF envelope and durable-term recovery safety
+  (DCKT-14, #26).
 - `Docket.Event`: metadata-only `:checkpoint_committed` event type and the
   `types/0` helper (DCKT-8, #12).
 - `docs/architecture/docket-operational-transition-spec.md` revision 8 and
