@@ -4,10 +4,10 @@ defmodule Docket.Storage.Runs do
 
   This capability owns every operation that enforces the run row's shared
   schedule, claim, fence, and poison invariants: insertion and reads, atomic
-  due claims, claim refresh and release, advance commits, serialized signal
-  mutations, and poison recovery. Those concerns cannot be split into
-  independently configured stores because they mutate and fence the same
-  aggregate.
+  due claims, claim refresh and release, pre-execution claim abandons, advance
+  commits, serialized signal mutations, and poison recovery. Those concerns
+  cannot be split into independently configured stores because they mutate
+  and fence the same aggregate.
 
   Lifecycle code composes run and event writes inside
   `Docket.Storage.transaction/2`; graph versions are saved separately before
@@ -68,6 +68,24 @@ defmodule Docket.Storage.Runs do
           required(:leases) => [claim_lease()],
           required(:poisoned) => [poisoned_claim()]
         }
+
+  @typedoc """
+  Policy for one pre-execution claim abandon.
+
+  `expected_checkpoint_seq` is the lease's committed sequence, `now` is the
+  caller's clock reading, `retry_at` is the future wake the abandoned run
+  receives, and `max_claim_abandons` bounds consecutive abandons before the
+  run is poisoned instead of rescheduled.
+  """
+  @type abandon_policy :: %{
+          required(:expected_checkpoint_seq) => non_neg_integer(),
+          required(:now) => DateTime.t(),
+          required(:retry_at) => DateTime.t(),
+          required(:max_claim_abandons) => pos_integer()
+        }
+
+  @typedoc "Disposition applied by one pre-execution claim abandon."
+  @type abandon_result :: {:ok, :rescheduled | :poisoned | :stale}
 
   @typedoc "Neutral proposal for one claim-fenced advance commit."
   @type commit_proposal :: %{
@@ -146,8 +164,11 @@ defmodule Docket.Storage.Runs do
   `policy.now`, clears `wake_at`, increments the count, and returns a lease. If
   the count has already reached the maximum, the store clears claim and wake,
   records paired poison facts at `policy.now`, and returns a poison result
-  without a lease. A maximum of three therefore launches exactly three
-  vehicles; a fourth recovery need poisons the run.
+  without a lease. A maximum of three therefore permits exactly three claims
+  that proceed into node execution; a fourth recovery need poisons the run.
+  Claims handed back through `abandon_claim/5` before execution began do not
+  count toward that maximum — they are bounded separately by the abandon
+  policy.
 
   Selection, attempt accounting, claim steal, and poison mutation occur in
   the same atomic operation. The total number of returned outcomes is at most
@@ -187,6 +208,59 @@ defmodule Docket.Storage.Runs do
             ) :: :ok
 
   @doc """
+  Hands back a claim whose vehicle could not begin node execution.
+
+  This is the disposition for deterministic pre-execution failure — above all
+  graph compilation incompatibility, where the executing node cannot compile
+  the stored effective graph against its locally installed node contracts.
+  That is a deployment-compatibility condition, not node execution failure,
+  so it must consume neither the run's execution-attempt budget nor be
+  reported through the run's failure machinery. Transient infrastructure
+  errors (for example a failed graph fetch) are not abandons; they use
+  ordinary `release_claim/5` or crash into claim expiry.
+
+  The operation is fenced on the exact current token **and** the lease's
+  committed checkpoint sequence, so it applies only before the holder's first
+  lifecycle commit. A matched abandon atomically:
+
+    * clears the claim token and claimed time;
+    * hands the acquisition increment back by decrementing the claim-attempt
+      count (floored at zero), keeping poison-by-attempts exclusively about
+      claims that reached execution;
+    * increments the consecutive claim-abandon count; and
+    * either records `policy.retry_at` as the next wake and returns
+      `{:ok, :rescheduled}`, or — when the abandon count had already reached
+      `policy.max_claim_abandons` — records paired poison facts at
+      `policy.now` with reason `"max_claim_abandons_exceeded"` and returns
+      `{:ok, :poisoned}` so persistent incompatibility becomes an explicit
+      operator concern instead of unbounded retry.
+
+  It never touches the committed run document, `checkpoint_seq`, or the
+  run's `updated_at`. A stale token, an advanced sequence, or an unknown run
+  changes nothing and returns `{:ok, :stale}`; after a steal or a serialized
+  signal commit the abandon can never disturb the winning claim or schedule.
+  Every return is success-shaped because the caller's next action is
+  identical in all cases — stop without committing; the atom is for
+  telemetry. The abandon count resets on any committed run mutation and on
+  poison recovery.
+
+  `policy.retry_at` must not precede `policy.now`: the future wake is what
+  keeps an incompatible node from immediately re-claiming the same run.
+  Callers should add jitter to their retry backoff so runs abandoned together
+  do not become due together. A rolling deployment therefore self-heals — a
+  compatible node claims the run at or after `retry_at` — while a fleet that
+  can never compile the graph poisons it after a bounded number of abandons.
+  Both timestamps are normalized like every other operational timestamp.
+  """
+  @callback abandon_claim(
+              ctx(),
+              :system,
+              run_id :: String.t(),
+              claim_token(),
+              abandon_policy()
+            ) :: abandon_result()
+
+  @doc """
   Commits one neutral runtime proposal under a mandatory token-and-sequence fence.
 
   The stored checkpoint sequence must equal
@@ -199,7 +273,8 @@ defmodule Docket.Storage.Runs do
   combination returns `{:error, :invalid_commit}`.
 
   Success replaces the run, records `checkpoint_type`, resets consecutive
-  claim attempts and poison facts, and applies the schedule atomically.
+  claim attempt and abandon counts and poison facts, and applies the schedule
+  atomically.
   `:retain_claim` refreshes the current claim for a continuing vehicle; every
   release schedule clears it. This callback never appends events. Lifecycle
   code appends the proposal's already-assigned events through
@@ -227,9 +302,9 @@ defmodule Docket.Storage.Runs do
   checkpoint sequence plus one. Serialized mutation is the only unclaimed
   graph-run write path: it revokes any current claim and applies a release
   schedule atomically. `:retain_claim` is therefore invalid for this callback.
-  On success the store resets claim attempts and poison facts and returns the
-  opaque value tagged `:committed`; lifecycle code can then append events in
-  the same outer transaction.
+  On success the store resets claim attempt and abandon counts and poison
+  facts and returns the opaque value tagged `:committed`; lifecycle code can
+  then append events in the same outer transaction.
 
   A no-change decision returns the opaque value tagged `:unchanged` and must
   not touch the row, claim, schedule, counters, timestamps, or event sequence.
@@ -244,7 +319,8 @@ defmodule Docket.Storage.Runs do
 
   Terminal status is checked first and returns `{:error, :inactive_run}`.
   Otherwise a poisoned run has its poison facts and claim cleared, its claim
-  attempts reset, and an immediate wake recorded at `now`. Calling this for an
+  attempt and abandon counts reset, and an immediate wake recorded at `now`.
+  Calling this for an
   already-unpoisoned non-terminal run is idempotent success and changes
   nothing. The command consumes neither checkpoint nor event sequence.
 

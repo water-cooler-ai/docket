@@ -15,8 +15,13 @@ defmodule Docket.RunInfo do
     and `nil` means claimed, externally parked, poisoned, or terminal.
   - `claimed_at` - when the current execution claim was acquired or last
     refreshed, or `nil` when unclaimed.
-  - `claim_attempts` - consecutive claims launched without committed
-    progress; resets to zero on any committed run mutation.
+  - `claim_attempts` - consecutive claims consumed by launched execution
+    without committed progress; resets to zero on any committed run mutation,
+    and a pre-execution claim abandon hands its acquisition increment back.
+  - `claim_abandons` - consecutive pre-execution claim abandons without
+    committed progress; a sustained count signals work this deployment cannot
+    yet execute (typically graph compilation incompatibility). Resets to zero
+    on any committed run mutation and on poison recovery.
   - `poisoned_at` / `poison_reason` - paired poison facts, both `nil` for a
     healthy run. A poisoned run is excluded from dispatch until an operator
     (or `retry_poisoned_run`) recovers it.
@@ -43,13 +48,22 @@ defmodule Docket.RunInfo do
   """
 
   @enforce_keys [:run]
-  defstruct [:run, :wake_at, :claimed_at, :poisoned_at, :poison_reason, claim_attempts: 0]
+  defstruct [
+    :run,
+    :wake_at,
+    :claimed_at,
+    :poisoned_at,
+    :poison_reason,
+    claim_attempts: 0,
+    claim_abandons: 0
+  ]
 
   @type t :: %__MODULE__{
           run: Docket.Run.t(),
           wake_at: DateTime.t() | nil,
           claimed_at: DateTime.t() | nil,
           claim_attempts: non_neg_integer(),
+          claim_abandons: non_neg_integer(),
           poisoned_at: DateTime.t() | nil,
           poison_reason: String.t() | nil
         }
@@ -76,6 +90,11 @@ defmodule Docket.RunInfo do
     unless is_integer(info.claim_attempts) and info.claim_attempts >= 0 do
       raise ArgumentError,
             "run info claim_attempts must be a non-negative integer, got: #{inspect(info.claim_attempts)}"
+    end
+
+    unless is_integer(info.claim_abandons) and info.claim_abandons >= 0 do
+      raise ArgumentError,
+            "run info claim_abandons must be a non-negative integer, got: #{inspect(info.claim_abandons)}"
     end
 
     validate_optional_timestamp!(info.wake_at, :wake_at)

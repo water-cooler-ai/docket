@@ -44,10 +44,12 @@ defmodule Docket.RunInfoTest do
       end
     end
 
-    test "rejects malformed timestamps and claim attempts" do
+    test "rejects malformed timestamps and claim counters" do
       assert_raise ArgumentError, fn -> RunInfo.new!(run: run(), wake_at: "soon") end
       assert_raise ArgumentError, fn -> RunInfo.new!(run: run(), claimed_at: 1) end
       assert_raise ArgumentError, fn -> RunInfo.new!(run: run(), claim_attempts: -1) end
+      assert_raise ArgumentError, fn -> RunInfo.new!(run: run(), claim_abandons: -1) end
+      assert RunInfo.new!(run: run()).claim_abandons == 0
     end
 
     test "has no claim token field" do

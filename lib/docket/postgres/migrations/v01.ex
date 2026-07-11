@@ -18,7 +18,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {"docket_runs_running_schedule_check",
        "status <> 'running' OR poisoned_at IS NOT NULL OR " <>
          "((wake_at IS NOT NULL) <> (claim_token IS NOT NULL))"},
-      {"docket_runs_counters_check", "step >= 0 AND checkpoint_seq >= 0 AND claim_attempts >= 0"}
+      {"docket_runs_counters_check",
+       "step >= 0 AND checkpoint_seq >= 0 AND claim_attempts >= 0 AND claim_abandons >= 0"}
     ]
 
     def up(%{prefix: prefix}) do
@@ -61,6 +62,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         add(:claimed_at, :timestamptz)
         add(:wake_at, :timestamptz)
         add(:claim_attempts, :integer, null: false, default: 0)
+        add(:claim_abandons, :integer, null: false, default: 0)
         add(:poisoned_at, :timestamptz)
         add(:poison_reason, :text)
         add(:inserted_at, :timestamptz, null: false)

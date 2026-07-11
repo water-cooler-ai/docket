@@ -16,6 +16,17 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
 
 ### Added
 
+- `Docket.Storage.Runs.abandon_claim/5` and its Postgres and conformance
+  implementations: the token-and-sequence fenced, non-poisoning disposition
+  for a claimed run whose graph the executing node cannot compile
+  (deployment incompatibility). A matched abandon hands the acquisition
+  attempt back, counts the abandon in the new `docket_runs.claim_abandons`
+  column (surfaced through `Docket.RunInfo` and reset by committed progress
+  or poison recovery), and reschedules the run at the caller's backoff; once
+  the configured abandon maximum is reached it poisons the run with the
+  distinct `max_claim_abandons_exceeded` reason instead of retrying
+  unboundedly (DCKT-35).
+
 - `Docket.Backend`: one backend bundle as the public durable backend
   substitution boundary, supplying compatible transaction, graph,
   run-aggregate, event, and supervision capabilities (DCKT-8, #12).

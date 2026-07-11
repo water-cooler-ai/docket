@@ -228,6 +228,26 @@ defmodule Docket.Test.MemoryBackend do
   end
 
   @impl Docket.Storage.Runs
+  def abandon_claim(backend, :system, run_id, claim_token, policy) do
+    validate_abandon_policy!(policy)
+
+    state_get_and_update(backend, fn state ->
+      case fetch_record(state, run_id) do
+        {:ok, %{claim_token: ^claim_token} = record}
+        when is_binary(claim_token) and byte_size(claim_token) > 0 ->
+          apply_abandon(state, run_id, record, policy)
+
+        _ ->
+          {{:ok, :stale}, state}
+      end
+    end)
+  end
+
+  def abandon_claim(_backend, scope, _run_id, _claim_token, _policy) do
+    raise ArgumentError, "abandon_claim scope must be :system, got: #{inspect(scope)}"
+  end
+
+  @impl Docket.Storage.Runs
   def commit(backend, scope, proposal) do
     validate_scope!(scope)
 
@@ -284,6 +304,7 @@ defmodule Docket.Test.MemoryBackend do
               claimed_at: nil,
               wake_at: now,
               claim_attempts: 0,
+              claim_abandons: 0,
               poisoned_at: nil,
               poison_reason: nil
           }
@@ -402,6 +423,7 @@ defmodule Docket.Test.MemoryBackend do
       claim_token: nil,
       claimed_at: nil,
       claim_attempts: 0,
+      claim_abandons: 0,
       poisoned_at: nil,
       poison_reason: nil,
       latest_checkpoint_type: checkpoint_type,
@@ -415,9 +437,60 @@ defmodule Docket.Test.MemoryBackend do
       wake_at: record.wake_at,
       claimed_at: record.claimed_at,
       claim_attempts: record.claim_attempts,
+      claim_abandons: record.claim_abandons,
       poisoned_at: record.poisoned_at,
       poison_reason: record.poison_reason
     )
+  end
+
+  defp apply_abandon(state, run_id, record, policy) do
+    cond do
+      record.run.checkpoint_seq != policy.expected_checkpoint_seq ->
+        {{:ok, :stale}, state}
+
+      record.claim_abandons < policy.max_claim_abandons ->
+        record = %{
+          record
+          | claim_token: nil,
+            claimed_at: nil,
+            claim_attempts: max(record.claim_attempts - 1, 0),
+            claim_abandons: record.claim_abandons + 1,
+            wake_at: policy.retry_at
+        }
+
+        {{:ok, :rescheduled}, put_in(state.runs[run_id], record)}
+
+      true ->
+        record = %{
+          record
+          | claim_token: nil,
+            claimed_at: nil,
+            claim_attempts: max(record.claim_attempts - 1, 0),
+            wake_at: nil,
+            poisoned_at: policy.now,
+            poison_reason: "max_claim_abandons_exceeded"
+        }
+
+        {{:ok, :poisoned}, put_in(state.runs[run_id], record)}
+    end
+  end
+
+  defp validate_abandon_policy!(%{
+         expected_checkpoint_seq: seq,
+         now: %DateTime{} = now,
+         retry_at: %DateTime{} = retry_at,
+         max_claim_abandons: max
+       })
+       when is_integer(seq) and seq >= 0 and is_integer(max) and max > 0 do
+    if DateTime.compare(retry_at, now) == :lt do
+      raise ArgumentError, "abandon policy retry_at must not precede now"
+    end
+
+    :ok
+  end
+
+  defp validate_abandon_policy!(policy) do
+    raise ArgumentError, "invalid abandon policy: #{inspect(policy)}"
   end
 
   defp claim_due_records(state, policy) do
@@ -645,6 +718,7 @@ defmodule Docket.Test.MemoryBackend do
     %{
       record
       | claim_attempts: 0,
+        claim_abandons: 0,
         poisoned_at: nil,
         poison_reason: nil
     }
