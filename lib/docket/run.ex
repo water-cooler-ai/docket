@@ -135,6 +135,10 @@ defmodule Docket.Run do
   @spec durable_statuses() :: [durable_status()]
   def durable_statuses, do: @durable_statuses
 
+  @doc "Returns the terminal subset of the durable graph statuses."
+  @spec terminal_statuses() :: [durable_status()]
+  def terminal_statuses, do: @terminal_statuses
+
   @doc """
   Returns true for the five durable/public graph statuses and false for the
   private `:created` sentinel (and anything else).

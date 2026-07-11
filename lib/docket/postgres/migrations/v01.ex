@@ -4,11 +4,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     use Ecto.Migration
 
+    @durable_status_sql Docket.Run.durable_statuses()
+                        |> Enum.map_join(", ", &"'#{&1}'")
+
+    @terminal_status_sql Docket.Run.terminal_statuses()
+                         |> Enum.map_join(", ", &"'#{&1}'")
+
     @run_checks [
-      {"docket_runs_status_check",
-       "status IN ('running', 'waiting', 'done', 'failed', 'cancelled')"},
+      {"docket_runs_status_check", "status IN (#{@durable_status_sql})"},
       {"docket_runs_finished_at_check",
-       "(status IN ('done', 'failed', 'cancelled')) = (finished_at IS NOT NULL)"},
+       "(status IN (#{@terminal_status_sql})) = (finished_at IS NOT NULL)"},
       {"docket_runs_claim_pair_check", "(claim_token IS NULL) = (claimed_at IS NULL)"},
       {"docket_runs_poison_pair_check", "(poisoned_at IS NULL) = (poison_reason IS NULL)"},
       {"docket_runs_waiting_terminal_idle_check",
@@ -33,6 +38,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       create_if_not_exists(
         unique_index(:docket_graph_versions, [:graph_id, :graph_hash], prefix: prefix)
+      )
+
+      create_if_not_exists(
+        index(:docket_graph_versions, [:graph_id, "inserted_at DESC", "id DESC"],
+          name: :docket_graph_versions_revision_order_index,
+          prefix: prefix
+        )
       )
 
       create_if_not_exists table(:docket_runs, primary_key: false, prefix: prefix) do
@@ -113,6 +125,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       create_if_not_exists(index(:docket_runs, [:status, :updated_at], prefix: prefix))
 
+      create_if_not_exists(
+        index(:docket_runs, [:updated_at, :id],
+          where: "status IN (#{@terminal_status_sql})",
+          prefix: prefix
+        )
+      )
+
+      create_if_not_exists(index(:docket_runs, [:graph_id, :graph_hash], prefix: prefix))
+
       create_if_not_exists table(:docket_events, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
 
@@ -140,6 +161,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       create_if_not_exists(unique_index(:docket_events, [:run_id, :seq], prefix: prefix))
+      create_if_not_exists(index(:docket_events, [:inserted_at, :id], prefix: prefix))
     end
 
     def down(%{prefix: prefix}) do

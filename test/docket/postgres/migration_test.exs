@@ -96,11 +96,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert indexes["docket_runs_status_updated_at_index"] =~ "(status, updated_at)"
 
+      terminal_retention = indexes["docket_runs_updated_at_id_index"]
+      assert terminal_retention =~ "btree (updated_at, id)"
+      assert terminal_retention =~ "status = ANY"
+
+      assert indexes["docket_runs_graph_id_graph_hash_index"] =~ "(graph_id, graph_hash)"
+
       assert indexes("docket_graph_versions")["docket_graph_versions_graph_id_graph_hash_index"] =~
                "CREATE UNIQUE INDEX"
 
+      revision_order =
+        indexes("docket_graph_versions")["docket_graph_versions_revision_order_index"]
+
+      assert revision_order =~ "(graph_id, inserted_at DESC, id DESC)"
+
       assert indexes("docket_events")["docket_events_run_id_seq_index"] =~
                "CREATE UNIQUE INDEX"
+
+      assert indexes("docket_events")["docket_events_inserted_at_id_index"] =~
+               "(inserted_at, id)"
 
       assert_row_round_trip()
 

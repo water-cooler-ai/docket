@@ -17,6 +17,15 @@ what has landed so far.
 
 ### Added
 
+- `Docket.Postgres.Pruner`: explicit, periodically supervised retention with
+  bounded event and terminal-run batches, transaction-scoped per-schema
+  advisory locking, `SKIP LOCKED` candidate selection, event-to-run cascade
+  accounting, and low-cardinality pass telemetry. Event retention uses the
+  persistence timestamp and cannot exceed run retention; only terminal runs
+  expire. Graph cleanup deletes only unreferenced versions older than the ten
+  newest publications for the same graph ID, ordered by immutable publication
+  time and row ID. Referenced versions and the newest ten revisions survive
+  regardless of age (DCKT-21).
 - `Docket.Postgres.Notifier`: the LISTEN fast path for immediate wakes. The
   Postgres RunStore announces every committed wake due at or before the
   database clock with `pg_notify` on the `docket_wake` channel (payload:
