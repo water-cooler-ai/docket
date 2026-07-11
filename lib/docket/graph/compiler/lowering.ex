@@ -8,16 +8,15 @@ defmodule Docket.Graph.Compiler.Lowering do
   # opts, keeping compilation deterministic.
 
   alias Docket.Graph
-  alias Docket.Graph.Compiler.{NodeContracts, Policies}
+  alias Docket.Graph.Compiler.Policies
   alias Docket.Graph.Edge
   alias Docket.Reducer
   alias Docket.Runtime
 
   @hash_prefix_length 12
 
-  @spec run(Graph.t(), %{optional(String.t()) => NodeContracts.fetch_result()}, keyword()) ::
-          Runtime.Graph.t()
-  def run(%Graph{} = graph, config_schemas, opts) do
+  @spec run(Graph.t(), keyword()) :: Runtime.Graph.t()
+  def run(%Graph{} = graph, opts) do
     graph_hash = Graph.hash(graph)
 
     %Runtime.Graph{
@@ -25,7 +24,7 @@ defmodule Docket.Graph.Compiler.Lowering do
       graph_id: graph.id,
       graph_hash: graph_hash,
       channels: channels(graph),
-      nodes: nodes(graph, config_schemas),
+      nodes: nodes(graph),
       edges: edge_descriptors(graph),
       outputs: output_projections(graph),
       policies: normalize_policies(graph, opts),
@@ -84,7 +83,7 @@ defmodule Docket.Graph.Compiler.Lowering do
   # Nodes
   # ---------------------------------------------------------------------------
 
-  defp nodes(graph, config_schemas) do
+  defp nodes(graph) do
     for {id, node} <- graph.nodes, into: %{} do
       %{module: module, function: function} = node.implementation
 
@@ -94,32 +93,12 @@ defmodule Docket.Graph.Compiler.Lowering do
          public_id: id,
          module: module,
          function: function,
-         config: config_with_defaults(config_schemas, id, node.config),
+         config: node.config,
          subscribe: subscriptions(graph, id),
          outgoing_edges: outgoing_edges(graph, id),
          policies: node.policies,
          metadata: node.metadata
        }}
-    end
-  end
-
-  # Config schema defaults are applied here during lowering; they are never
-  # written back into the public graph document. The schema comes from the
-  # per-compile fetch shared with validation, so user config_schema/0 code is
-  # never re-entered here.
-  defp config_with_defaults(config_schemas, public_id, config) do
-    case Map.get(config_schemas, public_id) do
-      {:ok, schema} ->
-        Enum.reduce(schema.fields, config, fn {key, field_schema}, acc ->
-          if field_schema.default == Docket.Schema.no_default() do
-            acc
-          else
-            Map.put_new(acc, key, field_schema.default)
-          end
-        end)
-
-      _missing_or_invalid ->
-        config
     end
   end
 

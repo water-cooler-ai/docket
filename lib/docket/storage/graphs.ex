@@ -1,10 +1,14 @@
 defmodule Docket.Storage.Graphs do
   @moduledoc """
-  Persistence contract for canonical graph versions.
+  Persistence contract for effective canonical graph versions.
 
   Graph documents are immutable and addressed by `{graph_id, graph_hash}`.
-  Lifecycle orchestration uses `Docket.Storage.transaction/2` when publishing
-  a graph version must be atomic with creating a run and its initial events.
+  Publication materializes node configuration defaults before hashing, so the
+  stored document carries its effective configuration. Compiled runtime graphs
+  remain node-local and are not part of this storage contract.
+  Graph publication is explicit and precedes run creation. `start_run` accepts
+  a saved graph reference and reads through this capability; lifecycle
+  transactions never publish graph documents.
 
   Graph versions are content addressed rather than tenant scoped. Backend
   configuration belongs in the opaque context, not per-call options.
@@ -13,11 +17,12 @@ defmodule Docket.Storage.Graphs do
   @type ctx :: Docket.Storage.ctx()
 
   @doc """
-  Saves a canonical graph document under `{graph_id, graph_hash}`.
+  Saves an effective canonical graph document under `{graph_id, graph_hash}`.
 
   Saving the same document again is idempotent. Reusing the key for different
   content is an error; a backend must not silently accept a hash/document
-  mismatch.
+  mismatch. The facade compiles and validates a graph before calling this
+  function, while storage retains the portable canonical document.
   """
   @callback save_graph(
               ctx(),

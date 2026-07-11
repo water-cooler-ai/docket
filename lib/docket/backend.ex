@@ -30,4 +30,18 @@ defmodule Docket.Backend do
 
   @doc "Builds the backend's supervision child specification."
   @callback child_spec(opts :: keyword()) :: Supervisor.child_spec()
+
+  @doc "Resolves the opaque root context passed to the backend transaction boundary."
+  @callback context(opts :: keyword()) :: Docket.Storage.ctx()
+
+  @optional_callbacks context: 1
+
+  @doc false
+  def resolve_context(backend, opts) when is_atom(backend) and is_list(opts) do
+    if function_exported?(backend, :context, 1) do
+      backend.context(opts)
+    else
+      Keyword.fetch!(opts, :name)
+    end
+  end
 end

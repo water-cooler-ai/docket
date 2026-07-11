@@ -2,9 +2,11 @@ defmodule Docket.Runtime.Graph do
   @moduledoc """
   Internal executable graph materialization produced by `Docket.Graph.Compiler`.
 
-  A runtime graph is derived, never stored as the canonical graph format. Hosts
-  persist `Docket.Graph`; the runtime loop consumes this structure. Every
-  runtime ID maps back to public graph intent through `lowering`.
+  A runtime graph is ephemeral node-local derived state, never a durable graph
+  format. The operational vehicle will fetch the effective canonical
+  `Docket.Graph`, compile it once on the executing node, and reuse this
+  structure for its claim drain. Every runtime ID maps back to public graph
+  intent through `lowering`.
   """
 
   alias Docket.Runtime.Graph.{Channel, Lowering, Node}

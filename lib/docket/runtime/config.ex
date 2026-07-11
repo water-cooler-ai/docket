@@ -7,7 +7,7 @@ defmodule Docket.Runtime.Config do
   # stay deterministic.
 
   @type t :: %{
-          checkpoint: module(),
+          checkpoint: module() | nil,
           checkpoint_overrides: %{
             optional(Docket.Checkpoint.type()) => Docket.Checkpoint.delivery()
           },
@@ -26,6 +26,16 @@ defmodule Docket.Runtime.Config do
       Keyword.get(opts, :checkpoint) ||
         raise ArgumentError, "runtime options require a :checkpoint module"
 
+    build(opts, checkpoint)
+  end
+
+  @doc false
+  @spec resolve_moment(keyword()) :: t()
+  def resolve_moment(opts) when is_list(opts) do
+    build(opts, Keyword.get(opts, :checkpoint))
+  end
+
+  defp build(opts, checkpoint) do
     %{
       checkpoint: checkpoint,
       checkpoint_overrides: Keyword.get(opts, :checkpoint_overrides, %{}),

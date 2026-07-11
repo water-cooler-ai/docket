@@ -34,7 +34,7 @@ writes.
 
 ### Backend is the plugin boundary
 
-Public configuration accepts one bundle, such as `storage: Docket.Postgres`.
+Public configuration accepts one bundle, such as `backend: Docket.Postgres`.
 The bundle supplies a compatible transaction boundary, graph store,
 run-aggregate store, event store, and supervision tree. Those capabilities
 remain focused and independently testable, but they are not arbitrary
@@ -86,10 +86,11 @@ The storage contract does not own runtime disposition vocabulary. A public
 committed checkpoint is created/delivered only after durable transaction
 success.
 
-The legacy sync checkpoint callback remains a veto-capable host-owned
-committer. Durable storage uses separately configured best-effort
-`checkpoint_observers`; observer failure cannot veto state, and observer
-delivery may be lost or duplicated across a crash.
+At the original lock, the legacy sync checkpoint callback remained a
+veto-capable host-owned committer beside separately configured durable
+`checkpoint_observers`. The one-production-lifecycle amendment below
+supersedes that compatibility decision for v0.1.0: only best-effort
+after-commit observers remain.
 
 ### Checkpoint history has a concrete representation
 
@@ -484,3 +485,66 @@ comment, and the two branch contract-doc corrections. **v0.1.0 is locked as
 of 2026-07-09.** DCKT-32 lands this audit and the amended revision-8 spec on
 `v0.1.0`; contract or boundary changes after this point reopen the lock with
 a new audit entry.
+
+# Post-Lock Amendment (2026-07-10): Backend Configuration Name
+
+**Decision:** Rename the unreleased public durable runtime option from
+`storage: BackendModule` to `backend: BackendModule`. The resolved internal
+context is correspondingly named `:backend_context`, and the backend child is
+named under `Runtime.Backend`.
+
+**Rationale:** The configured module implements `Docket.Backend` and owns the
+compatible transaction, graph, run, event, context, and supervision
+capabilities. Calling that bundle `storage` inaccurately implied that callers
+were selecting one `Docket.Storage` implementation rather than the complete
+durable backend boundary. The `Docket.Storage` capability and the backend's
+`storage/0` callback retain their names because they specifically represent
+the transaction boundary within the bundle.
+
+**Compatibility:** v0.1.0 remains unreleased, so no compatibility alias is
+provided. Supplying the former `storage:` option fails at runtime-supervisor
+startup rather than being silently ignored.
+
+**Ownership:** DCKT-12 owns this amendment because it introduces the durable
+public facade and its backend resolution. The amendment changes naming only;
+the locked single-bundle architecture and capability contracts are unchanged.
+
+# Post-Lock Amendment (2026-07-10): One Production Lifecycle
+
+**Decision:** v0.1.0 requires one `Docket.Backend` for every supervised
+production instance. The `0.0.1` host-owned checkpoint driver and its public
+`run`, `resume`, and live `get_run` facade are removed once the Postgres
+operational replacement and deterministic backend test modes are complete.
+`resolve_interrupt` becomes exclusively storage-backed. No compatibility
+aliases or configuration-dependent dispatch remain.
+
+**Rationale:** The two drivers have different transaction owners, recovery
+models, read semantics, and sources of truth. Keeping both would make Docket's
+durability guarantee configuration-dependent and permanently duplicate its
+supervision, signal, documentation, and test contracts. Backend ownership is
+the product boundary; Postgres is the first-party paved road, while the core
+runtime remains substrate-neutral behind `Docket.Backend` and
+`Docket.Lifecycle`.
+
+**Narrow compatibility break:** Node modules and graph definitions carry over
+unchanged. `Docket.Node`, `Docket.Graph`, `Docket.Schema`, reducers,
+interrupts, executors, compiler/serialization APIs, `Docket.Run.to_map` /
+`from_map`, and `Docket.Test.run_inline` and related processless helpers remain
+public. Adopters replace only lifecycle ownership: remove their checkpoint
+committer and host tables, install Docket's migration, configure
+`repo:`/`backend:`, publish graphs to `GraphRef`, replace `run` with
+`start_run`, replace `get_run` with `fetch_run`/`inspect_run`, and delete
+host-owned `resume` orchestration.
+
+**Migration:** Because `0.0.1` persistence is host-defined, the supported
+migration is an explicit drain-and-cut-over rather than a universal automatic
+database migration or indefinite old-wire compatibility. Retained events are
+the durable integration path; checkpoint observers are best-effort
+after-commit notifications only.
+
+**Landing and blockers:** DCKT-37 owns the removal and migration-doc changes.
+It is blocked by DCKT-25 (assembled operational facade/backend) and DCKT-24
+(deterministic backend test modes), and it blocks DCKT-26 so the final
+release-gate suite tests the single production lifecycle. Historical `0.0.1`
+design documents remain useful background but are superseded for v0.1.0
+production execution.

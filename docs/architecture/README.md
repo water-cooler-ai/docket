@@ -10,7 +10,8 @@ when you want to understand *why* the contracts are shaped the way they are.
    - The transition from the current `0.0.x` core runtime package to the
      `0.1.0` operational runtime with the `Docket.Postgres` backend —
      Oban-like in shape, one package, self-contained on optional Ecto and
-     Postgres dependencies.
+     Postgres dependencies. v0.1.0 has one backend-owned production lifecycle;
+     the v0.0.1 host-owned supervised driver is migration history only.
 2. `docket-v0.1.0-spec-lock-audit.md`
    - The final DCKT-1 architecture, pluggability, lifecycle-status, ticket,
      and dependency audit that produced transition-spec revision 8.
@@ -31,29 +32,43 @@ when you want to understand *why* the contracts are shaped the way they are.
    - Long-form research and background: goals, alternatives considered
      (Pregel, LangGraph, Temporal), and future design space.
 
+## Release-Line Boundary
+
+The graph programming model is continuous across the release lines: node
+modules, graphs, schemas, reducers, interrupts, executors, run serialization,
+and `Docket.Test` helpers carry forward. The lifecycle owner changes:
+
+- `0.0.1`: the host checkpoint callback persists runs and the host explicitly
+  resumes resident per-run processes.
+- `0.1.0`: a required `Docket.Backend` owns graph/run persistence, scheduling,
+  recovery, and signals. The old supervised `run` / `resume` / `get_run` path
+  is removed by DCKT-37 after the operational replacement is complete.
+
+The older graph-construction and execution-contract documents below record the
+`0.0.1` host-owned boundary. Where they conflict with the transition spec and
+its post-lock amendments, the transition spec governs v0.1.0.
+
 ## Current Core Shape
 
 Durable public documents:
 
 - `Docket.Graph`: the graph definition document that host applications build,
-  edit, verify, publish, store, and later pass to Docket. Public topology is
+  edit, and verify, and that the backend publishes as an immutable effective
+  version before starting a run. Public topology is
   represented by edge records; fan-in joins are multi-source edges, and branch
   groups live on source nodes.
-- `Docket.Run`: the durable execution state document that Docket emits through
-  checkpoints and host applications persist for reads, resume, audit, and
-  recovery.
+- `Docket.Run`: the durable execution state document encoded by the backend's
+  run store and returned through committed reads.
 
 Derived internal runtime values:
 
 - `Docket.Runtime.Graph`: compiled executable form of a `Docket.Graph`.
 - `Docket.Runtime.Loop`: processless transition functions over
-  `Docket.Runtime.Graph` and `Docket.Run`, shared by the supervised Runtime and
+  `Docket.Runtime.Graph` and `Docket.Run`, shared by backend vehicles and
   inline tests.
 
-Host-owned surfaces:
+Application-owned surfaces:
 
-- Graph and run persistence.
-- Graph versioning and publish workflow.
 - Authorization and tenant/project ownership.
 - UI projections for editors and live run overlays.
 - External effects performed by node code or adapters.
