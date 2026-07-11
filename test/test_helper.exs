@@ -13,7 +13,9 @@ generated_database_repos =
       {Docket.Postgres.EventStoreTestRepo, "DOCKET_EVENT_STORE_TEST_DATABASE_URL",
        "docket_event_store_test", 10},
       {Docket.Postgres.VehicleStorageTestRepo, "DOCKET_VEHICLE_STORAGE_TEST_DATABASE_URL",
-       "docket_vehicle_storage_test", 2}
+       "docket_vehicle_storage_test", 2},
+      {Docket.Postgres.NotifierTestRepo, "DOCKET_NOTIFIER_TEST_DATABASE_URL",
+       "docket_notifier_test", 10}
     ]
 
     Enum.reduce(repo_specs, [], fn {repo, environment_variable, database, pool_size}, generated ->
@@ -43,8 +45,9 @@ generated_database_repos =
 # (OS username, no password). Auto-generated databases are removed after the
 # suite; explicitly configured databases are left in place. Override the URLs with
 # DOCKET_TEST_DATABASE_URL, DOCKET_RUN_STORE_TEST_DATABASE_URL,
-# DOCKET_STORAGE_TEST_DATABASE_URL, DOCKET_GRAPH_STORE_TEST_DATABASE_URL, and
-# DOCKET_LIFECYCLE_STORAGE_TEST_DATABASE_URL.
+# DOCKET_STORAGE_TEST_DATABASE_URL, DOCKET_GRAPH_STORE_TEST_DATABASE_URL,
+# DOCKET_LIFECYCLE_STORAGE_TEST_DATABASE_URL, DOCKET_EVENT_STORE_TEST_DATABASE_URL,
+# DOCKET_VEHICLE_STORAGE_TEST_DATABASE_URL, and DOCKET_NOTIFIER_TEST_DATABASE_URL.
 ExUnit.start(exclude: [:postgres], assert_receive_timeout: 1_000)
 
 ExUnit.after_suite(fn _result ->

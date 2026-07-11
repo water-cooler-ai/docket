@@ -7,9 +7,9 @@ optional event history. It also provides the queue primitives needed to claim
 and recover runs without a separate jobs table.
 
 This guide describes the code that exists today. The backend is still being
-assembled: the migration, stores, claim dispatcher, and the vehicle that
-executes a claimed run are implemented, but `Docket.Postgres` (the public
-backend bundle) has not landed. Consequently the low-level pieces can be
+assembled: the migration, stores, claim dispatcher, the LISTEN/NOTIFY wake
+notifier, and the vehicle that executes a claimed run are implemented, but
+`Docket.Postgres` (the public backend bundle) has not landed. Consequently the low-level pieces can be
 tested, but the PostgreSQL backend is not yet a runnable production
 configuration.
 
@@ -283,7 +283,9 @@ The PostgreSQL foundation is substantial, but `0.1.0-dev` is not an operational
 release yet. The remaining public boundary includes:
 
 - the `Docket.Postgres` implementation of `Docket.Backend`;
-- supervision wiring from dispatcher leases to vehicle launches;
+- supervision wiring from dispatcher leases to vehicle launches, including
+  placement of the `Docket.Postgres.Notifier` child (`notifier: :none` omits
+  it for poll-only operation);
 - claim freshness for supersteps longer than the orphan TTL;
 - deterministic backend testing controls; and
 - retention/pruning policy and production integration coverage.
