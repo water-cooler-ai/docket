@@ -18,15 +18,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def append_events(ctx, scope, run_id, events) when is_list(events) do
       {repo, prefix} = Storage.context!(ctx)
 
-      with :ok <- ensure_visible(repo, prefix, scope, run_id),
-           {:ok, attrs} <- encode_events(events, run_id) do
-        append_batch(repo, prefix, run_id, attrs)
+      with {:ok, attrs} <- encode_events(events, run_id) do
+        transactional_append(repo, prefix, scope, run_id, attrs)
       end
     end
 
     def append_events(_ctx, scope, _run_id, _events) do
       validate_scope!(scope)
       {:error, :invalid_events}
+    end
+
+    defp transactional_append(repo, prefix, scope, run_id, attrs) do
+      case repo.transaction(fn ->
+             with :ok <- ensure_visible(repo, prefix, scope, run_id),
+                  :ok <- append_batch(repo, prefix, run_id, attrs) do
+               :ok
+             else
+               {:error, reason} -> repo.rollback(reason)
+             end
+           end) do
+        {:ok, :ok} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
     end
 
     defp append_batch(repo, prefix, run_id, attrs) do
@@ -99,22 +112,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         %Docket.Event{run_id: ^run_id, seq: seq, timestamp: %DateTime{} = timestamp} = event,
         {:ok, acc}
         when is_integer(seq) and seq > 0 ->
-          attrs = %{
-            run_id: run_id,
-            seq: seq,
-            type: event.type,
-            step: event.step,
-            node_id: event.node_id,
-            channel_id: event.channel_id,
-            task_id: event.task_id,
-            payload: Docket.DurableCodec.encode!(:event, event.payload),
-            metadata: Docket.DurableCodec.encode!(:event, event.metadata),
-            occurred_at: normalize_database_datetime(timestamp)
-          }
-
-          if Event.changeset(attrs).valid?,
-            do: {:cont, {:ok, [attrs | acc]}},
-            else: {:halt, {:error, :invalid_events}}
+          case encode_event(event, run_id, seq, timestamp) do
+            {:ok, attrs} -> {:cont, {:ok, [attrs | acc]}}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
 
         %Docket.Event{run_id: ^run_id, seq: seq}, _
         when not is_integer(seq) or seq <= 0 ->
@@ -133,6 +134,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {:ok, attrs} -> attrs |> Enum.reverse() |> consolidate_events()
         error -> error
       end
+    end
+
+    defp encode_event(event, run_id, seq, timestamp) do
+      attrs = %{
+        run_id: run_id,
+        seq: seq,
+        type: event.type,
+        step: event.step,
+        node_id: event.node_id,
+        channel_id: event.channel_id,
+        task_id: event.task_id,
+        payload: Docket.DurableCodec.encode!(:event, event.payload),
+        metadata: Docket.DurableCodec.encode!(:event, event.metadata),
+        occurred_at: normalize_database_datetime(timestamp)
+      }
+
+      if Event.changeset(attrs).valid?, do: {:ok, attrs}, else: {:error, :invalid_events}
+    rescue
+      _error in Docket.Error -> {:error, :invalid_events}
     end
 
     defp ensure_visible(repo, prefix, scope, run_id) do

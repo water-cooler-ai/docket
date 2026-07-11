@@ -2,6 +2,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.EventStoreTest do
     use ExUnit.Case, async: false
 
+    import Ecto.Query
+
     @moduletag :postgres
 
     alias Docket.Postgres.{EventStore, GraphStore, RunStore}
@@ -76,10 +78,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:error, :event_conflict} =
                EventStore.append_events(TestRepo, :system, run.id, [
+                 event(run, 3),
                  %{event | payload: %{"other" => true}}
                ])
 
       assert TestRepo.aggregate(Event, :count) == 1
+      refute TestRepo.exists?(from(row in Event, where: row.seq == 3))
     end
 
     test "batches new and replayed events and verifies every assigned sequence", %{run: run} do
@@ -113,6 +117,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                EventStore.append_events(TestRepo, :system, run.id, [
                  %{event(run, 2) | run_id: "other"}
                ])
+
+      assert {:error, :invalid_events} =
+               EventStore.append_events(TestRepo, :system, run.id, [
+                 %{event(run, 2) | payload: nil}
+               ])
+
+      assert {:error, :invalid_events} =
+               EventStore.append_events(TestRepo, :system, run.id, [
+                 %{event(run, 2) | metadata: %{"pid" => self()}}
+               ])
+
+      assert TestRepo.aggregate(Event, :count) == 0
     end
 
     test "enforces tenant ownership and validates empty appends without lookup", %{run: run} do
