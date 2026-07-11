@@ -20,12 +20,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       with :ok <- ensure_visible(repo, prefix, scope, run_id),
            {:ok, attrs} <- encode_events(events, run_id) do
-        Enum.reduce_while(attrs, :ok, fn event_attrs, :ok ->
-          case append_one(repo, prefix, event_attrs) do
-            :ok -> {:cont, :ok}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
+        append_batch(repo, prefix, run_id, attrs)
       end
     end
 
@@ -34,31 +29,51 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {:error, :invalid_events}
     end
 
-    defp append_one(repo, prefix, attrs) do
-      {count, _rows} =
-        repo.insert_all(Event, [Map.put(attrs, :inserted_at, DateTime.utc_now())],
-          prefix: prefix,
-          on_conflict: :nothing,
-          conflict_target: [:run_id, :seq]
-        )
+    defp append_batch(repo, prefix, run_id, attrs) do
+      inserted_at = normalize_database_datetime(DateTime.utc_now())
+      rows = Enum.map(attrs, &Map.put(&1, :inserted_at, inserted_at))
 
-      case count do
-        1 ->
-          :ok
+      repo.insert_all(Event, rows,
+        prefix: prefix,
+        on_conflict: :nothing,
+        conflict_target: [:run_id, :seq]
+      )
 
-        0 ->
-          case existing(repo, prefix, attrs.run_id, attrs.seq) do
-            nil -> {:error, :event_insert_failed}
-            row -> if same_event?(row, attrs), do: :ok, else: {:error, :event_conflict}
-          end
-      end
+      stored = existing(repo, prefix, run_id, Enum.map(attrs, & &1.seq))
+      stored_by_seq = Map.new(stored, &{&1.seq, &1})
+
+      Enum.reduce_while(attrs, :ok, fn event_attrs, :ok ->
+        case Map.fetch(stored_by_seq, event_attrs.seq) do
+          {:ok, row} ->
+            if same_event?(row, event_attrs),
+              do: {:cont, :ok},
+              else: {:halt, {:error, :event_conflict}}
+
+          :error ->
+            {:halt, {:error, :event_insert_failed}}
+        end
+      end)
     end
 
-    defp existing(repo, prefix, run_id, seq) do
+    defp existing(repo, prefix, run_id, seqs) do
       Event
-      |> where([event], event.run_id == ^run_id and event.seq == ^seq)
+      |> where([event], event.run_id == ^run_id and event.seq in ^seqs)
       |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
-      |> repo.one()
+      |> repo.all()
+    end
+
+    defp consolidate_events(attrs) do
+      Enum.reduce_while(attrs, {:ok, %{}}, fn attrs, {:ok, by_seq} ->
+        case Map.fetch(by_seq, attrs.seq) do
+          :error -> {:cont, {:ok, Map.put(by_seq, attrs.seq, attrs)}}
+          {:ok, ^attrs} -> {:cont, {:ok, by_seq}}
+          {:ok, _different} -> {:halt, {:error, :event_conflict}}
+        end
+      end)
+      |> case do
+        {:ok, by_seq} -> {:ok, by_seq |> Map.values() |> Enum.sort_by(& &1.seq)}
+        error -> error
+      end
     end
 
     defp same_event?(row, attrs) do
@@ -115,7 +130,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           {:halt, {:error, :invalid_events}}
       end)
       |> case do
-        {:ok, attrs} -> {:ok, Enum.reverse(attrs)}
+        {:ok, attrs} -> attrs |> Enum.reverse() |> consolidate_events()
         error -> error
       end
     end

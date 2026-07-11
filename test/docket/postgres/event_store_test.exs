@@ -82,6 +82,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert TestRepo.aggregate(Event, :count) == 1
     end
 
+    test "batches new and replayed events and verifies every assigned sequence", %{run: run} do
+      first = event(run, 2)
+      second = %{event(run, 3) | type: :node_completed, node_id: "node"}
+      third = event(run, 4)
+
+      assert :ok = EventStore.append_events(TestRepo, :system, run.id, [first])
+      assert :ok = EventStore.append_events(TestRepo, :system, run.id, [first, second, third])
+      assert TestRepo.aggregate(Event, :count) == 3
+
+      assert {:error, :event_conflict} =
+               EventStore.append_events(TestRepo, :system, run.id, [
+                 second,
+                 %{second | payload: %{"different" => true}}
+               ])
+
+      assert TestRepo.aggregate(Event, :count) == 3
+    end
+
     test "reports invalid identity fields precisely", %{run: run} do
       assert {:error, :invalid_event_sequence} =
                EventStore.append_events(TestRepo, :system, run.id, [%{event(run, 2) | seq: 0}])
