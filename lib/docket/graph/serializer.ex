@@ -39,7 +39,7 @@ defmodule Docket.Graph.Serializer do
   # equality
   # `from_map!(to_map(graph)) == graph` holds for graphs whose open content is
   # already canonical (string keys/values); a graph built with atom content
-  # reloads in canonical string form, exactly as a Jason/JSONB round trip
+  # reloads in canonical string form, exactly as a Jason/JSON round trip
   # would return it. Map keys starting with "$" are reserved for wire-format
   # tags (for example the "$guard" wrapper for guard expressions nested in
   # plain argument positions).

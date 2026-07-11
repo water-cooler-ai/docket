@@ -33,6 +33,10 @@ defmodule Docket.Storage.Graphs do
 
   @doc """
   Reads a canonical graph document by `{graph_id, graph_hash}`.
+
+  `:not_found` is reserved for an absent key. Backend/infrastructure failure
+  is not collapsed into absence; implementations raise when the substrate
+  cannot complete the read.
   """
   @callback fetch_graph(
               ctx(),

@@ -44,6 +44,16 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   dispatcher concurrency, exact claim-attempt poisoning, token-guarded
   heartbeat/release, and the shared internal mandatory-commit token predicate
   (DCKT-15, #20).
+- Postgres storage/read foundation: `Docket.Postgres.Storage` supplies the
+  shared Repo/prefix transaction context; `Docket.Postgres.GraphStore`
+  persists immutable canonical graph versions with concurrent conflict
+  arbitration; and the version-2 run row codec plus scoped
+  `RunStore.insert_run`/`fetch_run`/`inspect_run` reconstruct the exact
+  committed run while keeping claim tokens out of operational projections
+  (DCKT-14).
+- Canonical graph, run, and event wire fragments use PostgreSQL `json` rather
+  than normalizing `jsonb`, preserving exponent-form floats, negative zero,
+  and escaped strings across content hashing and cold recovery (DCKT-14).
 - `Docket.Event`: metadata-only `:checkpoint_committed` event type and the
   `types/0` helper (DCKT-8, #12).
 - `docs/architecture/docket-operational-transition-spec.md` revision 8 and
@@ -133,6 +143,10 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
 
 ### Changed
 
+- Postgres claim, heartbeat, release, steal, and poison operations no longer
+  rewrite promoted `Docket.Run.updated_at`. Dedicated operational timestamps
+  now carry those transitions, so `fetch_run` remains the exact last committed
+  graph-run document while `inspect_run` reports delivery state (DCKT-14).
 - Locked the final v0.1.0 production boundary to one required durable backend.
   The `0.0.1` host-owned `checkpoint:` driver and its `run`, `resume`, and live
   `get_run` facade will be removed by DCKT-37 only after backend assembly and

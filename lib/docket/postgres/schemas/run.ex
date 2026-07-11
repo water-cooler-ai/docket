@@ -72,7 +72,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       field(:state, :map)
       field(:checkpoint_seq, :integer, default: 0)
       field(:latest_checkpoint_type, Ecto.Enum, values: Docket.Checkpoint.types())
-      field(:claim_token, Ecto.UUID)
+      field(:claim_token, Ecto.UUID, redact: true)
       field(:claimed_at, :utc_datetime_usec)
       field(:wake_at, :utc_datetime_usec)
       field(:claim_attempts, :integer, default: 0)
@@ -105,6 +105,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :poisoned_at,
       :poison_reason,
       :started_at,
+      :updated_at,
       :finished_at
     ]
 
@@ -124,6 +125,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> validate_number(:checkpoint_seq, greater_than_or_equal_to: 0)
       |> validate_number(:claim_attempts, greater_than_or_equal_to: 0)
       |> unique_constraint(:run_id)
+      |> foreign_key_constraint(:graph_hash, name: :docket_runs_graph_hash_fkey)
     end
   end
 end

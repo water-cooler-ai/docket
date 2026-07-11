@@ -24,11 +24,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     ]
 
     def up(%{prefix: prefix}) do
+      # Canonical Docket wire fragments use `json`, not `jsonb`. PostgreSQL
+      # `jsonb` normalizes numeric lexemes and Unicode escapes, which can
+      # change Elixir value types or a graph's canonical content hash on
+      # reload. Backend-owned operational maps may remain `jsonb` when their
+      # values are generated and queried as normalized Postgres data.
       create_if_not_exists table(:docket_graph_versions, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
         add(:graph_id, :text, null: false)
         add(:graph_hash, :text, null: false)
-        add(:graph, :jsonb, null: false)
+        add(:graph, :json, null: false)
         add(:inserted_at, :timestamptz, null: false)
       end
 
@@ -56,11 +61,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         add(:status, :text, null: false)
         add(:step, :integer, null: false, default: 0)
-        add(:input, :jsonb, null: false)
-        add(:output, :jsonb)
-        add(:failure, :jsonb)
-        add(:metadata, :jsonb, null: false, default: fragment("'{}'::jsonb"))
-        add(:state, :jsonb, null: false)
+        add(:input, :json, null: false)
+        add(:output, :json)
+        add(:failure, :json)
+        add(:metadata, :json, null: false, default: fragment("'{}'::json"))
+        add(:state, :json, null: false)
         add(:checkpoint_seq, :bigint, null: false, default: 0)
         add(:latest_checkpoint_type, :text)
         add(:claim_token, :uuid)
@@ -137,8 +142,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         add(:node_id, :text)
         add(:channel_id, :text)
         add(:task_id, :text)
-        add(:payload, :jsonb, null: false, default: fragment("'{}'::jsonb"))
-        add(:metadata, :jsonb, null: false, default: fragment("'{}'::jsonb"))
+        add(:payload, :json, null: false, default: fragment("'{}'::json"))
+        add(:metadata, :json, null: false, default: fragment("'{}'::json"))
         add(:occurred_at, :timestamptz, null: false)
         add(:inserted_at, :timestamptz, null: false)
       end

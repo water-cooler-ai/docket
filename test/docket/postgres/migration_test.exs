@@ -48,6 +48,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
       assert columns("docket_runs") == Enum.sort(@run_columns)
 
+      assert column_type("docket_graph_versions", "graph") == "json"
+
+      for column <- ~w(input output failure metadata state) do
+        assert column_type("docket_runs", column) == "json"
+      end
+
+      assert column_type("docket_runs", "poison_reason") == "jsonb"
+      assert column_type("docket_events", "payload") == "json"
+      assert column_type("docket_events", "metadata") == "json"
+
       assert nullable?("docket_runs", "tenant_id")
       refute nullable?("docket_runs", "started_at")
 
@@ -504,6 +514,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       answer == "YES"
+    end
+
+    defp column_type(table, column) do
+      %{rows: [[data_type]]} =
+        TestRepo.query!(
+          """
+          SELECT data_type FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+          """,
+          [table, column]
+        )
+
+      data_type
     end
 
     defp indexes(table) do

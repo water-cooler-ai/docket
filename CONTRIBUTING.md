@@ -67,11 +67,15 @@ coverage) need PostgreSQL 13 or newer and are excluded by default. Opt in with:
 mix test --include postgres
 ```
 
-The isolated connections default to
-`postgres://localhost:5432/docket_migration_test` and
-`postgres://localhost:5432/docket_run_store_test` (your OS username, no
-password). Override them with `DOCKET_TEST_DATABASE_URL` and
-`DOCKET_RUN_STORE_TEST_DATABASE_URL`, respectively. Both test databases are
-dropped and recreated by their suites. PostgreSQL 13 is the implementation
-minimum because claim SQL uses materialized CTEs and the built-in
-`gen_random_uuid()`.
+Each live suite uses a dedicated database on localhost (your OS username, no
+password) so destructive migration setup cannot race another suite. Generated
+databases are removed after the test invocation; explicitly configured
+databases are left in place. The defaults are
+`docket_migration_test_<os-pid>`, `docket_run_store_test_<os-pid>`,
+`docket_storage_test_<os-pid>`, `docket_graph_store_test_<os-pid>`, and
+`docket_lifecycle_storage_test_<os-pid>`. Override them with the corresponding
+`DOCKET_TEST_DATABASE_URL`, `DOCKET_RUN_STORE_TEST_DATABASE_URL`,
+`DOCKET_STORAGE_TEST_DATABASE_URL`, `DOCKET_GRAPH_STORE_TEST_DATABASE_URL`,
+and `DOCKET_LIFECYCLE_STORAGE_TEST_DATABASE_URL`. PostgreSQL 13 is the
+implementation minimum because claim SQL uses materialized CTEs and the
+built-in `gen_random_uuid()`.

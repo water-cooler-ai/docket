@@ -453,7 +453,7 @@ correctness boundary.
 **The row is the run.** There is no `docket_run` document column: the run's
 stable public fields are relational columns, and only the Docket-owned
 execution internals — channels, interrupts, pending nodes and writes, active
-tasks, timers, internal counters — live in a single `state` jsonb column. The
+tasks, timers, internal counters — live in a single `state` json column. The
 line between the two is not new; it is the contract `Docket.Run` already
 declares: hosts may inspect the top-level fields (`id`, `graph_id`,
 `graph_hash`, `status`, `step`, `input`, `output`, timestamps) and must never
@@ -469,6 +469,29 @@ sequence are not denormalized copies of fields inside a document blob — they
 are the storage. `checkpoint_seq` the column and `checkpoint_seq` the document
 field are the same value, so there is no dual-write to keep consistent and no
 drift class to test for.
+
+`updated_at` has the same single-owner rule: it is the timestamp carried by
+the last committed `Docket.Run`, not a generic row-touch timestamp. Claim,
+heartbeat, release, steal, and poison operations change only their dedicated
+operational columns (`claimed_at`, `wake_at`, and `poisoned_at`) and leave the
+committed run projection byte-for-byte unchanged. This keeps `fetch_run`
+stable while `inspect_run` reports operational movement.
+
+Promoted run timestamps are accepted only in the database's canonical form:
+UTC `DateTime` values with six-digit microsecond precision. Rejecting a run
+whose precision metadata would be padded by `timestamptz` prevents a
+successful insert from returning a struct that differs from the next fetch.
+Backend-owned operational timestamp inputs are normalized to the same UTC/usec
+form before they are stored or returned in a lease/`RunInfo`.
+
+Canonical Docket wire fragments use PostgreSQL `json`, not `jsonb`: graph
+documents, run input/output/failure/metadata/state, and event payload/metadata
+must preserve JSON numeric lexemes and escaped strings across a database round
+trip. `jsonb` may normalize an exponent-form float into an integer and rejects
+the otherwise-valid escaped NUL value, either of which would change a graph's
+content hash or a run's execution value type. Backend-owned operational maps,
+such as `poison_reason`, may use `jsonb` when their normalized Postgres shape
+is the intended contract.
 
 Required concepts:
 
@@ -618,7 +641,7 @@ partial (wake_at, id) WHERE status = 'running' AND poisoned_at IS NULL
 partial (claimed_at, id) WHERE status = 'running' AND poisoned_at IS NULL
                          AND claim_token IS NOT NULL
 partial (poisoned_at) WHERE poisoned_at IS NOT NULL
-(status, updated_at)                              -- ops introspection
+(status, updated_at)                 -- committed-state/retention introspection
 ```
 
 Ready-unclaimed and expired-claim recovery are separate indexed paths. Each
@@ -667,7 +690,13 @@ must not multiply copies of that document:
   design the same cancel would rewrite megabytes to flip one field. The row
   codec keeps the complete canonical run state for `0.1.0`, including any
   input values also present in input-backed channels. That duplication is
-  measured and documented. Omit/rehydrate optimization is deferred until its
+  measured with deterministic logical JSON fixtures: a 1 KiB value produces
+  1,037 bytes of promoted input JSON plus 1,104 bytes of opaque state JSON
+  (2,141 bytes total, 1.939311x the state-only recovery payload); a 1 MiB
+  value produces 1,048,589 plus 1,048,656 bytes (2,097,245 total, 1.999936x).
+  Those are canonical encoded-JSON measurements, not claims about physical
+  PostgreSQL `json`, TOAST, or WAL amplification, which depend on Postgres and
+  workload details. Omit/rehydrate optimization is deferred until its
   immutability and versioning rules can be specified without weakening cold
   recovery.
 - **Checkpoint history is events, not a table.** Nothing on the correctness
@@ -866,7 +895,7 @@ SET state = $state,
     claim_attempts = 0,            -- committed graph progress proves health
     claimed_at = now(),            -- mid-drain: refresh
     -- at a park: claim_token = NULL, wake_at = $next_wake_or_null
-    updated_at = now()
+    updated_at = $run_updated_at    -- exact proposed Docket.Run timestamp
 WHERE run_id = $run_id
   AND checkpoint_seq = $seq
   AND claim_token = $claim_token;
@@ -891,7 +920,7 @@ immediate wake** (`wake_at = now()`):
 
 ```sql
 UPDATE docket_runs
-SET claim_token = NULL, claimed_at = NULL, wake_at = now(), updated_at = now()
+SET claim_token = NULL, claimed_at = NULL, wake_at = now()
 WHERE run_id = $run_id AND claim_token = $claim_token
 ```
 

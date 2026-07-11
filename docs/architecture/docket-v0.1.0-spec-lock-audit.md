@@ -160,7 +160,7 @@ are derived facts, not statuses.
 
 ### Failure is data, not state inference
 
-Add a top-level JSON-safe `Docket.Run.failure` and promoted `failure` JSONB
+Add a top-level JSON-safe `Docket.Run.failure` and promoted `failure` JSON
 column. It is present exactly when status is `failed`.
 
 Today `Runtime.Loop.fail/4` stores only `status: :failed` and `finished_at`; the
