@@ -5,7 +5,7 @@ defmodule Docket.DurableCodec do
   alias Docket.Graph.Compiler.Canonical
 
   @version 1
-  @kinds [:graph, :run]
+  @kinds [:event, :graph, :run]
   @known_structs [
     DateTime,
     MapSet,
@@ -30,9 +30,11 @@ defmodule Docket.DurableCodec do
   @doc false
   @spec encode!(:graph, Docket.Graph.t()) :: binary()
   @spec encode!(:run, map()) :: binary()
+  @spec encode!(:event, map()) :: binary()
   def encode!(:graph, %Graph{diagnostics: []} = graph), do: encode_term!(:graph, graph)
 
   def encode!(:run, map) when is_map(map) and not is_struct(map), do: encode_term!(:run, map)
+  def encode!(:event, map) when is_map(map) and not is_struct(map), do: encode_term!(:event, map)
   def encode!(kind, _term), do: invalid!("invalid #{kind} durable root")
 
   @doc false
@@ -44,7 +46,7 @@ defmodule Docket.DurableCodec do
   def valid_datetime?(_datetime), do: false
 
   @doc false
-  @spec decode(binary(), :graph | :run) ::
+  @spec decode(binary(), :event | :graph | :run) ::
           {:ok, Docket.Graph.t() | map()} | {:error, Docket.Error.t()}
   def decode(binary, kind) do
     {:ok, decode!(binary, kind)}
@@ -53,7 +55,7 @@ defmodule Docket.DurableCodec do
   end
 
   @doc false
-  @spec decode!(binary(), :graph | :run) :: Docket.Graph.t() | map()
+  @spec decode!(binary(), :event | :graph | :run) :: Docket.Graph.t() | map()
   def decode!(<<131, 80, _::binary>>, _kind), do: invalid!("compressed ETF is not accepted")
 
   def decode!(binary, kind) when is_binary(binary) and kind in @kinds do
@@ -85,6 +87,7 @@ defmodule Docket.DurableCodec do
     do: Canonical.validate!(graph)
 
   defp validate_decoded_root!(:run, map) when is_map(map) and not is_struct(map), do: :ok
+  defp validate_decoded_root!(:event, map) when is_map(map) and not is_struct(map), do: :ok
   defp validate_decoded_root!(kind, _term), do: invalid!("invalid #{kind} durable root")
 
   defp encode_term!(kind, term) do
