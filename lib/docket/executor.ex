@@ -12,6 +12,11 @@ defmodule Docket.Executor do
   remote, and late-completion protocols are post-v1; the `{:await, term()}`
   return is reserved for them and is treated as a permanent node failure in
   v1.
+
+  The runtime dispatches all activations in a superstep concurrently. The
+  executor callback remains a single-activation boundary; the update barrier
+  waits for every callback and applies their results in deterministic
+  activation order.
   """
 
   @callback execute(

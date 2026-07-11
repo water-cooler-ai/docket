@@ -1,10 +1,12 @@
 defmodule Docket.Executor.Local do
   @moduledoc """
   Synchronous local executor: calls the node module directly in the
-  dispatching process.
+  activation's dispatcher task.
 
-  `Local` cannot enforce `timeout_ms` (there is no process boundary); node
-  timeouts become real with `Docket.Executor.Task`.
+  The dispatcher gives concurrent activations separate tasks, but `Local`
+  does not add a child process around an individual node call and therefore
+  cannot enforce `timeout_ms`. Per-node timeouts become real with
+  `Docket.Executor.Task`.
   """
 
   @behaviour Docket.Executor
