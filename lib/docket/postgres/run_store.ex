@@ -926,7 +926,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       _ =
         Ecto.Adapters.SQL.query!(
           repo,
-          "SELECT pg_notify($1, $2) WHERE $3::timestamptz <= CURRENT_TIMESTAMP",
+          "SELECT pg_notify($1, $2) WHERE $3::timestamptz <= clock_timestamp()",
           [@wake_channel, prefix || "", normalize_database_datetime(wake_at)],
           log: false
         )

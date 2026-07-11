@@ -99,6 +99,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert {:error, :not_found} = RunStore.fetch_run(TestRepo, :system, run.id)
       end
 
+      test "a wake that became due after the transaction began still announces" do
+        listen!()
+        insert_graph!()
+        run = initialized_run("insert-mid-transaction-due")
+
+        assert {:ok, :committed} =
+                 Storage.transaction(TestRepo, fn tx ->
+                   Process.sleep(500)
+                   wake_at = DateTime.add(DateTime.utc_now(), -250, :millisecond)
+
+                   {:ok, _run} =
+                     RunStore.insert_run(tx, :tenantless, run, :run_initialized, wake_at)
+
+                   {:ok, :committed}
+                 end)
+
+        assert_receive {:notification, _, _, @channel, ""}
+      end
+
       test "a future first wake announces nothing" do
         listen!()
         insert_graph!()
