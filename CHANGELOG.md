@@ -44,6 +44,25 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   dispatcher concurrency, exact claim-attempt poisoning, token-guarded
   heartbeat/release, and the shared internal mandatory-commit token predicate
   (DCKT-15, #20).
+- Postgres storage/read foundation: `Docket.Postgres.Storage` supplies the
+  shared Repo/prefix transaction context; `Docket.Postgres.GraphStore`
+  persists immutable content-addressed graph versions with concurrent conflict
+  arbitration; and the private run row codec plus scoped
+  `RunStore.insert_run`/`fetch_run`/`inspect_run` reconstruct the exact
+  committed run while keeping claim tokens out of operational projections
+  (DCKT-14, #26).
+- Durable graphs and opaque run/event state use a private versioned
+  deterministic ETF codec and PostgreSQL `bytea`. Graph identity hashes the
+  exact stored ETF projection; relational columns retain the facts needed for
+  claiming, scheduling, inspection, retention, and constraints. The
+  graph JSON serializer and public `Docket.Graph.to_map/from_map` and
+  `Docket.Graph.hash` APIs, along with the persistence-only Run map
+  codec/version, were removed with no v0.0.1 decoder or dual-write path.
+  Graph identity is now computed privately only from effective graph bytes
+  produced by compiler ingest. Graph-specific canonicalization and strict
+  recovered collection validation live at the compiler boundary; the generic
+  durable codec owns only ETF envelope and durable-term recovery safety
+  (DCKT-14, #26).
 - `Docket.Event`: metadata-only `:checkpoint_committed` event type and the
   `types/0` helper (DCKT-8, #12).
 - `docs/architecture/docket-operational-transition-spec.md` revision 8 and
@@ -133,12 +152,16 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
 
 ### Changed
 
+- Postgres claim, heartbeat, release, steal, and poison operations no longer
+  rewrite promoted `Docket.Run.updated_at`. Dedicated operational timestamps
+  now carry those transitions, so `fetch_run` remains the exact last committed
+  graph-run document while `inspect_run` reports delivery state (DCKT-14, #26).
 - Locked the final v0.1.0 production boundary to one required durable backend.
   The `0.0.1` host-owned `checkpoint:` driver and its `run`, `resume`, and live
   `get_run` facade will be removed by DCKT-37 only after backend assembly and
-  deterministic backend testing land. Node/graph/schema/reducer/executor APIs,
-  `Docket.Run` serialization, and Postgres-free `Docket.Test` helpers remain
-  public; the supported adopter path is a documented drain-and-cut-over.
+  deterministic backend testing land. Node/graph/schema/reducer/executor APIs
+  and Postgres-free `Docket.Test` helpers remain public; Run persistence is a
+  backend-private boundary and the supported adopter path is drain-and-cut-over.
 - Renamed the unreleased durable runtime configuration from `storage:` to
   `backend:` because the configured `Docket.Backend` owns the transaction,
   graph, run, event, context, and supervision capabilities rather than naming
@@ -154,19 +177,11 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
 - `Docket.Node` documentation clarifies the four failure-signaling forms and
   their identical normalization (DCKT-8, #12).
 
-- Run wire format bumped to version 2 to carry `failure`; only the current
-  version loads (no released userbase to migrate), and the private
-  `:created` initialization sentinel is rejected by the wire format, durable
-  insertion, and the Postgres row status enum (DCKT-31, #17).
-- Run wire version 2 extended (same version, coordinated with the DCKT-31
-  bump) with the reserved `active_tasks`, `pending_writes`, and `timers`
-  keys: documents without them load with an empty active superstep, and
-  both directions strictly validate parked state — cross-checked task
-  identity, snapshot-vs-input-hash integrity, attempt/failure agreement,
-  retry-timer coverage, and one result per node per superstep — so an
-  inconsistent document fails at the write boundary, never at recovery.
-  The barrier re-validates parked pending results, so corrupted durable
-  state fails the run through the typed permanent path (DCKT-30, #18).
+- `Docket.Run` carries terminal failure and active-superstep state directly.
+  Explicit durable validation rejects the private `:created` sentinel,
+  failure/status disagreement, malformed collections, and inconsistent active
+  task/timer coverage before private backend encoding and after recovery
+  (DCKT-30/DCKT-31, #17/#18; persistence boundary superseded by DCKT-14).
 - The dispatcher executes exactly one node attempt per invocation; retry
   waiting moved out of the durable path into shell parking (supervised
   Runtime: timer wake that keeps serving reads during backoff; inline test
@@ -176,9 +191,9 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   (DCKT-30, #18).
 - Postgres v01 schema finalized to spec revision 8 (amended in place —
   0.1.0 is unreleased): `claim_attempts` / `poisoned_at` / `poison_reason`
-  replace `attempts` / `operational_status` / `operational_error`, `failure`
-  is promoted to a jsonb column, and `started_at` is non-null. Lifecycle
-  CHECK constraints make the status/failure/schedule/claim/poison tuple
+  replace `attempts` / `operational_status` / `operational_error`, and
+  `started_at` is non-null. Lifecycle CHECK constraints make the
+  status/schedule/claim/poison tuple
   authoritative even for raw claim SQL; a composite delete-restricted FK
   keeps every retained run's exact graph version, and a delete-cascaded FK
   keeps events from outliving their run. The single `wake_at` and

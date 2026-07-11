@@ -30,10 +30,10 @@ checkpoints; Docket can rebuild a live run from the last one at any time.
 - **Deterministic semantics.** Superstep planning, write conflict resolution,
   and guard evaluation are pure and ordered; replanning after a crash produces
   byte-identical task identities, so external effects can be deduplicated.
-- **Host-owned boundaries.** Docket owns execution semantics. Your application
-  owns persistence, graph versioning, authorization, tenancy, and UI. Graphs
-  and runs are plain documents with a JSON-safe wire format, so they store
-  anywhere.
+- **Explicit durable boundaries.** Docket owns execution semantics and the
+  private backend storage codec. Applications own graph versioning,
+  authorization, tenancy, and UI; the Postgres backend stores opaque state as
+  versioned ETF while preserving operational facts in relational columns.
 - **One interpreter.** The supervised runtime and the inline test runtime run
   the same loop code — tests exercise real semantics, synchronously, in the
   calling process.
@@ -106,47 +106,6 @@ Enum.map(checkpoints, & &1.type)
 #=> [:run_initialized, :step_committed, :run_completed]
 ```
 
-Or run it supervised. Implement a checkpoint handler (your persistence
-boundary) and a runtime module, and add the runtime to your supervision tree:
-
-```elixir
-defmodule MyApp.DocketCheckpoint do
-  @behaviour Docket.Checkpoint
-
-  @impl true
-  def handle(%Docket.Checkpoint{run: run}, _context) do
-    MyApp.Workflows.upsert_run!(run.id, Docket.Run.to_map(run))
-    :ok
-  end
-end
-
-defmodule MyApp.Docket do
-  use Docket, checkpoint: MyApp.DocketCheckpoint
-end
-
-# in your application supervision tree
-children = [MyApp.Docket]
-```
-
-```elixir
-{:ok, run} = MyApp.Docket.run(graph, %{"message" => "hello world"})
-{:ok, live} = MyApp.Docket.get_run(run.id)
-```
-
-`run/3` returns once the run is durably initialized — the synchronous
-`:run_initialized` checkpoint has been accepted by your handler — and
-execution continues in a supervised process. Progress arrives through
-checkpoints (the durable truth); `get_run/2` reads the live in-memory
-snapshot while the run is active.
-
-To resume after a crash, restart, or deploy, load what you persisted and hand
-it back:
-
-```elixir
-run = Docket.Run.from_map!(stored_run_map)
-{:ok, run} = MyApp.Docket.resume(graph, run)
-```
-
 ### v0.1.0 production facade
 
 A durable host configures one compatible backend bundle rather than mixing
@@ -202,7 +161,8 @@ Node modules and graph definitions carry over unchanged, including
 `Docket.Node`, `Docket.Graph`, `Docket.Schema`, reducers, interrupts, and
 executors. `Docket.Test.run_inline` and its related processless helpers remain
 the Postgres-free graph-semantics testing surface, and
-`Docket.Run.to_map` / `from_map` remain the public serialization boundary.
+Run persistence is backend-private. The v0.0.1 host Run map codec is not part
+of v0.1.0 and there is no compatibility decoder or dual-write path.
 
 The cutover is mechanical:
 
@@ -264,10 +224,11 @@ guarded branches (durable, serializable guard expressions over state), and
 cycles (optionally bounded by a graph or host `max_supersteps` policy). Node failures retry per node
 policy; a permanently failed superstep commits none of its writes.
 
-Everything that crosses a boundary is a document. `Docket.Graph` and
-`Docket.Run` both serialize to a canonical JSON-safe wire format; graphs are
-content-hashed, and every run records the graph ID and hash it was started
-from, so a resume against the wrong graph version is rejected.
+Durable graphs and run state use a private versioned deterministic ETF codec;
+the compiler canonicalizes and validates the effective graph before its exact
+ETF bytes are hashed once and stored. Graph hashing is private, and every run
+records the published graph ID and hash it was started from. Recovery validates
+strict collection key/value shapes and fails closed on malformed stored terms.
 
 ## 0.0.1 resident-process architecture
 

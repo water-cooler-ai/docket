@@ -1,12 +1,9 @@
 defmodule Docket.Wire do
   @moduledoc false
 
-  # Durable-value coercion for runtime-side open content: run input payloads,
-  # node state writes, interrupt resolution values, and run metadata. Mirrors
-  # the graph serializer's durability rules (which stay self-contained inside
-  # `Docket.Graph.Serializer`): atoms coerce to strings (map keys and values),
-  # terms with no JSON representation are rejected, and "$"-prefixed map keys
-  # are reserved for wire-format tags.
+  # Durable-value coercion for open runtime and graph content: atoms coerce to
+  # strings (map keys and values), terms outside Docket's portable open-value
+  # contract are rejected, and "$"-prefixed map keys are reserved.
   #
   # `dump_value/1` is non-raising so the update barrier can turn durability
   # failures into typed node errors instead of exceptions.
@@ -28,6 +25,21 @@ defmodule Docket.Wire do
         raise Docket.Error,
           type: :non_durable_value,
           message: "#{location} contains a non-durable value: #{reason}",
+          details: %{location: location}
+    end
+  end
+
+  @doc false
+  @spec dump_key!(term(), String.t()) :: String.t()
+  def dump_key!(key, location) do
+    case dump_value(%{key => nil}) do
+      {:ok, normalized} ->
+        normalized |> Map.keys() |> List.first()
+
+      {:error, reason} ->
+        raise Docket.Error,
+          type: :non_durable_value,
+          message: "#{location} contains a non-durable key: #{reason}",
           details: %{location: location}
     end
   end
@@ -79,7 +91,7 @@ defmodule Docket.Wire do
 
   defp durable!(atom) when is_atom(atom), do: Atom.to_string(atom)
 
-  defp durable!(list) when is_list(list), do: Enum.map(list, &durable!/1)
+  defp durable!(list) when is_list(list), do: durable_list!(list)
 
   defp durable!(%_struct{} = struct) do
     throw({:non_durable, "structs are not durable values, got #{inspect(struct)}"})
@@ -113,5 +125,12 @@ defmodule Docket.Wire do
 
   defp durable_key!(key) do
     throw({:non_durable, "map keys must be strings or atoms, got #{inspect(key)}"})
+  end
+
+  defp durable_list!([]), do: []
+  defp durable_list!([head | tail]), do: [durable!(head) | durable_list!(tail)]
+
+  defp durable_list!(tail) do
+    throw({:non_durable, "improper lists are not durable, got tail #{inspect(tail)}"})
   end
 end

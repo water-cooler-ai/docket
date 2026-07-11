@@ -45,6 +45,7 @@ defmodule Docket.Schema do
   """
 
   @no_default :__docket_no_default__
+  @types [:boolean, :enum, :float, :integer, :list, :map, :object, :string]
 
   defstruct [
     :type,
@@ -177,6 +178,96 @@ defmodule Docket.Schema do
       reasons -> {:error, reasons}
     end
   end
+
+  @doc false
+  @spec valid?(term()) :: boolean()
+  def valid?(%__MODULE__{} = schema) do
+    schema.type in @types and is_boolean(schema.required) and plain_map?(schema.fields) and
+      is_list(schema.values) and plain_map?(schema.constraints) and plain_map?(schema.metadata) and
+      Enum.all?(schema.fields, fn {key, child} ->
+        is_binary(key) and valid?(child)
+      end) and valid_item?(schema) and valid_default?(schema) and portable?(schema.values) and
+      portable?(schema.constraints) and portable?(schema.metadata)
+  rescue
+    _error -> false
+  end
+
+  def valid?(_schema), do: false
+
+  @doc false
+  @spec normalize_durable!(t(), String.t()) :: t()
+  def normalize_durable!(%__MODULE__{} = schema, location \\ "schema") do
+    fields =
+      Enum.reduce(schema.fields, %{}, fn {key, child}, normalized ->
+        key = Docket.Wire.dump_key!(key, "#{location} fields")
+
+        if Map.has_key?(normalized, key) do
+          raise Docket.Error,
+            type: :non_durable_value,
+            message: "#{location} has colliding field key #{inspect(key)} after normalization"
+        end
+
+        Map.put(normalized, key, normalize_durable!(child, "#{location}.#{key}"))
+      end)
+
+    %{
+      schema
+      | type: normalize_type(schema.type),
+        fields: fields,
+        item: normalize_item!(schema.item, location),
+        values: Docket.Wire.dump_value!(schema.values, "#{location} values"),
+        required: normalize_atom(schema.required),
+        default: normalize_default!(schema.default, location),
+        constraints: Docket.Wire.dump_value!(schema.constraints, "#{location} constraints"),
+        metadata: Docket.Wire.dump_value!(schema.metadata, "#{location} metadata")
+    }
+  rescue
+    error in Docket.Error ->
+      raise error
+
+    _error ->
+      raise Docket.Error,
+        type: :non_durable_value,
+        message: "#{location} is not a durable Docket.Schema"
+  end
+
+  defp valid_item?(%__MODULE__{type: :list, item: item}), do: valid?(item)
+  defp valid_item?(%__MODULE__{item: nil}), do: true
+  defp valid_item?(_schema), do: false
+
+  defp valid_default?(%__MODULE__{default: @no_default}), do: true
+
+  defp valid_default?(%__MODULE__{} = schema),
+    do: portable?(schema.default) and validate(schema, schema.default) == :ok
+
+  defp normalize_item!(nil, _location), do: nil
+
+  defp normalize_item!(%__MODULE__{} = item, location),
+    do: normalize_durable!(item, "#{location} item")
+
+  defp normalize_item!(other, _location), do: normalize_atom(other)
+
+  defp normalize_default!(@no_default, _location), do: @no_default
+
+  defp normalize_default!(default, location),
+    do: Docket.Wire.dump_value!(default, "#{location} default")
+
+  defp normalize_type(type) when type in @types, do: type
+  defp normalize_type(type) when is_atom(type), do: Atom.to_string(type)
+  defp normalize_type(type), do: type
+
+  defp normalize_atom(value) when value in [nil, true, false], do: value
+  defp normalize_atom(value) when is_atom(value), do: Atom.to_string(value)
+  defp normalize_atom(value), do: value
+
+  defp portable?(value) do
+    case Docket.Wire.dump_value(value) do
+      {:ok, normalized} -> normalized === value
+      {:error, _reason} -> false
+    end
+  end
+
+  defp plain_map?(value), do: is_map(value) and not is_struct(value)
 
   defp validate_value(%__MODULE__{required: true}, nil, location) do
     ["#{location} is required but was nil"]

@@ -10,9 +10,9 @@ Target: move from core runtime library to an Oban-shaped durable runtime
 An ABI-pinned distributed-artifact design was considered and rejected before
 it became part of the locked spec. Durable runs and graph references pin only
 `{graph_id, graph_hash}`. The hash identifies the canonical **effective**
-graph document: publication snapshots node `config_schema/0` contracts once,
-materializes omitted defaults into node configuration, canonicalizes again,
-then hashes, validates, compiles, and stores that document.
+graph projection: publication snapshots node `config_schema/0` contracts once,
+normalizes node configuration, materializes omitted defaults, then hashes,
+validates, compiles, and stores that direct versioned term.
 
 Later local compilation treats the stored document as already effective: it
 validates against the node contracts installed on that node but never injects
@@ -21,7 +21,7 @@ and therefore produces a new graph hash; it cannot change a retained version.
 
 Compiled `%Docket.Runtime.Graph{}` values are ephemeral node-local state. A
 start, signal operation, recovery, or claimed vehicle fetches the exact
-canonical document and compiles it with the Docket and application code
+effective graph and compiles it with the Docket and application code
 installed on that node. A claimed vehicle compiles once, then reuses that
 runtime graph while draining multiple supersteps under its claim. An optional
 local cache may avoid later compilation on the same release, but cache loss
@@ -431,44 +431,76 @@ additive migration.
 
 Publishing is explicit and content-addressed. `save_graph(graph)` snapshots
 node configuration schemas once, materializes their defaults, validates and
-compiles that effective graph, then stores its canonical
-`Docket.Graph.to_map/1` document keyed by `graph_id + graph_hash` and returns a
-stable graph reference.
+compiles that effective graph, then stores the diagnostic-free graph through
+the private versioned deterministic ETF codec, keyed by
+`graph_id + graph_hash`, and returns a stable graph reference.
+Graph identity is not a public operation: compiler publication computes it
+once from the final canonical effective graph's exact ETF bytes, and storage
+persists those same bytes. Authored graphs have no independent durable hash.
 Postgres implements `save_graph` with `ON CONFLICT DO NOTHING`. Two nodes racing
 to publish the same version both succeed idempotently. If the existing document
-under that key is not structurally equal to the canonical JSON document,
+under that key is not byte-identical to the deterministic ETF projection,
 `save_graph` returns a graph-content conflict rather than treating the conflict
 clause as proof that the content matched.
 
-`start_run(graph_ref, input)` fetches the already-saved effective canonical
-document and compiles it locally before entering the run/event lifecycle
+`start_run(graph_ref, input)` safely decodes the already-saved effective graph
+and compiles it locally before entering the run/event lifecycle
 transaction. It never writes the graph store. Recovery uses the same
 `fetch_graph` operation. A vehicle compiles once per claim and reuses the
-derived runtime graph across its drain loop. The canonical document remains
-the portable storage contract; an optional release-scoped local cache is not a
+derived runtime graph across its drain loop. The versioned ETF projection is
+the private storage contract; an optional release-scoped local cache is not a
 correctness boundary.
 
 ### `docket_runs`
 
-**The row is the run.** There is no `docket_run` document column: the run's
-stable public fields are relational columns, and only the Docket-owned
-execution internals — channels, interrupts, pending nodes and writes, active
-tasks, timers, internal counters — live in a single `state` jsonb column. The
-line between the two is not new; it is the contract `Docket.Run` already
-declares: hosts may inspect the top-level fields (`id`, `graph_id`,
-`graph_hash`, `status`, `step`, `input`, `output`, timestamps) and must never
-interpret the internals. Columns are that inspectable surface plus what the
-operational layer itself reads and writes; `state` is exactly the
-"do not interpret" blob, versioned internally by the document's own `version`
-field so its shape can evolve without migrations. The store maps between the
-row and `Docket.Run` via the existing `to_map/1` / `from_map/1` boundary; core
-is unchanged.
+**The row is the run.** There is no second run document and no public Run wire
+map. Fields needed for identity, claiming, scheduling, retention, inspection,
+and constraints are relational columns. Everything else — input, output,
+failure, metadata, channels, interrupts, pending nodes and writes, active
+tasks, timers, and `event_seq` — is one direct term projection encoded by the
+private versioned deterministic ETF codec in `state bytea`.
+
+The codec uses `term_to_binary/2` with `:deterministic` and ETF minor version 2.
+Reads use `binary_to_term/2` with `[:safe, :used]`, require full consumption,
+reject compressed ETF, and validate both the envelope and decoded durable
+terms. There is no legacy JSON decoder. The codec version changes whenever the
+private durable projection becomes incompatible; deterministic bytes are
+scoped to one OTP major, so a deployment must not mix OTP majors for one codec
+version.
+
+Graph-domain canonicalization is deliberately outside the generic codec.
+`Docket.Graph.Compiler.Canonical` normalizes open graph content and validates
+structural graph collections; recovered collections must be plain maps with
+binary keys and exact `Field`, `Output`, `Node`, or `Edge` values as
+appropriate. `Docket.DurableCodec` validates the generic ETF envelope, durable
+term safety, known structs, and decoded root. Decoding fails closed instead of
+repairing non-canonical or malformed stored graphs.
 
 This shape means every fact is stored once. `status`, `step`, and the fence
 sequence are not denormalized copies of fields inside a document blob — they
 are the storage. `checkpoint_seq` the column and `checkpoint_seq` the document
 field are the same value, so there is no dual-write to keep consistent and no
 drift class to test for.
+
+`updated_at` has the same single-owner rule: it is the timestamp carried by
+the last committed `Docket.Run`, not a generic row-touch timestamp. Claim,
+heartbeat, release, steal, and poison operations change only their dedicated
+operational columns (`claimed_at`, `wake_at`, and `poisoned_at`) and leave the
+committed run projection byte-for-byte unchanged. This keeps `fetch_run`
+stable while `inspect_run` reports operational movement.
+
+Promoted run timestamps are accepted only in the database's canonical form:
+UTC `DateTime` values with six-digit microsecond precision. Rejecting a run
+whose precision metadata would be padded by `timestamptz` prevents a
+successful insert from returning a struct that differs from the next fetch.
+Backend-owned operational timestamp inputs are normalized to the same UTC/usec
+form before they are stored or returned in a lease/`RunInfo`.
+
+Canonical Docket state is not stored as PostgreSQL JSON. Graphs, run state,
+and future event payload/metadata use `bytea`; `poison_reason` is a relational
+text code because the backend currently has exactly one poison class. Graph
+identity is the lowercase SHA-256 digest of the exact versioned ETF bytes
+stored in `docket_graph_versions.graph`.
 
 Required concepts:
 
@@ -479,10 +511,6 @@ graph_id
 graph_hash
 status
 step
-input
-output
-failure
-metadata
 state
 checkpoint_seq
 latest_checkpoint_type
@@ -545,24 +573,21 @@ lock. All of them lost, for the same underlying reason: minimalism must be
 measured as total moving parts across the system — CHECK constraints, partial
 indexes, signal preconditions, await/inspect shapes, and every consumer's
 render path — not as enum length. Each trim saves at most one token while
-relocating a currently SQL-enforceable or typed-column invariant into opaque
-JSON or application-only derivation.
+relocating a relationally queryable distinction into opaque state or
+application-only derivation.
 
-- **Fold `cancelled` into `failed` + cause.** Removes no column (`failure`
-  already exists) and relocates three typed contracts into JSON:
-  `cancel_run`'s three-way idempotency branch would read `failure->>'kind'`
-  instead of one indexed status comparison; the "`failure` present exactly for
-  `failed`" CHECK dies, because a cancelled run has no failure to describe and
-  a synthetic payload would have to be fabricated; and the reserved
-  graph-semantic `retry_failed` must never auto-retry an intentional
-  cancellation, which a folded encoding can only express as a negative JSON
-  predicate carried by every retry and dashboard query.
+- **Fold `cancelled` into `failed` + cause.** `cancel_run`, retry, retention,
+  and dashboards would have to decode opaque state and inspect a synthetic
+  failure cause instead of using one indexed status comparison. An intentional
+  cancellation is not a graph failure, and graph-semantic retry must never
+  revive it.
 - **Fold `waiting` into `running`.** Relaxes the lost-run detector — "a
   non-poisoned `running` row has exactly one of a wake or a claim" — to "at
   most one", making a stuck advanced row (no wake, no claim, no open
   interrupt) a legal row and demoting that invariant from SQL-enforced to
   application-only. `await_run` and operational inspection would re-derive
-  "blocked on input" from interrupt JSON that hosts must not interpret.
+  "blocked on input" from opaque interrupt state that SQL and hosts must not
+  interpret.
 - **Replace the enum with outcome timestamps** (`done_at` / `failed_at` /
   `cancelled_at`). A weaker three-null encoding of the same sum type: it
   admits two-outcomes-set and terminal-with-no-outcome rows that the enum
@@ -588,8 +613,8 @@ why they may be derived while the five semantic values may not.
 `:created` remains only as a private fresh-run sentinel used while calculating
 an initialization moment. It is never a durable/public operational status,
 never appears in a checkpoint, is not cancellable, and backends reject it.
-`Docket.Run.failure` is a stable JSON-safe description of a terminal graph
-failure and is promoted to the `failure` column. It is present exactly when
+`Docket.Run.failure` is the durable description of a terminal graph failure
+inside opaque state. Explicit Run validation requires it exactly when
 `status = 'failed'`; it is distinct from retryable node-attempt failures,
 poison reasons, API validation errors, fence loss, and observer failures.
 
@@ -618,7 +643,7 @@ partial (wake_at, id) WHERE status = 'running' AND poisoned_at IS NULL
 partial (claimed_at, id) WHERE status = 'running' AND poisoned_at IS NULL
                          AND claim_token IS NOT NULL
 partial (poisoned_at) WHERE poisoned_at IS NOT NULL
-(status, updated_at)                              -- ops introspection
+(status, updated_at)                 -- committed-state/retention introspection
 ```
 
 Ready-unclaimed and expired-claim recovery are separate indexed paths. Each
@@ -637,7 +662,6 @@ raw claim SQL:
 - stored status is one of the five durable values above;
 - `started_at` is present for every stored run;
 - `finished_at` is present exactly for terminal status;
-- `failure` is present exactly for `failed`, and `output` only for `done`;
 - `claim_token` and `claimed_at` are paired;
 - `poisoned_at` and `poison_reason` are paired;
 - terminal and `waiting` rows have no claim, wake, or current poison;
@@ -659,17 +683,15 @@ must not multiply copies of that document:
 - **The run row is the only full document.** Recovery needs exactly the
   latest committed run, and it is reconstructed from the `docket_runs` row —
   promoted columns plus `state`. No other table stores a full run snapshot.
-- **The column/state split keeps small writes small.** A superstep commit
+- **The column/state split keeps operational writes small.** A superstep commit
   rewrites `state` because channels changed — that cost is intrinsic. But a
   signal that touches no execution state (`cancel_run` flipping `status`)
   updates in-line columns only; Postgres carries the unchanged out-of-line
   `state` TOAST value over without rewriting it. Under a single-document
-  design the same cancel would rewrite megabytes to flip one field. The row
-  codec keeps the complete canonical run state for `0.1.0`, including any
-  input values also present in input-backed channels. That duplication is
-  measured and documented. Omit/rehydrate optimization is deferred until its
-  immutability and versioning rules can be specified without weakening cold
-  recovery.
+  design the same cancel would rewrite megabytes to flip one field. Input is
+  not duplicated in a promoted column; if runtime channel state contains the
+  same value, that is execution state required for exact cold recovery rather
+  than a second persistence format.
 - **Checkpoint history is events, not a table.** Nothing on the correctness
   path reads checkpoint history: recovery loads the run row, the fence is the
   `checkpoint_seq` column, and the latest checkpoint type is a run column. A
@@ -866,7 +888,7 @@ SET state = $state,
     claim_attempts = 0,            -- committed graph progress proves health
     claimed_at = now(),            -- mid-drain: refresh
     -- at a park: claim_token = NULL, wake_at = $next_wake_or_null
-    updated_at = now()
+    updated_at = $run_updated_at    -- exact proposed Docket.Run timestamp
 WHERE run_id = $run_id
   AND checkpoint_seq = $seq
   AND claim_token = $claim_token;
@@ -891,7 +913,7 @@ immediate wake** (`wake_at = now()`):
 
 ```sql
 UPDATE docket_runs
-SET claim_token = NULL, claimed_at = NULL, wake_at = now(), updated_at = now()
+SET claim_token = NULL, claimed_at = NULL, wake_at = now()
 WHERE run_id = $run_id AND claim_token = $claim_token
 ```
 
@@ -1165,7 +1187,7 @@ cannot accept, veto, or roll back a moment.
 
 ```text
 validate tenant and graph access
-fetch the effective canonical graph by graph reference and compile it locally
+fetch the effective graph by graph reference and compile it locally
 Docket.Lifecycle.start(backend, scope, fn tx ->
   calculate initialized runtime moment without handler delivery
   Runs.insert_run(tx, initialized run with :immediate disposition)
@@ -1375,8 +1397,8 @@ The break is deliberately narrower than replacing Docket's programming model:
   executors.
 - `Docket.Test.run_inline` and related processless helpers remain the
   Postgres-free graph-semantics testing surface.
-- `Docket.Run.to_map` / `from_map` remain the public wire boundary and are also
-  used by backend row codecs.
+- Run persistence is backend-private. `Docket.Run.to_map` / `from_map` and the
+  v0.0.1 Run wire version are removed rather than carried into v0.1.0.
 
 An adopter performs one explicit cutover:
 
@@ -1395,10 +1417,8 @@ An adopter performs one explicit cutover:
    retained events for delivery that must survive crashes.
 
 Because `0.0.1` persistence is host-defined, Docket cannot provide a universal
-database migration. The supported migration is drain-and-cut-over. A separate
-one-shot conversion helper may translate a latest `0.0.1` run document for an
-advanced importer, but it does not preserve the old runtime API or accept old
-wire formats indefinitely.
+database migration. The supported migration is drain-and-cut-over; v0.1.0 has
+no legacy Run decoder, conversion helper, or dual-write period.
 
 ## 11. Required Core Changes For 0.1.0
 
@@ -1480,11 +1500,11 @@ The 0.1.0 implementation should include:
   `Docket.Postgres.GraphStore`, `Docket.Postgres.RunStore`, and
   `Docket.Postgres.EventStore` implementing the three store behaviours against
   its transaction context. The run row codec maps promoted columns plus
-  `state` to `Docket.Run`. `GraphStore` returns canonical effective documents
-  only; vehicles own node-local compilation and may use a release-scoped cache.
+  `state` to `Docket.Run`. `GraphStore` safely returns effective graph structs;
+  vehicles own node-local compilation and may use a release-scoped cache.
 - An explicit `save_graph` facade that materializes node configuration
-  defaults, validates/compiles, and stores the canonical content-addressed
-  effective graph document, returning a stable reference.
+  defaults, validates/compiles, and stores the content-addressed effective
+  graph projection, returning a stable reference.
 - `Docket.Lifecycle` start orchestration that composes `Runs.insert_run` and
   `Events.append_events` inside one storage transaction, inserting the
   initialized run, assigned initialization and `:checkpoint_committed` events,
@@ -1593,7 +1613,7 @@ Substrate-independent.
   `claim_attempts`, poison/failure facts, run-to-graph and event-to-run foreign
   keys, lifecycle CHECK constraints, and metadata-only checkpoint history events).
 - Implement the Postgres transaction boundary and graph, run, and event stores.
-- Publish and verify the effective canonical graph before run creation,
+- Publish and verify the effective graph before run creation,
   rejecting a graph key whose existing document differs. Then compose
   initialized run insertion, initial wake, and initialization-event append in
   one lifecycle transaction; failure leaves the prepublished graph unchanged.

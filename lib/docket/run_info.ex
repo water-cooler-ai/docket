@@ -51,7 +51,7 @@ defmodule Docket.RunInfo do
           claimed_at: DateTime.t() | nil,
           claim_attempts: non_neg_integer(),
           poisoned_at: DateTime.t() | nil,
-          poison_reason: map() | nil
+          poison_reason: String.t() | nil
         }
 
   @typedoc "Typed operational halt returned by a poisoned `await_run`."
@@ -101,7 +101,7 @@ defmodule Docket.RunInfo do
 
   defp validate_poison_facts!(nil, nil), do: :ok
 
-  defp validate_poison_facts!(%DateTime{}, reason) when is_map(reason) and not is_struct(reason),
+  defp validate_poison_facts!(%DateTime{}, reason) when is_binary(reason) and reason != "",
     do: :ok
 
   defp validate_poison_facts!(poisoned_at, poison_reason) do

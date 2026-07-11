@@ -6,12 +6,10 @@ defmodule Docket.Graph.Compiler.NodeContracts do
   # every pass sees the same result even when a config_schema/0 callback is
   # stateful or nondeterministic, and lowering never re-invokes user code.
   #
-  # Config schemas cross the same wire boundary as graph schemas, so field
-  # keys, defaults, enum values, constraints, and metadata match canonical
-  # graph configuration before validation and materialization.
+  # Config keys and atom values normalize for the public Node callback
+  # contract, independently of graph persistence.
 
   alias Docket.Graph
-  alias Docket.Graph.Serializer
   alias Docket.Schema
 
   @type fetch_result :: {:ok, Schema.t()} | {:error, map()}
@@ -50,10 +48,12 @@ defmodule Docket.Graph.Compiler.NodeContracts do
     nodes =
       Map.new(graph.nodes, fn
         {id, %Graph.Node{} = node} ->
+          config = normalize_open(node.config)
+
           config =
             case Map.get(config_schemas, id) do
-              {:ok, schema} -> apply_defaults(node.config, schema)
-              _missing_or_invalid -> node.config
+              {:ok, schema} -> apply_defaults(config, schema)
+              _missing_or_invalid -> config
             end
 
           {id, %{node | config: config}}
@@ -67,13 +67,13 @@ defmodule Docket.Graph.Compiler.NodeContracts do
 
   @spec fetch_config_schema(module()) :: fetch_result()
   def fetch_config_schema(module) do
-    schema = module.config_schema()
+    case module.config_schema() do
+      %Schema{} = schema ->
+        schema = Schema.normalize_durable!(schema, "#{inspect(module)}.config_schema/0")
+        if Schema.valid?(schema), do: {:ok, schema}, else: {:error, %{returned: inspect(schema)}}
 
-    case schema
-         |> Serializer.dump_schema()
-         |> Serializer.load_schema!("node config schema") do
-      %Schema{} = canonical -> {:ok, canonical}
-      _other -> {:error, %{returned: inspect(schema)}}
+      other ->
+        {:error, %{returned: inspect(other)}}
     end
   rescue
     exception -> {:error, %{error: Exception.message(exception)}}
@@ -92,4 +92,19 @@ defmodule Docket.Graph.Compiler.NodeContracts do
   end
 
   defp apply_defaults(config, _schema), do: config
+
+  @doc false
+  def normalize_open(value) when is_map(value) and not is_struct(value) do
+    Map.new(value, fn {key, child} -> {normalize_key(key), normalize_open(child)} end)
+  end
+
+  def normalize_open(value) when is_list(value), do: Enum.map(value, &normalize_open/1)
+
+  def normalize_open(value) when is_atom(value) and value not in [nil, true, false],
+    do: Atom.to_string(value)
+
+  def normalize_open(value), do: value
+
+  defp normalize_key(key) when is_atom(key), do: Atom.to_string(key)
+  defp normalize_key(key), do: key
 end

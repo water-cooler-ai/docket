@@ -64,15 +64,13 @@ defmodule Docket.Run.TaskState do
   @doc """
   Hashes a committed state snapshot into the activation's input identity.
 
-  The hash is over the canonical JSON encoding, so equal durable snapshots
-  hash equally regardless of map ordering. The wire codec verifies a loaded
-  active task's snapshot against its recorded `input_hash` with this
-  function.
+  The hash is over deterministic external term format bytes, so equal durable
+  snapshots hash equally regardless of map insertion order.
   """
   @spec snapshot_hash(map()) :: String.t()
   def snapshot_hash(snapshot) do
     snapshot
-    |> Docket.Graph.Serializer.canonical_json_encode()
+    |> :erlang.term_to_binary([:deterministic, minor_version: 2])
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.encode16(case: :lower)
   end

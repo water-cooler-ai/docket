@@ -62,6 +62,77 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       |> assert_diagnostic(:non_durable_graph_value)
     end
 
+    test "rejects cold-unsafe structural atoms and malformed containers without raising" do
+      cold = String.to_atom("docket_graph_shape_#{System.unique_integer([:positive])}")
+      graph = Graphs.minimal_linear()
+      input = graph.inputs["value"]
+      output = graph.outputs["result"]
+      node = graph.nodes["copy"]
+      {edge_id, edge} = Enum.at(graph.edges, 0)
+
+      invalid_graphs = [
+        %{graph | name: cold, description: cold},
+        %{
+          graph
+          | inputs:
+              Map.put(graph.inputs, "value", %{
+                input
+                | id: cold,
+                  kind: cold,
+                  label: cold,
+                  description: cold,
+                  required: cold
+              })
+        },
+        %{
+          graph
+          | outputs:
+              Map.put(graph.outputs, "result", %{
+                output
+                | id: cold,
+                  label: cold,
+                  description: cold
+              })
+        },
+        %{
+          graph
+          | nodes:
+              Map.put(graph.nodes, "copy", %{
+                node
+                | id: cold,
+                  label: cold,
+                  description: cold
+              })
+        },
+        %{
+          graph
+          | edges:
+              Map.put(graph.edges, edge_id, %{
+                edge
+                | id: cold,
+                  label: cold,
+                  description: cold,
+                  source_handle: cold,
+                  target_handle: cold
+              })
+        },
+        %{graph | nodes: []},
+        %{
+          graph
+          | edges:
+              Map.put(graph.edges, edge_id, %{
+                edge
+                | guard: %Guard{op: :equals, args: ["value" | cold]}
+              })
+        }
+      ]
+
+      for invalid <- invalid_graphs do
+        assert {:error, %Graph{} = verified} = Compiler.compile_for_publication(invalid)
+        assert Enum.any?(verified.diagnostics, &(&1.severity == :error))
+      end
+    end
+
     test "raises on non-graph arguments instead of returning diagnostics" do
       assert_raise FunctionClauseError, fn -> Compiler.verify(%{not: :a_graph}) end
       assert_raise FunctionClauseError, fn -> Compiler.compile(nil) end
@@ -248,12 +319,12 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       assert {:ok, _verified} = Graph.verify(graph)
     end
 
-    test "returns diagnostics for output records that are not structs" do
+    test "rejects output records that are not durable structs" do
       graph = Graphs.minimal_linear()
 
       %{graph | outputs: Map.put(graph.outputs, "junk", %{})}
       |> verify_error!()
-      |> assert_diagnostic(:unknown_output_source, path: [:outputs, "junk"], public_id: "junk")
+      |> assert_diagnostic(:non_durable_graph_value)
     end
   end
 
@@ -394,15 +465,12 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       assert Process.get(key) == 1
     end
 
-    test "returns diagnostics for node records that are not structs" do
+    test "rejects node records that are not durable structs" do
       graph = Graphs.minimal_linear()
 
       %{graph | nodes: Map.put(graph.nodes, "junk", %{"not" => "a node"})}
       |> verify_error!()
-      |> assert_diagnostic(:missing_node_implementation,
-        path: [:nodes, "junk"],
-        public_id: "junk"
-      )
+      |> assert_diagnostic(:non_durable_graph_value)
     end
 
     test "nil node config schemas are diagnostics rather than compiler crashes" do
@@ -780,16 +848,14 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       assert Enum.any?(diagnostics, &(&1.severity == :error))
     end
 
-    test "an ingest failure does not produce false config diagnostics" do
-      # The tuple in graph metadata blocks canonicalization, so validation
-      # falls back to the raw in-memory graph — where node config still has
-      # atom keys. That must not surface as :invalid_node_config: the config
-      # matches its schema once canonicalized, and steering the user to "fix"
-      # it would be wrong.
+    test "a non-durable graph term does not produce false config diagnostics" do
+      # Compiler ingest validates the direct term. A process in metadata must
+      # fail durability without misdiagnosing an otherwise valid atom-keyed
+      # node config.
       graph = Graphs.minimal_linear()
 
       diagnostics =
-        %{graph | metadata: Map.put(graph.metadata, "opts", {1, 2})}
+        %{graph | metadata: Map.put(graph.metadata, "owner", self())}
         |> verify_error!()
 
       assert_diagnostic(diagnostics, :non_durable_graph_value)

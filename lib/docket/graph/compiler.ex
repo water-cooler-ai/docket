@@ -20,17 +20,17 @@ defmodule Docket.Graph.Compiler do
     not declare a `"max_supersteps"` policy
   """
 
-  alias Docket.Graph
+  alias Docket.{DurableCodec, Graph}
 
   alias Docket.Graph.Compiler.{
     Diagnostics,
+    Canonical,
     Lowering,
     NodeContracts,
     RuntimeValidation,
     Validation
   }
 
-  alias Docket.Graph.Serializer
   alias Docket.Runtime
 
   @type opts :: keyword()
@@ -90,81 +90,81 @@ defmodule Docket.Graph.Compiler do
   end
 
   defp run_pipeline(graph, opts, mode) do
-    {canonical, ingest_diagnostics} = ingest(graph)
+    {canonical, canonical_bytes, ingest_diagnostics} = ingest(graph)
 
+    if Diagnostics.blocking?(ingest_diagnostics) do
+      {:error, ingest_diagnostics}
+    else
+      run_canonical_pipeline(canonical, canonical_bytes, ingest_diagnostics, opts, mode)
+    end
+  end
+
+  defp run_canonical_pipeline(canonical, canonical_bytes, ingest_diagnostics, opts, mode) do
     # Config schemas are fetched exactly once per compile; validation and
     # lowering must see the same result even when config_schema/0 callbacks
     # are stateful, and lowering must never re-enter user code.
     config_schemas = NodeContracts.config_schemas(canonical)
 
-    {effective, materialization_diagnostics} =
-      materialize(canonical, config_schemas, mode != :effective_document)
+    {effective, effective_bytes, materialization_diagnostics} =
+      materialize(canonical, canonical_bytes, config_schemas, mode != :effective_document)
 
-    diagnostics =
-      ingest_diagnostics ++
-        materialization_diagnostics ++ Validation.run(effective, config_schemas, opts)
+    diagnostics = ingest_diagnostics ++ materialization_diagnostics
 
     if Diagnostics.blocking?(diagnostics) do
       {:error, diagnostics}
     else
-      runtime_graph = Lowering.run(effective, opts)
-      diagnostics = diagnostics ++ RuntimeValidation.run(runtime_graph, effective)
+      diagnostics = diagnostics ++ Validation.run(effective, config_schemas, opts)
 
       if Diagnostics.blocking?(diagnostics) do
         {:error, diagnostics}
       else
-        {:ok, effective, runtime_graph, diagnostics}
+        lower(effective, effective_bytes, opts, diagnostics)
       end
     end
   end
 
-  defp materialize(graph, _config_schemas, false), do: {graph, []}
+  defp lower(effective, effective_bytes, opts, diagnostics) do
+    graph_hash = digest(effective_bytes)
+    runtime_graph = Lowering.run(effective, graph_hash, opts)
+    diagnostics = diagnostics ++ RuntimeValidation.run(runtime_graph, effective)
 
-  defp materialize(graph, config_schemas, true) do
+    if Diagnostics.blocking?(diagnostics) do
+      {:error, diagnostics}
+    else
+      {:ok, effective, runtime_graph, diagnostics}
+    end
+  end
+
+  defp materialize(graph, bytes, _config_schemas, false), do: {graph, bytes, []}
+
+  defp materialize(graph, _bytes, config_schemas, true) do
     graph
     |> NodeContracts.materialize_defaults(config_schemas)
     |> ingest()
   end
 
-  # Graphs are free-form in memory; the compiler is a serialization boundary.
-  # Ingest canonicalizes the document through the wire format (atom keys and
-  # values in open content become strings, exactly as storage would see them)
-  # and validates/lowers the canonical form. Graphs that cannot cross the
-  # boundary keep their in-memory shape so the validation passes can still
-  # produce granular, path-bearing diagnostics next to the ingest error.
-  #
-  # The v1 wire format only represents schema_version 1 (dump stamps it), so
-  # a graph claiming any other version is never canonicalized; validation
-  # rejects it against the in-memory document instead.
-  defp ingest(%Graph{schema_version: version} = graph) when version != 1 do
-    {graph, []}
-  end
-
+  # Compilation normalizes only open runtime values through Docket.Wire, then
+  # validates the direct durable term.
   defp ingest(graph) do
-    {Serializer.load!(Serializer.dump(graph, []), []), []}
+    graph = Canonical.normalize!(graph)
+    bytes = DurableCodec.encode!(:graph, graph)
+    {graph, bytes, []}
   rescue
-    exception in Docket.Graph.Error ->
-      {graph, [ingest_diagnostic(exception)]}
-
-    exception ->
-      {graph,
+    exception in Docket.Error ->
+      {graph, nil,
        [
          Diagnostics.error(
            :non_durable_graph_value,
-           "graph cannot be canonically serialized",
-           metadata: %{error: inspect(exception)}
+           "graph contains state that cannot be durably encoded",
+           metadata: %{error: exception.message, details: exception.details}
          )
        ]}
   end
 
-  defp ingest_diagnostic(%Docket.Graph.Error{} = error) do
-    code =
-      case error.code do
-        :non_durable_value -> :non_durable_graph_value
-        code -> code
-      end
-
-    Diagnostics.error(code, error.message, metadata: %{details: error.details})
+  defp digest(bytes) do
+    bytes
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   defp validate_opts!(opts) do

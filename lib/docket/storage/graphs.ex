@@ -1,6 +1,6 @@
 defmodule Docket.Storage.Graphs do
   @moduledoc """
-  Persistence contract for effective canonical graph versions.
+  Persistence contract for effective durable graph versions.
 
   Graph documents are immutable and addressed by `{graph_id, graph_hash}`.
   Publication materializes node configuration defaults before hashing, so the
@@ -17,26 +17,31 @@ defmodule Docket.Storage.Graphs do
   @type ctx :: Docket.Storage.ctx()
 
   @doc """
-  Saves an effective canonical graph document under `{graph_id, graph_hash}`.
+  Saves an effective graph under `{graph_id, graph_hash}`.
 
   Saving the same document again is idempotent. Reusing the key for different
   content is an error; a backend must not silently accept a hash/document
   mismatch. The facade compiles and validates a graph before calling this
-  function, while storage retains the portable canonical document.
+  function. Storage receives the durable `Docket.Graph` directly; public map
+  serialization is not part of this contract.
   """
   @callback save_graph(
               ctx(),
               graph_id :: String.t(),
               graph_hash :: String.t(),
-              graph_document :: map()
+              graph :: Docket.Graph.t()
             ) :: :ok | {:error, :graph_content_conflict | term()}
 
   @doc """
-  Reads a canonical graph document by `{graph_id, graph_hash}`.
+  Reads an effective graph by `{graph_id, graph_hash}`.
+
+  `:not_found` is reserved for an absent key. Backend/infrastructure failure
+  is not collapsed into absence; implementations raise when the substrate
+  cannot complete the read.
   """
   @callback fetch_graph(
               ctx(),
               graph_id :: String.t(),
               graph_hash :: String.t()
-            ) :: {:ok, map()} | {:error, :not_found}
+            ) :: {:ok, Docket.Graph.t()} | {:error, :not_found | :corrupt_graph}
 end

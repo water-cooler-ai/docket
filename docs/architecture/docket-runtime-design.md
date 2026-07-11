@@ -581,23 +581,11 @@ back, but they do not construct, pattern match, mutate, or depend on
 Docket-owned execution internals. See `Docket.Run` (`lib/docket/run.ex`) for
 the canonical struct.
 
-If a host stores runs in a format that cannot persist Elixir structs directly,
-Docket should provide explicit codecs rather than making hosts treat the run as
-a public map contract. The codec names mirror the graph document codec
-(`Docket.Graph.to_map/2` / `Docket.Graph.from_map/2`) so each Docket document
-type has exactly one serialization entry/exit pair:
-
-```elixir
-Docket.Run.to_map(%Docket.Run{}) :: map()
-
-Docket.Run.from_map(map()) ::
-  {:ok, %Docket.Run{}} | {:error, term()}
-
-Docket.Run.from_map!(map()) :: %Docket.Run{}
-```
-
-The wire representation is a map at the storage boundary. The public runtime
-API and in-memory state remain structured `%Docket.Run{}` values.
+Run persistence is owned by the configured backend, not by a public host wire
+format. The Postgres backend partitions relational fields from one opaque
+state projection and encodes that projection with Docket's private, versioned
+deterministic ETF codec. There is no public `Run.to_map/from_map` API and no
+legacy decoder; public runtime APIs and in-memory state use `%Docket.Run{}`.
 
 ### 9.1 Nested Run State
 
@@ -1049,10 +1037,10 @@ be safe to receive the same checkpoint more than once.
 Apps may inspect top-level fields such as `id`, `graph_id`, `graph_hash`,
 `status`, `step`, `input`, `output`, and timestamps. The run also contains
 Docket-owned execution data such as channels, tasks, interrupts, timers, and
-checkpoint counters. Apps should persist the run but not interpret, pattern
-match, mutate, or rebuild Docket-owned execution internals. Code that needs an
-external storage format should use `Docket.Run.to_map/1` and
-`Docket.Run.from_map/1` rather than treating the run as a public map contract.
+checkpoint counters. Apps should not interpret, pattern match, mutate, rebuild,
+or independently persist those internals. Durable applications use the
+configured backend's `fetch_run`/`inspect_run` operations; the private storage
+codec is not a host interchange contract.
 
 The crucial persist/resume path should stay simple:
 
@@ -1163,15 +1151,13 @@ canonical graph it started with:
 - graph ID
 - SHA-256 graph content hash
 
-On runtime start, the host passes a canonical `Docket.Graph` document to Docket.
-Docket hashes that graph and stores the digest on `Docket.Run.graph_hash`. On
-resume, retry, replay, and time travel, the host passes both the graph document
-and the `Docket.Run` document or historical checkpoint/event document it wants
-Docket to hydrate from. Docket hashes the supplied graph, compares it with
-`run.graph_hash`, then materializes the internal `Docket.Runtime.Graph` value
-and initializes or continues the run through `Docket.Runtime.Loop.init/3`. A live
-Runtime keeps that materialized runtime graph in memory. It does not recompile
-the graph on every superstep.
+Publication returns a `GraphRef` containing the private identity computed once
+from the effective graph's exact stored ETF bytes. Runtime start, recovery,
+retry, replay, and inspection resolve that immutable published graph through
+the reference and compare its stored identity with `run.graph_hash`; hosts do
+not hash editable graph documents. Docket then materializes the internal
+`Docket.Runtime.Graph` value. A live Runtime keeps that materialized runtime
+graph in memory and does not recompile it on every superstep.
 
 The canonical graph document stores the metadata needed to understand how it was
 produced and how it should be interpreted:

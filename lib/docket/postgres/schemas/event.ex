@@ -5,7 +5,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     `Docket.Event`.
 
     `occurred_at` is the event's own timestamp (`Docket.Event.timestamp`);
-    `inserted_at` is when it was persisted.
+    `inserted_at` is when it was persisted. Payload and metadata are opaque
+    binary fields; the Events capability owns their encoding.
     """
 
     use Ecto.Schema
@@ -21,8 +22,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             node_id: String.t() | nil,
             channel_id: String.t() | nil,
             task_id: String.t() | nil,
-            payload: map(),
-            metadata: map(),
+            payload: binary() | nil,
+            metadata: binary() | nil,
             occurred_at: DateTime.t() | nil,
             inserted_at: DateTime.t() | nil
           }
@@ -35,8 +36,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       field(:node_id, :string)
       field(:channel_id, :string)
       field(:task_id, :string)
-      field(:payload, :map, default: %{})
-      field(:metadata, :map, default: %{})
+      field(:payload, :binary, redact: true)
+      field(:metadata, :binary, redact: true)
       field(:occurred_at, :utc_datetime_usec)
 
       timestamps(type: :utc_datetime_usec, updated_at: false)
@@ -58,7 +59,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         :metadata,
         :occurred_at
       ])
-      |> validate_required([:run_id, :seq, :type, :step, :occurred_at])
+      |> validate_required([:run_id, :seq, :type, :step, :payload, :metadata, :occurred_at])
       |> validate_number(:seq, greater_than: 0)
       |> validate_number(:step, greater_than_or_equal_to: 0)
       |> unique_constraint([:run_id, :seq])

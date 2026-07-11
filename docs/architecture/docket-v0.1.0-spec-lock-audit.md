@@ -153,15 +153,16 @@ Replacing them with `done_at` / `failed_at` / `cancelled_at` creates three
 nullable state columns plus exactly-one constraints. One enum plus
 `finished_at` is the smaller, stronger sum type.
 
-Keep the existing `done` spelling for 0.0.x compatibility. `created` is only a
-private initialization sentinel: never durable, never checkpointed, and never
-cancellable. `interrupted`, `retrying`, `scheduled`, `ready`, and `claimed`
-are derived facts, not statuses.
+Keep the concise `done` spelling as the v0.1.0 product vocabulary; this is not a
+v0.0.x compatibility promise. `created` is only a private initialization
+sentinel: never durable, never checkpointed, and never cancellable.
+`interrupted`, `retrying`, `scheduled`, `ready`, and `claimed` are derived
+facts, not statuses.
 
 ### Failure is data, not state inference
 
-Add a top-level JSON-safe `Docket.Run.failure` and promoted `failure` JSONB
-column. It is present exactly when status is `failed`.
+Add a top-level durable `Docket.Run.failure` inside the private opaque state.
+Explicit Run validation requires it exactly when status is `failed`.
 
 Today `Runtime.Loop.fail/4` stores only `status: :failed` and `finished_at`; the
 reason exists only in a `:run_failed` event. Because event policy may be
@@ -543,21 +544,35 @@ the product boundary; Postgres is the first-party paved road, while the core
 runtime remains substrate-neutral behind `Docket.Backend` and
 `Docket.Lifecycle`.
 
-**Narrow compatibility break:** Node modules and graph definitions carry over
-unchanged. `Docket.Node`, `Docket.Graph`, `Docket.Schema`, reducers,
-interrupts, executors, compiler/serialization APIs, `Docket.Run.to_map` /
-`from_map`, and `Docket.Test.run_inline` and related processless helpers remain
-public. Adopters replace only lifecycle ownership: remove their checkpoint
-committer and host tables, install Docket's migration, configure
-`repo:`/`backend:`, publish graphs to `GraphRef`, replace `run` with
-`start_run`, replace `get_run` with `fetch_run`/`inspect_run`, and delete
-host-owned `resume` orchestration.
+**Intentional compatibility break:** Node modules and graph definitions carry
+over unchanged. Host-owned Run
+serialization does not: `Docket.Run.to_map/from_map` and the old Run wire
+version are removed. Adopters remove their checkpoint committer and host run
+tables, install Docket's migration, configure `repo:`/`backend:`, publish
+graphs to `GraphRef`, replace `run` with `start_run`, replace `get_run` with
+`fetch_run`/`inspect_run`, and delete host-owned `resume` orchestration.
 
 **Migration:** Because `0.0.1` persistence is host-defined, the supported
 migration is an explicit drain-and-cut-over rather than a universal automatic
 database migration or indefinite old-wire compatibility. Retained events are
 the durable integration path; checkpoint observers are best-effort
 after-commit notifications only.
+
+## Post-Lock Amendment (2026-07-10): Private Effective-Graph Codec
+
+**Decision:** DCKT-14 stores the final effective graph directly as private,
+versioned deterministic ETF in `bytea`. The compiler owns graph-specific
+canonicalization and strict structural validation. The generic durable codec
+owns the ETF envelope, deterministic encoding, safe recovery, and durable-term
+validation. Graph identity is computed privately once from the exact final ETF
+bytes and is not exposed as `Docket.Graph.hash/1`.
+
+The graph JSON serializer and public `Docket.Graph.to_map/1`, `from_map/1`,
+`from_map!/1`, and `hash/1` APIs are removed. Recovery requires graph
+collections to have binary keys and exact expected struct values and rejects
+malformed or non-canonical stored terms rather than normalizing them on read.
+These decisions supersede DCKT-14 acceptance language that requires a JSON
+graph projection, public graph hashing, or host-side hash recomputation.
 
 **Landing and blockers:** DCKT-37 owns the removal and migration-doc changes.
 It is blocked by DCKT-25 (assembled operational facade/backend) and DCKT-24

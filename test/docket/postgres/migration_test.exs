@@ -21,14 +21,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down(prefix: "docket_private")
     end
 
+    defmodule InstallDocketReservedPrefix do
+      use Ecto.Migration
+
+      def up, do: Docket.Postgres.Migration.up(prefix: "select")
+      def down, do: Docket.Postgres.Migration.down(prefix: "select")
+    end
+
     @migration_version 20_260_709_000_001
     @prefixed_migration_version 20_260_709_000_002
+    @reserved_prefix_migration_version 20_260_709_000_003
 
     @tables ~w(docket_events docket_graph_versions docket_runs)
 
     @run_columns ~w(
-      id run_id tenant_id graph_id graph_hash status step input output failure
-      metadata state checkpoint_seq latest_checkpoint_type claim_token
+      id run_id tenant_id graph_id graph_hash status step state
+      checkpoint_seq latest_checkpoint_type claim_token
       claimed_at wake_at claim_attempts poisoned_at poison_reason
       inserted_at started_at updated_at finished_at
     )
@@ -47,6 +55,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert tables("public") == @tables
       assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
       assert columns("docket_runs") == Enum.sort(@run_columns)
+
+      assert column_type("docket_graph_versions", "graph") == "bytea"
+
+      assert column_type("docket_runs", "state") == "bytea"
+
+      assert column_type("docket_runs", "poison_reason") == "text"
+      assert column_type("docket_events", "payload") == "bytea"
+      assert column_type("docket_events", "metadata") == "bytea"
 
       assert nullable?("docket_runs", "tenant_id")
       refute nullable?("docket_runs", "started_at")
@@ -129,6 +145,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert tables("docket_private") == []
     end
 
+    test "quotes a valid prefix that is also a Postgres keyword" do
+      assert :ok =
+               Ecto.Migrator.up(
+                 TestRepo,
+                 @reserved_prefix_migration_version,
+                 InstallDocketReservedPrefix,
+                 log: false
+               )
+
+      assert tables("select") == @tables
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo, prefix: "select") == 1
+
+      assert :ok =
+               Ecto.Migrator.down(
+                 TestRepo,
+                 @reserved_prefix_migration_version,
+                 InstallDocketReservedPrefix,
+                 log: false
+               )
+
+      assert tables("select") == []
+    end
+
     test "accepts every valid lifecycle row shape" do
       install!()
 
@@ -140,16 +180,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         poisoned_running: [
           wake_at: nil,
           poisoned_at: now,
-          poison_reason: %{"kind" => "max_claim_attempts"}
+          poison_reason: "max_claim_attempts_exceeded"
         ],
         waiting: [status: "waiting", wake_at: nil],
-        done: [status: "done", wake_at: nil, finished_at: now, output: %{"answer" => 42}],
-        failed: [
-          status: "failed",
-          wake_at: nil,
-          finished_at: now,
-          failure: %{"code" => "node_failed", "message" => "boom"}
-        ],
+        done: [status: "done", wake_at: nil, finished_at: now],
+        failed: [status: "failed", wake_at: nil, finished_at: now],
         cancelled: [status: "cancelled", wake_at: nil, finished_at: now]
       ]
 
@@ -170,20 +205,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       invalid_tuples = [
         {"unknown status", [status: "created", wake_at: nil], ~w(docket_runs_status_check)},
         {"running with finished_at", [finished_at: now], ~w(docket_runs_finished_at_check)},
-        {"done without finished_at", [status: "done", wake_at: nil, output: %{"answer" => 42}],
+        {"done without finished_at", [status: "done", wake_at: nil],
          ~w(docket_runs_finished_at_check)},
-        {"failed without failure", [status: "failed", wake_at: nil, finished_at: now],
-         ~w(docket_runs_failure_check)},
-        {"done with failure",
-         [status: "done", wake_at: nil, finished_at: now, failure: %{"code" => "boom"}],
-         ~w(docket_runs_failure_check)},
-        {"output on a non-done run", [output: %{"answer" => 42}], ~w(docket_runs_output_check)},
         {"claim token without claimed_at", [wake_at: nil, claim_token: uuid()],
          ~w(docket_runs_claim_pair_check)},
         {"claimed_at without claim token", [claimed_at: now], ~w(docket_runs_claim_pair_check)},
         {"poisoned_at without poison_reason", [wake_at: nil, poisoned_at: now],
          ~w(docket_runs_poison_pair_check)},
-        {"poison_reason without poisoned_at", [poison_reason: %{"kind" => "stuck"}],
+        {"poison_reason without poisoned_at", [poison_reason: "stuck"],
          ~w(docket_runs_poison_pair_check)},
         {"waiting with a wake", [status: "waiting"], ~w(docket_runs_waiting_terminal_idle_check)},
         {"waiting with a claim",
@@ -194,19 +223,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
            status: "waiting",
            wake_at: nil,
            poisoned_at: now,
-           poison_reason: %{"kind" => "stuck"}
+           poison_reason: "stuck"
          ], ~w(docket_runs_waiting_terminal_idle_check docket_runs_poisoned_shape_check)},
-        {"terminal with a wake", [status: "done", finished_at: now, output: %{"answer" => 42}],
+        {"terminal with a wake", [status: "done", finished_at: now],
          ~w(docket_runs_waiting_terminal_idle_check)},
         {"poisoned with a claim",
          [
            wake_at: nil,
            poisoned_at: now,
-           poison_reason: %{"kind" => "stuck"},
+           poison_reason: "stuck",
            claim_token: uuid(),
            claimed_at: now
          ], ~w(docket_runs_poisoned_shape_check)},
-        {"poisoned with a wake", [poisoned_at: now, poison_reason: %{"kind" => "stuck"}],
+        {"poisoned with a wake", [poisoned_at: now, poison_reason: "stuck"],
          ~w(docket_runs_poisoned_shape_check)},
         {"running with both wake and claim", [claim_token: uuid(), claimed_at: now],
          ~w(docket_runs_running_schedule_check)},
@@ -317,7 +346,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       now = DateTime.utc_now()
 
       assert {:ok, _version} =
-               %{graph_id: "g1", graph_hash: "abc123", graph: %{"nodes" => []}}
+               %{graph_id: "g1", graph_hash: "abc123", graph: <<131, 106>>}
                |> Docket.Postgres.Schemas.GraphVersion.changeset()
                |> TestRepo.insert()
 
@@ -327,23 +356,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  graph_id: "g1",
                  graph_hash: "abc123",
                  status: :running,
-                 input: %{"prompt" => "hello"},
-                 state: %{"channels" => %{}, "version" => 1},
+                 state: <<131, 106>>,
                  started_at: now,
                  wake_at: now
                }
                |> Docket.Postgres.Schemas.Run.changeset()
                |> TestRepo.insert()
 
-      assert run.metadata == %{}
       assert run.step == 0
       assert run.checkpoint_seq == 0
       assert run.claim_attempts == 0
       assert run.poisoned_at == nil
       assert run.poison_reason == nil
       assert run.tenant_id == nil
-      assert run.output == nil
-      assert run.failure == nil
 
       assert {:error, changeset} =
                %{
@@ -351,8 +376,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  graph_id: "g1",
                  graph_hash: "abc123",
                  status: :running,
-                 input: %{"prompt" => "hello"},
-                 state: %{"channels" => %{}, "version" => 1},
+                 state: <<131, 106>>,
                  started_at: now,
                  wake_at: now
                }
@@ -367,6 +391,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  seq: 1,
                  type: :run_initialized,
                  step: 0,
+                 payload: <<131, 116, 0, 0, 0, 0>>,
+                 metadata: <<131, 116, 0, 0, 0, 0>>,
                  occurred_at: now
                }
                |> Docket.Postgres.Schemas.Event.changeset()
@@ -375,7 +401,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     # Inserts a docket_runs row through raw SQL — bypassing changesets on
     # purpose — as a ready `running` row unless overridden. Publishes the
-    # referenced graph version on first use. Returns the run_id row on
     # success.
     defp insert_run(overrides, prefix \\ "public") do
       now = DateTime.utc_now()
@@ -388,11 +413,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         graph_hash: "abc123",
         status: "running",
         step: 0,
-        input: %{},
-        output: nil,
-        failure: nil,
-        metadata: %{},
-        state: %{"channels" => %{}, "version" => 1},
+        state: <<131, 106>>,
         checkpoint_seq: 0,
         latest_checkpoint_type: nil,
         claim_token: nil,
@@ -428,9 +449,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """
         INSERT INTO docket_events
           (run_id, seq, type, step, payload, metadata, occurred_at, inserted_at)
-        VALUES ($1, $2, 'node_completed', 0, '{}', '{}', $3, $3)
+        VALUES ($1, $2, 'node_completed', 0, $3, $3, $4, $4)
         """,
-        [run_id, seq, now]
+        [run_id, seq, <<131, 116, 0, 0, 0, 0>>, now]
       )
     end
 
@@ -442,10 +463,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       TestRepo.query!(
         """
         INSERT INTO #{prefix}.docket_graph_versions (graph_id, graph_hash, graph, inserted_at)
-        VALUES ($1, $2, '{}', $3)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT DO NOTHING
         """,
-        [graph_id, graph_hash, DateTime.utc_now()]
+        [graph_id, graph_hash, <<131, 106>>, DateTime.utc_now()]
       )
     end
 
@@ -504,6 +525,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       answer == "YES"
+    end
+
+    defp column_type(table, column) do
+      %{rows: [[data_type]]} =
+        TestRepo.query!(
+          """
+          SELECT data_type FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+          """,
+          [table, column]
+        )
+
+      data_type
     end
 
     defp indexes(table) do

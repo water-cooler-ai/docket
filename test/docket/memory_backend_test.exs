@@ -4,8 +4,11 @@ defmodule Docket.MemoryBackendTest do
   alias Docket.{Event, Run}
   alias Docket.Test.MemoryBackend
 
-  @graph_hash String.duplicate("ab", 32)
-  @graph_document %{"id" => "g", "nodes" => []}
+  @graph %Docket.Graph{id: "g"}
+  @graph_hash @graph
+              |> then(&Docket.DurableCodec.encode!(:graph, &1))
+              |> then(&:crypto.hash(:sha256, &1))
+              |> Base.encode16(case: :lower)
   @initial_wake ~U[2026-07-09 11:00:00Z]
   @now ~U[2026-07-09 12:00:00Z]
   @commit_now ~U[2026-07-09 12:30:00Z]
@@ -42,7 +45,7 @@ defmodule Docket.MemoryBackendTest do
 
   defp initialize(backend, run, opts \\ []) do
     owner_scope = Keyword.get(opts, :scope, :tenantless)
-    graph_document = Keyword.get(opts, :graph_document, @graph_document)
+    graph = Keyword.get(opts, :graph, @graph)
     wake_at = Keyword.get(opts, :wake_at, @initial_wake)
     events = Keyword.get(opts, :events, [])
 
@@ -52,7 +55,7 @@ defmodule Docket.MemoryBackendTest do
                transaction,
                run.graph_id,
                run.graph_hash,
-               graph_document
+               graph
              ),
            {:ok, initialized} <-
              MemoryBackend.insert_run(
@@ -126,7 +129,7 @@ defmodule Docket.MemoryBackendTest do
 
     assert {:ok, ^initialized} = initialize(b, initialized, events: [retained])
     assert {:ok, ^initialized} = MemoryBackend.fetch_run(b, :tenantless, "r1")
-    assert {:ok, @graph_document} = MemoryBackend.fetch_graph(b, "g", @graph_hash)
+    assert {:ok, @graph} = MemoryBackend.fetch_graph(b, "g", @graph_hash)
     assert [^retained] = MemoryBackend.events(b, :system, "r1")
     assert @initial_wake == MemoryBackend.wake_at(b, "r1")
   end
@@ -175,14 +178,26 @@ defmodule Docket.MemoryBackendTest do
              )
   end
 
-  test "graph storage is structurally idempotent and rejects conflicting content", %{backend: b} do
-    assert :ok = MemoryBackend.save_graph(b, "g", @graph_hash, %{"a" => 1, "b" => 2})
-    assert :ok = MemoryBackend.save_graph(b, "g", @graph_hash, %{"b" => 2, "a" => 1})
+  test "graph storage is content-addressed and structurally idempotent", %{backend: b} do
+    first = %{@graph | metadata: %{"a" => 1, "b" => 2}}
+    equal = %{@graph | metadata: %{"b" => 2, "a" => 1}}
+    different = %{@graph | metadata: %{"a" => 2}}
+    graph_hash = durable_hash(first)
 
-    assert {:error, :graph_content_conflict} =
-             MemoryBackend.save_graph(b, "g", @graph_hash, %{"a" => 2})
+    assert :ok = MemoryBackend.save_graph(b, "g", graph_hash, first)
+    assert :ok = MemoryBackend.save_graph(b, "g", graph_hash, equal)
 
-    assert {:ok, %{"a" => 1, "b" => 2}} = MemoryBackend.fetch_graph(b, "g", @graph_hash)
+    assert {:error, :invalid_graph_hash} =
+             MemoryBackend.save_graph(b, "g", graph_hash, different)
+
+    assert {:ok, ^first} = MemoryBackend.fetch_graph(b, "g", graph_hash)
+  end
+
+  defp durable_hash(graph) do
+    graph
+    |> then(&Docket.DurableCodec.encode!(:graph, &1))
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   test "failed event append rolls graph and run initialization back", %{backend: b} do

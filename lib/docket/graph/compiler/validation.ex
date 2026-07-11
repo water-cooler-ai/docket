@@ -20,7 +20,6 @@ defmodule Docket.Graph.Compiler.Validation do
   @finish_id "$finish"
   @supported_schema_version 1
   @supported_guard_ops [:all, :any, :changed, :equals, :exists, :not, :path, :version_at_least]
-  @schema_types [:boolean, :enum, :float, :integer, :list, :map, :object, :string]
   @reducer_types Docket.Reducer.types()
 
   @spec run(Graph.t(), %{optional(String.t()) => NodeContracts.fetch_result()}, keyword()) ::
@@ -45,12 +44,13 @@ defmodule Docket.Graph.Compiler.Validation do
   # 9.2 Public document
   # ---------------------------------------------------------------------------
 
-  # Durability is not checked here: compiler ingest canonicalizes the graph
-  # through the wire format and reports serialization failures itself.
+  # Durability is checked once by compiler ingest through the private direct
+  # term codec; these passes focus on graph semantics.
   defp validate_document(graph, opts) do
     List.flatten([
       check_schema_version(graph),
       check_graph_id(graph),
+      check_document_attrs(graph),
       check_record_ids(graph),
       check_field_collisions(graph),
       check_policies(graph, opts)
@@ -97,6 +97,15 @@ defmodule Docket.Graph.Compiler.Validation do
         )
       ]
     end
+  end
+
+  defp check_document_attrs(%Graph{} = graph) do
+    shape_error(
+      optional_text?(graph.name) and optional_text?(graph.description),
+      :invalid_document,
+      "graph name and description must be nil or strings",
+      []
+    )
   end
 
   defp check_record_ids(graph) do
@@ -162,6 +171,7 @@ defmodule Docket.Graph.Compiler.Validation do
 
   defp validate_field(collection, id, %Field{} = field) do
     List.flatten([
+      check_field_attrs(collection, id, field),
       check_field_schema(collection, id, field.schema),
       check_field_reducer(collection, id, field),
       check_field_default(collection, id, field)
@@ -177,6 +187,19 @@ defmodule Docket.Graph.Compiler.Validation do
         public_id: id
       )
     ]
+  end
+
+  defp check_field_attrs(collection, id, %Field{} = field) do
+    expected_kind = if collection == :inputs, do: :input, else: :state
+
+    shape_error(
+      field.id == id and field.kind == expected_kind and optional_text?(field.label) and
+        optional_text?(field.description) and is_boolean(field.required),
+      :invalid_field,
+      "#{singular(collection)} #{inspect(id)} has invalid structural attributes",
+      [collection, id],
+      id
+    )
   end
 
   defp check_field_schema(collection, id, nil) do
@@ -359,8 +382,7 @@ defmodule Docket.Graph.Compiler.Validation do
     end
   end
 
-  defp valid_schema?(%Schema{type: type}) when type in @schema_types, do: true
-  defp valid_schema?(_schema), do: false
+  defp valid_schema?(schema), do: Schema.valid?(schema)
 
   # ---------------------------------------------------------------------------
   # 9.4 Outputs
@@ -373,20 +395,32 @@ defmodule Docket.Graph.Compiler.Validation do
   end
 
   defp validate_output(graph, id, %Graph.Output{} = output) do
-    case resolve_field(graph, output.source) do
-      nil ->
-        [
-          error(
-            :unknown_output_source,
-            "output #{inspect(id)} source #{inspect(output.source)} is not an input or state field",
-            path: [:outputs, id, :source],
-            public_id: id
-          )
-        ]
+    attrs =
+      shape_error(
+        output.id == id and optional_text?(output.label) and optional_text?(output.description),
+        :invalid_record,
+        "output #{inspect(id)} has invalid structural attributes",
+        [:outputs, id],
+        id
+      )
 
-      source_field ->
-        check_output_schema(id, output.schema, source_field.schema)
-    end
+    source =
+      case resolve_field(graph, output.source) do
+        nil ->
+          [
+            error(
+              :unknown_output_source,
+              "output #{inspect(id)} source #{inspect(output.source)} is not an input or state field",
+              path: [:outputs, id, :source],
+              public_id: id
+            )
+          ]
+
+        source_field ->
+          check_output_schema(id, output.schema, source_field.schema)
+      end
+
+    attrs ++ source
   end
 
   defp validate_output(_graph, id, other) do
@@ -468,7 +502,7 @@ defmodule Docket.Graph.Compiler.Validation do
   # "retry", reserved "on_error"). The rules live in Policies so the compiler
   # and plan-time validation cannot drift apart.
   defp validate_node_policies(id, %Graph.Node{policies: policies}) do
-    case Policies.node_policies(canonicalize_open(policies)) do
+    case Policies.node_policies(NodeContracts.normalize_open(policies)) do
       {:ok, _resolved} ->
         []
 
@@ -485,38 +519,50 @@ defmodule Docket.Graph.Compiler.Validation do
   defp validate_node_policies(_id, _other), do: []
 
   defp validate_node(id, %Graph.Node{} = node, config_schemas) do
-    case node.implementation do
-      nil ->
-        [
-          error(:missing_node_implementation, "node #{inspect(id)} has no implementation",
-            path: [:nodes, id, :implementation],
-            public_id: id
-          )
-        ]
+    attrs =
+      shape_error(
+        node.id == id and optional_text?(node.label) and optional_text?(node.description),
+        :invalid_record,
+        "node #{inspect(id)} has invalid structural attributes",
+        [:nodes, id],
+        id
+      )
 
-      %{type: :module, module: module, function: :call} when is_atom(module) ->
-        validate_node_module(id, node, module, config_schemas)
+    implementation =
+      case node.implementation do
+        nil ->
+          [
+            error(:missing_node_implementation, "node #{inspect(id)} has no implementation",
+              path: [:nodes, id, :implementation],
+              public_id: id
+            )
+          ]
 
-      %{type: :module} = implementation ->
-        [
-          error(
-            :unsupported_node_implementation,
-            "node #{inspect(id)} implementation is not supported in v1; module implementations must use call/3, got #{inspect(implementation)}",
-            path: [:nodes, id, :implementation],
-            public_id: id
-          )
-        ]
+        %{type: :module, module: module, function: :call} when is_atom(module) ->
+          validate_node_module(id, node, module, config_schemas)
 
-      implementation ->
-        [
-          error(
-            :unsupported_node_implementation,
-            "node #{inspect(id)} implementation type is not supported in v1, got #{inspect(implementation)}",
-            path: [:nodes, id, :implementation],
-            public_id: id
-          )
-        ]
-    end
+        %{type: :module} = implementation ->
+          [
+            error(
+              :unsupported_node_implementation,
+              "node #{inspect(id)} implementation is not supported in v1; module implementations must use call/3, got #{inspect(implementation)}",
+              path: [:nodes, id, :implementation],
+              public_id: id
+            )
+          ]
+
+        implementation ->
+          [
+            error(
+              :unsupported_node_implementation,
+              "node #{inspect(id)} implementation type is not supported in v1, got #{inspect(implementation)}",
+              path: [:nodes, id, :implementation],
+              public_id: id
+            )
+          ]
+      end
+
+    attrs ++ implementation
   end
 
   defp validate_node(id, other, _config_schemas) do
@@ -560,11 +606,7 @@ defmodule Docket.Graph.Compiler.Validation do
   defp validate_node_config(id, node, module, config_schemas) do
     case Map.get(config_schemas, id) do
       {:ok, schema} ->
-        # The config is canonicalized here rather than trusting ingest: in
-        # fallback mode (a graph that failed serialization elsewhere) the
-        # in-memory config may still be atom-keyed, and validating it raw
-        # would produce false diagnostics against the string-keyed schema.
-        case Schema.validate(schema, canonicalize_open(node.config)) do
+        case Schema.validate(schema, NodeContracts.normalize_open(node.config)) do
           :ok ->
             []
 
@@ -596,24 +638,6 @@ defmodule Docket.Graph.Compiler.Validation do
     end
   end
 
-  # Canonicalizes open content the way the wire format would (atoms become
-  # strings, map keys stringify) without failing on non-durable terms; those
-  # are already reported by ingest.
-  defp canonicalize_open(value) when is_map(value) and not is_struct(value) do
-    Map.new(value, fn {key, child} -> {canonicalize_key(key), canonicalize_open(child)} end)
-  end
-
-  defp canonicalize_open(value) when is_list(value), do: Enum.map(value, &canonicalize_open/1)
-
-  defp canonicalize_open(value) when is_atom(value) and value not in [nil, true, false] do
-    Atom.to_string(value)
-  end
-
-  defp canonicalize_open(value), do: value
-
-  defp canonicalize_key(key) when is_atom(key), do: Atom.to_string(key)
-  defp canonicalize_key(key), do: key
-
   defp module_loaded?(module) do
     case Code.ensure_loaded(module) do
       {:module, ^module} -> true
@@ -633,6 +657,14 @@ defmodule Docket.Graph.Compiler.Validation do
 
   defp validate_edge(graph, id, %Edge{} = edge) do
     List.flatten([
+      shape_error(
+        edge.id == id and optional_text?(edge.label) and optional_text?(edge.description) and
+          optional_text?(edge.source_handle) and optional_text?(edge.target_handle),
+        :invalid_record,
+        "edge #{inspect(id)} has invalid structural attributes",
+        [:edges, id],
+        id
+      ),
       validate_edge_from(graph, id, edge.from),
       validate_edge_to(graph, id, edge.to),
       validate_edge_guard_shape(id, edge.guard)
@@ -785,6 +817,16 @@ defmodule Docket.Graph.Compiler.Validation do
         public_id: id
       )
     ]
+  end
+
+  defp optional_text?(value), do: is_nil(value) or is_binary(value)
+
+  defp shape_error(true, _code, _message, _path), do: []
+  defp shape_error(false, code, message, path), do: [error(code, message, path: path)]
+  defp shape_error(true, _code, _message, _path, _public_id), do: []
+
+  defp shape_error(false, code, message, path, public_id) do
+    [error(code, message, path: path, public_id: public_id)]
   end
 
   # ---------------------------------------------------------------------------

@@ -88,9 +88,8 @@ the prompt and output fields are configuration.
 
 A few contract details worth noting:
 
-- Config schemas may be declared with atom keys, but graphs are canonicalized
-  through the JSON-safe wire format before compilation, so `call/3` always
-  receives **string-keyed** config.
+- Config schemas may be declared with atom keys, but durable graph
+  normalization gives `call/3` **string-keyed** config.
 - App-owned context (like the LLM client) is passed as the `:context` run
   option, and arrives at the node under `context.application`. The other
   context keys (`run_id`, `node_id`, `step`, `attempt`, `source_versions`,

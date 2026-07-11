@@ -3,10 +3,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduledoc """
     Row schema for `docket_runs`.
 
-    The public `Docket.Run` fields (`run_id`, `graph_id`, `graph_hash`,
-    `status`, `step`, `input`, `output`, `failure`, `metadata`, timestamps)
-    are columns; `state` holds the Docket-owned execution internals and must
-    not be interpreted by hosts.
+    Columns expose only the fields Postgres needs for identity, claiming,
+    scheduling, inspection, and constraints. `state` holds all remaining
+    durable run fields and must not be interpreted by hosts.
 
     Operational columns:
 
@@ -39,11 +38,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             graph_hash: String.t() | nil,
             status: Docket.Run.durable_status() | nil,
             step: non_neg_integer(),
-            input: map() | nil,
-            output: map() | nil,
-            failure: map() | nil,
-            metadata: map(),
-            state: map() | nil,
+            state: binary() | nil,
             checkpoint_seq: non_neg_integer(),
             latest_checkpoint_type: Docket.Checkpoint.type() | nil,
             claim_token: Ecto.UUID.t() | nil,
@@ -51,7 +46,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             wake_at: DateTime.t() | nil,
             claim_attempts: non_neg_integer(),
             poisoned_at: DateTime.t() | nil,
-            poison_reason: map() | nil,
+            poison_reason: String.t() | nil,
             inserted_at: DateTime.t() | nil,
             started_at: DateTime.t() | nil,
             updated_at: DateTime.t() | nil,
@@ -65,19 +60,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       field(:graph_hash, :string)
       field(:status, Ecto.Enum, values: Docket.Run.durable_statuses())
       field(:step, :integer, default: 0)
-      field(:input, :map)
-      field(:output, :map)
-      field(:failure, :map)
-      field(:metadata, :map, default: %{})
-      field(:state, :map)
+      field(:state, :binary, redact: true)
       field(:checkpoint_seq, :integer, default: 0)
       field(:latest_checkpoint_type, Ecto.Enum, values: Docket.Checkpoint.types())
-      field(:claim_token, Ecto.UUID)
+      field(:claim_token, Ecto.UUID, redact: true)
       field(:claimed_at, :utc_datetime_usec)
       field(:wake_at, :utc_datetime_usec)
       field(:claim_attempts, :integer, default: 0)
       field(:poisoned_at, :utc_datetime_usec)
-      field(:poison_reason, :map)
+      field(:poison_reason, :string)
       field(:started_at, :utc_datetime_usec)
       field(:finished_at, :utc_datetime_usec)
 
@@ -91,10 +82,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :graph_hash,
       :status,
       :step,
-      :input,
-      :output,
-      :failure,
-      :metadata,
       :state,
       :checkpoint_seq,
       :latest_checkpoint_type,
@@ -105,10 +92,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :poisoned_at,
       :poison_reason,
       :started_at,
+      :updated_at,
       :finished_at
     ]
 
-    @required [:run_id, :graph_id, :graph_hash, :status, :input, :state, :started_at]
+    @required [:run_id, :graph_id, :graph_hash, :status, :state, :started_at]
 
     @doc """
     Builds a changeset for inserting or updating a run row.
@@ -124,6 +112,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> validate_number(:checkpoint_seq, greater_than_or_equal_to: 0)
       |> validate_number(:claim_attempts, greater_than_or_equal_to: 0)
       |> unique_constraint(:run_id)
+      |> foreign_key_constraint(:graph_hash, name: :docket_runs_graph_hash_fkey)
     end
   end
 end

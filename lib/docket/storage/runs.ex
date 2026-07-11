@@ -60,7 +60,7 @@ defmodule Docket.Storage.Runs do
   @type poisoned_claim :: %{
           required(:run_id) => String.t(),
           required(:poisoned_at) => DateTime.t(),
-          required(:poison_reason) => map()
+          required(:poison_reason) => String.t()
         }
 
   @typedoc "Results of one claim scan. Poisoned candidates never appear as leases."
@@ -115,6 +115,8 @@ defmodule Docket.Storage.Runs do
   Reads the last committed graph-run document under an explicit scope.
 
   An unknown run or scope mismatch returns `{:error, :not_found}`.
+  Backend/infrastructure failure and corrupt persisted run state are not
+  collapsed into absence; implementations raise in those cases.
   """
   @callback fetch_run(ctx(), scope(), run_id :: String.t()) ::
               {:ok, Docket.Run.t()} | {:error, :not_found}
@@ -125,6 +127,8 @@ defmodule Docket.Storage.Runs do
   The `Docket.RunInfo` projection exposes the wake, claimed time,
   claim-attempt count, and poison facts, but never the current claim token.
   An unknown run or scope mismatch returns `{:error, :not_found}`.
+  Backend/infrastructure failure and corrupt persisted run state raise rather
+  than being reported as `:not_found`.
   """
   @callback inspect_run(ctx(), scope(), run_id :: String.t()) ::
               {:ok, Docket.RunInfo.t()} | {:error, :not_found}

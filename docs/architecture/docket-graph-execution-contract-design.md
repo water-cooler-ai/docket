@@ -406,8 +406,8 @@ Known contract:
 
 Resolved v1 contract:
 
-- `resume/4` requires `graph.id == run.graph_id` and
-  `Docket.Graph.hash(graph) == run.graph_hash`.
+- Resume requires the stored effective graph ID and compiler-produced private
+  hash to match the run's pinned `graph_id` and `graph_hash`.
 - A mismatch returns
   `{:error, %Docket.Error{type: :graph_mismatch, reason: reason}}`.
 - If the old graph content is unavailable, the host cannot resume that run and
