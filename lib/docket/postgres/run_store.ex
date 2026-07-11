@@ -219,6 +219,39 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       raise ArgumentError, "release_claim scope must be :system, got: #{inspect(scope)}"
     end
 
+    @doc "Commits an exact-next run document under the current claim fence."
+    @spec commit(ctx(), Docket.Storage.scope(), Docket.Storage.Runs.commit_proposal()) ::
+            {:ok, Docket.Run.t()} | {:error, :stale_fence | :invalid_commit | :not_found}
+    def commit(ctx, scope, proposal) do
+      {repo, prefix} = Storage.context!(ctx)
+
+      with :ok <- validate_commit(proposal),
+           {:ok, attrs} <- RunCodec.dump(proposal.run),
+           {:ok, stored} <- fetch_scoped_row(repo, prefix, scope, proposal.run.id),
+           :ok <- validate_immutable_binding(stored, proposal.run) do
+        query =
+          Run
+          |> where([run], run.run_id == ^proposal.run.id)
+          |> scope_query(scope)
+          |> where(
+            [run],
+            run.checkpoint_seq == ^proposal.expected_checkpoint_seq and
+              run.claim_token == ^proposal.claim_token
+          )
+          |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
+
+        updates = commit_updates(attrs, proposal.checkpoint_type, proposal.schedule)
+
+        case repo.update_all(query, updates, log: false) do
+          {1, _} -> {:ok, proposal.run}
+          {0, _} -> commit_miss(repo, prefix, scope, proposal.run.id)
+        end
+      else
+        {:error, :not_found} -> {:error, :not_found}
+        _ -> {:error, :invalid_commit}
+      end
+    end
+
     @doc false
     @spec current_claim(String.t(), Docket.Storage.Runs.claim_token()) ::
             Ecto.Query.dynamic_expr()
@@ -340,6 +373,100 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       case repo.one(query) do
         nil -> {:error, :not_found}
         %Run{} = row -> {:ok, row}
+      end
+    end
+
+    defp validate_commit(%{
+           run: %Docket.Run{} = run,
+           expected_checkpoint_seq: expected,
+           claim_token: token,
+           checkpoint_type: checkpoint_type,
+           schedule: schedule
+         })
+         when is_integer(expected) and expected >= 0 and is_binary(token) and byte_size(token) > 0 and
+                is_atom(checkpoint_type) do
+      with {:ok, _token} <- Ecto.UUID.cast(token),
+           true <- checkpoint_type in Docket.Checkpoint.types(),
+           true <- run.checkpoint_seq == expected + 1,
+           true <- valid_schedule?(schedule),
+           true <- schedule_matches_status?(schedule, run.status),
+           :ok <- Docket.Run.validate_failure(run) do
+        :ok
+      else
+        _ -> {:error, :invalid_commit}
+      end
+    end
+
+    defp validate_commit(_proposal), do: {:error, :invalid_commit}
+
+    defp validate_immutable_binding(stored, proposed) do
+      if stored.graph_id == proposed.graph_id and stored.graph_hash == proposed.graph_hash,
+        do: :ok,
+        else: {:error, :invalid_commit}
+    end
+
+    defp valid_schedule?(:retain_claim), do: true
+
+    defp valid_schedule?({:release_claim, reason})
+         when reason in [:immediate, :external, :terminal],
+         do: true
+
+    defp valid_schedule?({:release_claim, {:at, %DateTime{}}}), do: true
+    defp valid_schedule?(_), do: false
+
+    defp schedule_matches_status?(:retain_claim, :running), do: true
+    defp schedule_matches_status?({:release_claim, :immediate}, :running), do: true
+    defp schedule_matches_status?({:release_claim, {:at, %DateTime{}}}, :running), do: true
+    defp schedule_matches_status?({:release_claim, :external}, :waiting), do: true
+
+    defp schedule_matches_status?({:release_claim, :terminal}, status),
+      do: status in [:done, :failed, :cancelled]
+
+    defp schedule_matches_status?(_, _), do: false
+
+    defp commit_updates(attrs, checkpoint_type, schedule) do
+      base = [
+        graph_id: attrs.graph_id,
+        graph_hash: attrs.graph_hash,
+        status: attrs.status,
+        step: attrs.step,
+        state: attrs.state,
+        checkpoint_seq: attrs.checkpoint_seq,
+        latest_checkpoint_type: checkpoint_type,
+        claim_attempts: 0,
+        poisoned_at: nil,
+        poison_reason: nil,
+        started_at: attrs.started_at,
+        updated_at: attrs.updated_at,
+        finished_at: attrs.finished_at
+      ]
+
+      schedule_updates =
+        case schedule do
+          :retain_claim ->
+            [wake_at: nil, claimed_at: dynamic([_run], fragment("CURRENT_TIMESTAMP"))]
+
+          {:release_claim, :immediate} ->
+            [
+              claim_token: nil,
+              claimed_at: nil,
+              wake_at: dynamic([_run], fragment("CURRENT_TIMESTAMP"))
+            ]
+
+          {:release_claim, {:at, at}} ->
+            [claim_token: nil, claimed_at: nil, wake_at: normalize_database_datetime(at)]
+
+          {:release_claim, reason} when reason in [:external, :terminal] ->
+            [claim_token: nil, claimed_at: nil, wake_at: nil]
+        end
+
+      [set: base ++ schedule_updates]
+    end
+
+    defp commit_miss(repo, prefix, scope, run_id) do
+      case fetch_scoped_row(repo, prefix, scope, run_id) do
+        {:ok, _row} -> {:error, :stale_fence}
+        {:error, :not_found} -> {:error, :not_found}
       end
     end
 

@@ -516,7 +516,7 @@ defmodule Docket.Test.MemoryBackend do
       not is_struct(run, Docket.Run) -> {:error, :invalid_commit}
       not is_integer(expected_seq) or expected_seq < 0 -> {:error, :invalid_commit}
       not is_binary(claim_token) or byte_size(claim_token) == 0 -> {:error, :invalid_commit}
-      not is_atom(checkpoint_type) or is_nil(checkpoint_type) -> {:error, :invalid_commit}
+      checkpoint_type not in Docket.Checkpoint.types() -> {:error, :invalid_commit}
       not valid_schedule?(schedule) -> {:error, :invalid_commit}
       not schedule_matches_status?(schedule, run.status) -> {:error, :invalid_commit}
       Docket.Run.validate_failure(run) != :ok -> {:error, :invalid_commit}
@@ -625,7 +625,7 @@ defmodule Docket.Test.MemoryBackend do
       proposed_run.graph_id == record.run.graph_id and
       proposed_run.graph_hash == record.run.graph_hash and
       proposed_run.checkpoint_seq == record.run.checkpoint_seq + 1 and
-      is_atom(checkpoint_type) and not is_nil(checkpoint_type) and schedule != :retain_claim and
+      checkpoint_type in Docket.Checkpoint.types() and schedule != :retain_claim and
       valid_schedule?(schedule) and schedule_matches_status?(schedule, proposed_run.status) and
       Docket.Run.validate_failure(proposed_run) == :ok
   end

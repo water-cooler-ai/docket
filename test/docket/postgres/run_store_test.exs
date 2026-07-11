@@ -400,6 +400,80 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert row!(run.id).updated_at == @committed_at
     end
 
+    test "commit rejects malformed proposals before lookup and invalid bindings" do
+      missing = initialized_run("missing")
+      next = %{missing | checkpoint_seq: missing.checkpoint_seq + 1}
+
+      assert {:error, :invalid_commit} =
+               RunStore.commit(TestRepo, :system, proposal(next, nil, missing.checkpoint_seq))
+
+      assert {:error, :invalid_commit} =
+               RunStore.commit(
+                 TestRepo,
+                 :system,
+                 proposal(
+                   %{next | checkpoint_seq: 10},
+                   Ecto.UUID.generate(),
+                   missing.checkpoint_seq
+                 )
+               )
+
+      run = initialized_run("binding")
+      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+      lease = claim_one(@now)
+      changed = %{run | graph_hash: "other", checkpoint_seq: run.checkpoint_seq + 1}
+
+      assert {:error, :invalid_commit} =
+               RunStore.commit(
+                 TestRepo,
+                 :system,
+                 proposal(changed, lease.claim_token, run.checkpoint_seq)
+               )
+    end
+
+    test "commit validates schedule against proposed status" do
+      run = initialized_run("schedule")
+      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+      lease = claim_one(@now)
+      next = %{run | checkpoint_seq: run.checkpoint_seq + 1}
+
+      assert {:error, :invalid_commit} =
+               RunStore.commit(
+                 TestRepo,
+                 :system,
+                 proposal(
+                   next,
+                   lease.claim_token,
+                   run.checkpoint_seq,
+                   {:release_claim, :external}
+                 )
+               )
+    end
+
+    test "concurrent sequence and token race has exactly one durable winner" do
+      run = initialized_run("race")
+      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+      lease = claim_one(@now)
+
+      next = %{
+        run
+        | checkpoint_seq: run.checkpoint_seq + 1,
+          updated_at: DateTime.add(run.updated_at, 1, :second)
+      }
+
+      proposal = proposal(next, lease.claim_token, run.checkpoint_seq)
+
+      results =
+        1..2
+        |> Task.async_stream(fn _ -> RunStore.commit(TestRepo, :system, proposal) end,
+          ordered: false
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      assert Enum.sort(results) == Enum.sort([{:ok, next}, {:error, :stale_fence}])
+      assert {:ok, ^next} = RunStore.fetch_run(TestRepo, :system, run.id)
+    end
+
     test "returns an empty typed batch when no work is eligible" do
       assert {:ok, %{leases: [], poisoned: []}} = claim_due(@now)
 
@@ -789,6 +863,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp claim_one(now, overrides \\ []) do
       assert {:ok, %{leases: [lease], poisoned: []}} = claim_due(now, overrides)
       lease
+    end
+
+    defp proposal(run, token, expected, schedule \\ :retain_claim) do
+      %{
+        run: run,
+        expected_checkpoint_seq: expected,
+        claim_token: token,
+        checkpoint_type: :step_committed,
+        schedule: schedule
+      }
     end
 
     defp current_claim?(run_id, token) do

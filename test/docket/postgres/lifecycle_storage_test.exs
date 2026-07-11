@@ -2,9 +2,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.LifecycleStorageTest do
     use ExUnit.Case, async: false
 
+    import Ecto.Query
+
     @moduletag :postgres
 
-    alias Docket.Postgres.{GraphStore, RunStore, Storage}
+    alias Docket.Postgres.{EventStore, GraphStore, RunStore, Storage}
     alias Docket.Postgres.LifecycleStorageTestRepo, as: TestRepo
     alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}
     alias Docket.Runtime.Moment
@@ -66,6 +68,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def events, do: Docket.Postgres.LifecycleStorageTest.NoopEvents
     end
 
+    defmodule RealBackend do
+      def storage, do: Docket.Postgres.Storage
+      def runs, do: Docket.Postgres.RunStore
+      def events, do: Docket.Postgres.EventStore
+    end
+
     setup_all do
       config = TestRepo.config()
       _ = Ecto.Adapters.Postgres.storage_down(config)
@@ -110,6 +118,120 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                RunStore.inspect_run(TestRepo, :tenantless, moment.run.id)
 
       assert run == moment.run
+      assert TestRepo.aggregate(Event, :count) == 0
+    end
+
+    test "real lifecycle commit atomically advances the fenced run and assigned events" do
+      {graph_id, graph_hash, _document} = publish_graph!("commit-graph")
+      initial = initialization_moment("commit-run", graph_id, graph_hash)
+      backend = {RealBackend, %{repo: TestRepo}}
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
+
+      assert {:ok, %{leases: [lease], poisoned: []}} =
+               RunStore.claim_due(TestRepo, :system, %{
+                 now: @now,
+                 limit: 1,
+                 orphan_ttl_ms: 60_000,
+                 max_claim_attempts: 3
+               })
+
+      later = DateTime.add(@now, 1, :second)
+
+      next =
+        Moment.propose(
+          initial.run,
+          :step_committed,
+          [Moment.event_entry(:node_completed, 1, node_id: "node")],
+          :continue,
+          later
+        )
+
+      assert {:ok, ^next} =
+               Docket.Lifecycle.commit_moment(
+                 backend,
+                 :tenantless,
+                 next,
+                 initial.run.checkpoint_seq,
+                 lease.claim_token
+               )
+
+      expected_run = next.run
+      assert {:ok, ^expected_run} = RunStore.fetch_run(TestRepo, :tenantless, next.run.id)
+
+      assert %{claim_attempts: 0, wake_at: nil, claimed_at: later_claimed} =
+               RunStore.inspect_run(TestRepo, :tenantless, next.run.id) |> elem(1)
+
+      assert %DateTime{} = later_claimed
+      assert TestRepo.aggregate(Event, :count) == 4
+
+      assert Enum.map(TestRepo.all(from(event in Event, order_by: event.seq)), & &1.seq) == [
+               1,
+               2,
+               3,
+               4
+             ]
+
+      assert :ok = EventStore.append_events(TestRepo, :tenantless, next.run.id, next.events)
+      assert TestRepo.aggregate(Event, :count) == 4
+
+      [event | _] = next.events
+      conflicting = %{event | payload: %{"different" => true}}
+
+      assert {:error, :event_conflict} =
+               EventStore.append_events(TestRepo, :tenantless, next.run.id, [conflicting])
+
+      assert {:error, :stale_fence} =
+               Docket.Lifecycle.commit_moment(
+                 backend,
+                 :tenantless,
+                 next,
+                 initial.run.checkpoint_seq,
+                 lease.claim_token
+               )
+
+      assert TestRepo.aggregate(Event, :count) == 4
+    end
+
+    test "event failure rolls a successful advance back to its prior claim and run" do
+      {graph_id, graph_hash, _document} = publish_graph!("advance-rollback-graph")
+      initial = initialization_moment("advance-rollback-run", graph_id, graph_hash)
+      noop_backend = {NoopBackend, %{repo: TestRepo}}
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(noop_backend, :tenantless, initial)
+
+      assert {:ok, %{leases: [lease]}} =
+               RunStore.claim_due(TestRepo, :system, %{
+                 now: @now,
+                 limit: 1,
+                 orphan_ttl_ms: 60_000,
+                 max_claim_attempts: 3
+               })
+
+      next =
+        Moment.propose(
+          initial.run,
+          :step_committed,
+          [],
+          :continue,
+          DateTime.add(@now, 1, :second)
+        )
+
+      assert {:error, :injected_event_failure} =
+               Docket.Lifecycle.commit_moment(
+                 {FailingBackend, %{repo: TestRepo}},
+                 :tenantless,
+                 next,
+                 initial.run.checkpoint_seq,
+                 lease.claim_token
+               )
+
+      initial_run = initial.run
+      assert {:ok, ^initial_run} = RunStore.fetch_run(TestRepo, :tenantless, initial.run.id)
+
+      assert %{claim_attempts: 1, wake_at: nil} =
+               RunStore.inspect_run(TestRepo, :tenantless, initial.run.id) |> elem(1)
+
       assert TestRepo.aggregate(Event, :count) == 0
     end
 

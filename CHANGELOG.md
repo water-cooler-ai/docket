@@ -44,6 +44,10 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   dispatcher concurrency, exact claim-attempt poisoning, token-guarded
   heartbeat/release, and the shared internal mandatory-commit token predicate
   (DCKT-15, #20).
+- Postgres atomic runtime-moment persistence: `RunStore.commit/3` enforces the
+  sequence-and-claim fence while applying schedule state, and
+  `Docket.Postgres.EventStore` idempotently appends assigned, versioned event
+  facts inside the same lifecycle transaction (DCKT-16).
 - Postgres storage/read foundation: `Docket.Postgres.Storage` supplies the
   shared Repo/prefix transaction context; `Docket.Postgres.GraphStore`
   persists immutable content-addressed graph versions with concurrent conflict

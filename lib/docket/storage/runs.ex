@@ -192,7 +192,8 @@ defmodule Docket.Storage.Runs do
   The stored checkpoint sequence must equal
   `proposal.expected_checkpoint_seq`, the current claim must equal the
   non-empty `proposal.claim_token`, and the proposed run's sequence must be
-  exactly `expected_checkpoint_seq + 1`. A stored sequence or token mismatch
+  exactly `expected_checkpoint_seq + 1`. The checkpoint type must be one of
+  `Docket.Checkpoint.types/0`. A stored sequence or token mismatch
   returns `{:error, :stale_fence}` without changing anything. A nil token,
   wrong proposed sequence, run identity mismatch, or invalid schedule/status
   combination returns `{:error, :invalid_commit}`.
