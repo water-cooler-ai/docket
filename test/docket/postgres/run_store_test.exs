@@ -697,6 +697,273 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert row!("run") == snapshot
     end
 
+    test "pre-execution abandon hands the attempt back and schedules the retry wake" do
+      insert_run!("abandon")
+      lease = claim_one(@now)
+      assert lease.claim_attempt == 1
+
+      before_abandon = row!("abandon")
+      abandoned_at = DateTime.add(@now, 1, :second)
+      retry_at = DateTime.add(abandoned_at, 30, :second)
+
+      assert {:ok, :rescheduled} =
+               RunStore.abandon_claim(
+                 TestRepo,
+                 :system,
+                 "abandon",
+                 lease.claim_token,
+                 abandon_policy(abandoned_at, retry_at)
+               )
+
+      abandoned = row!("abandon")
+      assert abandoned.claim_token == nil
+      assert abandoned.claimed_at == nil
+      assert abandoned.wake_at == retry_at
+      assert abandoned.claim_attempts == 0
+      assert abandoned.claim_abandons == 1
+      assert abandoned.poisoned_at == nil
+      assert abandoned.poison_reason == nil
+      assert abandoned.checkpoint_seq == before_abandon.checkpoint_seq
+      assert abandoned.updated_at == before_abandon.updated_at
+      assert abandoned.state == before_abandon.state
+
+      assert {:ok, %{run: run} = info} = RunStore.inspect_run(TestRepo, :system, "abandon")
+      assert info.claim_abandons == 1
+      assert info.claim_attempts == 0
+      assert info.wake_at == retry_at
+      refute Docket.RunInfo.poisoned?(info)
+      assert run.updated_at == before_abandon.updated_at
+
+      assert {:ok, %{leases: [], poisoned: []}} = claim_due(abandoned_at)
+      relaunched = claim_one(retry_at)
+      assert relaunched.claim_attempt == 1
+      assert relaunched.claim_token != lease.claim_token
+    end
+
+    test "abandon requires :system scope and a coherent future-wake policy" do
+      insert_run!("abandon-policy")
+      lease = claim_one(@now)
+      policy = abandon_policy(@now, DateTime.add(@now, 1, :second))
+
+      assert_raise ArgumentError, fn ->
+        RunStore.abandon_claim(TestRepo, :tenantless, "abandon-policy", lease.claim_token, policy)
+      end
+
+      for invalid <- [
+            Map.delete(policy, :retry_at),
+            %{policy | retry_at: DateTime.add(policy.now, -1, :second)},
+            %{policy | max_claim_abandons: 0},
+            %{policy | expected_checkpoint_seq: -1},
+            %{policy | now: nil}
+          ] do
+        assert_raise ArgumentError, fn ->
+          RunStore.abandon_claim(TestRepo, :system, "abandon-policy", lease.claim_token, invalid)
+        end
+      end
+
+      assert row!("abandon-policy").claim_token == lease.claim_token
+    end
+
+    test "stale abandon after steal, commit, or signal mutation cannot disturb the winner" do
+      insert_run!("stale-abandon")
+      first = claim_one(@now)
+      stolen_at = DateTime.add(@now, 4, :second)
+      stolen = claim_one(stolen_at, orphan_ttl_ms: 0)
+      assert stolen.claim_token != first.claim_token
+
+      winner = row!("stale-abandon")
+      policy = abandon_policy(stolen_at, DateTime.add(stolen_at, 30, :second))
+
+      assert {:ok, :stale} =
+               RunStore.abandon_claim(
+                 TestRepo,
+                 :system,
+                 "stale-abandon",
+                 first.claim_token,
+                 policy
+               )
+
+      assert {:ok, :stale} =
+               RunStore.abandon_claim(TestRepo, :system, "stale-abandon", "not-a-uuid", policy)
+
+      assert {:ok, :stale} =
+               RunStore.abandon_claim(TestRepo, :system, "missing-run", first.claim_token, policy)
+
+      assert row!("stale-abandon") == winner
+
+      # A retain_claim commit keeps the token but advances the fence; a later
+      # abandon carrying the lease's original sequence must not regress the
+      # freshly reset attempt counter.
+      run =
+        initialized_run("stale-abandon", checkpoint_seq: 8, started_at: @now, updated_at: @now)
+
+      proposal = proposal(run, stolen.claim_token, 7)
+      assert {:ok, ^run} = RunStore.commit(TestRepo, :system, proposal)
+
+      committed = row!("stale-abandon")
+      assert committed.claim_attempts == 0
+      assert committed.claim_token == stolen.claim_token
+
+      assert {:ok, :stale} =
+               RunStore.abandon_claim(
+                 TestRepo,
+                 :system,
+                 "stale-abandon",
+                 stolen.claim_token,
+                 policy
+               )
+
+      assert row!("stale-abandon") == committed
+    end
+
+    test "abandon races a concurrent steal to exactly one effect" do
+      insert_run!("abandon-race")
+      first = claim_one(@now)
+      race_at = DateTime.add(@now, 4, :second)
+      policy = abandon_policy(race_at, DateTime.add(race_at, 30, :second))
+
+      [abandon_result, steal_result] =
+        [
+          fn ->
+            RunStore.abandon_claim(TestRepo, :system, "abandon-race", first.claim_token, policy)
+          end,
+          fn -> claim_due(race_at, orphan_ttl_ms: 0) end
+        ]
+        |> Task.async_stream(& &1.(), ordered: true, timeout: 15_000)
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      row = row!("abandon-race")
+
+      case abandon_result do
+        {:ok, :rescheduled} ->
+          case steal_result do
+            {:ok, %{leases: [lease], poisoned: []}} ->
+              # The steal re-claimed the already-abandoned row.
+              assert lease.claim_token != first.claim_token
+              assert row.claim_token == lease.claim_token
+              assert row.claim_attempts == 1
+              assert row.claim_abandons == 1
+
+            {:ok, %{leases: [], poisoned: []}} ->
+              assert row.claim_token == nil
+              assert row.wake_at == policy.retry_at
+              assert row.claim_attempts == 0
+              assert row.claim_abandons == 1
+          end
+
+        {:ok, :stale} ->
+          # The steal won first; the stale abandon left its claim intact.
+          assert {:ok, %{leases: [lease], poisoned: []}} = steal_result
+          assert row.claim_token == lease.claim_token
+          assert row.claim_attempts == 2
+          assert row.claim_abandons == 0
+      end
+    end
+
+    test "abandon at the configured maximum poisons with its own reason" do
+      insert_run!("abandon-poison")
+      max = 2
+
+      final_now =
+        Enum.reduce(1..max, @now, fn cycle, now ->
+          lease = claim_one(now)
+          abandoned_at = DateTime.add(now, 1, :second)
+          retry_at = DateTime.add(abandoned_at, 1, :second)
+          policy = abandon_policy(abandoned_at, retry_at, max_claim_abandons: max)
+
+          assert {:ok, :rescheduled} =
+                   RunStore.abandon_claim(
+                     TestRepo,
+                     :system,
+                     "abandon-poison",
+                     lease.claim_token,
+                     policy
+                   )
+
+          assert row!("abandon-poison").claim_abandons == cycle
+          retry_at
+        end)
+
+      lease = claim_one(final_now)
+      poisoned_at = DateTime.add(final_now, 1, :second)
+
+      policy =
+        abandon_policy(poisoned_at, DateTime.add(poisoned_at, 1, :second),
+          max_claim_abandons: max
+        )
+
+      assert {:ok, :poisoned} =
+               RunStore.abandon_claim(
+                 TestRepo,
+                 :system,
+                 "abandon-poison",
+                 lease.claim_token,
+                 policy
+               )
+
+      poisoned = row!("abandon-poison")
+      assert poisoned.status == :running
+      assert poisoned.claim_token == nil
+      assert poisoned.claimed_at == nil
+      assert poisoned.wake_at == nil
+      assert poisoned.claim_abandons == max
+      assert poisoned.poisoned_at == poisoned_at
+      assert poisoned.poison_reason == "max_claim_abandons_exceeded"
+
+      assert {:ok, %{leases: [], poisoned: []}} =
+               claim_due(DateTime.add(poisoned_at, 1, :hour), orphan_ttl_ms: 0)
+
+      recovered_at = DateTime.add(poisoned_at, 2, :hour)
+
+      assert {:ok, _run} =
+               RunStore.retry_poisoned_run(TestRepo, :system, "abandon-poison", recovered_at)
+
+      recovered = row!("abandon-poison")
+      assert recovered.claim_abandons == 0
+      assert recovered.claim_attempts == 0
+      assert recovered.poisoned_at == nil
+      assert recovered.wake_at == recovered_at
+    end
+
+    test "abandons never advance attempt poison and committed progress resets the abandon count" do
+      insert_run!("abandon-progress")
+
+      final_now =
+        Enum.reduce(1..5, @now, fn _cycle, now ->
+          lease = claim_one(now, max_claim_attempts: 3)
+          assert lease.claim_attempt == 1
+
+          abandoned_at = DateTime.add(now, 1, :second)
+          retry_at = DateTime.add(abandoned_at, 1, :second)
+
+          assert {:ok, :rescheduled} =
+                   RunStore.abandon_claim(
+                     TestRepo,
+                     :system,
+                     "abandon-progress",
+                     lease.claim_token,
+                     abandon_policy(abandoned_at, retry_at, max_claim_abandons: 10)
+                   )
+
+          retry_at
+        end)
+
+      assert row!("abandon-progress").claim_abandons == 5
+      assert row!("abandon-progress").claim_attempts == 0
+
+      lease = claim_one(final_now, max_claim_attempts: 3)
+
+      run =
+        initialized_run("abandon-progress", checkpoint_seq: 8, started_at: @now, updated_at: @now)
+
+      proposal = proposal(run, lease.claim_token, 7, {:release_claim, :immediate})
+      assert {:ok, ^run} = RunStore.commit(TestRepo, :system, proposal)
+
+      committed = row!("abandon-progress")
+      assert committed.claim_abandons == 0
+      assert committed.claim_attempts == 0
+    end
+
     test "a claim is stealable only after the exact TTL boundary" do
       insert_run!("run")
       first = claim_one(@now)
@@ -863,6 +1130,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp policy(now, overrides \\ []) do
       Map.merge(
         %{now: now, limit: 1, orphan_ttl_ms: 1_000, max_claim_attempts: 3},
+        Map.new(overrides)
+      )
+    end
+
+    defp abandon_policy(now, retry_at, overrides \\ []) do
+      Map.merge(
+        %{expected_checkpoint_seq: 7, now: now, retry_at: retry_at, max_claim_abandons: 3},
         Map.new(overrides)
       )
     end

@@ -37,7 +37,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @run_columns ~w(
       id run_id tenant_id graph_id graph_hash status step state
       checkpoint_seq latest_checkpoint_type claim_token
-      claimed_at wake_at claim_attempts poisoned_at poison_reason
+      claimed_at wake_at claim_attempts claim_abandons poisoned_at poison_reason
       inserted_at started_at updated_at finished_at
     )
 
@@ -243,7 +243,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
          ~w(docket_runs_running_schedule_check)},
         {"negative step", [step: -1], ~w(docket_runs_counters_check)},
         {"negative checkpoint_seq", [checkpoint_seq: -1], ~w(docket_runs_counters_check)},
-        {"negative claim_attempts", [claim_attempts: -1], ~w(docket_runs_counters_check)}
+        {"negative claim_attempts", [claim_attempts: -1], ~w(docket_runs_counters_check)},
+        {"negative claim_abandons", [claim_abandons: -1], ~w(docket_runs_counters_check)}
       ]
 
       for {label, overrides, constraints} <- invalid_tuples do
@@ -420,6 +421,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         claimed_at: nil,
         wake_at: now,
         claim_attempts: 0,
+        claim_abandons: 0,
         poisoned_at: nil,
         poison_reason: nil,
         inserted_at: now,

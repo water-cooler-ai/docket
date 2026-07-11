@@ -14,8 +14,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         claimed, externally parked, poisoned, or terminal.
       * `claim_token` / `claimed_at` — execution ownership.
       * `checkpoint_seq` — the optimistic commit fence.
-      * `claim_attempts` — consecutive claims launched without committed
-        progress.
+      * `claim_attempts` — consecutive claims consumed by launched execution
+        without committed progress.
+      * `claim_abandons` — consecutive pre-execution claim abandons without
+        committed progress.
       * `poisoned_at` / `poison_reason` — paired poison facts, both `nil`
         for a healthy run.
 
@@ -45,6 +47,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             claimed_at: DateTime.t() | nil,
             wake_at: DateTime.t() | nil,
             claim_attempts: non_neg_integer(),
+            claim_abandons: non_neg_integer(),
             poisoned_at: DateTime.t() | nil,
             poison_reason: String.t() | nil,
             inserted_at: DateTime.t() | nil,
@@ -67,6 +70,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       field(:claimed_at, :utc_datetime_usec)
       field(:wake_at, :utc_datetime_usec)
       field(:claim_attempts, :integer, default: 0)
+      field(:claim_abandons, :integer, default: 0)
       field(:poisoned_at, :utc_datetime_usec)
       field(:poison_reason, :string)
       field(:started_at, :utc_datetime_usec)
@@ -89,6 +93,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :claimed_at,
       :wake_at,
       :claim_attempts,
+      :claim_abandons,
       :poisoned_at,
       :poison_reason,
       :started_at,
@@ -111,6 +116,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> validate_number(:step, greater_than_or_equal_to: 0)
       |> validate_number(:checkpoint_seq, greater_than_or_equal_to: 0)
       |> validate_number(:claim_attempts, greater_than_or_equal_to: 0)
+      |> validate_number(:claim_abandons, greater_than_or_equal_to: 0)
       |> unique_constraint(:run_id)
       |> foreign_key_constraint(:graph_hash, name: :docket_runs_graph_hash_fkey)
     end

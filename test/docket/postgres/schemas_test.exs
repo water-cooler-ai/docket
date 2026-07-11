@@ -80,7 +80,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       test "rejects negative counters" do
-        for field <- [:step, :checkpoint_seq, :claim_attempts] do
+        for field <- [:step, :checkpoint_seq, :claim_attempts, :claim_abandons] do
           changeset = Run.changeset(Map.put(@valid_run, field, -1))
 
           refute changeset.valid?

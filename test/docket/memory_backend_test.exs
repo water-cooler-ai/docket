@@ -84,6 +84,15 @@ defmodule Docket.MemoryBackendTest do
     MemoryBackend.claim_due(backend, :system, claim_policy(now, opts))
   end
 
+  defp abandon_policy(now, retry_at, opts) do
+    %{
+      expected_checkpoint_seq: Keyword.get(opts, :expected_checkpoint_seq, 1),
+      now: now,
+      retry_at: retry_at,
+      max_claim_abandons: Keyword.get(opts, :max_claim_abandons, 3)
+    }
+  end
+
   defp claim_one(backend, now, opts \\ []) do
     assert {:ok, %{leases: [lease], poisoned: []}} =
              claim_due(backend, now, Keyword.put(opts, :limit, 1))
@@ -686,6 +695,79 @@ defmodule Docket.MemoryBackendTest do
 
     assert MemoryBackend.claim(b, "r1") == nil
     assert MemoryBackend.wake_at(b, "r1") == released_at
+  end
+
+  test "pre-execution abandon is fenced, hands the attempt back, and escalates to poison", %{
+    backend: b
+  } do
+    assert {:ok, _} = initialize(b, run("r1"))
+    first = claim_one(b, @now)
+    abandoned_at = DateTime.add(@now, 1, :second)
+    retry_at = DateTime.add(abandoned_at, 30, :second)
+    policy = abandon_policy(abandoned_at, retry_at, max_claim_abandons: 2)
+
+    assert_raise ArgumentError, fn ->
+      MemoryBackend.abandon_claim(b, :tenantless, "r1", first.claim_token, policy)
+    end
+
+    assert_raise ArgumentError, fn ->
+      MemoryBackend.abandon_claim(b, :system, "r1", first.claim_token, %{
+        policy
+        | retry_at: DateTime.add(abandoned_at, -1, :second)
+      })
+    end
+
+    assert {:ok, :stale} = MemoryBackend.abandon_claim(b, :system, "r1", "wrong", policy)
+
+    assert {:ok, :stale} =
+             MemoryBackend.abandon_claim(b, :system, "r1", first.claim_token, %{
+               policy
+               | expected_checkpoint_seq: 99
+             })
+
+    assert MemoryBackend.claim(b, "r1") == first.claim_token
+
+    assert {:ok, :rescheduled} =
+             MemoryBackend.abandon_claim(b, :system, "r1", first.claim_token, policy)
+
+    assert {:ok, info} = MemoryBackend.inspect_run(b, :system, "r1")
+    assert info.claim_attempts == 0
+    assert info.claim_abandons == 1
+    assert info.wake_at == retry_at
+    assert MemoryBackend.claim(b, "r1") == nil
+
+    second = claim_one(b, retry_at)
+
+    assert {:ok, :rescheduled} =
+             MemoryBackend.abandon_claim(b, :system, "r1", second.claim_token, %{
+               policy
+               | now: retry_at,
+                 retry_at: DateTime.add(retry_at, 30, :second)
+             })
+
+    third = claim_one(b, DateTime.add(retry_at, 30, :second))
+
+    assert {:ok, :poisoned} =
+             MemoryBackend.abandon_claim(b, :system, "r1", third.claim_token, %{
+               policy
+               | now: DateTime.add(retry_at, 31, :second),
+                 retry_at: DateTime.add(retry_at, 60, :second)
+             })
+
+    assert {:ok, info} = MemoryBackend.inspect_run(b, :system, "r1")
+    assert info.poison_reason == "max_claim_abandons_exceeded"
+    assert info.poisoned_at == DateTime.add(retry_at, 31, :second)
+    assert info.claim_abandons == 2
+    assert info.wake_at == nil
+    assert MemoryBackend.claim(b, "r1") == nil
+
+    recovered_at = DateTime.add(retry_at, 90, :second)
+    assert {:ok, _} = MemoryBackend.retry_poisoned_run(b, :system, "r1", recovered_at)
+
+    assert {:ok, info} = MemoryBackend.inspect_run(b, :system, "r1")
+    assert info.claim_abandons == 0
+    assert info.claim_attempts == 0
+    refute Docket.RunInfo.poisoned?(info)
   end
 
   test "advance commit requires the current non-nil token and exact next sequence", %{backend: b} do

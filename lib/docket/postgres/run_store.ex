@@ -6,8 +6,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     A claim is the current authority to commit a run, not evidence that only
     one process exists. An expired holder can overlap a new holder after a
-    steal, but only the freshly stored token can refresh, release, or satisfy
-    the commit fence.
+    steal, but only the freshly stored token can refresh, release, abandon,
+    or satisfy the commit fence.
 
     Claim acquisition is one short database statement. It locks bounded,
     separately indexed ready and expired candidate sets with `SKIP LOCKED`,
@@ -64,6 +64,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             claimed_at: nil,
             wake_at: wake_at,
             claim_attempts: 0,
+            claim_abandons: 0,
             poisoned_at: nil,
             poison_reason: nil
           })
@@ -112,6 +113,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             wake_at: row.wake_at,
             claimed_at: row.claimed_at,
             claim_attempts: row.claim_attempts,
+            claim_abandons: row.claim_abandons,
             poisoned_at: row.poisoned_at,
             poison_reason: row.poison_reason
           )
@@ -219,6 +221,98 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       raise ArgumentError, "release_claim scope must be :system, got: #{inspect(scope)}"
     end
 
+    @doc """
+    Hands back a pre-execution claim under a token-and-sequence fence.
+
+    One conditional UPDATE reverses the acquisition's attempt increment,
+    counts the abandon, and either records the policy's retry wake or — once
+    the abandon count reached the policy maximum — poisons the run with
+    reason `"max_claim_abandons_exceeded"`. A stale token or an advanced
+    checkpoint sequence matches nothing and reports `{:ok, :stale}`.
+    """
+    @spec abandon_claim(
+            ctx(),
+            :system,
+            String.t(),
+            Docket.Storage.Runs.claim_token(),
+            Docket.Storage.Runs.abandon_policy()
+          ) :: Docket.Storage.Runs.abandon_result()
+    def abandon_claim(ctx, :system, run_id, claim_token, policy) do
+      {repo, prefix} = Storage.context!(ctx)
+
+      %{expected_checkpoint_seq: seq, now: now, retry_at: retry_at, max_claim_abandons: max} =
+        validate_abandon_policy!(policy)
+
+      predicate =
+        dynamic(
+          [run],
+          ^current_claim(run_id, claim_token) and run.checkpoint_seq == ^seq
+        )
+
+      updates = [
+        set: [
+          claim_token: nil,
+          claimed_at: nil,
+          claim_attempts: dynamic([run], fragment("GREATEST(? - 1, 0)", run.claim_attempts)),
+          claim_abandons:
+            dynamic(
+              [run],
+              fragment(
+                "CASE WHEN ? < ? THEN ? + 1 ELSE ? END",
+                run.claim_abandons,
+                ^max,
+                run.claim_abandons,
+                run.claim_abandons
+              )
+            ),
+          wake_at:
+            dynamic(
+              [run],
+              fragment(
+                "CASE WHEN ? < ? THEN ? ELSE NULL END",
+                run.claim_abandons,
+                ^max,
+                type(^retry_at, :utc_datetime_usec)
+              )
+            ),
+          poisoned_at:
+            dynamic(
+              [run],
+              fragment(
+                "CASE WHEN ? < ? THEN NULL ELSE ? END",
+                run.claim_abandons,
+                ^max,
+                type(^now, :utc_datetime_usec)
+              )
+            ),
+          poison_reason:
+            dynamic(
+              [run],
+              fragment(
+                "CASE WHEN ? < ? THEN NULL ELSE 'max_claim_abandons_exceeded' END",
+                run.claim_abandons,
+                ^max
+              )
+            )
+        ]
+      ]
+
+      query =
+        predicate
+        |> claim_query(prefix)
+        |> select([run], run.poisoned_at)
+
+      case repo.update_all(query, updates, log: false) do
+        {0, _} -> {:ok, :stale}
+        {1, [nil]} -> {:ok, :rescheduled}
+        {1, [%DateTime{}]} -> {:ok, :poisoned}
+      end
+    end
+
+    def abandon_claim(_ctx, scope, _run_id, _claim_token, _policy) do
+      raise ArgumentError, "abandon_claim scope must be :system, got: #{inspect(scope)}"
+    end
+
     @doc "Commits an exact-next run document under the current claim fence."
     @spec commit(ctx(), Docket.Storage.scope(), Docket.Storage.Runs.commit_proposal()) ::
             {:ok, Docket.Run.t()} | {:error, :stale_fence | :invalid_commit | :not_found}
@@ -303,6 +397,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                        claimed_at: nil,
                        wake_at: normalize_database_datetime(now),
                        claim_attempts: 0,
+                       claim_abandons: 0,
                        poisoned_at: nil,
                        poison_reason: nil
                      ]
@@ -553,6 +648,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         checkpoint_seq: attrs.checkpoint_seq,
         latest_checkpoint_type: checkpoint_type,
         claim_attempts: 0,
+        claim_abandons: 0,
         poisoned_at: nil,
         poison_reason: nil,
         started_at: attrs.started_at,
@@ -745,6 +841,33 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       raise ArgumentError,
             "claim policy requires DateTime now, positive limit/max_claim_attempts, " <>
               "and non-negative orphan_ttl_ms, got: #{inspect(policy)}"
+    end
+
+    defp validate_abandon_policy!(
+           %{
+             expected_checkpoint_seq: seq,
+             now: %DateTime{} = now,
+             retry_at: %DateTime{} = retry_at,
+             max_claim_abandons: max
+           } = policy
+         )
+         when is_integer(seq) and seq >= 0 and is_integer(max) and max > 0 do
+      if DateTime.compare(retry_at, now) == :lt do
+        raise ArgumentError,
+              "abandon policy retry_at must not precede now, got: #{inspect(policy)}"
+      end
+
+      %{
+        policy
+        | now: normalize_database_datetime(now),
+          retry_at: normalize_database_datetime(retry_at)
+      }
+    end
+
+    defp validate_abandon_policy!(policy) do
+      raise ArgumentError,
+            "abandon policy requires non-negative expected_checkpoint_seq, DateTime now " <>
+              "and retry_at, and positive max_claim_abandons, got: #{inspect(policy)}"
     end
 
     defp normalize_database_datetime(%DateTime{} = datetime) do
