@@ -292,7 +292,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, ^run} = RunStore.fetch_run(TestRepo, :system, run.id)
       assert {:ok, refreshed_info} = RunStore.inspect_run(TestRepo, :system, run.id)
       assert refreshed_info.run == run
-      assert refreshed_info.claimed_at == refreshed_at
+      assert DateTime.compare(refreshed_info.claimed_at, @now) == :gt
 
       released_at = DateTime.add(@now, 2, :second)
 
@@ -353,8 +353,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  refreshed_at
                )
 
+      # Refresh writes the database clock, so only monotone advance is
+      # observable here; precision is the column's native microsecond.
       assert {:ok, refreshed} = RunStore.inspect_run(TestRepo, :system, run.id)
-      assert refreshed.claimed_at.microsecond == {123_000, 6}
+      assert DateTime.compare(refreshed.claimed_at, claimed_at) == :gt
 
       released_at = ~U[2026-07-10 12:00:02Z]
 
@@ -516,13 +518,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       for lease <- leases do
         assert Map.keys(lease) |> Enum.sort() ==
-                 ~w(claim_attempt claim_token claimed_at checkpoint_seq graph_hash graph_id run_id)a
+                 ~w(claim_attempt claim_token claimed_at checkpoint_seq graph_hash graph_id orphan_ttl_ms run_id)a
                  |> Enum.sort()
 
         assert lease.graph_id == "graph"
         assert lease.graph_hash == "hash"
         assert lease.checkpoint_seq == 7
         assert lease.claim_attempt == 1
+        assert lease.orphan_ttl_ms == 1_000
         assert {:ok, _} = Ecto.UUID.cast(lease.claim_token)
 
         row = row!(lease.run_id)
@@ -837,10 +840,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert :ok =
                RunStore.refresh_claim(TestRepo, :system, "run", first.claim_token, expired_at)
 
-      assert row!("run").claimed_at == expired_at
+      refreshed = row!("run")
+      assert DateTime.compare(refreshed.claimed_at, original.claimed_at) == :gt
       assert {:ok, %{leases: [], poisoned: []}} = claim_due(expired_at)
 
-      stolen_at = DateTime.add(@now, 4, :second)
+      stolen_at = DateTime.add(DateTime.utc_now(), 10, :second)
       stolen = claim_one(stolen_at)
       assert stolen.claim_token != first.claim_token
 
@@ -863,6 +867,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert row!("run") == winner
       assert :ok = RunStore.release_claim(TestRepo, :system, "run", first.claim_token, stale_time)
+      assert row!("run") == winner
+
+      {:ok, committed} = RunStore.fetch_run(TestRepo, :system, "run")
+      loser_next = %{committed | checkpoint_seq: committed.checkpoint_seq + 1}
+
+      assert {:error, :stale_fence} =
+               RunStore.commit(
+                 TestRepo,
+                 :system,
+                 proposal(loser_next, first.claim_token, committed.checkpoint_seq)
+               )
+
       assert row!("run") == winner
 
       released_at = DateTime.add(stale_time, 1, :second)
@@ -1304,7 +1320,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert :ok =
                RunStore.refresh_claim(ctx, :system, "prefixed", lease.claim_token, refreshed_at)
 
-      assert row!("prefixed", "docket_private").claimed_at == refreshed_at
+      assert DateTime.compare(row!("prefixed", "docket_private").claimed_at, @now) == :gt
 
       released_at = DateTime.add(@now, 2, :second)
 

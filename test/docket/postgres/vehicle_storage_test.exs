@@ -40,6 +40,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def events, do: Docket.Postgres.VehicleStorageTest.FailingEvents
     end
 
+    defmodule RelayRuns do
+      defdelegate fetch_run(ctx, scope, run_id), to: Docket.Postgres.RunStore
+      defdelegate release_claim(ctx, scope, run_id, token, now), to: Docket.Postgres.RunStore
+      defdelegate abandon_claim(ctx, scope, run_id, token, policy), to: Docket.Postgres.RunStore
+      defdelegate claim_due(ctx, scope, policy), to: Docket.Postgres.RunStore
+      defdelegate commit(ctx, scope, proposal), to: Docket.Postgres.RunStore
+
+      def refresh_claim(ctx, scope, run_id, token, now) do
+        result = Docket.Postgres.RunStore.refresh_claim(ctx, scope, run_id, token, now)
+
+        case Process.whereis(:storage_heartbeat_relay) do
+          nil -> :ok
+          pid -> send(pid, {:refreshed, result})
+        end
+
+        result
+      end
+    end
+
+    defmodule RelayBackend do
+      def storage, do: Docket.Postgres.Storage
+      def graphs, do: Docket.Postgres.GraphStore
+      def runs, do: Docket.Postgres.VehicleStorageTest.RelayRuns
+      def events, do: Docket.Postgres.EventStore
+    end
+
     setup_all do
       config = TestRepo.config()
       _ = Ecto.Adapters.Postgres.storage_down(config)
@@ -109,6 +135,44 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       # Pool size is 1: this query succeeds only if the vehicle holds no
       # checked-out connection while the node executes.
       assert %{rows: [[1]]} = TestRepo.query!("SELECT 1", [], timeout: 2_000)
+
+      send(node_pid, :release)
+      assert_receive {:DOWN, ^monitor, :process, ^vehicle, :normal}, 5_000
+
+      assert {:ok, done} = RunStore.fetch_run(context, :system, run.id)
+      assert done.status == :done
+    end
+
+    test "heartbeat refreshes the claim from a companion process while node work blocks", %{
+      context: context,
+      backend: backend
+    } do
+      rtg = publish!(context, Graphs.blocking())
+      run = start_run!(backend, rtg, %{})
+      lease = claim!(context, DateTime.utc_now())
+      supervisor = start_supervised!({Task.Supervisor, name: __MODULE__.HeartbeatSup})
+      Process.register(self(), :storage_heartbeat_relay)
+
+      opts =
+        [backend: {RelayBackend, context}, graph_cache: false]
+        |> Keyword.merge(
+          context: %{coordinator: self()},
+          task_supervisor: supervisor,
+          heartbeat: [interval_ms: 50]
+        )
+
+      assert {:ok, vehicle} = Vehicle.launch(lease, opts)
+      monitor = Process.monitor(vehicle)
+
+      assert_receive {:blocked, node_pid, "blocker", 1}, 5_000
+
+      # Pool size is 1 and node work holds no connection, so the companion
+      # heartbeat's refresh gets the pool to itself while the node blocks.
+      assert_receive {:refreshed, :ok}, 5_000
+      assert_receive {:refreshed, :ok}, 5_000
+
+      assert {:ok, info} = RunStore.inspect_run(context, :system, run.id)
+      assert DateTime.compare(info.claimed_at, lease.claimed_at) == :gt
 
       send(node_pid, :release)
       assert_receive {:DOWN, ^monitor, :process, ^vehicle, :normal}, 5_000

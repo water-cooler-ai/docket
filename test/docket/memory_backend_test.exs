@@ -703,6 +703,14 @@ defmodule Docket.MemoryBackendTest do
              MemoryBackend.refresh_claim(b, :system, "r1", "wrong", refreshed_at)
 
     assert :ok = MemoryBackend.refresh_claim(b, :system, "r1", first.claim_token, refreshed_at)
+
+    # A refresh never moves the claimed time backward: an earlier caller
+    # clock succeeds but leaves the fresher stamp in place.
+    earlier = DateTime.add(refreshed_at, -10, :second)
+    assert :ok = MemoryBackend.refresh_claim(b, :system, "r1", first.claim_token, earlier)
+    assert {:ok, info} = MemoryBackend.inspect_run(b, :system, "r1")
+    assert info.claimed_at == refreshed_at
+
     assert :ok = MemoryBackend.release_claim(b, :system, "r1", "wrong", refreshed_at)
     assert MemoryBackend.claim(b, "r1") == first.claim_token
 

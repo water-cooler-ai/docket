@@ -31,7 +31,7 @@ PostgreSQL guide now documents the landed design and names the remaining gaps.
 | Lifecycle composer | Implemented | `Docket.Lifecycle` owns start, moment commit, and signal transaction recipes. |
 | Durable facade | Implemented against a backend | Publication, start, reads, signals, poison retry, and bounded await are exercised with the conformance backend. |
 | Dispatcher | Implemented | Demand-bounded, jittered polling and lease launch/release behavior exist. |
-| Execution vehicle | Implemented | `Docket.Postgres.Vehicle` fetches and compiles the graph for a lease (with an optional generation-checked cache), drains fenced moments, and abandons, releases, or parks the run. Claim freshness during long supersteps is still open. |
+| Execution vehicle | Implemented | `Docket.Postgres.Vehicle` fetches and compiles the graph for a lease (with an optional generation-checked cache), drains fenced moments, and abandons, releases, or parks the run. Claim freshness during long supersteps is configurable: strict timeout alignment by default, opt-in token-guarded heartbeat with stale-result rejection. |
 | Backend supervision assembly | Missing | Nothing wires Repo context, dispatcher, and vehicle launch into `Docket.Postgres.child_spec/1`. |
 | Deterministic backend test mode | Missing | There is no public PostgreSQL drain/manual testing API. |
 | Pruning/retention | Missing | There is no event/run pruner or public retention configuration. |
@@ -122,11 +122,10 @@ at minimum:
 
 1. `Docket.Postgres` implementing the backend bundle and validating its
    configuration;
-2. claim freshness during supersteps longer than the orphan TTL;
-3. supervision wiring and an end-to-end PostgreSQL test proving start,
+2. supervision wiring and an end-to-end PostgreSQL test proving start,
    dispatch, crash recovery, signal, and terminal completion;
-4. a documented deterministic test mode; and
-5. a deliberate decision to remove or explicitly retain the legacy facade.
+3. a documented deterministic test mode; and
+4. a deliberate decision to remove or explicitly retain the legacy facade.
 
 Pruning and notification-assisted wakeups may be separately scoped, but the
 release documentation must not imply they exist until their code lands.
