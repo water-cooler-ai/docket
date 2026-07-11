@@ -101,10 +101,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     stretch of node execution between two commits shorter than the
     dispatcher's `orphan_ttl_ms`: bound node work with per-node `timeout_ms`
     policies under an executor that enforces them (`Docket.Executor.Task`;
-    `Docket.Executor.Local` cannot), and remember that a superstep runs its
-    activations serially, so per-node bounds stack within one superstep. The
-    vehicle does not verify this alignment: per-node timeouts cannot bound a
-    superstep, so a runtime check would promise freshness it cannot deliver.
+    `Docket.Executor.Local` cannot). Activations in a superstep run
+    concurrently, so the between-commit stretch is governed by the slowest
+    activation. The vehicle does not verify this alignment: per-node
+    timeouts cannot bound a superstep, so a runtime check would promise
+    freshness it cannot deliver.
 
     **Token-guarded heartbeat** (`heartbeat: [interval_ms: 5_000]`). The
     vehicle spawns one companion process per drain that refreshes the claim
@@ -127,12 +128,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     moment at the next pre-commit boundary with `{:discarded, :claim_lost}`
     and stops, firing no observers. If loss lands while a commit is already
     in flight, the commit fence rejects it - the fence, not the heartbeat,
-    is the arbiter. A heartbeat that cannot reach the store retries every
-    tick while the lease could still be fresh; once staleness can no longer
-    be ruled out it gives up, and the vehicle stops with
-    `{:discarded, :heartbeat_down}`, which widens the at-least-once
-    duplication window by the one discarded superstep. Transient refresh
-    failures inside that budget never disturb a drain.
+    is the arbiter. The pre-commit freshness check is advisory throughout:
+    it exists to stop early and skip observers for doomed moments; the
+    token-and-sequence fence remains the sole arbiter of every commit, so
+    an undetected steal is still rejected durably.
+
+    A heartbeat that cannot reach the store retries every tick while the
+    lease could still be fresh; once staleness can no longer be ruled out
+    it gives up, and the vehicle stops with `{:discarded, :heartbeat_down}`,
+    which widens the at-least-once duplication window by the one discarded
+    superstep. Transient refresh failures inside that budget never disturb
+    a drain. Each refresh attempt is itself bounded by the remaining
+    staleness budget: a store call that blocks past it - pool starvation,
+    an unresponsive database - is abandoned and counted as a failure, so an
+    alive-but-stuck heartbeat can never vouch for freshness beyond the
+    bound. Keep store call timeouts finite and below the TTL so slow calls
+    surface as retryable failures rather than abandoned attempts.
 
     ## Durable-state safety versus external-effect dedupe
 
@@ -153,9 +164,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       * Node execution holds no checked-out database connection; connections
         are used only inside each commit's transaction and each heartbeat
         refresh.
-      * Node code under `Docket.Executor.Local` runs in the vehicle process;
-        if it traps exits, a graceful shutdown only kills the vehicle at the
-        supervisor's kill timeout, and a configured heartbeat keeps the
+      * Node code runs under the vehicle's dispatcher tasks; node code that
+        traps or ignores exit signals can stall a graceful shutdown until
+        the supervisor's kill timeout, and a configured heartbeat keeps the
         claim fresh until the vehicle actually dies.
       * Assemblies should start the vehicle `Task.Supervisor` before the
         dispatcher and give its children a shutdown of at least the
@@ -638,9 +649,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     # ---------------------------------------------------------------------
 
     # The one-word :atomics flag is the loss channel: 0 = fresh, 1 = the
-    # token went stale, 2 = freshness can no longer be vouched for. Node
-    # code runs in the vehicle process and may consume mailbox messages, so
-    # no monitor message is load-bearing on the vehicle side.
+    # token went stale, 2 = freshness can no longer be vouched for. The
+    # vehicle's mailbox carries executor coordination traffic and is not a
+    # safe channel, so no monitor message is load-bearing on the vehicle
+    # side; the flag is always written before its writer exits.
     @heartbeat_fresh 0
     @heartbeat_claim_lost 1
     @heartbeat_down 2
@@ -737,29 +749,76 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     # A stale token is authoritative loss. Anything else is a transient
     # store failure: retry every tick while the next attempt could still
-    # land inside the lease's staleness bound, then give up loudly. The
-    # flag is written before this process exits, so a set flag is always
-    # observable by the time the process is dead.
+    # land inside the lease's staleness bound, then give up loudly.
     defp heartbeat_refresh(hb) do
-      case attempt_refresh(hb) do
+      case attempt_refresh(hb, staleness_remaining(hb)) do
         :ok ->
           heartbeat_loop(%{hb | last_ok: hb.monotonic_clock.()})
 
+        :halt ->
+          :ok
+
         {:error, :claim_lost} ->
-          :atomics.put(hb.flag, 1, @heartbeat_claim_lost)
+          # The refresh worker wrote the flag before it exited.
           :ok
 
         {:error, _transient} ->
           if hb.monotonic_clock.() + hb.interval_ms - hb.last_ok < hb.orphan_ttl_ms do
             heartbeat_loop(hb)
           else
-            :atomics.put(hb.flag, 1, @heartbeat_down)
+            # Never overwrite an already-recorded claim loss.
+            :atomics.compare_exchange(hb.flag, 1, @heartbeat_fresh, @heartbeat_down)
             :ok
           end
       end
     end
 
-    defp attempt_refresh(hb) do
+    defp staleness_remaining(hb) do
+      max(hb.orphan_ttl_ms - (hb.monotonic_clock.() - hb.last_ok), 0)
+    end
+
+    # One refresh attempt, bounded by the remaining staleness budget. The
+    # store call runs in a monitored worker so a call that blocks - pool
+    # starvation, an unresponsive database - cannot leave an alive-but-stuck
+    # heartbeat vouching for freshness past the bound; at the bound the
+    # worker is killed and the attempt counts as a failure. The worker
+    # itself records a stale token before it exits, so observing its death
+    # implies the flag is visible.
+    defp attempt_refresh(hb, budget_ms) do
+      flag = hb.flag
+      vehicle_ref = hb.vehicle_ref
+
+      {pid, ref} =
+        spawn_monitor(fn ->
+          result = store_refresh(hb)
+
+          if result == {:error, :claim_lost} do
+            :atomics.put(flag, 1, @heartbeat_claim_lost)
+          end
+
+          exit({:refresh_result, result})
+        end)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, {:refresh_result, result}} ->
+          result
+
+        {:DOWN, ^ref, :process, ^pid, reason} ->
+          {:error, reason}
+
+        {:DOWN, ^vehicle_ref, :process, _vehicle, _reason} ->
+          Process.exit(pid, :kill)
+          Process.demonitor(ref, [:flush])
+          :halt
+      after
+        budget_ms ->
+          Process.exit(pid, :kill)
+          Process.demonitor(ref, [:flush])
+          {:error, :refresh_timeout}
+      end
+    end
+
+    defp store_refresh(hb) do
       hb.runs.refresh_claim(hb.context, :system, hb.run_id, hb.claim_token, hb.clock.())
     rescue
       error -> {:error, error}

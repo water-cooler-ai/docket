@@ -122,8 +122,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             Docket.Test.MemoryBackend.refresh_claim(context, scope, run_id, claim_token, now)
 
           case Process.whereis(:vehicle_heartbeat_relay) do
-            nil -> :ok
-            pid -> send(pid, {:refreshed, self(), result})
+            nil ->
+              :ok
+
+            pid ->
+              # This runs in a refresh worker spawned by the heartbeat, so
+              # the parent is the heartbeat itself. Relaying it lets tests
+              # synchronize on heartbeat exit - the loss flag is always
+              # written before the heartbeat dies.
+              {:parent, heartbeat} = Process.info(self(), :parent)
+              send(pid, {:refreshed, heartbeat, result})
           end
 
           result
@@ -151,11 +159,52 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         def refresh_claim(_context, _scope, _run_id, _claim_token, _now) do
           case Process.whereis(:vehicle_heartbeat_relay) do
-            nil -> :ok
-            pid -> send(pid, {:refresh_attempted, self()})
+            nil ->
+              :ok
+
+            pid ->
+              {:parent, heartbeat} = Process.info(self(), :parent)
+              send(pid, {:refresh_attempted, heartbeat})
           end
 
           raise "injected refresh failure"
+        end
+      end
+    end
+
+    # Announces each refresh attempt, then blocks forever: the store call
+    # never returns, so only the heartbeat's own staleness bound can end it.
+    defmodule StuckRefreshBackend do
+      def storage, do: Docket.Test.MemoryBackend
+      def graphs, do: Docket.Test.MemoryBackend
+      def events, do: Docket.Test.MemoryBackend
+      def runs, do: __MODULE__.Runs
+
+      defmodule Runs do
+        defdelegate fetch_run(context, scope, run_id), to: Docket.Test.MemoryBackend
+
+        defdelegate release_claim(context, scope, run_id, claim_token, now),
+          to: Docket.Test.MemoryBackend
+
+        defdelegate abandon_claim(context, scope, run_id, claim_token, policy),
+          to: Docket.Test.MemoryBackend
+
+        defdelegate claim_due(context, scope, policy), to: Docket.Test.MemoryBackend
+        defdelegate commit(context, scope, proposal), to: Docket.Test.MemoryBackend
+
+        def refresh_claim(_context, _scope, _run_id, _claim_token, _now) do
+          case Process.whereis(:vehicle_heartbeat_relay) do
+            nil ->
+              :ok
+
+            pid ->
+              {:parent, heartbeat} = Process.info(self(), :parent)
+              send(pid, {:refresh_started, self(), heartbeat})
+          end
+
+          receive do
+            :unblock -> {:error, :claim_lost}
+          end
         end
       end
     end
@@ -1001,6 +1050,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         [stolen] = claim!(backend_ref, DateTime.add(DateTime.utc_now(), 120, :second))
         assert stolen.claim_token != lease.claim_token
 
+        # The loss flag is written before the heartbeat exits, so its DOWN
+        # guarantees the vehicle's pre-commit check observes the loss.
         assert_receive {:refreshed, heartbeat, {:error, :claim_lost}}
         monitor = Process.monitor(heartbeat)
         assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
@@ -1077,13 +1128,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         opts =
           vehicle_opts({RaisingRefreshBackend, context},
-            heartbeat: [interval_ms: 10],
+            heartbeat: [interval_ms: 200],
             context: %{coordinator: test_pid},
             # Both racing first draws (heartbeat last_ok, drain budget
-            # start) are 0 by design; the failure check then draws the
-            # sticky 100_000 and exhausts the 60s staleness budget. Do not
-            # shorten to [0, 100_000] - it reintroduces the race.
-            monotonic_clock: scripted_monotonic([0, 0, 100_000])
+            # start) are 0 by design; the tick's staleness_remaining draws
+            # 30_000 (a live attempt budget), and the failure check then
+            # draws the sticky 100_000 and exhausts the 60s staleness
+            # budget. Do not shorten the list - it reintroduces races.
+            monotonic_clock: scripted_monotonic([0, 0, 30_000, 100_000])
           )
 
         task = Task.Supervisor.async_nolink(@task_sup, fn -> Vehicle.drain(lease, opts) end)
@@ -1091,6 +1143,45 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         assert_receive {:refresh_attempted, heartbeat}
         monitor = Process.monitor(heartbeat)
+        assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
+
+        send(node_pid, :release)
+        assert {:ok, {:discarded, :heartbeat_down}} = Task.await(task)
+
+        assert {:ok, info} = MemoryBackend.inspect_run(context, :system, run.id)
+        assert info.claimed_at == nil
+        assert %DateTime{} = info.wake_at
+      end
+
+      test "a refresh call stuck past the staleness budget stops the drain", %{
+        backend_ref: backend_ref,
+        context: context
+      } do
+        test_pid = self()
+        Process.register(test_pid, :vehicle_heartbeat_relay)
+
+        {run, lease} = start_claimed!(backend_ref, Graphs.blocking(), %{})
+
+        opts =
+          vehicle_opts({StuckRefreshBackend, context},
+            heartbeat: [interval_ms: 200],
+            context: %{coordinator: test_pid},
+            # Draw order: heartbeat arm (0), drain-budget start (0), the
+            # tick's staleness_remaining (59_990 -> a 10ms attempt budget
+            # for the stuck call), then the sticky exhaustion check.
+            monotonic_clock: scripted_monotonic([0, 0, 59_990, 100_000])
+          )
+
+        task = Task.Supervisor.async_nolink(@task_sup, fn -> Vehicle.drain(lease, opts) end)
+        assert_receive {:blocked, node_pid, "blocker", 1}
+
+        assert_receive {:refresh_started, worker, heartbeat}
+        worker_monitor = Process.monitor(worker)
+        monitor = Process.monitor(heartbeat)
+
+        # The stuck store call is killed at the staleness bound, and the
+        # heartbeat gives up loudly (flag written before it exits).
+        assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _killed}
         assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
 
         send(node_pid, :release)
