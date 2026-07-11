@@ -138,6 +138,101 @@ defmodule Docket.Runtime.MomentTest do
     end
   end
 
+  describe "yield/2" do
+    defp continue_moment!(rtg, input \\ %{}) do
+      init = propose_init!(rtg, input, opts())
+
+      {:ok, %Moment{disposition: :continue} = moment} =
+        Loop.propose_advance(rtg, init.run, opts())
+
+      moment
+    end
+
+    test "narrows :continue to an immediate park with a consistent envelope" do
+      moment = continue_moment!(compile!(Graphs.cycle_counter()))
+      assert moment.checkpoint_type == :step_committed
+
+      assert {:ok, yielded} = Moment.yield(moment, :drain_budget)
+
+      assert yielded.disposition == {:park, :immediate, :drain_budget}
+      assert yielded.checkpoint_type == :step_committed
+
+      expected_metadata =
+        Map.merge(moment.checkpoint_metadata, %{
+          "wake_disposition" => "immediate",
+          "park_reason" => "drain_budget"
+        })
+
+      assert yielded.checkpoint_metadata == expected_metadata
+      assert %Docket.Event{type: :checkpoint_committed} = final = List.last(yielded.events)
+      assert final.metadata == expected_metadata
+    end
+
+    test "preserves run, sequences, timestamps, payloads, and identity" do
+      moment = continue_moment!(compile!(Graphs.cycle_counter()))
+      {:ok, yielded} = Moment.yield(moment, :drain_budget)
+
+      assert yielded.run == moment.run
+      assert yielded.proposed_at == moment.proposed_at
+      assert yielded.pending_attempts == moment.pending_attempts
+      assert length(yielded.events) == length(moment.events)
+
+      strip = &Enum.map(&1, fn event -> %{event | metadata: nil} end)
+      assert strip.(yielded.events) == strip.(moment.events)
+      assert Enum.map(yielded.events, & &1.seq) == Enum.map(moment.events, & &1.seq)
+      assert Enum.map(yielded.events, & &1.timestamp) == Enum.map(moment.events, & &1.timestamp)
+      assert Enum.map(yielded.events, & &1.payload) == Enum.map(moment.events, & &1.payload)
+    end
+
+    test "preserves :interrupt_requested on a barrier that stays runnable" do
+      moment = continue_moment!(compile!(Graphs.interrupt_with_parallel_work()))
+      assert moment.checkpoint_type == :interrupt_requested
+      assert moment.run.status == :running
+
+      assert {:ok, yielded} = Moment.yield(moment, :drain_budget)
+
+      assert yielded.checkpoint_type == :interrupt_requested
+      assert yielded.disposition == {:park, :immediate, :drain_budget}
+      assert yielded.checkpoint_metadata["checkpoint_type"] == "interrupt_requested"
+      assert List.last(yielded.events).metadata == yielded.checkpoint_metadata
+    end
+
+    test "never overrides an existing park or terminal disposition" do
+      rtg = compile!(Graphs.minimal_linear())
+      init = propose_init!(rtg, %{"value" => "x"}, opts())
+      terminal = List.last(drain(rtg, init.run, opts()))
+
+      assert terminal.disposition == {:park, :terminal, :run_completed}
+
+      assert {:error, {:not_continue, {:park, :terminal, :run_completed}}} =
+               Moment.yield(terminal, :drain_budget)
+
+      retry_rtg = compile!(Graphs.retry_then_continue())
+      retry_init = propose_init!(retry_rtg, %{}, opts())
+      {:ok, retry_moment} = Loop.propose_advance(retry_rtg, retry_init.run, opts())
+
+      assert {:park, {:at, %DateTime{}}, :retry_backoff} = retry_moment.disposition
+      assert {:error, {:not_continue, _park}} = Moment.yield(retry_moment, :drain_budget)
+    end
+
+    test "rejects malformed moments" do
+      moment = continue_moment!(compile!(Graphs.cycle_counter()))
+      {runtime_events, [checkpoint_event]} = Enum.split(moment.events, -1)
+
+      assert {:error, :malformed_moment} =
+               Moment.yield(%{moment | events: runtime_events}, :drain_budget)
+
+      assert {:error, :malformed_moment} =
+               Moment.yield(%{moment | events: []}, :drain_budget)
+
+      assert {:error, :malformed_moment} =
+               Moment.yield(%{moment | checkpoint_metadata: %{}}, :drain_budget)
+
+      duplicated = %{moment | events: moment.events ++ [checkpoint_event]}
+      assert {:error, :malformed_moment} = Moment.yield(duplicated, :drain_budget)
+    end
+  end
+
   describe "propose_advance/3" do
     test "drives a multi-step graph one commit boundary at a time to inline parity" do
       graph = Graphs.cycle_counter()
