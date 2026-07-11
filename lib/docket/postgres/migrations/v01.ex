@@ -4,11 +4,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     use Ecto.Migration
 
+    @durable_status_sql Docket.Run.durable_statuses()
+                        |> Enum.map_join(", ", &"'#{&1}'")
+
+    @terminal_status_sql Docket.Run.terminal_statuses()
+                         |> Enum.map_join(", ", &"'#{&1}'")
+
     @run_checks [
-      {"docket_runs_status_check",
-       "status IN ('running', 'waiting', 'done', 'failed', 'cancelled')"},
+      {"docket_runs_status_check", "status IN (#{@durable_status_sql})"},
       {"docket_runs_finished_at_check",
-       "(status IN ('done', 'failed', 'cancelled')) = (finished_at IS NOT NULL)"},
+       "(status IN (#{@terminal_status_sql})) = (finished_at IS NOT NULL)"},
       {"docket_runs_claim_pair_check", "(claim_token IS NULL) = (claimed_at IS NULL)"},
       {"docket_runs_poison_pair_check", "(poisoned_at IS NULL) = (poison_reason IS NULL)"},
       {"docket_runs_waiting_terminal_idle_check",
@@ -122,7 +127,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       create_if_not_exists(
         index(:docket_runs, [:updated_at, :id],
-          where: "status IN ('done', 'failed', 'cancelled')",
+          where: "status IN (#{@terminal_status_sql})",
           prefix: prefix
         )
       )

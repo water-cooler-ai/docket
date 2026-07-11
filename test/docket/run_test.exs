@@ -29,6 +29,7 @@ defmodule Docket.RunTest do
   describe "status helpers" do
     test "exposes exactly the five durable values" do
       assert Run.durable_statuses() == [:running, :waiting, :done, :failed, :cancelled]
+      assert Run.terminal_statuses() == [:done, :failed, :cancelled]
 
       for status <- Run.durable_statuses(), do: assert(Run.durable_status?(status))
       refute Run.durable_status?(:created)

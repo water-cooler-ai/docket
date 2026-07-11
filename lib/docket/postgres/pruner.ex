@@ -19,6 +19,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     The batch size bounds explicitly selected event and run rows. A run may
     own more than one batch of events, so foreign-key cascade work is
     deliberately not claimed to be bounded by the batch size.
+
+    Each pass emits `[:docket, :postgres, :pruner, :pass]`. Its numeric
+    measurements are `events_deleted`, `runs_deleted`,
+    `cascade_events_deleted`, `graphs_deleted`, and `duration`; `duration` is
+    in native `System.monotonic_time/0` units, following the `:telemetry` span
+    convention. Metadata contains only the bounded `result` dimension.
     """
 
     use GenServer
@@ -26,6 +32,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Storage
 
     @telemetry_event [:docket, :postgres, :pruner, :pass]
+    @terminal_status_sql Docket.Run.terminal_statuses()
+                         |> Enum.map_join(", ", &"'#{&1}'")
+
+    @retained_graph_revisions 10
     @type ctx :: Storage.ctx()
     @type policy :: %{
             required(:now) => DateTime.t() | :database,
@@ -199,7 +209,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       sql = """
       SELECT runs.id, runs.run_id, runs.graph_id, runs.graph_hash
       FROM #{table(prefix, "docket_runs")} AS runs
-      WHERE runs.status IN ('done', 'failed', 'cancelled')
+      WHERE runs.status IN (#{@terminal_status_sql})
         AND runs.updated_at < $1
       ORDER BY runs.updated_at, runs.id
       LIMIT $2
@@ -274,7 +284,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         SELECT graphs.id
         FROM #{table(prefix, "docket_graph_versions")} AS graphs
         JOIN ranked ON ranked.id = graphs.id
-        WHERE ranked.revision_rank > 10
+        WHERE ranked.revision_rank > #{@retained_graph_revisions}
           AND NOT EXISTS (
             SELECT 1
             FROM #{table(prefix, "docket_runs")} AS runs
