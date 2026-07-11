@@ -46,9 +46,12 @@ defmodule Docket.Graph.Compiler do
   """
   @spec verify(Graph.t(), opts()) :: {:ok, Graph.t()} | {:error, Graph.t()}
   def verify(%Graph{} = graph, opts \\ []) when is_list(opts) do
-    case run_pipeline(graph, validate_opts!(opts)) do
-      {:ok, _runtime_graph, diagnostics} -> {:ok, %{graph | diagnostics: diagnostics}}
-      {:error, diagnostics} -> {:error, %{graph | diagnostics: diagnostics}}
+    case run_pipeline(graph, validate_opts!(opts), :authored) do
+      {:ok, _effective_graph, _runtime_graph, diagnostics} ->
+        {:ok, %{graph | diagnostics: diagnostics}}
+
+      {:error, diagnostics} ->
+        {:error, %{graph | diagnostics: diagnostics}}
     end
   end
 
@@ -57,33 +60,70 @@ defmodule Docket.Graph.Compiler do
   """
   @spec compile(Graph.t(), opts()) :: {:ok, Runtime.Graph.t()} | {:error, Graph.t()}
   def compile(%Graph{} = graph, opts \\ []) when is_list(opts) do
-    case run_pipeline(graph, validate_opts!(opts)) do
-      {:ok, runtime_graph, _diagnostics} -> {:ok, runtime_graph}
+    case run_pipeline(graph, validate_opts!(opts), :authored) do
+      {:ok, _effective_graph, runtime_graph, _diagnostics} -> {:ok, runtime_graph}
       {:error, diagnostics} -> {:error, %{graph | diagnostics: diagnostics}}
     end
   end
 
-  defp run_pipeline(graph, opts) do
+  @doc false
+  @spec compile_for_publication(Graph.t(), opts()) ::
+          {:ok, Graph.t(), Runtime.Graph.t()} | {:error, Graph.t()}
+  def compile_for_publication(%Graph{} = graph, opts \\ []) when is_list(opts) do
+    case run_pipeline(graph, validate_opts!(opts), :publication) do
+      {:ok, effective_graph, runtime_graph, _diagnostics} ->
+        {:ok, effective_graph, runtime_graph}
+
+      {:error, diagnostics} ->
+        {:error, %{graph | diagnostics: diagnostics}}
+    end
+  end
+
+  @doc false
+  @spec compile_effective_document(Graph.t(), opts()) ::
+          {:ok, Runtime.Graph.t()} | {:error, Graph.t()}
+  def compile_effective_document(%Graph{} = graph, opts \\ []) when is_list(opts) do
+    case run_pipeline(graph, validate_opts!(opts), :effective_document) do
+      {:ok, _effective_graph, runtime_graph, _diagnostics} -> {:ok, runtime_graph}
+      {:error, diagnostics} -> {:error, %{graph | diagnostics: diagnostics}}
+    end
+  end
+
+  defp run_pipeline(graph, opts, mode) do
     {canonical, ingest_diagnostics} = ingest(graph)
 
     # Config schemas are fetched exactly once per compile; validation and
     # lowering must see the same result even when config_schema/0 callbacks
     # are stateful, and lowering must never re-enter user code.
     config_schemas = NodeContracts.config_schemas(canonical)
-    diagnostics = ingest_diagnostics ++ Validation.run(canonical, config_schemas, opts)
+
+    {effective, materialization_diagnostics} =
+      materialize(canonical, config_schemas, mode != :effective_document)
+
+    diagnostics =
+      ingest_diagnostics ++
+        materialization_diagnostics ++ Validation.run(effective, config_schemas, opts)
 
     if Diagnostics.blocking?(diagnostics) do
       {:error, diagnostics}
     else
-      runtime_graph = Lowering.run(canonical, config_schemas, opts)
-      diagnostics = diagnostics ++ RuntimeValidation.run(runtime_graph, canonical)
+      runtime_graph = Lowering.run(effective, opts)
+      diagnostics = diagnostics ++ RuntimeValidation.run(runtime_graph, effective)
 
       if Diagnostics.blocking?(diagnostics) do
         {:error, diagnostics}
       else
-        {:ok, runtime_graph, diagnostics}
+        {:ok, effective, runtime_graph, diagnostics}
       end
     end
+  end
+
+  defp materialize(graph, _config_schemas, false), do: {graph, []}
+
+  defp materialize(graph, config_schemas, true) do
+    graph
+    |> NodeContracts.materialize_defaults(config_schemas)
+    |> ingest()
   end
 
   # Graphs are free-form in memory; the compiler is a serialization boundary.

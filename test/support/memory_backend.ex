@@ -40,6 +40,9 @@ defmodule Docket.Test.MemoryBackend do
   def events, do: __MODULE__
 
   @impl Docket.Backend
+  def context(opts), do: Keyword.fetch!(opts, :name)
+
+  @impl Docket.Backend
   def child_spec(opts) do
     %{
       id: Keyword.get(opts, :id, __MODULE__),

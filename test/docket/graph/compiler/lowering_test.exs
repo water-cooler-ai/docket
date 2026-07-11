@@ -2,7 +2,7 @@ defmodule Docket.Graph.Compiler.LoweringTest do
   use Docket.Test.Case, async: true
 
   alias Docket.Runtime
-  alias Docket.{Reducer, Schema}
+  alias Docket.{Graph, Reducer, Schema}
 
   describe "channel lowering" do
     test "inputs lower to last-value input channels" do
@@ -119,6 +119,39 @@ defmodule Docket.Graph.Compiler.LoweringTest do
       # The public document keeps its free-form in-memory shape; string keys
       # and defaults only appear in the derived runtime graph.
       assert graph.nodes["styled"].config == %{tone: "warm"}
+    end
+
+    test "publication returns an effective canonical graph with defaults in its hash" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_node!("styled", implementation: Nodes.WithDefaults, config: %{tone: "warm"})
+        |> Graph.put_edge!("edge_copy_styled", from: "copy", to: "styled")
+
+      assert {:ok, effective, runtime} =
+               Docket.Graph.Compiler.compile_for_publication(graph)
+
+      assert graph.nodes["styled"].config == %{tone: "warm"}
+
+      assert effective.nodes["styled"].config == %{
+               "tone" => "warm",
+               "temperature" => 0.5
+             }
+
+      assert runtime.graph_hash == Graph.hash(effective)
+      assert runtime.nodes["node:styled"].config == effective.nodes["styled"].config
+    end
+
+    test "publication canonicalizes atom enum values and defaults from node schemas" do
+      graph =
+        Graphs.minimal_linear()
+        |> Graph.put_node!("classified", implementation: Nodes.AtomEnumDefault, config: %{})
+        |> Graph.put_edge!("edge_copy_classified", from: "copy", to: "classified")
+
+      assert {:ok, effective, runtime} =
+               Docket.Graph.Compiler.compile_for_publication(graph)
+
+      assert effective.nodes["classified"].config == %{"level" => "low"}
+      assert runtime.nodes["node:classified"].config == %{"level" => "low"}
     end
 
     test "targets subscribe to their incoming activation channels" do
@@ -272,6 +305,19 @@ defmodule Docket.Graph.Compiler.LoweringTest do
       runtime_graph = compile!(graph, max_supersteps: 25)
 
       assert runtime_graph.policies["max_supersteps"] == 25
+    end
+
+    test "publication permits an unbounded cyclic graph" do
+      graph =
+        Graphs.cycle_counter()
+        |> Map.update!(:policies, &Map.delete(&1, "max_supersteps"))
+
+      assert {:ok, effective, runtime_graph} =
+               Docket.Graph.Compiler.compile_for_publication(graph)
+
+      refute Map.has_key?(effective.policies, "max_supersteps")
+      refute Map.has_key?(runtime_graph.policies, "max_supersteps")
+      assert runtime_graph.graph_hash == Graph.hash(effective)
     end
 
     test "an explicit nil policy is replaced by the opts runtime default" do

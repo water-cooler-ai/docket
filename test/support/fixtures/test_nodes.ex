@@ -87,6 +87,21 @@ defmodule Docket.Test.Fixtures.Nodes do
     def call(_state, _config, _context), do: {:ok, %{}}
   end
 
+  defmodule AtomEnumDefault do
+    @moduledoc false
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{
+        level: Docket.Schema.enum([:low, :high], default: :low)
+      })
+    end
+
+    @impl true
+    def call(_state, _config, _context), do: {:ok, %{}}
+  end
+
   defmodule StatefulConfigSchema do
     @moduledoc false
     # Returns a valid schema on the first call in a process and raises on
@@ -127,6 +142,17 @@ defmodule Docket.Test.Fixtures.Nodes do
 
     @impl true
     def config_schema, do: :not_a_schema
+
+    @impl true
+    def call(_state, _config, _context), do: {:ok, %{}}
+  end
+
+  defmodule NilConfigSchema do
+    @moduledoc false
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: nil
 
     @impl true
     def call(_state, _config, _context), do: {:ok, %{}}

@@ -1,7 +1,8 @@
 # Docket Operational Transition Spec
 
-Status: transition spec (rev 8 + lock amendment 1)
-Date: 2026-07-09; amendment 1: 2026-07-10
+Status: transition spec (rev 8, amended 2026-07-10 — backend bundle and lifecycle owner, mandatory backend-owned production lifecycle, five durable graph statuses, explicit poison/failure facts, transactional wake hints, durable retry state, retained-run graph integrity, bounded claim selection, desynchronized polling)
+Date: 2026-07-09
+Amended: 2026-07-10 (`backend:` public configuration name; backend-only production lifecycle)
 Target: move from core runtime library to an Oban-shaped durable runtime
 
 ## Lock Amendment 1 — Effective Graphs, Node-Local Compilation
@@ -150,6 +151,14 @@ It deliberately leaves these to the host application:
 `0.1.0` is the first release where Docket's Postgres backend owns the durable
 lifecycle of runs.
 
+That ownership is the only supported production lifecycle in `0.1.0`.
+Supervised Docket instances require one `Docket.Backend`; the `0.0.1`
+host-owned checkpoint driver and its `run`, `resume`, and live `get_run`
+facade are removed rather than retained as a second operating mode. This is a
+narrow production-boundary break: node modules, graph definitions, schemas,
+reducers, interrupts, executors, `Docket.Run` serialization, and the
+Postgres-free `Docket.Test` graph-semantics helpers remain public.
+
 It should include:
 
 - A first-class `Docket.Postgres` backend inside the `docket` package,
@@ -165,6 +174,8 @@ It should include:
 - Crash recovery via claim expiry — the dispatch poll is the recovery path.
 - Optional tenant scoping on run APIs — no tenant concept required to adopt.
 - Stateless workers with no run-to-node affinity.
+- A single backend-owned supervised production API; no storage-free supervised
+  fallback or host-owned checkpoint committer.
 
 The 0.1.0 user experience should be closer to installing Oban than to wiring a
 set of low-level behaviours manually.
@@ -177,12 +188,12 @@ The host app should feel like this:
 defmodule MyApp.Docket do
   use Docket,
     repo: MyApp.Repo,
-    storage: Docket.Postgres,
+    backend: Docket.Postgres,
     concurrency: 50
 end
 ```
 
-`storage: Docket.Postgres` is self-contained: no Oban, no extra queue
+`backend: Docket.Postgres` is self-contained: no Oban, no extra queue
 framework, no second package, no second supervision story to configure. It is
 also the substitution boundary. A backend bundle supplies one compatible
 transaction boundary, graph store, run-aggregate store, event store, and
@@ -275,7 +286,6 @@ Owns:
 - Compiler and runtime graph lowering.
 - Node, checkpoint, executor, and guard contracts.
 - Runtime loop semantics.
-- Supervised runtime process (the in-process, Postgres-free driver).
 - Processless initialization/transition driver that produces one uncommitted
   runtime moment at a time without storage writes, handler delivery, or
   committed telemetry.
@@ -575,9 +585,9 @@ queue position derived from `wake_at`/claim columns rather than fused into
 status — the derived facts carry no invariant of their own, which is exactly
 why they may be derived while the five semantic values may not.
 
-`:created` remains only as the private fresh-run sentinel needed by the legacy
-in-process initializer. It is never a durable/public operational status, never
-appears in a checkpoint, is not cancellable, and Postgres rejects it.
+`:created` remains only as a private fresh-run sentinel used while calculating
+an initialization moment. It is never a durable/public operational status,
+never appears in a checkpoint, is not cancellable, and backends reject it.
 `Docket.Run.failure` is a stable JSON-safe description of a terminal graph
 failure and is promoted to the `failure` column. It is present exactly when
 `status = 'failed'`; it is distinct from retryable node-attempt failures,
@@ -1147,9 +1157,9 @@ runtime events, checkpoint metadata, and an explicit schedule algebra:
 
 It is not a public committed `Docket.Checkpoint`. `Docket.Lifecycle` persists
 the moment and only transaction success creates/delivers the committed
-checkpoint value. The legacy host-owned driver may present the moment to its
-configured checkpoint committer before accepting it; durable drivers use a
-separate best-effort `checkpoint_observers` configuration after commit.
+checkpoint value. Backends may invoke separately configured best-effort
+`checkpoint_observers` after commit; observers never own persistence and
+cannot accept, veto, or roll back a moment.
 
 ### Start Run
 
@@ -1287,7 +1297,7 @@ prune according to policy
 
 ## 10. Core API Transition
 
-The current API:
+The `0.0.1` production API is:
 
 ```elixir
 MyApp.Docket.run(graph, input, opts)
@@ -1296,10 +1306,9 @@ MyApp.Docket.get_run(run_id, opts)
 MyApp.Docket.resolve_interrupt(run_id, interrupt_id, value, opts)
 ```
 
-Should remain available for `0.0.x` core usage.
-
-The `0.1.0` operational API should introduce names that make durable lifecycle
-clear:
+It remains the API of the `0.0.x` release line, not a second mode inside
+`0.1.0`. The `0.1.0` facade replaces it with names and semantics that make
+backend-owned durable lifecycle explicit:
 
 ```elixir
 MyApp.Docket.save_graph(graph, opts)
@@ -1317,18 +1326,23 @@ returns the updated run on success and a typed error on validation failure,
 preserving the `0.0.x` error-reporting contract (`resolve_interrupt` returns
 schema validation errors directly to the caller). There is no generic
 `signal/3`; each operation has its own arguments and validation, and the named
-functions carry that surface directly (section 8).
+functions carry that surface directly (section 8). `resolve_interrupt` keeps
+its source-level shape but becomes exclusively storage-backed; it never falls
+back to a local Runtime process.
 
 `fetch_run` is a storage read and is the primary read API — it always works,
-because a parked run's truth is in Postgres. `get_run` is the optional live read:
-it succeeds only when a vehicle is actively draining the run and is reachable
-through the per-node fast path (section 7), returning the in-memory snapshot,
-which may be a superstep or two ahead of the last durable checkpoint. It returns
-`:not_found` whenever no local vehicle is active — a parked run, or a vehicle on
-another node — and callers fall back to `fetch_run`. So `get_run` is a
-best-effort freshness optimization, not a contract; `0.1.0` may implement it as
-always-`:not_found` (no registry) and add the live path later. It also remains
-the in-process read for the Postgres-free GenServer driver.
+because a parked run's truth is in the backend. `get_run` is removed: an
+uncommitted in-memory snapshot is node-local, timing-dependent, and not a
+stable distributed contract. Callers use `fetch_run` for the committed run or
+`inspect_run` when they also need operational state. A future live-progress
+projection, if justified, must use a distinct name and explicitly weak
+consistency contract rather than reviving `get_run`.
+
+`resume` is removed from the production facade. Recovery is backend-owned:
+dispatchers reclaim eligible or expired runs from the last committed state.
+Applications no longer load a `Docket.Run`, choose a graph, and relaunch a
+resident process. `Docket.Test.resume_inline` remains available for
+processless graph-semantics tests.
 
 `inspect_run` returns a substrate-neutral `Docket.RunInfo` projection containing
 the run plus `wake_at`, `claimed_at` (never the claim token),
@@ -1345,12 +1359,46 @@ it as bounded polling of `inspect_run` (a `:poll_interval` plus a required
 A `LISTEN`-based fast path is additive. `await_run` exists for tests and
 short-lived callers.
 
-Durable checkpoint observers are best-effort after-commit hooks and may be
-lost or duplicated across a process crash. They are not a long-lived delivery
-guarantee. Integrations that require durable consumption must enable retained
-events and consume/export them by event sequence (or use a future outbox
-product); the legacy sync checkpoint callback remains a committer only for the
-host-owned driver.
+Checkpoint observers are best-effort after-commit hooks and may be lost or
+duplicated across a process crash. They are not a long-lived delivery guarantee.
+Integrations that require durable consumption must enable retained events and
+consume/export them by event sequence (or use a future outbox product).
+`Docket.Checkpoint` may remain as the committed notification value, but
+`checkpoint:` is no longer a persistence or supervision configuration.
+
+### 0.0.1 adopter migration
+
+The break is deliberately narrower than replacing Docket's programming model:
+
+- Node modules and graph definitions carry over unchanged, including
+  `Docket.Node`, `Docket.Graph`, `Docket.Schema`, reducers, interrupts, and
+  executors.
+- `Docket.Test.run_inline` and related processless helpers remain the
+  Postgres-free graph-semantics testing surface.
+- `Docket.Run.to_map` / `from_map` remain the public wire boundary and are also
+  used by backend row codecs.
+
+An adopter performs one explicit cutover:
+
+1. Stop `0.0.1` writers and drain, terminate, or explicitly export any active
+   runs. There is no transparent dual-driver period.
+2. Remove the host `Docket.Checkpoint` committer and its Docket-specific run /
+   checkpoint tables.
+3. Install the Docket migration and configure `use Docket` with
+   `repo: MyApp.Repo` and `backend: Docket.Postgres`.
+4. Publish each effective graph through `save_graph` and retain its
+   `Docket.GraphRef`.
+5. Replace `run(graph, input)` with `start_run(graph_ref, input)`, `get_run`
+   with `fetch_run` or `inspect_run`, and delete application-owned `resume`
+   orchestration.
+6. Move non-transactional notifications to `checkpoint_observers`; use
+   retained events for delivery that must survive crashes.
+
+Because `0.0.1` persistence is host-defined, Docket cannot provide a universal
+database migration. The supported migration is drain-and-cut-over. A separate
+one-shot conversion helper may translate a latest `0.0.1` run document for an
+advanced importer, but it does not preserve the old runtime API or accept old
+wire formats indefinitely.
 
 ## 11. Required Core Changes For 0.1.0
 
@@ -1393,14 +1441,13 @@ durable backend.
   `Docket.Lifecycle` commits each moment before asking core for the next. This is
   the seam the dispatcher's vehicle drives;
   `Docket.Test.step_inline` already proves the same loop runs outside a
-  GenServer, so this is a third driver, not a second interpreter.
+  GenServer, so backend execution and tests share one interpreter.
 - Include superstep/attempt and run identity in checkpoint context, so the
   backend can make commit-and-schedule atomic and recovery idempotent.
 - Make moment calculation independent of checkpoint delivery. The operational
   driver wins the storage commit, then creates/delivers the committed
-  checkpoint and telemetry. Preserve the legacy `checkpoint:` sync callback
-  only as the host-owned committer; durable drivers use separately configured,
-  best-effort `checkpoint_observers:` whose failures cannot veto state.
+  checkpoint and telemetry. Only separately configured, best-effort
+  `checkpoint_observers:` remain; their failures cannot veto state.
 - Allocate one `:checkpoint_committed` event from `Run.event_seq` for every
   moment, independently of `checkpoint_seq`; add `:retry_scheduled` for retry
   control commits.
@@ -1411,6 +1458,11 @@ durable backend.
 - Apply signals on the same step boundary as superstep progress.
 - Make storage-backed reads distinct from live process reads.
 - Preserve inline testing without requiring Postgres.
+- Require one backend for every supervised production instance; remove
+  `run`, `resume`, `get_run`, the `checkpoint:` committer configuration, and
+  the storage-free per-run GenServer/registry driver from the v0.1.0 public
+  facade once the Postgres vehicle, assembly, and deterministic backend test
+  modes are complete.
 - Require exact sequence progression and a non-nil current claim token for
   every advance commit. Serialized mutation is the only unclaimed update path.
 
@@ -1505,7 +1557,8 @@ Design for those spaces, but ship the durable Postgres path first.
 
 - Set current package version to `0.0.1`.
 - Document that `0.0.x` is the core runtime line.
-- Keep host-owned persistence and tenancy in the README accurate.
+- Preserve the `0.0.1` host-owned lifecycle as release-history and migration
+  documentation, not as a `0.1.0` runtime mode.
 
 ### Milestone B - Core Operational Seams
 
@@ -1518,7 +1571,7 @@ Substrate-independent.
 - Add explicit scope (`:system | :tenantless | {:tenant, id}`) and the named
   `Docket.Lifecycle` composition owner.
 - Define `Docket.Runtime.Moment`; separate moment calculation from committed
-  checkpoints, legacy host committers, and best-effort durable observers.
+  checkpoints and best-effort durable observers.
 - Introduce pure named `resolve_interrupt` / `cancel_run` functions with no
   signal structs or behaviour, including `:run_cancelled` checkpoint/event
   facts and storage-backed serialized mutation semantics.
@@ -1531,6 +1584,8 @@ Substrate-independent.
   timers durable; change the dispatcher from recursive retry to one attempt per
   invocation.
 - Add storage-backed `fetch_run` / `inspect_run` semantics at the facade layer.
+- After the operational replacement is complete, remove the host-owned
+  supervised driver and require a backend at supervised startup.
 
 ### Milestone C - `Docket.Postgres` MVP
 
@@ -1562,6 +1617,10 @@ Substrate-independent.
   and bursts, jittered poll scheduling, tenancy, pruning, query-plan shape, and
   database invariants.
 - Implement the `:inline` and `:manual` testing modes with `drain_runs/1`.
+- After backend assembly and those deterministic modes land, execute DCKT-37:
+  require a backend at supervised startup and remove the `0.0.1` host-owned
+  `run` / `resume` / live `get_run` / `checkpoint:` production driver before
+  the final release-gate suite.
 - Provide install and supervision docs plus the introspection query guide.
 
 ### Milestone D - Multi-Region
@@ -1605,5 +1664,11 @@ The transition succeeds when an adopter can:
 - Test graph semantics without Postgres and test operational semantics
   deterministically via the `:inline` / `:manual` testing modes under the
   Ecto sandbox.
+- Migrate a `0.0.1` application without rewriting its nodes, graphs, schemas,
+  reducers, executors, inline semantic tests, or run serialization; only the
+  lifecycle ownership and its call sites change.
+- Fail supervised startup without a configured backend; expose no `run`,
+  `resume`, `get_run`, or host-owned `checkpoint:` production path in
+  `0.1.0`.
 
 The package should feel boring to operate. That is the bar.
