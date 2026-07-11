@@ -7,14 +7,11 @@ when you want to understand *why* the contracts are shaped the way they are.
 ## Reading Order
 
 1. `docket-operational-transition-spec.md`
-   - The transition from the current `0.0.x` core runtime package to the
-     `0.1.0` operational runtime with the `Docket.Postgres` backend —
-     Oban-like in shape, one package, self-contained on optional Ecto and
-     Postgres dependencies. v0.1.0 has one backend-owned production lifecycle;
-     the v0.0.1 host-owned supervised driver is migration history only.
+   - A public-facing guide to the implemented PostgreSQL data model, queue
+     semantics, claim fencing, tenancy, migrations, and current assembly gaps.
 2. `docket-v0.1.0-spec-lock-audit.md`
-   - The final DCKT-1 architecture, pluggability, lifecycle-status, ticket,
-     and dependency audit that produced transition-spec revision 8.
+   - A current implementation audit: what from the proposed v0.1.0 design has
+     landed and what still blocks an operational release.
 3. `docket-graph-construction-design.md`
    - The public `Docket.Graph` editing API, ID rules, publication boundary,
      and private effective-graph identity contract.
@@ -40,13 +37,15 @@ and `Docket.Test` helpers carry forward. The lifecycle owner changes:
 
 - `0.0.1`: the host checkpoint callback persists runs and the host explicitly
   resumes resident per-run processes.
-- `0.1.0`: a required `Docket.Backend` owns graph/run persistence, scheduling,
-  recovery, and signals. The old supervised `run` / `resume` / `get_run` path
-  is removed by DCKT-37 after the operational replacement is complete.
+- `0.1.0-dev`: the backend contract, durable facade, PostgreSQL stores, and
+  dispatcher exist. The public `Docket.Postgres` bundle and claimed-run
+  vehicle do not, so the old supervised `run` / `resume` / `get_run` path is
+  still present.
 
 The older graph-construction and execution-contract documents below record the
-`0.0.1` host-owned boundary. Where they conflict with the transition spec and
-its post-lock amendments, the transition spec governs v0.1.0.
+`0.0.1` host-owned boundary. The PostgreSQL guide describes the developing
+durable boundary; the implementation audit calls out places where it is not
+complete.
 
 ## Current Core Shape
 

@@ -3,7 +3,7 @@ defmodule Docket.Storage.Events do
   Persistence contract for append-only run events.
 
   Event retention is a backend policy. Lifecycle orchestration calls this
-  store in the same `Docket.Storage.transaction/2` as the corresponding run
+  store in the same backend transaction as the corresponding run
   insert or commit so durable state and its retained facts cannot diverge.
   """
 

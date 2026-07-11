@@ -8,11 +8,12 @@ Each v0.1.0 ticket updates the Unreleased section in its own PR.
 
 ## 0.1.0 — Unreleased
 
-The first operational release line: Docket owns the durable graph-run
-lifecycle through a self-contained Postgres backend. Work accumulates on the
-`v0.1.0` branch. The design source of truth is
-`docs/architecture/docket-operational-transition-spec.md` (revision 8) plus
-the DCKT-1 issue tree; entries below reflect what has landed so far.
+The developing operational release line. The backend contract, PostgreSQL
+stores, migration, lifecycle transactions, and dispatcher have landed. The
+public `Docket.Postgres` bundle and claimed-run vehicle have not, so this branch
+is not yet a runnable PostgreSQL production backend. The implementation guide
+and current-state audit live in `docs/architecture/`; entries below reflect
+what has landed so far.
 
 ### Added
 
@@ -80,8 +81,9 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   (DCKT-14, #26).
 - `Docket.Event`: metadata-only `:checkpoint_committed` event type and the
   `types/0` helper (DCKT-8, #12).
-- `docs/architecture/docket-operational-transition-spec.md` revision 8 and
-  the v0.1.0 spec-lock audit (DCKT-32, #13).
+- The original operational transition spec and v0.1.0 spec-lock audit
+  (DCKT-32, #13), since rewritten as a current PostgreSQL guide and
+  implementation audit.
 - `Docket.Run.Failure`: durable, JSON-safe terminal failure payload
   (`code`, `message`, optional `node_id`/`details`), present exactly when a
   run is `:failed` (`Run.validate_failure/1`, enforced at the wire boundary
