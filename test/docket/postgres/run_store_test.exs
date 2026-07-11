@@ -590,36 +590,47 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert row!(untouched.run_id).poisoned_at == nil
     end
 
-    test "maximum three launches exactly three attempts before poison" do
-      insert_run!("run")
+    test "configured maximum launches exactly that many vehicles before poison" do
+      for max_attempts <- 1..3 do
+        run_id = "run-#{max_attempts}"
+        insert_run!(run_id)
 
-      for attempt <- 1..3 do
-        now = DateTime.add(@now, attempt, :millisecond)
+        for attempt <- 1..max_attempts do
+          now = DateTime.add(@now, attempt, :millisecond)
 
-        assert {:ok, %{leases: [%{claim_attempt: ^attempt}], poisoned: []}} =
-                 claim_due(now, orphan_ttl_ms: 0, max_claim_attempts: 3)
+          assert {:ok, %{leases: [%{run_id: ^run_id, claim_attempt: ^attempt}], poisoned: []}} =
+                   claim_due(now,
+                     orphan_ttl_ms: 0,
+                     max_claim_attempts: max_attempts
+                   )
+        end
+
+        poison_time = DateTime.add(@now, max_attempts + 1, :millisecond)
+
+        assert {:ok, %{leases: [], poisoned: [poison]}} =
+                 claim_due(poison_time,
+                   orphan_ttl_ms: 0,
+                   max_claim_attempts: max_attempts
+                 )
+
+        assert poison.run_id == run_id
+        assert poison.poisoned_at == poison_time
+        assert poison.poison_reason == "max_claim_attempts_exceeded"
+
+        row = row!(run_id)
+        assert row.claim_attempts == max_attempts
+        assert row.claim_token == nil
+        assert row.claimed_at == nil
+        assert row.wake_at == nil
+        assert row.poisoned_at == poison_time
+        assert row.checkpoint_seq == 7
+
+        assert {:ok, %{leases: [], poisoned: []}} =
+                 claim_due(DateTime.add(poison_time, 1, :second),
+                   orphan_ttl_ms: 0,
+                   max_claim_attempts: max_attempts
+                 )
       end
-
-      poison_time = DateTime.add(@now, 4, :millisecond)
-
-      assert {:ok, %{leases: [], poisoned: [poison]}} =
-               claim_due(poison_time, orphan_ttl_ms: 0, max_claim_attempts: 3)
-
-      assert poison.run_id == "run"
-      assert poison.poisoned_at == poison_time
-
-      assert poison.poison_reason == "max_claim_attempts_exceeded"
-
-      row = row!("run")
-      assert row.claim_attempts == 3
-      assert row.claim_token == nil
-      assert row.claimed_at == nil
-      assert row.wake_at == nil
-      assert row.poisoned_at == poison_time
-      assert row.checkpoint_seq == 7
-
-      assert {:ok, %{leases: [], poisoned: []}} =
-               claim_due(DateTime.add(poison_time, 1, :second), orphan_ttl_ms: 0)
     end
 
     test "expiry alone preserves authority; steal invalidates stale refresh, release, and commit fence" do
