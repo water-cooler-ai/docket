@@ -74,6 +74,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def events, do: Docket.Postgres.EventStore
     end
 
+    defmodule RecordingObserver do
+      @behaviour Docket.Checkpoint.Observer
+
+      @impl true
+      def observe(checkpoint, %{application: %{notify: pid}}) do
+        send(pid, {:committed_observer, checkpoint})
+        :ok
+      end
+    end
+
     setup_all do
       config = TestRepo.config()
       _ = Ecto.Adapters.Postgres.storage_down(config)
@@ -338,10 +348,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           DateTime.add(@now, 1, :second)
         )
 
-      assert {:ok, %Moment{run: %{status: :cancelled} = cancelled}} =
-               Docket.Lifecycle.signal(backend, :tenantless, initial.run.id, fn run ->
-                 Docket.Runtime.RunMutation.cancel_run(run, DateTime.add(@now, 2, :second))
-               end)
+      parent = self()
+
+      cancellation =
+        Task.async(fn ->
+          Docket.Lifecycle.signal(backend, :tenantless, initial.run.id, fn run ->
+            send(parent, :cancellation_locked)
+
+            receive do
+              :commit_cancellation ->
+                Docket.Runtime.RunMutation.cancel_run(run, DateTime.add(@now, 2, :second))
+            end
+          end)
+        end)
+
+      assert_receive :cancellation_locked
 
       handler_id = {__MODULE__, self(), :fence_loser}
 
@@ -357,16 +378,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      assert {:error, :stale_fence} =
-               Docket.Lifecycle.commit_moment(
-                 backend,
-                 :tenantless,
-                 advance,
-                 initial.run.checkpoint_seq,
-                 lease.claim_token
-               )
+      task_supervisor =
+        start_supervised!({Task.Supervisor, name: Module.concat(__MODULE__, Effects)})
+
+      advance_commit =
+        Task.async(fn ->
+          commit_moment_with_effects(
+            backend,
+            advance,
+            initial.run.checkpoint_seq,
+            lease.claim_token,
+            checkpoint_observers: [RecordingObserver],
+            task_supervisor: task_supervisor,
+            context: %{notify: parent}
+          )
+        end)
+
+      refute Task.yield(advance_commit, 50)
+      send(cancellation.pid, :commit_cancellation)
+
+      assert {:ok, %Moment{run: %{status: :cancelled} = cancelled}} =
+               Task.await(cancellation, 1_000)
+
+      assert {:error, :stale_fence} = Task.await(advance_commit, 1_000)
 
       refute_receive {:committed_telemetry, _, _, _}
+      refute_receive {:committed_observer, _}
       assert {:ok, ^cancelled} = RunStore.fetch_run(TestRepo, :tenantless, initial.run.id)
       assert TestRepo.aggregate(Event, :count) == 4
     end
@@ -617,6 +654,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> Map.merge(Map.new(overrides))
       |> Run.changeset()
       |> TestRepo.insert!()
+    end
+
+    defp commit_moment_with_effects(backend, moment, expected_seq, claim_token, opts) do
+      case Docket.Lifecycle.commit_moment(
+             backend,
+             :tenantless,
+             moment,
+             expected_seq,
+             claim_token
+           ) do
+        {:ok, committed} = result ->
+          :ok = Docket.Lifecycle.after_commit(committed, opts)
+          result
+
+        {:error, _reason} = error ->
+          error
+      end
     end
 
     defp initialization_moment(run_id, graph_id, graph_hash) do
