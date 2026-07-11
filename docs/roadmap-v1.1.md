@@ -452,6 +452,9 @@ value-per-risk:
 6. **tenant-claim-fairness** — database-wide tenant-partitioned active-claim
    limits, fair partition selection, optional spare-capacity bursting, and
    contention/pool benchmarks (Theme 9; v0.1.1 operational follow-up).
+7. **await-protocol** — `{:await, term()}` late-completion protocol for
+   detached node execution (Theme 10; epic DCKT-40, after the v0.1.0 line
+   ships — breaks down into its own slices when scheduled).
 
 ## Open questions (need a call before their slice starts)
 
