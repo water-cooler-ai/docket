@@ -11,6 +11,20 @@ defmodule Docket.Runtime.RunMutationTest do
     {compile!(Graphs.interrupt_review()), run}
   end
 
+  defp with_active_tasks(run, timers_by_task_id) do
+    active_tasks =
+      Map.new(timers_by_task_id, fn {task_id, _timer} ->
+        {task_id, %TaskState{task_id: task_id, node_id: task_id, step: run.step, attempt: 2}}
+      end)
+
+    timers =
+      for {task_id, %DateTime{} = fires_at} <- timers_by_task_id, into: %{} do
+        {task_id, %TimerState{kind: :retry, fires_at: fires_at}}
+      end
+
+    %{run | active_tasks: active_tasks, timers: timers}
+  end
+
   describe "resolve_interrupt/5" do
     test "deterministically produces one immediate-wake moment" do
       {rtg, run} = waiting_run()
@@ -73,6 +87,57 @@ defmodule Docket.Runtime.RunMutationTest do
 
       assert {:error, %Docket.Error{type: :invalid_run}} =
                RunMutation.resolve_interrupt(rtg, created, "unknown", "value", @now)
+    end
+
+    test "parks at the earliest deadline when every active attempt has a future retry timer" do
+      {rtg, run} = waiting_run()
+      [interrupt_id] = Map.keys(run.interrupts)
+      earliest = DateTime.add(@now, 30, :second)
+
+      parked =
+        with_active_tasks(run, %{
+          "near" => earliest,
+          "far" => DateTime.add(@now, 90, :second)
+        })
+
+      assert {:ok, %Moment{} = moment} =
+               RunMutation.resolve_interrupt(rtg, parked, interrupt_id, "approved", @now)
+
+      assert moment.disposition == {:park, {:at, earliest}, :interrupt_resolved}
+      assert moment.checkpoint_metadata["wake_disposition"] == "at"
+    end
+
+    test "proposes an immediate wake when any active attempt's deadline is due" do
+      {rtg, run} = waiting_run()
+      [interrupt_id] = Map.keys(run.interrupts)
+
+      parked =
+        with_active_tasks(run, %{
+          "due" => @now,
+          "far" => DateTime.add(@now, 90, :second)
+        })
+
+      assert {:ok, %Moment{} = moment} =
+               RunMutation.resolve_interrupt(rtg, parked, interrupt_id, "approved", @now)
+
+      assert moment.disposition == {:park, :immediate, :interrupt_resolved}
+      assert moment.checkpoint_metadata["wake_disposition"] == "immediate"
+    end
+
+    test "proposes an immediate wake when an active attempt has no timer" do
+      {rtg, run} = waiting_run()
+      [interrupt_id] = Map.keys(run.interrupts)
+
+      untimed = %TaskState{task_id: "untimed", node_id: "untimed", step: run.step, attempt: 2}
+
+      parked = with_active_tasks(run, %{"far" => DateTime.add(@now, 90, :second)})
+      parked = put_in(parked.active_tasks["untimed"], untimed)
+
+      assert {:ok, %Moment{} = moment} =
+               RunMutation.resolve_interrupt(rtg, parked, interrupt_id, "approved", @now)
+
+      assert moment.disposition == {:park, :immediate, :interrupt_resolved}
+      assert moment.checkpoint_metadata["wake_disposition"] == "immediate"
     end
 
     test "retains interrupt schema and durable-value validation" do
