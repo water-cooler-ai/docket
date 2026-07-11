@@ -252,7 +252,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    @doc "Serializes and applies one pure, unclaimed graph-run mutation."
+    @doc "Serializes and applies one pure run mutation without requiring a claim fence."
     @spec mutate_run(ctx(), Docket.Storage.scope(), String.t(), Docket.Storage.Runs.mutation()) ::
             Docket.Storage.Runs.mutation_result()
     def mutate_run(ctx, scope, run_id, mutation) when is_function(mutation, 1) do
