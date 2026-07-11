@@ -186,8 +186,62 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Agent.get(agent, & &1.releases) == [{"shutdown", "token-shutdown", @now}]
     end
 
-    defp start_dispatcher!(agent, overrides \\ []) do
+    test "supervisor shutdown runs the bounded vehicle drain", %{agent: agent} do
+      set_claims(agent, [batch([lease("supervised")])])
+      parent = self()
+
       opts =
+        dispatcher_opts(agent,
+          drain_timeout_ms: 25,
+          launch: fn _lease ->
+            pid = spawn(fn -> receive(do: (:stop -> :ok)) end)
+            send(parent, {:supervised_vehicle, pid})
+            {:ok, pid}
+          end
+        )
+
+      {:ok, supervisor} = Supervisor.start_link([{Dispatcher, opts}], strategy: :one_for_one)
+      Process.unlink(supervisor)
+      assert_receive {:supervised_vehicle, vehicle}
+
+      started = System.monotonic_time(:millisecond)
+      assert :ok = Supervisor.stop(supervisor, :shutdown, 500)
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      assert elapsed >= 20
+      assert elapsed < 250
+      assert Process.alive?(vehicle)
+      send(vehicle, :stop)
+    end
+
+    test "linked vehicle exits are accounted through their monitor without crashing", %{
+      agent: agent
+    } do
+      set_claims(agent, [batch([lease("linked")]), batch()])
+      parent = self()
+
+      dispatcher =
+        start_dispatcher!(agent,
+          launch: fn _lease ->
+            pid = spawn_link(fn -> receive(do: (:stop -> :ok)) end)
+            send(parent, {:linked_vehicle, pid})
+            {:ok, pid}
+          end
+        )
+
+      assert_receive {:linked_vehicle, vehicle}
+      send(vehicle, :stop)
+
+      assert eventually(fn -> length(policies(agent)) == 2 end)
+      assert Process.alive?(dispatcher)
+    end
+
+    defp start_dispatcher!(agent, overrides \\ []) do
+      start_supervised!({Dispatcher, dispatcher_opts(agent, overrides)})
+    end
+
+    defp dispatcher_opts(agent, overrides) do
+      Keyword.merge(
         [
           context: agent,
           run_store: RunStore,
@@ -199,10 +253,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           launch: fn _lease -> {:error, :not_configured} end,
           clock: fn -> @now end,
           jitter: fn interval -> interval end
-        ]
-        |> Keyword.merge(overrides)
-
-      start_supervised!({Dispatcher, opts})
+        ],
+        overrides
+      )
     end
 
     defp set_claims(agent, claims), do: Agent.update(agent, &%{&1 | claims: claims})
