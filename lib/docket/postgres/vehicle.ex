@@ -36,6 +36,55 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     A claimed run that is not runnable under the lease's committed sequence
     is an invariant violation and raises.
 
+    ## Drain budget
+
+    A continuously runnable graph is valid and would otherwise retain one
+    dispatcher slot indefinitely. The optional `:drain_budget` bounds
+    consecutive commits per drain at durable moment boundaries:
+
+        drain_budget: [max_moments: 100, max_elapsed_ms: 1_000]
+
+    `:infinity` (the default for both) disables a limit. Enabled limits must
+    be positive integers. When the proposed moment's disposition is exactly
+    `:continue` and either committing it would reach `:max_moments` for this
+    drain, or the injectable `:monotonic_clock` observes `:max_elapsed_ms`
+    expired at the pre-commit boundary, the vehicle narrows the moment with
+    `Docket.Runtime.Moment.yield(moment, :drain_budget)` and commits it as an
+    immediate park: one transaction persists the advanced run and events,
+    clears the claim, records an immediate wake, and notifies. The run stays
+    `:running` and re-enters the global eligible queue. Both limits firing
+    together produce one yield.
+
+    Budget scope and non-promises:
+
+      * Elapsed decisions come only from `:monotonic_clock` (milliseconds,
+        defaults to `System.monotonic_time/1`); the DateTime `:clock` never
+        participates, so frozen or backward wall clocks cannot affect them.
+      * The budget starts at the first moment calculation; claim fetch and
+        graph load/compile never consume it.
+      * The elapsed limit stops *starting* new supersteps once expiry is
+        observed; the in-flight superstep is never preempted and runs to its
+        commit boundary, so a single long node execution can overshoot the
+        elapsed budget without bound.
+      * Terminal, retry, timer, interrupt, external-wait, failure, and
+        cancellation dispositions always win at an exact budget boundary;
+        `max_supersteps` remains separate graph/runtime safety that
+        terminally fails the run.
+      * This bounds slot monopolization only. It promises no strict FIFO or
+        round robin, no fixed maximum queue wait, no starvation freedom
+        under sustained arrivals, and no tenant or workload fairness.
+      * Every budget yield triggers both a transactional wake notification
+        and the vehicle-exit poll; the dispatcher coalesces them, but tight
+        budgets on cyclic runs make claim/launch/notify churn the steady
+        state. Size limits deliberately.
+
+    Each completed drain emits `[:docket, :postgres, :vehicle, :drain]` with
+    measurements `%{committed_moments, elapsed_ms}` (the yield commit
+    included) and metadata `%{outcome, budget}`, where `budget` is
+    `:max_moments`, `:max_elapsed_ms`, or `:both` only when a budget yield
+    durably committed, else `nil`. No run, task, token, tenant, or graph
+    identity appears in the event.
+
     Operational notes:
 
       * Node external effects are at-least-once around claim expiry and
@@ -50,6 +99,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         dispatcher and give its children a shutdown of at least the
         dispatcher's drain timeout, so graceful drain outlives supervisor
         shutdown ordering.
+      * Wire the dispatcher's `:launch` through `launcher/1` so malformed
+        vehicle configuration raises where the supervision tree is built.
+        Configuration this module validates raises inside the vehicle task
+        otherwise - loud, but per claim rather than at boot.
     """
 
     alias Docket.{Error, Lifecycle, Run}
@@ -69,10 +122,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     ]
     @after_commit_option_keys [:checkpoint_observers, :task_supervisor, :context]
 
+    @type drain_budget :: [
+            {:max_moments, pos_integer() | :infinity}
+            | {:max_elapsed_ms, pos_integer() | :infinity}
+          ]
+
     @type option ::
             {:backend, {module(), Docket.Storage.ctx()}}
             | {:task_supervisor, Supervisor.supervisor()}
             | {:clock, (-> DateTime.t())}
+            | {:monotonic_clock, (-> integer())}
+            | {:drain_budget, drain_budget()}
             | {:jitter, (pos_integer() -> non_neg_integer())}
             | {:abandon_backoff_ms, pos_integer()}
             | {:max_claim_abandons, pos_integer()}
@@ -106,10 +166,31 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              | {:deferred, :rescheduled | :poisoned | :stale}}
 
     @doc """
+    Builds the dispatcher's `:launch` callback from eagerly validated options.
+
+    Validation happens in this call, so a malformed `:drain_budget` or
+    `:monotonic_clock` raises `ArgumentError` where the supervision tree is
+    built - before any vehicle launches or any claim is consumed - instead
+    of failing per claim. This is the recommended wiring:
+    `launch: Docket.Postgres.Vehicle.launcher(opts)`.
+    """
+    @spec launcher([option()]) ::
+            (Docket.Storage.Runs.claim_lease() -> {:ok, pid()} | {:error, term()})
+    def launcher(opts) do
+      _drain_budget = drain_budget!(opts)
+      _monotonic_clock = monotonic_clock!(opts)
+      _task_supervisor = Keyword.fetch!(opts, :task_supervisor)
+      {_backend, _context} = Keyword.fetch!(opts, :backend)
+
+      &launch(&1, opts)
+    end
+
+    @doc """
     Launches a vehicle under the configured `:task_supervisor`.
 
     Shaped for the dispatcher's `:launch` callback:
-    `launch: &Docket.Postgres.Vehicle.launch(&1, opts)`.
+    `launch: &Docket.Postgres.Vehicle.launch(&1, opts)`. Prefer `launcher/1`,
+    which validates the options once at assembly time.
     """
     @spec launch(Docket.Storage.Runs.claim_lease(), [option()]) ::
             {:ok, pid()} | {:error, term()}
@@ -129,12 +210,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       case claimed_run(state) do
         {:ok, run} ->
           case runtime_graph(state) do
-            {:ok, rtg} -> advance(state, rtg, run, first_advance_opts(state))
-            {:incompatible, reason} -> abandon(state, reason)
+            {:ok, rtg} ->
+              budget = %{committed: 0, started: state.monotonic_clock.()}
+              advance(state, rtg, run, first_advance_opts(state), budget)
+
+            {:incompatible, reason} ->
+              finish(state, nil, nil, abandon(state, reason))
           end
 
         :fence_lost ->
-          release(state, :fence_lost)
+          finish(state, nil, nil, release(state, :fence_lost))
       end
     end
 
@@ -148,6 +233,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         runs: backend.runs(),
         graphs: backend.graphs(),
         clock: Keyword.get(opts, :clock, &DateTime.utc_now/0),
+        monotonic_clock: monotonic_clock!(opts),
+        drain_budget: drain_budget!(opts),
         jitter: Keyword.get(opts, :jitter, &:rand.uniform/1),
         abandon_backoff_ms: Keyword.get(opts, :abandon_backoff_ms, @default_abandon_backoff_ms),
         max_claim_abandons: Keyword.get(opts, :max_claim_abandons, @default_max_claim_abandons),
@@ -240,13 +327,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     # Moment loop
     # ---------------------------------------------------------------------
 
-    defp advance(%{lease: lease} = state, rtg, run, advance_opts) do
+    defp advance(%{lease: lease} = state, rtg, run, advance_opts, budget) do
       case Loop.propose_advance(rtg, run, advance_opts) do
         {:ok, moment} ->
-          commit(state, rtg, run, moment)
+          commit(state, rtg, run, moment, budget)
 
         {:park, _run, park} ->
-          defer(state, park)
+          finish(state, budget, nil, defer(state, park))
 
         {:wait, _run, interrupt_ids} ->
           raise Error.new(
@@ -267,7 +354,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    defp commit(state, rtg, run, moment) do
+    defp commit(state, rtg, run, moment, budget) do
+      {moment, fired} = maybe_yield(state, budget, moment)
+
       case Lifecycle.commit_moment(
              state.backend_ref,
              :system,
@@ -277,7 +366,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
            ) do
         {:ok, moment} ->
           :ok = Lifecycle.after_commit(moment, state.after_commit_opts)
-          continue(state, rtg, moment)
+          continue(state, rtg, moment, %{budget | committed: budget.committed + 1}, fired)
 
         {:error, reason} when reason in [:invalid_commit, :not_found] ->
           raise Error.new(
@@ -287,18 +376,141 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 )
 
         {:error, reason} ->
-          release(state, {:discarded, reason})
+          finish(state, budget, nil, release(state, {:discarded, reason}))
       end
     end
 
-    defp continue(state, rtg, %{disposition: :continue} = moment),
-      do: advance(state, rtg, moment.run, state.moment_opts)
+    defp continue(state, rtg, %{disposition: :continue} = moment, budget, nil),
+      do: advance(state, rtg, moment.run, state.moment_opts, budget)
 
-    defp continue(_state, _rtg, %{disposition: {:park, kind, _reason}}),
-      do: {:ok, {:parked, kind}}
+    defp continue(state, _rtg, %{disposition: {:park, kind, _reason}}, budget, fired),
+      do: finish(state, budget, fired, {:ok, {:parked, kind}})
+
+    # A proposed :continue moment at or past the drain budget narrows to an
+    # immediate drain-budget park before commit. Every other disposition wins
+    # untouched at the boundary; both limits firing together yield once.
+    defp maybe_yield(state, budget, %{disposition: :continue} = moment) do
+      case fired_budget(state, budget) do
+        nil ->
+          {moment, nil}
+
+        fired ->
+          case Docket.Runtime.Moment.yield(moment, :drain_budget) do
+            {:ok, yielded} ->
+              {yielded, fired}
+
+            {:error, reason} ->
+              raise Error.new(
+                      :claim_invariant,
+                      "drain-budget yield for run #{inspect(state.lease.run_id)} was rejected",
+                      details: %{reason: reason}
+                    )
+          end
+      end
+    end
+
+    defp maybe_yield(_state, _budget, moment), do: {moment, nil}
+
+    defp fired_budget(
+           %{drain_budget: %{max_moments: moments, max_elapsed_ms: elapsed_ms}} = state,
+           budget
+         ) do
+      count? = moments != :infinity and budget.committed + 1 >= moments
+
+      elapsed? =
+        elapsed_ms != :infinity and
+          state.monotonic_clock.() - budget.started >= elapsed_ms
+
+      cond do
+        count? and elapsed? -> :both
+        count? -> :max_moments
+        elapsed? -> :max_elapsed_ms
+        true -> nil
+      end
+    end
+
+    # One observability fact per completed drain; `fired` is non-nil only
+    # when a drain-budget yield durably committed. No identity labels.
+    defp finish(state, budget, fired, {:ok, outcome} = result) do
+      {committed, elapsed} =
+        case budget do
+          nil ->
+            {0, 0}
+
+          %{committed: committed, started: started} ->
+            {committed, max(state.monotonic_clock.() - started, 0)}
+        end
+
+      :telemetry.execute(
+        [:docket, :postgres, :vehicle, :drain],
+        %{committed_moments: committed, elapsed_ms: elapsed},
+        %{outcome: outcome_kind(outcome), budget: fired}
+      )
+
+      result
+    end
+
+    defp outcome_kind({:parked, _kind}), do: :parked
+    defp outcome_kind(:fence_lost), do: :fence_lost
+    defp outcome_kind({:discarded, _reason}), do: :discarded
+    defp outcome_kind({:abandoned, _disposition, _reason}), do: :abandoned
+    defp outcome_kind({:deferred, _disposition}), do: :deferred
 
     defp first_advance_opts(state),
       do: Keyword.put(state.moment_opts, :resume_floor, state.lease.claimed_at)
+
+    # ---------------------------------------------------------------------
+    # Option validation
+    # ---------------------------------------------------------------------
+
+    @doc false
+    @spec drain_budget!([option()]) :: %{
+            max_moments: pos_integer() | :infinity,
+            max_elapsed_ms: pos_integer() | :infinity
+          }
+    def drain_budget!(opts) do
+      budget = Keyword.get(opts, :drain_budget, [])
+
+      unless Keyword.keyword?(budget) do
+        raise ArgumentError, ":drain_budget must be a keyword list, got: #{inspect(budget)}"
+      end
+
+      case Keyword.keys(budget) -- [:max_moments, :max_elapsed_ms] do
+        [] -> :ok
+        unknown -> raise ArgumentError, ":drain_budget has unknown keys: #{inspect(unknown)}"
+      end
+
+      %{
+        max_moments: budget_limit!(budget, :max_moments),
+        max_elapsed_ms: budget_limit!(budget, :max_elapsed_ms)
+      }
+    end
+
+    defp budget_limit!(budget, key) do
+      case Keyword.get(budget, key, :infinity) do
+        :infinity ->
+          :infinity
+
+        limit when is_integer(limit) and limit > 0 ->
+          limit
+
+        other ->
+          raise ArgumentError,
+                ":drain_budget #{key} must be a positive integer or :infinity, " <>
+                  "got: #{inspect(other)}"
+      end
+    end
+
+    defp monotonic_clock!(opts) do
+      case Keyword.get(opts, :monotonic_clock, fn -> System.monotonic_time(:millisecond) end) do
+        clock when is_function(clock, 0) ->
+          clock
+
+        other ->
+          raise ArgumentError,
+                ":monotonic_clock must be a zero-arity function, got: #{inspect(other)}"
+      end
+    end
 
     # ---------------------------------------------------------------------
     # Claim hand-back and release

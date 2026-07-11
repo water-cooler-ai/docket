@@ -150,6 +150,62 @@ defmodule Docket.Runtime.Moment do
   end
 
   @doc """
+  Narrows a `:continue` moment to an immediate driver-yield park.
+
+  This is the only sanctioned way for a driver to rewrite a proposed
+  moment's disposition. It accepts exactly a structurally valid moment whose
+  disposition is `:continue` and returns the same moment parked as
+  `{:park, :immediate, reason}`, with the checkpoint metadata envelope and
+  the single final `:checkpoint_committed` event's metadata rebuilt
+  consistently for the new disposition.
+
+  Everything else is preserved: the proposed run and its sequences, every
+  event's sequence and timestamp, runtime event payloads, the checkpoint
+  type (a yielded barrier keeps `:step_committed` or
+  `:interrupt_requested`), pending-attempt identity, and `proposed_at`.
+
+  A moment that already parks (including terminal) is never overridden and
+  returns `{:error, {:not_continue, disposition}}`. A malformed moment -
+  missing, duplicated, or misplaced final checkpoint event, or an envelope
+  that does not match that event - returns `{:error, :malformed_moment}`.
+  """
+  @spec yield(t(), atom()) :: {:ok, t()} | {:error, term()}
+  def yield(%__MODULE__{disposition: :continue} = moment, reason) when is_atom(reason) do
+    case Enum.split(moment.events, -1) do
+      {runtime_events, [%Event{type: :checkpoint_committed} = checkpoint_event]}
+      when checkpoint_event.metadata == moment.checkpoint_metadata ->
+        if Enum.any?(runtime_events, &(&1.type == :checkpoint_committed)) do
+          {:error, :malformed_moment}
+        else
+          disposition = {:park, :immediate, reason}
+
+          metadata =
+            checkpoint_metadata(
+              moment.run,
+              runtime_events,
+              moment.checkpoint_type,
+              disposition,
+              moment.pending_attempts
+            )
+
+          {:ok,
+           %{
+             moment
+             | disposition: disposition,
+               checkpoint_metadata: metadata,
+               events: runtime_events ++ [%{checkpoint_event | metadata: metadata}]
+           }}
+        end
+
+      _other ->
+        {:error, :malformed_moment}
+    end
+  end
+
+  def yield(%__MODULE__{disposition: disposition}, reason) when is_atom(reason),
+    do: {:error, {:not_continue, disposition}}
+
+  @doc """
   Builds the committed `Docket.Checkpoint` value for a moment.
 
   Call only after the moment has durably committed (or, for host-owned

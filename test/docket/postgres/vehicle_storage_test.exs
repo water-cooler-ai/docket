@@ -383,14 +383,186 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     # Helpers
     # -----------------------------------------------------------------------
 
+    test "drain-budget yield commits run, events, claim release, wake, and notify atomically",
+         %{context: context, backend: backend} do
+      rtg = publish!(context, Graphs.endless_cycle())
+      run = start_run!(backend, rtg, %{})
+      lease = claim!(context, @now)
+
+      listen!()
+
+      assert {:ok, {:parked, :immediate}} =
+               Vehicle.drain(
+                 lease,
+                 vehicle_opts(context, clock: fn -> @now end, drain_budget: [max_moments: 2])
+               )
+
+      assert_receive {:notification, _pid, _ref, "docket_wake", ""}, 2_000
+
+      assert {:ok, running} = RunStore.fetch_run(context, :system, run.id)
+      assert running.status == :running
+      assert running.checkpoint_seq == lease.checkpoint_seq + 2
+
+      assert {:ok, %RunInfo{} = info} = RunStore.inspect_run(context, :system, run.id)
+      assert info.claimed_at == nil
+      assert %DateTime{} = info.wake_at
+
+      row = TestRepo.get_by!(Run, run_id: run.id)
+      assert row.claim_token == nil
+
+      committed =
+        Event
+        |> TestRepo.all()
+        |> Enum.filter(&(&1.run_id == run.id))
+        |> Enum.sort_by(& &1.seq)
+
+      metadata = fn event -> Docket.DurableCodec.decode!(event.metadata, :event) end
+
+      yields =
+        Enum.filter(committed, fn event ->
+          event.type == :checkpoint_committed and
+            metadata.(event)["park_reason"] == "drain_budget"
+        end)
+
+      assert [yield_event] = yields
+      assert yield_event.seq == List.last(committed).seq
+      assert metadata.(yield_event)["wake_disposition"] == "immediate"
+      assert metadata.(yield_event)["checkpoint_type"] == "step_committed"
+      assert metadata.(yield_event)["checkpoint_seq"] == running.checkpoint_seq
+    end
+
+    test "event append failure persists no partial yield and sends no notification", %{
+      context: context,
+      backend: backend
+    } do
+      rtg = publish!(context, Graphs.endless_cycle())
+      run = start_run!(backend, rtg, %{})
+      lease = claim!(context, @now)
+
+      listen!()
+
+      assert {:ok, {:discarded, :injected_event_failure}} =
+               Vehicle.drain(
+                 lease,
+                 backend: {FailingEventsBackend, context},
+                 graph_cache: false,
+                 clock: fn -> @now end,
+                 drain_budget: [max_moments: 1]
+               )
+
+      refute_receive {:notification, _pid, _ref, "docket_wake", _payload}, 300
+
+      assert {:ok, unchanged} = RunStore.fetch_run(context, :system, run.id)
+      assert unchanged.checkpoint_seq == run.checkpoint_seq
+      assert unchanged.step == run.step
+
+      events = Event |> TestRepo.all() |> Enum.filter(&(&1.run_id == run.id))
+
+      assert Enum.filter(events, fn event ->
+               event.type == :checkpoint_committed and
+                 Docket.DurableCodec.decode!(event.metadata, :event)["park_reason"] ==
+                   "drain_budget"
+             end) == []
+
+      # The discard released the claim with a poll-visible wake.
+      assert {:ok, %RunInfo{claimed_at: nil, wake_at: %DateTime{}}} =
+               RunStore.inspect_run(context, :system, run.id)
+    end
+
+    test "at concurrency one an infinite cycle yields so the older due run completes", %{
+      context: context,
+      backend: backend
+    } do
+      cycle_rtg = publish!(context, Graphs.endless_cycle())
+      linear_rtg = publish!(context, Graphs.minimal_linear())
+
+      # The cycle is due earlier, so the single slot claims it first.
+      cycle = start_run!(backend, cycle_rtg, %{}, DateTime.add(@now, -60, :second))
+      short = start_run!(backend, linear_rtg, %{"value" => "x"}, @now)
+
+      lease = claim!(context, @now)
+      assert lease.run_id == cycle.id
+
+      assert {:ok, {:parked, :immediate}} =
+               Vehicle.drain(
+                 lease,
+                 vehicle_opts(context, clock: fn -> @now end, drain_budget: [max_moments: 3])
+               )
+
+      # The yield stamped the cycle's wake at commit time, so the short run
+      # is now the older due candidate and wins the freed slot.
+      short_lease = claim!(context, DateTime.utc_now())
+      assert short_lease.run_id == short.id
+
+      assert {:ok, {:parked, :terminal}} =
+               Vehicle.drain(short_lease, vehicle_opts(context, clock: fn -> @now end))
+
+      assert {:ok, %{status: :done}} = RunStore.fetch_run(context, :system, short.id)
+      assert {:ok, %{status: :running}} = RunStore.fetch_run(context, :system, cycle.id)
+
+      # The cycle keeps its own progress on the next slot.
+      cycle_lease = claim!(context, DateTime.utc_now())
+      assert cycle_lease.run_id == cycle.id
+    end
+
+    test "cache-disabled repeated budget yields keep committing progress", %{
+      context: context,
+      backend: backend
+    } do
+      rtg = publish!(context, Graphs.endless_cycle())
+      run = start_run!(backend, rtg, %{})
+
+      steps =
+        for _ <- 1..3 do
+          lease = claim!(context, DateTime.utc_now())
+
+          assert {:ok, {:parked, :immediate}} =
+                   Vehicle.drain(
+                     lease,
+                     vehicle_opts(context,
+                       clock: fn -> @now end,
+                       drain_budget: [max_moments: 1]
+                     )
+                   )
+
+          {:ok, current} = RunStore.fetch_run(context, :system, run.id)
+          current.step
+        end
+
+      assert steps == Enum.sort(steps)
+      assert length(Enum.uniq(steps)) == 3
+    end
+
+    defp listen! do
+      opts =
+        TestRepo.config()
+        |> Keyword.drop([
+          :adapter,
+          :log,
+          :name,
+          :otp_app,
+          :pool,
+          :pool_count,
+          :pool_size,
+          :priv,
+          :stacktrace,
+          :telemetry_prefix
+        ])
+        |> Keyword.merge(sync_connect: true, auto_reconnect: true)
+
+      {:ok, listener} = Postgrex.Notifications.start_link(opts)
+      {:ok, _reference} = Postgrex.Notifications.listen(listener, "docket_wake")
+      listener
+    end
+
     defp publish!(context, graph) do
       {:ok, effective, rtg} = Compiler.compile_for_publication(graph, profile: :publish)
       :ok = GraphStore.save_graph(context, rtg.graph_id, rtg.graph_hash, effective)
       rtg
     end
 
-    defp start_run!(backend, rtg, input) do
-      opts = [clock: fn -> @now end]
+    defp start_run!(backend, rtg, input, now \\ @now) do
+      opts = [clock: fn -> now end]
       run = Loop.build_initial_run(rtg, input, opts)
       {:ok, moment} = Loop.propose_init(rtg, run, opts)
       {:ok, moment} = Lifecycle.start(backend, :tenantless, moment)

@@ -569,6 +569,194 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Enum.count(claimed, &String.starts_with?(&1, "expired-")) == 3
     end
 
+    test "demand of two or more reserves one outcome per non-empty class" do
+      # All ready rows are older than the expired row, so oldest-first alone
+      # would fill the whole batch from the ready class.
+      for index <- 1..3 do
+        insert_run!("ready-#{index}", wake_at: DateTime.add(@now, -(50 - index), :second))
+      end
+
+      insert_run!("expired-1",
+        wake_at: nil,
+        claim_token: Ecto.UUID.generate(),
+        claimed_at: DateTime.add(@now, -10, :second)
+      )
+
+      assert {:ok, %{leases: leases, poisoned: []}} = claim_due(@now, limit: 3)
+      claimed = leases |> Enum.map(& &1.run_id) |> Enum.sort()
+
+      # One reserved slot per class, remainder by oldest eligibility.
+      assert claimed == ["expired-1", "ready-1", "ready-2"]
+    end
+
+    test "the reservation also holds when the expired class dominates by age" do
+      for index <- 1..3 do
+        insert_run!("expired-#{index}",
+          wake_at: nil,
+          claim_token: Ecto.UUID.generate(),
+          claimed_at: DateTime.add(@now, -(50 - index), :second)
+        )
+      end
+
+      insert_run!("ready-1", wake_at: DateTime.add(@now, -10, :second))
+
+      assert {:ok, %{leases: leases, poisoned: []}} = claim_due(@now, limit: 3)
+      claimed = leases |> Enum.map(& &1.run_id) |> Enum.sort()
+
+      assert claimed == ["expired-1", "expired-2", "ready-1"]
+    end
+
+    test "a poisoned head consumes its class's reserved slot as an outcome" do
+      insert_run!("expired-exhausted",
+        wake_at: nil,
+        claim_token: Ecto.UUID.generate(),
+        claimed_at: DateTime.add(@now, -30, :second),
+        claim_attempts: 3
+      )
+
+      insert_run!("ready-1", wake_at: DateTime.add(@now, -20, :second))
+      insert_run!("ready-2", wake_at: DateTime.add(@now, -10, :second))
+
+      assert {:ok, %{leases: [lease], poisoned: [poison]}} = claim_due(@now, limit: 2)
+      assert lease.run_id == "ready-1"
+      assert poison.run_id == "expired-exhausted"
+    end
+
+    test "demand one serves the preferred class first and falls through when empty" do
+      insert_run!("expired-old",
+        wake_at: nil,
+        claim_token: Ecto.UUID.generate(),
+        claimed_at: DateTime.add(@now, -60, :second)
+      )
+
+      insert_run!("ready-new", wake_at: DateTime.add(@now, -5, :second))
+
+      # The expired row is older, but the preference overrides age at demand 1.
+      assert claim_one(@now, limit: 1, preference: :ready).run_id == "ready-new"
+      assert claim_one(@now, limit: 1, preference: :expired).run_id == "expired-old"
+
+      insert_run!("ready-only", wake_at: DateTime.add(@now, -1, :second))
+
+      # Empty preferred class falls through without wasting the demand.
+      assert claim_one(@now, limit: 1, preference: :expired).run_id == "ready-only"
+
+      assert_raise ArgumentError, fn ->
+        RunStore.claim_due(TestRepo, :system, policy(@now, preference: :sideways))
+      end
+    end
+
+    test "alternating demand-1 preference makes progress on both classes despite age skew" do
+      # Every expired row is older than every ready row, so neutral
+      # oldest-first would drain the whole expired class before any ready row.
+      for index <- 1..3 do
+        insert_run!("ready-#{index}", wake_at: DateTime.add(@now, -index, :second))
+
+        insert_run!("expired-#{index}",
+          wake_at: nil,
+          claim_token: Ecto.UUID.generate(),
+          claimed_at: DateTime.add(@now, -(index + 100), :second)
+        )
+      end
+
+      claimed =
+        for preference <- [:ready, :expired, :ready, :expired],
+            do: claim_one(@now, limit: 1, preference: preference).run_id
+
+      assert Enum.count(claimed, &String.starts_with?(&1, "ready-")) == 2
+      assert Enum.count(claimed, &String.starts_with?(&1, "expired-")) == 2
+    end
+
+    test "concurrent mixed-class polling drains both classes exactly once under contention" do
+      for index <- 1..6 do
+        insert_run!("ready-#{index}", wake_at: DateTime.add(@now, -index, :second))
+
+        insert_run!("expired-#{index}",
+          wake_at: nil,
+          claim_token: Ecto.UUID.generate(),
+          claimed_at: DateTime.add(@now, -(index + 100), :second)
+        )
+      end
+
+      # Four claimants poll concurrently until the queue is dry; SKIP LOCKED
+      # contention may skip rows within a poll but never duplicates or
+      # strands one class while the other drains.
+      drain_all = fn drain_all ->
+        case claim_due(@now, limit: 2) do
+          {:ok, %{leases: [], poisoned: []}} -> []
+          {:ok, %{leases: leases, poisoned: []}} -> leases ++ drain_all.(drain_all)
+        end
+      end
+
+      claimed =
+        1..4
+        |> Task.async_stream(fn _worker -> drain_all.(drain_all) end,
+          max_concurrency: 4,
+          timeout: 30_000
+        )
+        |> Enum.flat_map(fn {:ok, leases} -> leases end)
+
+      run_ids = Enum.map(claimed, & &1.run_id)
+      assert length(run_ids) == 12
+      assert Enum.uniq(run_ids) == run_ids
+      assert Enum.count(run_ids, &String.starts_with?(&1, "ready-")) == 6
+      assert Enum.count(run_ids, &String.starts_with?(&1, "expired-")) == 6
+
+      tokens = Enum.map(claimed, & &1.claim_token)
+      assert Enum.uniq(tokens) == tokens
+    end
+
+    test "claim scans emit identity-free telemetry with class counts and fallback" do
+      handler_id = "claim-telemetry-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:docket, :postgres, :run_store, :claim],
+          fn _event, measurements, metadata, _config ->
+            send(parent, {:claim_telemetry, measurements, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      insert_run!("ready-1", wake_at: DateTime.add(@now, -20, :second))
+
+      insert_run!("expired-1",
+        wake_at: nil,
+        claim_token: Ecto.UUID.generate(),
+        claimed_at: DateTime.add(@now, -30, :second)
+      )
+
+      assert {:ok, %{leases: [_, _]}} = claim_due(@now, limit: 2)
+
+      assert_receive {:claim_telemetry, measurements, metadata}
+      assert measurements.demand == 2
+      assert measurements.leases == 2
+      assert measurements.poisoned == 0
+      assert measurements.ready_candidates == 1
+      assert measurements.expired_candidates == 1
+      assert measurements.ready_selected == 1
+      assert measurements.expired_selected == 1
+      assert measurements.ready_oldest_age_ms == 20_000
+      assert measurements.expired_oldest_age_ms == 30_000
+      assert metadata == %{preference: nil, fallback: false}
+
+      # Preferred-but-empty class reports the fallthrough.
+      insert_run!("expired-2",
+        wake_at: nil,
+        claim_token: Ecto.UUID.generate(),
+        claimed_at: DateTime.add(@now, -30, :second)
+      )
+
+      assert {:ok, %{leases: [%{run_id: "expired-2"}]}} =
+               claim_due(@now, limit: 1, preference: :ready)
+
+      assert_receive {:claim_telemetry, %{demand: 1, expired_selected: 1},
+                      %{preference: :ready, fallback: true}}
+    end
+
     test "leases and poison outcomes across both paths share one limit" do
       insert_run!("poison-ready",
         wake_at: DateTime.add(@now, -30, :second),
@@ -1044,7 +1232,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
           TestRepo.query!(
             "EXPLAIN (COSTS OFF) " <> RunStore.claim_statement(),
-            [@now, cutoff, 3, 3]
+            [@now, cutoff, 3, 3, nil]
           ).rows
         end)
         |> elem(1)

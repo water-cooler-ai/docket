@@ -438,6 +438,330 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, %{status: :done}} = Host.fetch_run(run.id)
     end
 
+    describe "drain budget" do
+      @drain_event [:docket, :postgres, :vehicle, :drain]
+
+      defp watch_drains do
+        handler_id = "vehicle-drain-#{System.unique_integer([:positive])}"
+        parent = self()
+
+        :ok =
+          :telemetry.attach(
+            handler_id,
+            @drain_event,
+            fn _event, measurements, metadata, _config ->
+              send(parent, {:drain, measurements, metadata})
+            end,
+            nil
+          )
+
+        on_exit(fn -> :telemetry.detach(handler_id) end)
+      end
+
+      defp scripted_monotonic(values) do
+        agent = start_supervised!({Agent, fn -> values end}, id: make_ref())
+
+        fn ->
+          Agent.get_and_update(agent, fn
+            [last] -> {last, [last]}
+            [head | tail] -> {head, tail}
+          end)
+        end
+      end
+
+      test "max_moments bounds consecutive commits and yields the Nth continuing moment", %{
+        backend_ref: backend_ref,
+        context: context
+      } do
+        watch_drains()
+        {run, lease} = start_claimed!(backend_ref, Graphs.endless_cycle(), %{})
+
+        assert {:ok, {:parked, :immediate}} =
+                 Vehicle.drain(lease, vehicle_opts(backend_ref, drain_budget: [max_moments: 4]))
+
+        assert {:ok, running} = Host.fetch_run(run.id)
+        assert running.status == :running
+        # Initialization committed seq 1 outside the drain; the drain adds
+        # exactly max_moments commits, the last one the budget yield.
+        assert running.checkpoint_seq == 5
+
+        assert MemoryBackend.claim(context, run.id) == nil
+        assert %DateTime{} = MemoryBackend.wake_at(context, run.id)
+
+        checkpoints =
+          context
+          |> MemoryBackend.events(run.id)
+          |> Enum.filter(&(&1.type == :checkpoint_committed))
+
+        assert length(checkpoints) == 5
+
+        final = List.last(checkpoints)
+        assert final.metadata["checkpoint_type"] == "step_committed"
+        assert final.metadata["wake_disposition"] == "immediate"
+        assert final.metadata["park_reason"] == "drain_budget"
+
+        yields = Enum.filter(checkpoints, &(&1.metadata["park_reason"] == "drain_budget"))
+        assert length(yields) == 1
+
+        assert_receive {:drain, %{committed_moments: 4, elapsed_ms: _},
+                        %{outcome: :parked, budget: :max_moments}}
+
+        # The yielded run stays claimable and keeps making progress.
+        [lease2] = claim!(backend_ref, DateTime.add(DateTime.utc_now(), 2, :second))
+
+        assert {:ok, {:parked, :immediate}} =
+                 Vehicle.drain(lease2, vehicle_opts(backend_ref, drain_budget: [max_moments: 4]))
+
+        assert {:ok, later} = Host.fetch_run(run.id)
+        assert later.checkpoint_seq == 9
+        assert later.channels["state:count"].value > running.channels["state:count"].value
+      end
+
+      test "max_moments of one still commits one moment of progress per drain", %{
+        backend_ref: backend_ref
+      } do
+        {run, lease} = start_claimed!(backend_ref, Graphs.endless_cycle(), %{})
+
+        assert {:ok, {:parked, :immediate}} =
+                 Vehicle.drain(lease, vehicle_opts(backend_ref, drain_budget: [max_moments: 1]))
+
+        assert {:ok, after_first} = Host.fetch_run(run.id)
+        assert after_first.status == :running
+        assert after_first.checkpoint_seq == 2
+        assert after_first.step == 1
+      end
+
+      test "elapsed budget yields at the first pre-commit boundary observing expiry", %{
+        backend_ref: backend_ref
+      } do
+        watch_drains()
+        {run, lease} = start_claimed!(backend_ref, Graphs.endless_cycle(), %{})
+
+        # Wall clock runs backward while the monotonic clock advances; only
+        # the monotonic samples (start, then one per pre-commit boundary)
+        # gate the yield. The first boundary observes 500ms, commits, the
+        # second observes 1500ms and yields: elapsed bounds *starting*
+        # supersteps, never preempting the in-flight one.
+        t0 = DateTime.utc_now()
+        backwards = start_supervised!({Agent, fn -> 0 end}, id: make_ref())
+
+        backward_clock = fn ->
+          seconds = Agent.get_and_update(backwards, &{&1, &1 + 1})
+          DateTime.add(t0, -seconds, :second)
+        end
+
+        assert {:ok, {:parked, :immediate}} =
+                 Vehicle.drain(
+                   lease,
+                   vehicle_opts(backend_ref,
+                     clock: backward_clock,
+                     monotonic_clock: scripted_monotonic([0, 500, 1_500]),
+                     drain_budget: [max_elapsed_ms: 1_000]
+                   )
+                 )
+
+        assert {:ok, running} = Host.fetch_run(run.id)
+        assert running.status == :running
+        assert running.checkpoint_seq == 3
+
+        assert_receive {:drain, %{committed_moments: 2, elapsed_ms: 1_500},
+                        %{outcome: :parked, budget: :max_elapsed_ms}}
+      end
+
+      test "count and elapsed limits firing together produce one yield", %{
+        backend_ref: backend_ref,
+        context: context
+      } do
+        watch_drains()
+        {run, lease} = start_claimed!(backend_ref, Graphs.endless_cycle(), %{})
+
+        assert {:ok, {:parked, :immediate}} =
+                 Vehicle.drain(
+                   lease,
+                   vehicle_opts(backend_ref,
+                     monotonic_clock: scripted_monotonic([0, 500, 1_500]),
+                     drain_budget: [max_moments: 2, max_elapsed_ms: 1_000]
+                   )
+                 )
+
+        yields =
+          context
+          |> MemoryBackend.events(run.id)
+          |> Enum.filter(&(&1.metadata["park_reason"] == "drain_budget"))
+
+        assert length(yields) == 1
+        assert_receive {:drain, %{committed_moments: 2}, %{outcome: :parked, budget: :both}}
+      end
+
+      test "a terminal moment wins at the exact budget boundary", %{backend_ref: backend_ref} do
+        watch_drains()
+        {run, lease} = start_claimed!(backend_ref, Graphs.minimal_linear(), %{"value" => "x"})
+
+        # minimal_linear commits exactly two moments; the second is terminal
+        # and coincides with the max_moments boundary.
+        assert {:ok, {:parked, :terminal}} =
+                 Vehicle.drain(lease, vehicle_opts(backend_ref, drain_budget: [max_moments: 2]))
+
+        assert {:ok, %{status: :done}} = Host.fetch_run(run.id)
+        assert_receive {:drain, %{committed_moments: 2}, %{outcome: :parked, budget: nil}}
+      end
+
+      test "retry and external-wait parks win at the exact budget boundary", %{
+        backend_ref: backend_ref
+      } do
+        t0 = DateTime.add(DateTime.utc_now(), 3600, :second)
+        {_run, lease} = start_claimed!(backend_ref, Graphs.retry_then_continue(), %{}, t0)
+
+        assert {:ok, {:parked, {:at, _deadline}}} =
+                 Vehicle.drain(
+                   lease,
+                   vehicle_opts(backend_ref,
+                     clock: fn -> t0 end,
+                     drain_budget: [max_moments: 1]
+                   )
+                 )
+
+        {run2, lease2} = start_claimed!(backend_ref, Graphs.interrupt_review(), %{})
+
+        assert {:ok, {:parked, :external}} =
+                 Vehicle.drain(lease2, vehicle_opts(backend_ref, drain_budget: [max_moments: 1]))
+
+        assert {:ok, %{status: :waiting}} = Host.fetch_run(run2.id)
+      end
+
+      test "max_supersteps terminal failure wins over a coincident drain budget", %{
+        backend_ref: backend_ref
+      } do
+        watch_drains()
+        {run, lease} = start_claimed!(backend_ref, Graphs.fanout(), %{"value" => "x"})
+
+        # With max_supersteps 1 the second moment is the terminal failure,
+        # exactly where max_moments 2 would otherwise yield.
+        assert {:ok, {:parked, :terminal}} =
+                 Vehicle.drain(
+                   lease,
+                   vehicle_opts(backend_ref,
+                     max_supersteps: 1,
+                     drain_budget: [max_moments: 2]
+                   )
+                 )
+
+        assert {:ok, failed} = Host.fetch_run(run.id)
+        assert failed.status == :failed
+        assert failed.failure.code == "max_supersteps_exceeded"
+        assert_receive {:drain, _measurements, %{outcome: :parked, budget: nil}}
+      end
+
+      test "cancellation wins over the drain budget as fence loss, never a yield", %{
+        backend_ref: backend_ref,
+        context: context
+      } do
+        watch_drains()
+        {run, lease} = start_claimed!(backend_ref, Graphs.endless_cycle(), %{})
+
+        assert {:ok, cancelled} = Host.cancel_run(run.id)
+        assert cancelled.status == :cancelled
+
+        assert {:ok, :fence_lost} =
+                 Vehicle.drain(lease, vehicle_opts(backend_ref, drain_budget: [max_moments: 1]))
+
+        assert {:ok, after_drain} = Host.fetch_run(run.id)
+        assert after_drain == cancelled
+
+        events = MemoryBackend.events(context, run.id)
+        assert Enum.filter(events, &(&1.metadata["park_reason"] == "drain_budget")) == []
+        assert_receive {:drain, %{committed_moments: 0}, %{outcome: :fence_lost, budget: nil}}
+      end
+
+      test "a failed yield commit emits no committed-yield telemetry", %{
+        backend_ref: backend_ref,
+        context: context
+      } do
+        watch_drains()
+        {run, lease} = start_claimed!(backend_ref, Graphs.endless_cycle(), %{})
+        {:ok, pre_drain} = Host.fetch_run(run.id)
+
+        assert {:ok, {:discarded, :stale_fence}} =
+                 Vehicle.drain(
+                   lease,
+                   vehicle_opts({StaleCommitBackend, context}, drain_budget: [max_moments: 1])
+                 )
+
+        assert {:ok, after_drain} = Host.fetch_run(run.id)
+        assert after_drain == pre_drain
+        assert_receive {:drain, %{committed_moments: 0}, %{outcome: :discarded, budget: nil}}
+
+        # The first run was released with an immediate wake, so claim both
+        # and pick the fresh run's lease.
+        {:ok, reference} = Host.save_graph(Graphs.endless_cycle())
+        {:ok, run2} = Host.start_run(reference, %{})
+        leases = claim!(backend_ref, DateTime.add(DateTime.utc_now(), 2, :second), 2)
+        lease2 = Enum.find(leases, &(&1.run_id == run2.id))
+        {:ok, pre_drain2} = Host.fetch_run(run2.id)
+
+        assert {:ok, {:discarded, :injected_event_failure}} =
+                 Vehicle.drain(
+                   lease2,
+                   vehicle_opts({FailingEventsBackend, context}, drain_budget: [max_moments: 1])
+                 )
+
+        assert {:ok, after_drain2} = Host.fetch_run(run2.id)
+        assert after_drain2 == pre_drain2
+        assert_receive {:drain, %{committed_moments: 0}, %{outcome: :discarded, budget: nil}}
+      end
+
+      test "launcher/1 rejects malformed configuration before any vehicle launches", %{
+        backend_ref: backend_ref
+      } do
+        valid = vehicle_opts(backend_ref, task_supervisor: @task_sup)
+
+        assert is_function(Vehicle.launcher(valid), 1)
+
+        assert is_function(
+                 Vehicle.launcher(
+                   Keyword.put(
+                     valid,
+                     :drain_budget,
+                     max_moments: :infinity,
+                     max_elapsed_ms: :infinity
+                   )
+                 ),
+                 1
+               )
+
+        for budget <- [
+              [max_moments: 0],
+              [max_moments: -1],
+              [max_moments: 1.5],
+              [max_elapsed_ms: 0],
+              [max_elapsed_ms: "1000"],
+              [bogus: 1],
+              %{max_moments: 1},
+              :nonsense
+            ] do
+          assert_raise ArgumentError, fn ->
+            Vehicle.launcher(Keyword.put(valid, :drain_budget, budget))
+          end
+        end
+
+        assert_raise ArgumentError, fn ->
+          Vehicle.launcher(Keyword.put(valid, :monotonic_clock, :not_a_fun))
+        end
+
+        assert_raise KeyError, fn ->
+          Vehicle.launcher(Keyword.delete(valid, :task_supervisor))
+        end
+      end
+
+      test "drain/2 validates the budget for direct callers", %{backend_ref: backend_ref} do
+        {_run, lease} = start_claimed!(backend_ref, Graphs.minimal_linear(), %{"value" => "x"})
+
+        assert_raise ArgumentError, fn ->
+          Vehicle.drain(lease, vehicle_opts(backend_ref, drain_budget: [max_moments: 0]))
+        end
+      end
+    end
+
     def telemetry_relay(event, _measurements, _metadata, %{pid: pid}) do
       send(pid, {:telemetry, event})
     end

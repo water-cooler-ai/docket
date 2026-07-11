@@ -37,12 +37,21 @@ defmodule Docket.Storage.Runs do
           :retain_claim
           | {:release_claim, :immediate | :external | :terminal | {:at, DateTime.t()}}
 
-  @typedoc "Policy for one atomic due-claim scan."
+  @typedoc """
+  Policy for one atomic due-claim scan.
+
+  `:preference` is an optional, advisory demand-1 hint naming the candidate
+  class (`:ready` or `:expired`) served first when `limit` is exactly one.
+  It is operational and local - dispatchers alternate it across consecutive
+  polls and lose the phase on restart - never durable run state. Absent (or
+  at any other demand) selection is class-neutral.
+  """
   @type claim_policy :: %{
           required(:now) => DateTime.t(),
           required(:limit) => pos_integer(),
           required(:orphan_ttl_ms) => non_neg_integer(),
-          required(:max_claim_attempts) => pos_integer()
+          required(:max_claim_attempts) => pos_integer(),
+          optional(:preference) => :ready | :expired | nil
         }
 
   @typedoc "Lightweight authority returned for a run that should be launched."
@@ -173,6 +182,23 @@ defmodule Docket.Storage.Runs do
   Selection, attempt accounting, claim steal, and poison mutation occur in
   the same atomic operation. The total number of returned outcomes is at most
   `policy.limit`.
+
+  Selection keeps both continuously eligible classes making progress:
+
+    * With `limit >= 2` and both classes non-empty, at least one outcome
+      (lease or poison - the reservation is per outcome, not per lease) goes
+      to each class; the remaining demand takes the oldest eligible rows
+      under the stable `(eligible_at, id)` tie-break.
+    * With `limit == 1`, the optional `policy.preference` class is served
+      first, falling through to the other class when the preferred one is
+      empty so preference never wastes demand. Without a preference the
+      oldest eligible row wins regardless of class.
+
+  Eligibility-time ordering provides aging, not fairness. Implementations
+  promise no strict FIFO, no bounded queue wait, no tenant or workload-class
+  fairness, and no starvation freedom under sustained arrivals or persistent
+  row locks; concurrent claimants may skip locked rows, so per-class
+  progress holds only up to rows another transaction currently holds.
   """
   @callback claim_due(ctx(), :system, claim_policy()) ::
               {:ok, claim_batch()} | {:error, term()}

@@ -153,6 +153,52 @@ defmodule Docket.Test.Fixtures.Graphs do
   end
 
   @doc """
+  start -> increment -> decide; decide always loops back to increment.
+
+  A valid indefinitely runnable cyclic graph: the loop guard never
+  becomes false and no max-supersteps policy bounds it, so every superstep
+  commits a finite moment and the run never reaches `$finish`.
+  """
+  def endless_cycle do
+    Graph.new!(id: "endless-cycle")
+    |> Graph.put_field!("count", schema: Schema.float(), default: 0.0)
+    |> Graph.put_node!("increment",
+      implementation: Nodes.Increment,
+      config: %{field: "count"}
+    )
+    |> Graph.put_node!("decide", implementation: Nodes.Echo)
+    |> Graph.put_edge!("edge_start_increment", from: "$start", to: "increment")
+    |> Graph.put_edge!("edge_increment_decide", from: "increment", to: "decide")
+    |> Graph.put_edge!("edge_loop",
+      from: "decide",
+      to: "increment",
+      guard: Guard.not(Guard.equals(Guard.path("count", []), -1.0))
+    )
+  end
+
+  @doc """
+  start fans out to gate (interrupts) and worker (completes); worker's edge
+  keeps dispatchable work behind the open interrupt.
+
+  Proves a barrier can commit `:interrupt_requested` while the run stays
+  `:running` with a `:continue` disposition.
+  """
+  def interrupt_with_parallel_work do
+    Graph.new!(id: "interrupt-with-parallel-work")
+    |> Graph.put_field!("decision", schema: Schema.string())
+    |> Graph.put_field!("applied", schema: Schema.string())
+    |> Graph.put_node!("gate",
+      implementation: Nodes.InterruptOnce,
+      config: %{resume_field: "decision", write_field: "applied"}
+    )
+    |> Graph.put_node!("worker", implementation: Nodes.Echo)
+    |> Graph.put_node!("after_worker", implementation: Nodes.Echo)
+    |> Graph.put_edge!("edge_start_gate", from: "$start", to: "gate")
+    |> Graph.put_edge!("edge_start_worker", from: "$start", to: "worker")
+    |> Graph.put_edge!("edge_worker_after", from: "worker", to: "after_worker")
+  end
+
+  @doc """
   start -> gate; gate interrupts until "decision" is resolved, then writes
   "applied" and finishes.
 
