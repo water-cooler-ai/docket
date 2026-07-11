@@ -4,9 +4,10 @@ Status: design rationale and background, not a current spec
 Date: 2026-06-25
 
 Release note: resident per-run process and host-checkpoint sections describe
-the `0.0.1` driver. v0.1.0 retains the graph/runtime semantics and processless
-test helpers but makes a `Docket.Backend` the required production lifecycle
-owner; the operational transition spec is authoritative.
+the `0.0.1` driver. `0.1.0-dev` retains that driver alongside the
+backend-neutral durable facade; the PostgreSQL production owner is not yet
+assembled. The PostgreSQL backend guide and implementation audit describe the
+current boundary.
 
 Implementation note: this document records the research basis, mental
 model, goals, and alternatives considered for the runtime. Concrete

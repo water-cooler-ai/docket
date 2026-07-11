@@ -4,6 +4,10 @@ This example connects durable Docket runs to app-owned users, accounts, and
 workflow rows without making the parent application a second persistence
 driver.
 
+> **Status:** this is the target integration API. The backend-neutral facade
+> exists, but `Docket.Postgres` and its claimed-run vehicle are not implemented
+> on `0.1.0-dev`, so this example is not runnable with PostgreSQL yet.
+
 ## Configure one backend
 
 ```elixir
@@ -16,9 +20,9 @@ defmodule MyApp.Docket do
 end
 ```
 
-`Docket.Postgres` owns graph/run persistence, claiming, scheduling, and cold
-recovery. The private ETF state stored by the backend is not an application
-wire format.
+Once assembled, `Docket.Postgres` will own graph/run persistence, claiming,
+scheduling, and cold recovery. The private ETF state stored by the existing
+PostgreSQL stores is not an application wire format.
 
 ## Publish, then start
 

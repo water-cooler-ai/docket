@@ -9,8 +9,8 @@ defmodule Docket.Storage.Runs do
   cannot be split into independently configured stores because they mutate
   and fence the same aggregate.
 
-  Lifecycle code composes run and event writes inside
-  `Docket.Storage.transaction/2`; graph versions are saved separately before
+  Lifecycle code composes run and event writes inside one backend transaction;
+  graph versions are saved separately before
   a run can reference them. This contract deliberately accepts neutral
   run proposals and schedule effects, never `Docket.Checkpoint` or
   `Docket.Runtime.Moment` values. A successful outer transaction is the point
@@ -117,7 +117,7 @@ defmodule Docket.Storage.Runs do
   That type becomes the latest checkpoint metadata, and `wake_at` is the
   run's first explicit schedule.
 
-  This callback writes only the run aggregate. `Docket.Lifecycle` appends
+  This callback writes only the run aggregate. Lifecycle orchestration appends
   assigned initialization events in the same outer transaction; it never
   publishes the already-saved graph version.
   """
@@ -266,8 +266,8 @@ defmodule Docket.Storage.Runs do
   The stored checkpoint sequence must equal
   `proposal.expected_checkpoint_seq`, the current claim must equal the
   non-empty `proposal.claim_token`, and the proposed run's sequence must be
-  exactly `expected_checkpoint_seq + 1`. The checkpoint type must be one of
-  `Docket.Checkpoint.types/0`. A stored sequence or token mismatch
+  exactly `expected_checkpoint_seq + 1`. The checkpoint type must be a
+  supported Docket checkpoint type. A stored sequence or token mismatch
   returns `{:error, :stale_fence}` without changing anything. A nil token,
   wrong proposed sequence, run identity mismatch, or invalid schedule/status
   combination returns `{:error, :invalid_commit}`.

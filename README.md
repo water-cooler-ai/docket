@@ -5,34 +5,30 @@ built for long-running, interruptible work like agentic LLM sessions, where a
 run may pause for a human decision, survive a deploy, and resume exactly where
 it left off.
 
-This README describes the `0.0.x` core runtime line. The transition toward the
-`0.1.0` operational runtime with the `Docket.Postgres` backend is documented in
-[docs/architecture/docket-operational-transition-spec.md](docs/architecture/docket-operational-transition-spec.md).
-
-`0.1.0` will have one production lifecycle: every supervised Docket instance
-uses a `Docket.Backend`, with `Docket.Postgres` as the first-party paved road.
-The `0.0.1` host-owned `checkpoint:` driver and its `run`, `resume`, and live
-`get_run` facade remain documented below only as migration context and will not
-ship as a second v0.1.0 mode. DCKT-37 owns that removal after the operational
-backend and its deterministic test modes are complete.
+This branch is `0.1.0-dev`. The graph runtime is usable inline and through the
+legacy supervised checkpoint driver. The PostgreSQL foundation—migrations,
+stores, transaction recipes, claim fencing, and a dispatcher—is implemented,
+but the public `Docket.Postgres` backend bundle and claimed-run vehicle have
+not landed. PostgreSQL is therefore not yet a runnable production backend.
+See the [PostgreSQL backend guide](docs/architecture/docket-operational-transition-spec.md)
+for the implemented model and remaining release boundary.
 
 You describe a workflow as a graph document: nodes that do work, shared state
 fields they read and write, and edges (optionally guarded) that decide what
 runs next. Docket executes the graph in deterministic supersteps, emitting a
-checkpoint after every committed transition. Your application persists those
-checkpoints; Docket can rebuild a live run from the last one at any time.
+checkpoint at every durable transition boundary.
 
 ## Goals
 
-- **Durable by contract.** The source of truth for a run is the last accepted
-  checkpoint in *your* storage, not memory in a process. Kill the node,
-  redeploy, resume.
+- **Durable by contract.** State changes are proposed at explicit checkpoint
+  boundaries. The legacy driver hands them to host storage; the developing
+  PostgreSQL backend commits them with a token-and-sequence fence.
 - **Deterministic semantics.** Superstep planning, write conflict resolution,
   and guard evaluation are pure and ordered; replanning after a crash produces
   byte-identical task identities, so external effects can be deduplicated.
 - **Explicit durable boundaries.** Docket owns execution semantics and the
   private backend storage codec. Applications own graph versioning,
-  authorization, tenancy, and UI; the Postgres backend stores opaque state as
+  authorization and UI; the PostgreSQL stores encode opaque state as
   versioned ETF while preserving operational facts in relational columns.
 - **One interpreter.** The supervised runtime and the inline test runtime run
   the same loop code — tests exercise real semantics, synchronously, in the
@@ -55,7 +51,7 @@ checkpoints; Docket can rebuild a live run from the last one at any time.
   process with real timeouts; a million concurrent waiting sessions is a
   normal Tuesday for the runtime.
 
-## 0.0.1 quick start (migration reference)
+## Quick start
 
 Define a node — a module that declares its config schema and does one unit of
 work against the shared state:
@@ -106,10 +102,12 @@ Enum.map(checkpoints, & &1.type)
 #=> [:run_initialized, :step_committed, :run_completed]
 ```
 
-### v0.1.0 production facade
+### PostgreSQL facade (target API)
 
-A durable host configures one compatible backend bundle rather than mixing
-transaction and store modules:
+The durable facade is implemented against the backend contract, but the
+`Docket.Postgres` bundle shown below is not implemented yet. This example
+documents the intended public assembly, not a working `0.1.0-dev`
+configuration:
 
 ```elixir
 defmodule MyApp.DurableDocket do
@@ -138,33 +136,33 @@ content-addressed document. `start_run` accepts only the returned stable
 reference, fetches the saved document, and compiles it on the executing node;
 later schema defaults are never injected into that retained graph version, and
 starting a run never republishes the graph. Compiled runtime graphs are
-node-local and ephemeral. The operational vehicle will compile once per claim
-and reuse that value while draining supersteps. Applications must keep node code and
+node-local and ephemeral. The planned production vehicle compiles once per
+claim and reuses that value while draining supersteps. Applications must keep node code and
 retained checkpoints compatible across deploys, drain old vehicles, or use
 versioned node modules when behavior must remain fixed. Cyclic graphs may run
 without a superstep limit; hosts may optionally configure `max_supersteps`, or
 publish a graph policy when the limit should be part of graph identity. The
-operational facade also provides
+backend-neutral durable facade also provides
 `resolve_interrupt`, `cancel_run`,
 `retry_poisoned_run`, and bounded `await_run`. `tenant_mode: :none` permits
 only tenantless rows; `tenant_mode: :required` requires a non-empty
 `tenant_id` before storage access. Durable `checkpoint_observers:` run after
 commit, are best-effort, and cannot veto state. Durable consumers that cannot
 tolerate lost or duplicate delivery should consume retained events instead of
-observer callbacks. The host-owned `checkpoint:` committer is a `0.0.1`
-migration concern and is removed from the v0.1.0 production facade by DCKT-37.
+observer callbacks. The host-owned `checkpoint:` committer remains on this
+branch and is planned for removal from the final v0.1.0 production facade.
 
-### Migrating from 0.0.1
+### Planned migration from 0.0.1
 
 The production-boundary break does not replace the graph programming model.
 Node modules and graph definitions carry over unchanged, including
 `Docket.Node`, `Docket.Graph`, `Docket.Schema`, reducers, interrupts, and
 executors. `Docket.Test.run_inline` and its related processless helpers remain
-the Postgres-free graph-semantics testing surface, and
-Run persistence is backend-private. The v0.0.1 host Run map codec is not part
+the PostgreSQL-free graph-semantics testing surface. Run persistence is
+backend-private. The v0.0.1 host Run map codec is not part
 of v0.1.0 and there is no compatibility decoder or dual-write path.
 
-The cutover is mechanical:
+Once the PostgreSQL bundle and vehicle land, the intended cutover is:
 
 1. Drain or terminate active `0.0.1` runs and stop old writers.
 2. Delete the host checkpoint committer and Docket-specific host tables.
@@ -230,7 +228,7 @@ ETF bytes are hashed once and stored. Graph hashing is private, and every run
 records the published graph ID and hash it was started from. Recovery validates
 strict collection key/value shapes and fails closed on malformed stored terms.
 
-## 0.0.1 resident-process architecture
+## Current supervised architecture
 
 Each runtime instance is one supervision tree:
 
@@ -260,15 +258,18 @@ This shape is what makes durable agentic sessions natural on the BEAM:
   loop. The BEAM's preemptive scheduler runs the sessions; your database
   holds the truth.
 
-## What Docket does not do
+## Current boundaries
 
-Docket deliberately leaves to the host application:
+Docket deliberately leaves these to the host application:
 
-- Persistence — checkpoints hand you the run document; you store it.
-- Graph versioning and publish workflows.
-- Authorization, tenancy, and ownership (attach identity via run `metadata`).
+- Authorization and ownership checks before calling a Docket facade.
+- Graph publish workflows and application-level version selection.
 - UI projections for editors and live run views.
 - External effects — nodes call your code; Docket never talks to the network.
+
+On `0.1.0-dev`, the host also owns persistence when using the legacy supervised
+driver. The developing PostgreSQL backend owns its tables and tenant scoping,
+but it is not operational until its bundle and vehicle are assembled.
 
 ## Installation
 
@@ -285,7 +286,8 @@ end
 ## Learn more
 
 - [examples/parent-app-integration.md](examples/parent-app-integration.md) —
-  wiring Docket runs to your users, accounts, and database rows.
+  the target durable integration boundary, marked where PostgreSQL assembly is
+  still pending.
 - [examples/llm-node.md](examples/llm-node.md) — a generic, configurable LLM
   node implementation.
 - [docs/architecture/](docs/architecture/) — design rationale: the graph

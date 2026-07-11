@@ -3,7 +3,7 @@ defmodule Docket.Runtime.Graph do
   Internal executable graph materialization produced by `Docket.Graph.Compiler`.
 
   A runtime graph is ephemeral node-local derived state, never a durable graph
-  format. The operational vehicle will fetch the effective canonical
+  format. The planned operational vehicle will fetch the effective canonical
   `Docket.Graph`, compile it once on the executing node, and reuse this
   structure for its claim drain. Every runtime ID maps back to public graph
   intent through `lowering`.
