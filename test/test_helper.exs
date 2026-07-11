@@ -15,7 +15,9 @@ generated_database_repos =
       {Docket.Postgres.VehicleStorageTestRepo, "DOCKET_VEHICLE_STORAGE_TEST_DATABASE_URL",
        "docket_vehicle_storage_test", 2},
       {Docket.Postgres.NotifierTestRepo, "DOCKET_NOTIFIER_TEST_DATABASE_URL",
-       "docket_notifier_test", 10}
+       "docket_notifier_test", 10},
+      {Docket.Postgres.PrunerTestRepo, "DOCKET_PRUNER_TEST_DATABASE_URL", "docket_pruner_test",
+       10}
     ]
 
     Enum.reduce(repo_specs, [], fn {repo, environment_variable, database, pool_size}, generated ->
@@ -47,7 +49,8 @@ generated_database_repos =
 # DOCKET_TEST_DATABASE_URL, DOCKET_RUN_STORE_TEST_DATABASE_URL,
 # DOCKET_STORAGE_TEST_DATABASE_URL, DOCKET_GRAPH_STORE_TEST_DATABASE_URL,
 # DOCKET_LIFECYCLE_STORAGE_TEST_DATABASE_URL, DOCKET_EVENT_STORE_TEST_DATABASE_URL,
-# DOCKET_VEHICLE_STORAGE_TEST_DATABASE_URL, and DOCKET_NOTIFIER_TEST_DATABASE_URL.
+# DOCKET_VEHICLE_STORAGE_TEST_DATABASE_URL, DOCKET_NOTIFIER_TEST_DATABASE_URL,
+# and DOCKET_PRUNER_TEST_DATABASE_URL.
 ExUnit.start(exclude: [:postgres], assert_receive_timeout: 1_000)
 
 ExUnit.after_suite(fn _result ->

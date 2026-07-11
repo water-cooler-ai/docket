@@ -1181,9 +1181,11 @@ The library does not support run migrations in this design. There is no API for
 moving a run to another graph hash, no channel transformation contract, and no
 attempt to move active runs between graph definitions.
 
-The host application should retain recent host graph artifacts. A practical
-default is to keep roughly the latest 10 artifacts per graph, with host-configurable
-retention.
+The Postgres backend retains the newest 10 published versions per graph ID,
+ordered by immutable publication time and row ID, even when no run references
+them. Older versions are eligible only when unreferenced. Other backends must
+provide an equivalent graph-availability policy or document their stronger
+retention guarantee.
 
 If old graph content required by an active run is no longer available, the library
 should return a typed error such as:

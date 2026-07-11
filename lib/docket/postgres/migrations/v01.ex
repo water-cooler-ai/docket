@@ -35,6 +35,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         unique_index(:docket_graph_versions, [:graph_id, :graph_hash], prefix: prefix)
       )
 
+      create_if_not_exists(
+        index(:docket_graph_versions, [:graph_id, "inserted_at DESC", "id DESC"],
+          name: :docket_graph_versions_revision_order_index,
+          prefix: prefix
+        )
+      )
+
       create_if_not_exists table(:docket_runs, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
         add(:run_id, :text, null: false)
@@ -113,6 +120,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       create_if_not_exists(index(:docket_runs, [:status, :updated_at], prefix: prefix))
 
+      create_if_not_exists(
+        index(:docket_runs, [:updated_at, :id],
+          where: "status IN ('done', 'failed', 'cancelled')",
+          prefix: prefix
+        )
+      )
+
+      create_if_not_exists(index(:docket_runs, [:graph_id, :graph_hash], prefix: prefix))
+
       create_if_not_exists table(:docket_events, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
 
@@ -140,6 +156,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       create_if_not_exists(unique_index(:docket_events, [:run_id, :seq], prefix: prefix))
+      create_if_not_exists(index(:docket_events, [:inserted_at, :id], prefix: prefix))
     end
 
     def down(%{prefix: prefix}) do

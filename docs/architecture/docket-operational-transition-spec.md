@@ -78,7 +78,15 @@ does not derive identity with `MAX(seq)`.
 
 Every committed runtime moment includes a metadata-only
 `:checkpoint_committed` event after its runtime facts. Events cascade when a
-run is deleted. Event retention and pruning are not implemented yet.
+run is deleted. `Docket.Postgres.Pruner` can delete persisted events earlier
+under an explicit event-retention policy, but that retention cannot exceed the
+run-retention period.
+
+The same bounded pass deletes only terminal runs older than the configured run
+retention. It then removes unreferenced graph versions older than the newest ten
+publications for each graph ID. Graph publication order is `inserted_at`, with
+the immutable row ID breaking ties. Any referencing run protects its exact
+graph version regardless of age.
 
 ## Publication and start
 

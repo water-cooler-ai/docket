@@ -34,7 +34,7 @@ PostgreSQL guide now documents the landed design and names the remaining gaps.
 | Execution vehicle | Implemented | `Docket.Postgres.Vehicle` fetches and compiles the graph for a lease (with an optional generation-checked cache), drains fenced moments, and abandons, releases, or parks the run. Claim freshness during long supersteps is configurable: strict timeout alignment by default, opt-in token-guarded heartbeat with stale-result rejection. |
 | Backend supervision assembly | Missing | Nothing wires Repo context, dispatcher, and vehicle launch into `Docket.Postgres.child_spec/1`. |
 | Deterministic backend test mode | Missing | There is no public PostgreSQL drain/manual testing API. |
-| Pruning/retention | Missing | There is no event/run pruner or public retention configuration. |
+| Pruning/retention | Implemented substrate | `Docket.Postgres.Pruner` performs locked, bounded event/run cleanup and retains each graph ID's newest ten unreferenced revisions; DCKT-25 still owns public bundle configuration and supervision assembly. |
 | Legacy production API removal | Not done | `run`, `resume`, `get_run`, and `checkpoint:` remain in the public supervised runtime. |
 
 ## Decisions verified in code
