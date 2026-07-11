@@ -47,9 +47,10 @@ checkpoint at every durable transition boundary.
   human-in-the-loop interrupts.
 - **OTP** — where Python-based graph runtimes have to bolt on persistence,
   queues, and schedulers, the BEAM already is the scheduler. Each run is one
-  supervised, addressable process; node code can execute in an isolated task
-  process with real timeouts; a million concurrent waiting sessions is a
-  normal Tuesday for the runtime.
+  supervised, addressable process; nodes selected in the same superstep execute
+  concurrently against one committed snapshot, and node code can execute in an
+  additional isolated task process with real timeouts; a million concurrent
+  waiting sessions is a normal Tuesday for the runtime.
 
 ## Quick start
 

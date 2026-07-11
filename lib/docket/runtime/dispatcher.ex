@@ -9,19 +9,30 @@ defmodule Docket.Runtime.Dispatcher do
   # guards, apply reducers, commit checkpoints, or make retry policy
   # decisions beyond classifying whether attempt budget remains.
   #
-  # Activations run serially in the calling process in v1; semantic
-  # parallelism is guaranteed by barrier visibility, not scheduling.
+  # Activations run concurrently and results are returned in activation
+  # order. Semantic determinism still comes from the update barrier: every
+  # activation receives the same committed snapshot and no result is applied
+  # until the whole dispatch has completed.
 
   alias Docket.Run.TaskState
   alias Docket.Runtime.{Activation, TaskResult}
 
   @spec dispatch([Activation.t()], Docket.Runtime.Graph.t(), Docket.Run.t(), map()) ::
           [TaskResult.t()]
+  def dispatch([], _rtg, _run, _config), do: []
+
   def dispatch(activations, rtg, run, config) do
-    Enum.map(activations, fn activation ->
-      node = Map.fetch!(rtg.nodes, activation.runtime_node_id)
-      attempt(activation, node, run, config)
-    end)
+    activations
+    |> Task.async_stream(
+      fn activation ->
+        node = Map.fetch!(rtg.nodes, activation.runtime_node_id)
+        attempt(activation, node, run, config)
+      end,
+      ordered: true,
+      max_concurrency: length(activations),
+      timeout: :infinity
+    )
+    |> Enum.map(fn {:ok, result} -> result end)
   end
 
   defp attempt(activation, node, run, config) do

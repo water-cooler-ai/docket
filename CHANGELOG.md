@@ -205,6 +205,9 @@ what has landed so far.
 
 ### Changed
 
+- Runtime dispatch now executes every node selected for a superstep
+  concurrently against the same committed snapshot, then collects results in
+  deterministic activation order before crossing the existing update barrier.
 - Postgres run insertion, moment commit, signal mutation, and poison recovery
   emit `pg_notify` on `docket_wake` within the same transaction whenever the
   recorded wake is due at or before the database clock. Claim release and

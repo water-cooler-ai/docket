@@ -4,7 +4,10 @@ Status: slices 1–5 implemented (PR #6, 2026-07-05): schema-v1.1, reducers,
 schema-shorthand, inline-fields, telemetry-events. The reducer contract
 rationale moved to `docs/architecture/docket-reducers-design.md`; API truth
 lives in module docs. Themes 6 (graph module DSL) and 7 (subgraph
-composition) remain open design space, recorded below.
+composition) remain open design space, recorded below. Theme 9 records the
+tenant-claim fairness follow-up targeted at v0.1.1. Theme 10 records the
+`{:await}` late-completion protocol (DCKT-40), sized during the DCKT-22
+claim-freshness review.
 
 The v1.1 theme: **make building graphs feel natural without adding a second
 canonical model.** Every proposal below is sugar or extension over the existing
@@ -302,6 +305,135 @@ can't be expressed with `path`/`equals`/`all`/`any`.
 
 ---
 
+## Theme 9 — Tenant-partitioned claim fairness (v0.1.1 follow-up)
+
+Add moderate multi-tenant fairness to the shared durable dispatcher without
+preempting node execution or weakening claim fencing. A global dispatcher
+concurrency limit still bounds all active vehicles, while a database-wide
+partition limit bounds how many live claims one tenant may hold at once:
+
+```elixir
+dispatcher: [
+  concurrency: 100,
+  claim_partitions: [
+    by: :tenant_id,
+    max_active: 2,
+    burst: true
+  ]
+]
+```
+
+The exact public option names remain design work. The intended behavior is:
+
+- Claim selection is fair across eligible tenant partitions and stable within
+  a tenant by wake time and run ID. A tenant with a deep backlog must not hide
+  another tenant's first eligible run.
+- `max_active` is enforced across every dispatcher sharing the database and
+  prefix, not independently per BEAM node. Acquisition remains atomic and
+  compatible with the existing token, sequence fence, expiry, poison, and
+  `FOR UPDATE SKIP LOCKED` paths.
+- With `burst: false`, no tenant may exceed its partition limit. With
+  `burst: true`, one tenant may consume otherwise-idle global capacity, but
+  burst claims yield to other eligible tenants as capacity turns over. Bursting
+  improves utilization; it must not turn into a permanent reservation.
+- Tenantless runs form their own partition. Future partition keys such as
+  project, account, or plan tier are out of scope until tenant partitioning
+  proves the storage and scheduling contract.
+
+This is deliberately separate from the two existing vehicle mechanisms:
+
+- **Drain budgets provide run-level time slicing.** A vehicle may retain its
+  claim for another superstep while both its moment and elapsed budgets remain.
+  Once either budget is exhausted, the in-flight superstep finishes, and its
+  commit atomically advances the run, releases the claim, and records an
+  immediate wake. Nothing is preempted halfway through a superstep.
+- **Heartbeats provide claim freshness.** They refresh the exact token while a
+  long superstep is executing and cause stale results to be rejected. They do
+  not grant another scheduling quantum, reset the drain budget, or provide
+  tenant fairness.
+
+Together, the partition limit prevents one tenant's collection of runs from
+occupying the fleet, while the drain budget prevents one continuously runnable
+run from occupying a tenant's allotment indefinitely. This is moderate
+fairness, not a promise of strict round robin, bounded queue latency, weighted
+fair queuing, or equal resource usage: one superstep may contain substantially
+more parallel node work than another.
+
+### Storage and pooling constraints
+
+- Vehicles continue to hold no database connection while node code runs.
+  Partition accounting belongs in atomic claim/release/commit operations; it
+  must not introduce a transaction spanning execution.
+- Prefer claim-query/index changes over a row-locking coordinator or one queue
+  per tenant. High-cardinality tenants must not create high-cardinality OTP
+  processes, database queues, or telemetry labels.
+- Measure claim latency, rows scanned, pool checkout time, and claim/commit
+  throughput with many partitions, one hot partition, and mixed ready/expired
+  claims. Bursting must not amplify polling or notification churn.
+- Any denormalized partition counters must be recoverable from authoritative
+  live claims and remain correct across crash, expiry, steal, cancellation,
+  terminal commit, and poison recovery. Avoid counters if the claim query can
+  enforce the limit efficiently from indexed run rows.
+
+### Required tests
+
+- Multiple dispatchers cannot exceed a tenant's non-burst limit under
+  concurrent claims.
+- A tenant with thousands of eligible runs cannot block another tenant's first
+  run from being claimed.
+- Spare capacity is usable in burst mode and returns to competing tenants after
+  current supersteps reach their normal commit boundaries.
+- Claim expiry, steal, retry parking, terminal commits, and vehicle crashes
+  release partition capacity exactly once without leaking or double-counting
+  slots.
+- Tenant partitioning changes scheduling only; existing tenant scope checks
+  continue to prevent cross-tenant reads and mutations.
+
+---
+
+## Theme 10 — `{:await}` late-completion protocol (detached execution, DCKT-40)
+
+v0.1.0 gives blocking node work two freshness strategies (DCKT-22): keep each
+between-commit stretch under the orphan TTL (strict alignment — commits are
+the heartbeat) or hold a token-guarded heartbeat. Work an external system
+durably owns parks as an external wait instead. The remaining shape is work a
+node started **in-process** but wants to hand back to the runtime — stop
+holding a vehicle slot and claim while it finishes. The execution contract
+reserves `{:await, term()}` for exactly this; v1 rejects it as permanent
+failure. This theme promotes it to a specified protocol.
+
+Design skeleton (established adversarially during DCKT-22; see the epic for
+the full constraint list):
+
+- Detachment is voluntary. The runtime can never extract an await from opaque
+  blocking code — any TTL-fired takeover is a timeout in disguise. The
+  node/executor returns `{:await, token}`; the runtime dispatcher becomes
+  partial-result-capable.
+- A new detached `TaskState` status and wait kind make the mid-superstep park
+  legal: the checkpoint records task identity only (task ID, attempt,
+  idempotency key, input hash) — in-flight call state is uncheckpointable.
+  The retry-park pending-writes machinery already proves the checkpoint shape.
+- Result re-entry is a new serialized `RunMutation` through the row-locked
+  signal path, fenced on the run still holding that exact task detached at
+  that exact attempt; stale, duplicate, and superseded results are no-ops.
+- `TaskState.deadline_at` becomes live with a detached-deadline sweeper.
+  Every await carries a mandatory deadline: any bounded version of detachment
+  contains a timeout as its own backstop, and a detached run must never sit
+  `:waiting` with neither wake nor deadline.
+- The completion needs a live home after the vehicle exits (node-local holder,
+  unreplicated); holder crash resolves through deadline expiry.
+- External effects stay at-least-once. A rejected late result's effects
+  already happened; stable task/idempotency keys remain the only dedupe
+  surface. No exactly-once promise, ever.
+
+Epic-sized (~15+ files: executor behaviour and both executors, runtime
+dispatcher, TaskResult/TaskState/Moment, Loop/Algorithm, RunMutation,
+Lifecycle, RunStore schedule + sweeper, Postgres dispatcher/vehicle, a holder
+module, MemoryBackend, both contract docs). Tracked as DCKT-40; targets v1.1
+after the v0.1.0 line ships.
+
+---
+
 ## Proposed slice order
 
 Each slice is a branch per the v1 workflow; order reflects dependencies and
@@ -317,6 +449,9 @@ value-per-risk:
    materialize graph fields, conflict rules, orphaned-field diagnostic.
 5. **telemetry-events** — `:telemetry` emission for run/node/interrupt events
    (Theme 8.3); independent of everything above, can slot in anywhere.
+6. **tenant-claim-fairness** — database-wide tenant-partitioned active-claim
+   limits, fair partition selection, optional spare-capacity bursting, and
+   contention/pool benchmarks (Theme 9; v0.1.1 operational follow-up).
 
 ## Open questions (need a call before their slice starts)
 
@@ -327,3 +462,9 @@ value-per-risk:
 3. Inline field conflict rule: is identical-definition-no-op /
    conflict-error the right balance, or should a `force: true` escape hatch
    exist? (Theme 5) **this is good for now**
+4. Tenant claim enforcement: indexed live-run selection alone or recoverable
+   denormalized partition counters? Decide from contention benchmarks rather
+   than API preference. (Theme 9)
+5. Burst semantics: how quickly must spare claims turn over once another
+   tenant becomes eligible, without preempting an in-flight superstep?
+   (Theme 9)
