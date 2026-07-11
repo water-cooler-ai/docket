@@ -167,13 +167,15 @@ parked in Theme 8's explore list, not part of this slice.
 
 ---
 
-## Theme 6 — Graph module DSL (macro tier)
+## Theme 6 — Graph modules and DSL (macro tier)
 
-A `use Docket.Graph.DSL` frontend for defining graphs in modules:
+Make `use Docket.Graph` the natural convention for static graph definitions.
+Using the graph module installs the graph DSL, including the schema declaration
+tools used by inputs, fields, node-local declarations, and outputs:
 
 ```elixir
 defmodule MyApp.Graphs.SupportReply do
-  use Docket.Graph.DSL, id: "support-reply"
+  use Docket.Graph, id: "support-reply"
 
   input :customer_message, :string, required: true
   field :messages, {:list, :map}, reducer: :append
@@ -182,14 +184,29 @@ defmodule MyApp.Graphs.SupportReply do
   output :draft_response
 end
 
-MyApp.Graphs.SupportReply.graph()  #=> %Docket.Graph{}
+MyApp.Graphs.SupportReply.graph()           #=> %Docket.Graph{}
+MyApp.Graphs.SupportReply.compiled_graph()  #=> %Docket.Runtime.Graph{}
 ```
 
-Hard requirement if built: the macros expand to the exact same editing-API
-calls — one construction semantics, two spellings. Risks: a second surface to
-keep in lockstep, and it only serves compile-time graphs (UI-built graphs
-can't use it), which is why Themes 3–5 come first. Decide after living with
-the improved pipeline API; this may turn out unnecessary.
+The module is compiled and validated in `__before_compile__/1`. Its canonical
+`Docket.Graph` and lowered `Docket.Runtime.Graph` are embedded into the BEAM;
+they are not written to ETS or `:persistent_term` during compilation and do
+not need to be rebuilt during application startup. Invalid static definitions
+therefore fail the application build rather than the first run. Literal node
+module references must establish compile dependencies so changes to a node's
+schema cause dependent graph modules to be recompiled.
+
+`graph/0` preserves the authored canonical document for inspection,
+publication, and serialization. `compiled_graph/0` returns the immutable
+runtime materialization and is the direct execution path. Runtime-created,
+UI-built, and stored graphs remain ordinary `%Docket.Graph{}` values and
+continue through the existing compiler and node-local runtime cache.
+
+Hard requirement: every DSL macro expands to the exact same public editing and
+schema APIs used by hand-written graph pipelines — one construction semantics,
+two spellings. `use Docket.Graph` is an additive module frontend, not a second
+graph representation. The macro tier only serves static definitions, which is
+why Themes 3–5 still come first.
 
 ---
 
