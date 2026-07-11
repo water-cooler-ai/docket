@@ -54,7 +54,13 @@ defmodule Docket.Storage.Runs do
           optional(:preference) => :ready | :expired | nil
         }
 
-  @typedoc "Lightweight authority returned for a run that should be launched."
+  @typedoc """
+  Lightweight authority returned for a run that should be launched.
+
+  `orphan_ttl_ms` echoes the claiming policy's TTL so the holder knows the
+  staleness bound its own claim expires under. It is informational per-claim
+  state, not a promise that the TTL cannot differ on a later claim.
+  """
   @type claim_lease :: %{
           required(:run_id) => String.t(),
           required(:graph_id) => String.t(),
@@ -62,7 +68,8 @@ defmodule Docket.Storage.Runs do
           required(:checkpoint_seq) => non_neg_integer(),
           required(:claim_token) => claim_token(),
           required(:claimed_at) => DateTime.t(),
-          required(:claim_attempt) => pos_integer()
+          required(:claim_attempt) => pos_integer(),
+          required(:orphan_ttl_ms) => non_neg_integer()
         }
 
   @typedoc "Operational result for an exhausted candidate that was not launched."
@@ -206,8 +213,13 @@ defmodule Docket.Storage.Runs do
   @doc """
   Refreshes claim liveness under the exact current token.
 
-  Success sets `claimed_at` to `now`. A stale token, missing run, or lost claim
-  returns `{:error, :claim_lost}` and changes nothing.
+  Success advances `claimed_at`, and never backward: the stored time only
+  moves toward the backend's authoritative current time, so a refresh that
+  was delayed in flight cannot regress a fresher value written by a
+  `:retain_claim` commit and re-expose the run to steal. `now` is the
+  caller's clock reading; backends with an authoritative clock of their own
+  may prefer that clock over `now`. A stale token, missing run, or lost
+  claim returns `{:error, :claim_lost}` and changes nothing.
   """
   @callback refresh_claim(
               ctx(),

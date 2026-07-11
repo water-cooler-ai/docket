@@ -194,7 +194,8 @@ defmodule Docket.Test.MemoryBackend do
       case fetch_record(state, run_id) do
         {:ok, %{claim_token: ^claim_token} = record}
         when is_binary(claim_token) and byte_size(claim_token) > 0 ->
-          {:ok, put_in(state.runs[run_id], %{record | claimed_at: now})}
+          {:ok,
+           put_in(state.runs[run_id], %{record | claimed_at: latest(record.claimed_at, now)})}
 
         _ ->
           {{:error, :claim_lost}, state}
@@ -205,6 +206,12 @@ defmodule Docket.Test.MemoryBackend do
   def refresh_claim(_backend, scope, _run_id, _claim_token, _now) do
     raise ArgumentError, "refresh_claim scope must be :system, got: #{inspect(scope)}"
   end
+
+  defp latest(%DateTime{} = stored, %DateTime{} = now) do
+    if DateTime.compare(now, stored) == :lt, do: stored, else: now
+  end
+
+  defp latest(_stored, now), do: now
 
   @impl Docket.Storage.Runs
   def release_claim(backend, :system, run_id, claim_token, now) do
@@ -527,7 +534,8 @@ defmodule Docket.Test.MemoryBackend do
             checkpoint_seq: record.run.checkpoint_seq,
             claim_token: claim_token,
             claimed_at: policy.now,
-            claim_attempt: claim_attempt
+            claim_attempt: claim_attempt,
+            orphan_ttl_ms: policy.orphan_ttl_ms
           }
 
           {put_in(state.runs[run_id], record), [lease | leases], poisoned}

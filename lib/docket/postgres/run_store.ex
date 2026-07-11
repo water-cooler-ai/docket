@@ -188,7 +188,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       case Ecto.Adapters.SQL.query(repo, claim_statement(prefix), params) do
         {:ok, %{rows: rows}} ->
-          {batch, stats} = decode_claim_batch(rows, now)
+          {batch, stats} = decode_claim_batch(rows, now, ttl)
           emit_claim_telemetry({batch, stats}, limit, preference)
           {:ok, batch}
 
@@ -206,6 +206,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     Expiry is deliberately absent from the predicate. A token remains valid
     after its TTL until another claimant actually replaces it.
+
+    The write uses the database clock and never regresses:
+    `GREATEST(claimed_at, CURRENT_TIMESTAMP)`. A refresh that was delayed in
+    the pool behind a `:retain_claim` commit therefore cannot move
+    `claimed_at` backward past the commit's fresher stamp and re-expose the
+    run to steal. The caller's `now` is validated but not written.
     """
     @spec refresh_claim(
             ctx(),
@@ -215,15 +221,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             DateTime.t()
           ) ::
             :ok | {:error, :claim_lost}
-    def refresh_claim(ctx, :system, run_id, claim_token, %DateTime{} = now) do
+    def refresh_claim(ctx, :system, run_id, claim_token, %DateTime{}) do
       {repo, prefix} = Storage.context!(ctx)
-      now = normalize_database_datetime(now)
 
       {count, _} =
         run_id
         |> current_claim(claim_token)
         |> claim_query(prefix)
-        |> repo.update_all([set: [claimed_at: now]], log: false)
+        |> repo.update_all(
+          [
+            set: [
+              claimed_at:
+                dynamic([run], fragment("GREATEST(?, CURRENT_TIMESTAMP)", run.claimed_at))
+            ]
+          ],
+          log: false
+        )
 
       if count == 1, do: :ok, else: {:error, :claim_lost}
     end
@@ -850,7 +863,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       expired_oldest_age_ms: 0
     }
 
-    defp decode_claim_batch(rows, now) do
+    defp decode_claim_batch(rows, now, orphan_ttl_ms) do
       {{leases, poisoned}, stats} =
         Enum.reduce(rows, {{[], []}, @empty_claim_stats}, fn
           [
@@ -876,7 +889,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               checkpoint_seq: checkpoint_seq,
               claim_token: load_uuid!(claim_token),
               claimed_at: claimed_at,
-              claim_attempt: claim_attempt
+              claim_attempt: claim_attempt,
+              orphan_ttl_ms: orphan_ttl_ms
             }
 
             {{[lease | leases], poisoned},
