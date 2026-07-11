@@ -9,14 +9,33 @@ Each v0.1.0 ticket updates the Unreleased section in its own PR.
 ## 0.1.0 — Unreleased
 
 The developing operational release line. The backend contract, PostgreSQL
-stores, migration, lifecycle transactions, and dispatcher have landed. The
-public `Docket.Postgres` bundle and claimed-run vehicle have not, so this branch
+stores, migration, lifecycle transactions, dispatcher, and claimed-run vehicle
+have landed. The public `Docket.Postgres` bundle has not, so this branch
 is not yet a runnable PostgreSQL production backend. The implementation guide
 and current-state audit live in `docs/architecture/`; entries below reflect
 what has landed so far.
 
 ### Added
 
+- `Docket.Postgres.Vehicle`: the Task-per-claim execution shell that turns a
+  dispatcher lease into runtime progress. A drain fetches the committed run
+  under the lease fence, loads and compiles the exact effective graph version
+  node-locally exactly once (never injecting post-publication defaults),
+  then loops one `Docket.Runtime.Moment` per fenced
+  `Docket.Lifecycle.commit_moment/5`, continuing only on `:continue` and
+  exiting on every park after the commit released the claim. Deterministic
+  pre-execution compile/decode failure abandons the claim per
+  `abandon_claim/5`; fence loss or event-append failure discards the moment,
+  releases a still-current claim, and stops; everything else crashes into
+  claim-expiry recovery. Node execution holds no checked-out database
+  connection (DCKT-20).
+- `Docket.Postgres.GraphCache`: optional node-local compiled-graph cache
+  keyed by store-provided `{graph_id, graph_hash}` and validated per read
+  against the local generation (`:docket` module fingerprint plus each node
+  implementation module's beam MD5, or an injected release identity), so a
+  cached graph never crosses an incompatible local generation and cache loss
+  only affects latency. Known-incompatible versions are negative-cached, with
+  a bounded TTL when the stored document could not even be decoded (DCKT-20).
 - `Docket.Storage.Runs.abandon_claim/5` and its Postgres and conformance
   implementations: the token-and-sequence fenced, non-poisoning disposition
   for a claimed run whose graph the executing node cannot compile
@@ -137,7 +156,10 @@ what has landed so far.
   telemetry (DCKT-11, #22).
 - Pure `Docket.Runtime.RunMutation.resolve_interrupt/5` and `cancel_run/2`
   graph mutations produce deterministic pre-commit moments with explicit
-  immediate or terminal dispositions. Cancellation adds the sync
+  dispositions: cancellation is terminal, and resolution wakes immediately
+  unless every active attempt is parked behind a future retry deadline, in
+  which case it parks at the earliest deadline so a resolved run is never
+  dispatched before any attempt is due (DCKT-9, DCKT-20). Cancellation adds the sync
   `:run_cancelled` checkpoint/event fact; repeated cancellation returns an
   explicit unchanged result with the stored run and consumes no sequences
   (DCKT-9).

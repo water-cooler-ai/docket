@@ -257,12 +257,14 @@ defmodule Docket.Runtime.Loop do
   - `{:error, error}` - sync checkpoint failure or uninitialized run; the
     caller keeps the previous run
 
-  Shells that have already served a park's wait pass the park's `resume_at`
-  as `:resume_floor` in `opts`, so deadline checks do not depend on the
-  wall clock having advanced (deterministic inline tests inject `:sleeper`
-  instead of sleeping). The floor must be the served park's `resume_at` and
-  never a later instant: flooring at the wake deadline makes exactly the
-  due attempts eligible while later deadlines stay parked.
+  Shells that have already served a park's wait pass the served instant -
+  the park's `resume_at`, or a durable claim's `claimed_at`, which is never
+  earlier than the wake it served - as `:resume_floor` in `opts`, so
+  deadline checks do not depend on the wall clock having advanced
+  (deterministic inline tests inject `:sleeper` instead of sleeping). The
+  floor must never exceed the caller's real current instant: flooring at
+  the served instant makes exactly the elapsed attempts eligible while
+  later deadlines stay parked.
   """
   def plan(rtg, %Run{} = run, opts) do
     config = Config.resolve(opts)

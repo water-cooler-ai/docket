@@ -7,10 +7,10 @@ optional event history. It also provides the queue primitives needed to claim
 and recover runs without a separate jobs table.
 
 This guide describes the code that exists today. The backend is still being
-assembled: the migration and stores are implemented, as is the claim
-dispatcher, but `Docket.Postgres` (the public backend bundle) and the vehicle
-that executes a claimed run have not landed. Consequently the low-level pieces
-can be tested, but the PostgreSQL backend is not yet a runnable production
+assembled: the migration, stores, claim dispatcher, and the vehicle that
+executes a claimed run are implemented, but `Docket.Postgres` (the public
+backend bundle) has not landed. Consequently the low-level pieces can be
+tested, but the PostgreSQL backend is not yet a runnable production
 configuration.
 
 ## The model
@@ -126,8 +126,15 @@ is demand bounded and jittered so nodes don't continually wake in phase. A
 failed vehicle launch releases its claim. Shutdown stops new polling and waits
 for active vehicles up to the configured drain timeout.
 
-The dispatcher is implemented, but the production vehicle and the callback
-that wires leases to it are not. That is the primary missing execution piece.
+`Docket.Postgres.Vehicle` is that execution piece. A drain loads the
+committed run under the lease fence, compiles the stored effective graph
+node-locally exactly once (optionally through `Docket.Postgres.GraphCache`,
+which validates every read against the local module generation), and then
+commits one runtime moment at a time through `Docket.Lifecycle`, exiting at
+the first park. Wiring `launch: &Docket.Postgres.Vehicle.launch(&1, opts)`
+plus a `Task.Supervisor` into the dispatcher is what remains for the backend
+bundle; the supervisor should start before the dispatcher and give vehicles
+a shutdown of at least the dispatcher's drain timeout.
 
 ### Pre-execution abandon
 
@@ -276,8 +283,8 @@ The PostgreSQL foundation is substantial, but `0.1.0-dev` is not an operational
 release yet. The remaining public boundary includes:
 
 - the `Docket.Postgres` implementation of `Docket.Backend`;
-- a vehicle that compiles a claimed graph and drains runtime moments;
-- supervision wiring from dispatcher leases to those vehicles;
+- supervision wiring from dispatcher leases to vehicle launches;
+- claim freshness for supersteps longer than the orphan TTL;
 - deterministic backend testing controls; and
 - retention/pruning policy and production integration coverage.
 

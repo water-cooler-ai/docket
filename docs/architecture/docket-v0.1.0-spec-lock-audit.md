@@ -10,8 +10,8 @@ not ticket intent. The code and module documentation remain authoritative.
 
 The durable data model and transaction boundaries are implemented and closely
 match the locked architecture. The branch is not yet the proposed operational
-release: it lacks the public `Docket.Postgres` backend bundle and the vehicle
-that turns dispatcher leases into runtime progress.
+release: it lacks the public `Docket.Postgres` backend bundle that assembles
+the dispatcher and vehicle into one supervised configuration.
 
 The documentation previously obscured that distinction. It described the
 target configuration as usable, called the legacy lifecycle removed when it
@@ -31,7 +31,7 @@ PostgreSQL guide now documents the landed design and names the remaining gaps.
 | Lifecycle composer | Implemented | `Docket.Lifecycle` owns start, moment commit, and signal transaction recipes. |
 | Durable facade | Implemented against a backend | Publication, start, reads, signals, poison retry, and bounded await are exercised with the conformance backend. |
 | Dispatcher | Implemented | Demand-bounded, jittered polling and lease launch/release behavior exist. |
-| Execution vehicle | Missing | No process fetches and compiles the graph for a lease, advances moments, heartbeats, and parks/releases the run. |
+| Execution vehicle | Implemented | `Docket.Postgres.Vehicle` fetches and compiles the graph for a lease (with an optional generation-checked cache), drains fenced moments, and abandons, releases, or parks the run. Claim freshness during long supersteps is still open. |
 | Backend supervision assembly | Missing | Nothing wires Repo context, dispatcher, and vehicle launch into `Docket.Postgres.child_spec/1`. |
 | Deterministic backend test mode | Missing | There is no public PostgreSQL drain/manual testing API. |
 | Pruning/retention | Missing | There is no event/run pruner or public retention configuration. |
@@ -122,8 +122,7 @@ at minimum:
 
 1. `Docket.Postgres` implementing the backend bundle and validating its
    configuration;
-2. a claimed-run vehicle with local graph compilation, moment draining,
-   heartbeat, fenced commit, and safe release behavior;
+2. claim freshness during supersteps longer than the orphan TTL;
 3. supervision wiring and an end-to-end PostgreSQL test proving start,
    dispatch, crash recovery, signal, and terminal completion;
 4. a documented deterministic test mode; and

@@ -11,7 +11,9 @@ generated_database_repos =
       {Docket.Postgres.LifecycleStorageTestRepo, "DOCKET_LIFECYCLE_STORAGE_TEST_DATABASE_URL",
        "docket_lifecycle_storage_test", 10},
       {Docket.Postgres.EventStoreTestRepo, "DOCKET_EVENT_STORE_TEST_DATABASE_URL",
-       "docket_event_store_test", 10}
+       "docket_event_store_test", 10},
+      {Docket.Postgres.VehicleStorageTestRepo, "DOCKET_VEHICLE_STORAGE_TEST_DATABASE_URL",
+       "docket_vehicle_storage_test", 2}
     ]
 
     Enum.reduce(repo_specs, [], fn {repo, environment_variable, database, pool_size}, generated ->

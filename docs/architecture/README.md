@@ -37,9 +37,9 @@ and `Docket.Test` helpers carry forward. The lifecycle owner changes:
 
 - `0.0.1`: the host checkpoint callback persists runs and the host explicitly
   resumes resident per-run processes.
-- `0.1.0-dev`: the backend contract, durable facade, PostgreSQL stores, and
-  dispatcher exist. The public `Docket.Postgres` bundle and claimed-run
-  vehicle do not, so the old supervised `run` / `resume` / `get_run` path is
+- `0.1.0-dev`: the backend contract, durable facade, PostgreSQL stores,
+  dispatcher, and claimed-run vehicle exist. The public `Docket.Postgres`
+  bundle does not, so the old supervised `run` / `resume` / `get_run` path is
   still present.
 
 The older graph-construction and execution-contract documents below record the

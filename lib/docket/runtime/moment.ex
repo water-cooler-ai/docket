@@ -34,7 +34,9 @@ defmodule Docket.Runtime.Moment do
   | `{:park, :terminal, reason}` | the run is terminal; it never wakes again |
 
   `{:park, :immediate, reason}` is reserved for driver yield boundaries and
-  graph signals; resolving an interrupt produces this disposition.
+  graph signals; resolving an interrupt produces this disposition unless
+  every active attempt is parked behind a future retry deadline, in which
+  case resolution parks at the earliest deadline.
 
   `checkpoint_metadata` is the JSON-safe identity envelope shared with the
   moment's `:checkpoint_committed` event. It records the checkpoint fence,

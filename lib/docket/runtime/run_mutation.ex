@@ -12,7 +12,7 @@ defmodule Docket.Runtime.RunMutation do
   """
 
   alias Docket.{Error, Run, Schema, Wire}
-  alias Docket.Run.InterruptState
+  alias Docket.Run.{InterruptState, TimerState}
   alias Docket.Runtime.{Algorithm, Graph, Moment}
 
   @type mutation_result :: {:ok, Moment.t()} | {:error, Error.t()}
@@ -21,11 +21,16 @@ defmodule Docket.Runtime.RunMutation do
   @durable_active [:running, :waiting]
 
   @doc """
-  Resolves an open interrupt and proposes an immediate wake.
+  Resolves an open interrupt and proposes the run's next wake.
 
   Terminal status is checked before interrupt lookup. A resolved interrupt is
   distinguished from an unknown interrupt, and the stored schema plus graph
   field contract both validate the resolution value.
+
+  Resolution proposes an immediate wake unless every active attempt is
+  parked behind a future retry deadline; then it parks at the earliest
+  deadline, so the committed wake never precedes the first dispatchable
+  attempt.
   """
   @spec resolve_interrupt(Graph.t(), Run.t(), String.t(), term(), DateTime.t()) ::
           mutation_result()
@@ -87,7 +92,7 @@ defmodule Docket.Runtime.RunMutation do
              proposed,
              :interrupt_resolved,
              entries,
-             {:park, :immediate, :interrupt_resolved},
+             resolution_disposition(proposed, now),
              now
            )}
         end
@@ -125,6 +130,26 @@ defmodule Docket.Runtime.RunMutation do
     do: inactive_run(run, "cancelled")
 
   def cancel_run(%Run{} = run, %DateTime{}), do: non_durable_run(run)
+
+  # An active attempt without a timer is dispatchable now; committed retry
+  # parks always write one timer per active task.
+  defp resolution_disposition(%Run{active_tasks: tasks} = run, now) when map_size(tasks) > 0 do
+    deadlines =
+      Enum.map(tasks, fn {task_id, _task} ->
+        case Map.fetch(run.timers, task_id) do
+          {:ok, %TimerState{fires_at: fires_at}} -> fires_at
+          :error -> nil
+        end
+      end)
+
+    if Enum.any?(deadlines, &(is_nil(&1) or DateTime.compare(&1, now) != :gt)) do
+      {:park, :immediate, :interrupt_resolved}
+    else
+      {:park, {:at, Enum.min(deadlines, DateTime)}, :interrupt_resolved}
+    end
+  end
+
+  defp resolution_disposition(%Run{}, _now), do: {:park, :immediate, :interrupt_resolved}
 
   defp durable_resolution(value) do
     case Wire.dump_value(value) do
