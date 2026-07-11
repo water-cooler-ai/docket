@@ -236,6 +236,43 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Process.alive?(dispatcher)
     end
 
+    test "consecutive successful demand-1 polls alternate the preferred class", %{agent: agent} do
+      set_claims(agent, [batch(), batch(), batch()])
+      dispatcher = start_dispatcher!(agent)
+
+      assert eventually(fn -> length(policies(agent)) == 1 end)
+      Dispatcher.request_poll(dispatcher)
+      assert eventually(fn -> length(policies(agent)) == 2 end)
+      Dispatcher.request_poll(dispatcher)
+      assert eventually(fn -> length(policies(agent)) == 3 end)
+
+      assert Enum.map(policies(agent), & &1.preference) == [:ready, :expired, :ready]
+      assert Enum.map(policies(agent), & &1.limit) == [1, 1, 1]
+    end
+
+    test "an errored poll does not flip the demand-1 preference", %{agent: agent} do
+      set_claims(agent, [{:error, :db_down}, batch()])
+      dispatcher = start_dispatcher!(agent)
+
+      assert eventually(fn -> length(policies(agent)) == 1 end)
+      Dispatcher.request_poll(dispatcher)
+      assert eventually(fn -> length(policies(agent)) == 2 end)
+
+      assert Enum.map(policies(agent), & &1.preference) == [:ready, :ready]
+    end
+
+    test "polls above demand 1 carry the preference but never flip it", %{agent: agent} do
+      set_claims(agent, [batch(), batch()])
+      dispatcher = start_dispatcher!(agent, concurrency: 2)
+
+      assert eventually(fn -> length(policies(agent)) == 1 end)
+      Dispatcher.request_poll(dispatcher)
+      assert eventually(fn -> length(policies(agent)) == 2 end)
+
+      assert Enum.map(policies(agent), & &1.preference) == [:ready, :ready]
+      assert Enum.map(policies(agent), & &1.limit) == [2, 2]
+    end
+
     defp start_dispatcher!(agent, overrides \\ []) do
       start_supervised!({Dispatcher, dispatcher_opts(agent, overrides)})
     end

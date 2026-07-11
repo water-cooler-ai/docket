@@ -498,7 +498,7 @@ defmodule Docket.Test.MemoryBackend do
       state.runs
       |> Enum.filter(fn {_run_id, record} -> claim_candidate?(record, policy) end)
       |> Enum.sort_by(fn {run_id, record} -> claim_sort_key(run_id, record) end)
-      |> Enum.take(policy.limit)
+      |> select_candidates(policy.limit, Map.get(policy, :preference))
 
     {state, leases, poisoned} =
       Enum.reduce(candidates, {state, [], []}, fn {run_id, _record}, {state, leases, poisoned} ->
@@ -550,6 +550,35 @@ defmodule Docket.Test.MemoryBackend do
 
     {state, Enum.reverse(leases), Enum.reverse(poisoned)}
   end
+
+  # Mirrors the Postgres class-progress policy: with demand of at least two
+  # and both classes present, the oldest candidate of each class is selected
+  # before the remaining demand takes the sorted (oldest-eligible) order;
+  # with demand of exactly one an optional preferred class is served first,
+  # falling through when empty. No preference means class-neutral order.
+  defp select_candidates(sorted, limit, preference) do
+    cond do
+      limit >= 2 ->
+        heads =
+          [:ready, :expired]
+          |> Enum.map(fn class -> Enum.find(sorted, &(candidate_class(&1) == class)) end)
+          |> Enum.reject(&is_nil/1)
+
+        heads ++ Enum.take(Enum.reject(sorted, &(&1 in heads)), limit - length(heads))
+
+      limit == 1 and preference in [:ready, :expired] ->
+        case Enum.find(sorted, &(candidate_class(&1) == preference)) do
+          nil -> Enum.take(sorted, 1)
+          candidate -> [candidate]
+        end
+
+      true ->
+        Enum.take(sorted, limit)
+    end
+  end
+
+  defp candidate_class({_run_id, %{claim_token: nil}}), do: :ready
+  defp candidate_class({_run_id, _claimed}), do: :expired
 
   defp claim_candidate?(record, policy) do
     record.run.status == :running and is_nil(record.poisoned_at) and

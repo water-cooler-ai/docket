@@ -15,6 +15,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Dispatchers call it outside any transaction that spans vehicle execution,
     so no connection is held while node code runs.
 
+    Candidate selection keeps both continuously eligible classes making
+    progress. With demand of at least two and both classes non-empty, at
+    least one outcome (lease or poison) goes to each class before the
+    remaining demand falls back to the oldest eligible rows under the stable
+    `(eligible_at, id)` tie-break. With demand of exactly one, the policy's
+    optional `:preference` names the class served first, falling through to
+    the other class when the preferred one is empty; without a preference
+    the oldest eligible row wins regardless of class. This is bounded aging,
+    not fairness: no strict FIFO, no bounded queue wait, no tenant or
+    workload-class fairness, and no starvation freedom under sustained
+    arrivals or persistent row locks.
+
+    Every claim scan emits `[:docket, :postgres, :run_store, :claim]` with
+    per-class candidate counts (bounded by demand - the scan never counts
+    eligible rows beyond its own limited candidate sets), selected counts,
+    poison count, demand, oldest selected eligibility ages, and the
+    preference it served. Run, task, token, tenant, and graph identities
+    never appear in it.
+
     Committed `Docket.Run` fields and backend-owned operational fields share a
     row but have separate clocks. In particular, `updated_at` belongs to the
     last committed run document; claims, heartbeats, releases, and poison
@@ -147,10 +166,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Atomically claims at most `policy.limit` due runs.
 
     Ready and expired candidates are selected through separate partial-index
-    paths. The oldest eligible rows across both fenced paths consume the
-    shared demand budget. A candidate below the attempt limit receives a new
-    token; an exhausted candidate is poisoned instead and is never returned
-    as a lease.
+    paths and consume one shared demand budget under the class-progress
+    policy described in the module documentation: at demand two or more each
+    non-empty class receives at least one outcome before the oldest eligible
+    rows take the remainder; at demand one the optional `policy.preference`
+    class is served first with fallthrough. A candidate below the attempt
+    limit receives a new token; an exhausted candidate is poisoned instead
+    and is never returned as a lease.
     """
     @spec claim_due(ctx(), :system, Docket.Storage.Runs.claim_policy()) ::
             {:ok, Docket.Storage.Runs.claim_batch()} | {:error, term()}
@@ -158,13 +180,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {repo, prefix} = Storage.context!(ctx)
 
       %{now: now, limit: limit, orphan_ttl_ms: ttl, max_claim_attempts: max} =
-        validate_policy!(policy)
+        policy = validate_policy!(policy)
 
+      preference = Map.get(policy, :preference)
       cutoff = DateTime.add(now, -ttl, :millisecond)
+      params = [now, cutoff, limit, max, preference && Atom.to_string(preference)]
 
-      case Ecto.Adapters.SQL.query(repo, claim_statement(prefix), [now, cutoff, limit, max]) do
-        {:ok, %{rows: rows}} -> {:ok, decode_claim_batch(rows)}
-        {:error, reason} -> {:error, reason}
+      case Ecto.Adapters.SQL.query(repo, claim_statement(prefix), params) do
+        {:ok, %{rows: rows}} ->
+          {batch, stats} = decode_claim_batch(rows, now)
+          emit_claim_telemetry({batch, stats}, limit, preference)
+          {:ok, batch}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     end
 
@@ -495,13 +524,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         FOR UPDATE SKIP LOCKED
       ),
       candidates AS MATERIALIZED (
-        SELECT id
+        SELECT id, class, eligible_at
         FROM (
-          SELECT id, eligible_at FROM ready_candidates
+          SELECT id, eligible_at, 'ready' AS class,
+                 ROW_NUMBER() OVER (ORDER BY eligible_at, id) AS class_rank
+          FROM ready_candidates
           UNION ALL
-          SELECT id, eligible_at FROM expired_candidates
+          SELECT id, eligible_at, 'expired' AS class,
+                 ROW_NUMBER() OVER (ORDER BY eligible_at, id) AS class_rank
+          FROM expired_candidates
         ) AS eligible
-        ORDER BY eligible_at, id
+        ORDER BY
+          CASE WHEN $3 >= 2 AND class_rank = 1 THEN 0 ELSE 1 END,
+          CASE WHEN $3 = 1 AND class = $5 THEN 0 ELSE 1 END,
+          eligible_at, id
         LIMIT $3
       ),
       updated AS (
@@ -536,7 +572,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           runs.claimed_at,
           runs.claim_attempts,
           runs.poisoned_at,
-          runs.poison_reason
+          runs.poison_reason,
+          candidates.class,
+          candidates.eligible_at
       )
       SELECT
         run_id,
@@ -547,7 +585,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         claimed_at,
         claim_attempts,
         poisoned_at,
-        poison_reason
+        poison_reason,
+        class,
+        eligible_at,
+        (SELECT count(*) FROM ready_candidates),
+        (SELECT count(*) FROM expired_candidates)
       FROM updated
       ORDER BY run_id
       """
@@ -799,9 +841,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    defp decode_claim_batch(rows) do
-      {leases, poisoned} =
-        Enum.reduce(rows, {[], []}, fn
+    @empty_claim_stats %{
+      ready_candidates: 0,
+      expired_candidates: 0,
+      ready_selected: 0,
+      expired_selected: 0,
+      ready_oldest_age_ms: 0,
+      expired_oldest_age_ms: 0
+    }
+
+    defp decode_claim_batch(rows, now) do
+      {{leases, poisoned}, stats} =
+        Enum.reduce(rows, {{[], []}, @empty_claim_stats}, fn
           [
             run_id,
             graph_id,
@@ -811,9 +862,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             claimed_at,
             claim_attempt,
             nil,
-            nil
+            nil,
+            class,
+            eligible_at,
+            ready_candidates,
+            expired_candidates
           ],
-          {leases, poisoned} ->
+          {{leases, poisoned}, stats} ->
             lease = %{
               run_id: run_id,
               graph_id: graph_id,
@@ -824,7 +879,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               claim_attempt: claim_attempt
             }
 
-            {[lease | leases], poisoned}
+            {{[lease | leases], poisoned},
+             observe_outcome(stats, class, eligible_at, ready_candidates, expired_candidates, now)}
 
           [
             run_id,
@@ -835,19 +891,67 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             nil,
             _claim_attempt,
             %DateTime{} = poisoned_at,
-            poison_reason
+            poison_reason,
+            class,
+            eligible_at,
+            ready_candidates,
+            expired_candidates
           ],
-          {leases, poisoned} ->
+          {{leases, poisoned}, stats} ->
             result = %{
               run_id: run_id,
               poisoned_at: poisoned_at,
               poison_reason: poison_reason
             }
 
-            {leases, [result | poisoned]}
+            {{leases, [result | poisoned]},
+             observe_outcome(stats, class, eligible_at, ready_candidates, expired_candidates, now)}
         end)
 
-      %{leases: Enum.reverse(leases), poisoned: Enum.reverse(poisoned)}
+      {%{leases: Enum.reverse(leases), poisoned: Enum.reverse(poisoned)}, stats}
+    end
+
+    defp observe_outcome(stats, class, eligible_at, ready_candidates, expired_candidates, now) do
+      age = max(DateTime.diff(now, eligible_at, :millisecond), 0)
+
+      stats = %{
+        stats
+        | ready_candidates: ready_candidates,
+          expired_candidates: expired_candidates
+      }
+
+      case class do
+        "ready" ->
+          %{
+            stats
+            | ready_selected: stats.ready_selected + 1,
+              ready_oldest_age_ms: max(stats.ready_oldest_age_ms, age)
+          }
+
+        "expired" ->
+          %{
+            stats
+            | expired_selected: stats.expired_selected + 1,
+              expired_oldest_age_ms: max(stats.expired_oldest_age_ms, age)
+          }
+      end
+    end
+
+    defp emit_claim_telemetry({batch, stats}, demand, preference) do
+      fallback? =
+        demand == 1 and preference != nil and
+          ((preference == :ready and stats.expired_selected > 0) or
+             (preference == :expired and stats.ready_selected > 0))
+
+      :telemetry.execute(
+        [:docket, :postgres, :run_store, :claim],
+        Map.merge(stats, %{
+          demand: demand,
+          leases: length(batch.leases),
+          poisoned: length(batch.poisoned)
+        }),
+        %{preference: preference, fallback: fallback?}
+      )
     end
 
     defp load_uuid!(token) do
@@ -867,13 +971,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
          )
          when is_integer(limit) and limit > 0 and is_integer(ttl) and ttl >= 0 and
                 is_integer(max) and max > 0 do
-      %{policy | now: normalize_database_datetime(now)}
+      case Map.get(policy, :preference) do
+        preference when preference in [nil, :ready, :expired] ->
+          %{policy | now: normalize_database_datetime(now)}
+
+        other ->
+          raise ArgumentError,
+                "claim policy preference must be :ready or :expired, got: #{inspect(other)}"
+      end
     end
 
     defp validate_policy!(policy) do
       raise ArgumentError,
             "claim policy requires DateTime now, positive limit/max_claim_attempts, " <>
-              "and non-negative orphan_ttl_ms, got: #{inspect(policy)}"
+              "non-negative orphan_ttl_ms, and optional preference of :ready or :expired, " <>
+              "got: #{inspect(policy)}"
     end
 
     defp validate_abandon_policy!(

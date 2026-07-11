@@ -76,7 +76,8 @@ defmodule Docket.MemoryBackendTest do
       now: now,
       limit: Keyword.get(opts, :limit, 10),
       orphan_ttl_ms: Keyword.get(opts, :orphan_ttl_ms, 60_000),
-      max_claim_attempts: Keyword.get(opts, :max_claim_attempts, 3)
+      max_claim_attempts: Keyword.get(opts, :max_claim_attempts, 3),
+      preference: Keyword.get(opts, :preference)
     }
   end
 
@@ -568,6 +569,41 @@ defmodule Docket.MemoryBackendTest do
     stolen = Enum.find(leases, &(&1.run_id == "a"))
     assert stolen.claim_token != first.claim_token
     assert stolen.claim_attempt == 2
+  end
+
+  test "claim_due reserves one outcome per non-empty class at demand two or more", %{backend: b} do
+    victim_wake = DateTime.add(@now, -2000, :second)
+    assert {:ok, _} = initialize(b, run("victim"), wake_at: victim_wake)
+    _lease = claim_one(b, DateTime.add(@now, -1999, :second))
+
+    # Every ready row is older than the expired claim, so oldest-first alone
+    # would fill the whole batch from the ready class.
+    for id <- ["ready-1", "ready-2", "ready-3"] do
+      assert {:ok, _} = initialize(b, run(id), wake_at: DateTime.add(@now, -3000, :second))
+    end
+
+    assert {:ok, %{leases: leases, poisoned: []}} =
+             claim_due(b, @now, limit: 3, orphan_ttl_ms: 60_000)
+
+    assert Enum.map(leases, & &1.run_id) |> Enum.sort() == ["ready-1", "ready-2", "victim"]
+  end
+
+  test "claim_due demand-1 preference serves the named class and falls through", %{backend: b} do
+    assert {:ok, _} =
+             initialize(b, run("expired-old"), wake_at: DateTime.add(@now, -5000, :second))
+
+    _lease = claim_one(b, DateTime.add(@now, -4000, :second))
+
+    assert {:ok, _} = initialize(b, run("ready-new"), wake_at: DateTime.add(@now, -10, :second))
+
+    # The expired claim is older, but the preference overrides age at demand 1.
+    assert claim_one(b, @now, preference: :ready).run_id == "ready-new"
+    assert claim_one(b, @now, preference: :expired).run_id == "expired-old"
+
+    assert {:ok, _} = initialize(b, run("ready-only"), wake_at: DateTime.add(@now, -5, :second))
+
+    # Empty preferred class falls through without wasting the demand.
+    assert claim_one(b, @now, preference: :expired).run_id == "ready-only"
   end
 
   test "claim_due excludes future wakes until they become due", %{backend: b} do

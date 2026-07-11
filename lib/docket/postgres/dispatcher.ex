@@ -61,6 +61,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         poll: nil,
         poll_pending?: false,
         poll_timer: nil,
+        preference: :ready,
         vehicles: %{}
       }
 
@@ -81,8 +82,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     def handle_info({:scheduled_poll, _stale_token}, state), do: {:noreply, state}
 
-    def handle_info({:claim_result, request_ref, result}, %{poll: {_, _, request_ref}} = state) do
+    def handle_info(
+          {:claim_result, request_ref, result},
+          %{poll: {_, _, request_ref, demand}} = state
+        ) do
       state = finish_poll(state)
+      state = alternate_preference(result, demand, state)
       state = consume_claim_result(result, state)
       {:noreply, resume_polling(state)}
     end
@@ -91,7 +96,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     def handle_info({:DOWN, monitor, :process, pid, _reason}, state) do
       cond do
-        match?({^pid, ^monitor, _}, state.poll) ->
+        match?({^pid, ^monitor, _, _}, state.poll) ->
           state = %{state | poll: nil}
           {:noreply, resume_polling(state)}
 
@@ -141,14 +146,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             send(parent, {:claim_result, request_ref, result})
           end)
 
-        %{state | poll: {pid, monitor, request_ref}}
+        %{state | poll: {pid, monitor, request_ref, demand}}
       end
     end
 
-    defp finish_poll(%{poll: {_pid, monitor, _request_ref}} = state) do
+    defp finish_poll(%{poll: {_pid, monitor, _request_ref, _demand}} = state) do
       Process.demonitor(monitor, [:flush])
       %{state | poll: nil}
     end
+
+    # Demand-1 polls alternate the preferred candidate class across
+    # consecutive successful polls so neither continuously eligible class
+    # starves at concurrency one. The phase is process-local and resets on
+    # restart.
+    defp alternate_preference({:ok, _batch}, 1, %{preference: :ready} = state),
+      do: %{state | preference: :expired}
+
+    defp alternate_preference({:ok, _batch}, 1, %{preference: :expired} = state),
+      do: %{state | preference: :ready}
+
+    defp alternate_preference(_result, _demand, state), do: state
 
     defp consume_claim_result({:ok, %{leases: leases, poisoned: poisoned}}, state)
          when is_list(leases) and is_list(poisoned) do
@@ -222,7 +239,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         now: state.clock.(),
         limit: demand,
         orphan_ttl_ms: state.orphan_ttl_ms,
-        max_claim_attempts: state.max_claim_attempts
+        max_claim_attempts: state.max_claim_attempts,
+        preference: state.preference
       }
     end
 
@@ -248,7 +266,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp settle_poll_for_shutdown(%{poll: nil} = state, _deadline), do: state
 
     defp settle_poll_for_shutdown(
-           %{poll: {pid, monitor, request_ref}} = state,
+           %{poll: {pid, monitor, request_ref, _demand}} = state,
            deadline
          ) do
       remaining = max(deadline - System.monotonic_time(:millisecond), 0)
