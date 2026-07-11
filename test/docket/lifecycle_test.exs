@@ -73,19 +73,19 @@ defmodule Docket.LifecycleTest do
 
   defmodule Host do
     use Docket,
-      storage: Docket.Test.MemoryBackend,
+      backend: Docket.Test.MemoryBackend,
       checkpoint_observers: [FailingObserver, RecordingObserver]
   end
 
   defmodule TenantHost do
     use Docket,
-      storage: Docket.Test.MemoryBackend,
+      backend: Docket.Test.MemoryBackend,
       tenant_mode: :required
   end
 
   defmodule BlockingHost do
     use Docket,
-      storage: Docket.Test.MemoryBackend,
+      backend: Docket.Test.MemoryBackend,
       checkpoint_observers: [BlockingObserver]
   end
 
@@ -286,6 +286,13 @@ defmodule Docket.LifecycleTest do
   test "graph save is explicit and idempotent, and forged references do not start" do
     graph = Graphs.minimal_linear()
     assert {:ok, first} = Host.save_graph(graph)
+
+    assert {:ok, ^first} =
+             Host.save_graph(graph,
+               backend: __MODULE__.NotABackend,
+               backend_context: :not_the_instance_context
+             )
+
     assert {:ok, ^first} = Host.save_graph(graph)
 
     forged = %{first | graph_hash: String.duplicate("0", 64)}
@@ -376,7 +383,7 @@ defmodule Docket.LifecycleTest do
 
   defp backend_ref(host) do
     {:ok, defaults} = Docket.Runtime.Registry.defaults(host)
-    {Keyword.fetch!(defaults, :storage), Keyword.fetch!(defaults, :storage_context)}
+    {Keyword.fetch!(defaults, :backend), Keyword.fetch!(defaults, :backend_context)}
   end
 
   defp graph_with_mutable_default do

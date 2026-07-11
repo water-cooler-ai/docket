@@ -22,7 +22,7 @@ defmodule Docket do
 
       defmodule MyApp.DurableDocket do
         use Docket,
-          storage: MyApp.DocketBackend,
+          backend: MyApp.DocketBackend,
           tenant_mode: :required,
           checkpoint_observers: [MyApp.DocketObserver]
       end
@@ -39,7 +39,7 @@ defmodule Docket do
   `:context`, determinism injection points, limits) plus `:run_id` /
   `:metadata` for fresh runs. Options given to the runtime instance at
   startup act as defaults; per-call options win except for the instance-owned
-  `:storage` and `:tenant_mode` boundaries. Public durable calls resolve only
+  `:backend` and `:tenant_mode` boundaries. Public durable calls resolve only
   `:tenantless` or an explicit `{:tenant, id}`; `:system` is reserved for
   internal dispatch/recovery.
 
@@ -213,7 +213,7 @@ defmodule Docket do
   Returns `{:ok, run}` after the sync `:interrupt_resolved` checkpoint is
   accepted. Unknown or already-resolved interrupts return
   `{:error, %Docket.Error{type: :not_found}}`; so do runs with no active
-  Runtime. With `storage:` configured, the stored effective canonical graph is
+  Runtime. With `backend:` configured, the stored effective canonical graph is
   loaded and compiled on the executing node without injecting new defaults,
   the pure mutation and its events commit atomically, and tenant scope is enforced before storage access.
   Authorization remains host-owned.
@@ -221,7 +221,7 @@ defmodule Docket do
   def resolve_interrupt(runtime, run_id, interrupt_id, value, opts \\ []) do
     case RuntimeRegistry.defaults(runtime) do
       {:ok, defaults} when is_list(defaults) ->
-        if Keyword.has_key?(defaults, :storage) do
+        if Keyword.has_key?(defaults, :backend) do
           with {:ok, resolved} <- instance_opts(runtime, opts) do
             durable_resolve_interrupt(resolved, run_id, interrupt_id, value)
           end
@@ -409,8 +409,8 @@ defmodule Docket do
         merged =
           defaults
           |> Keyword.merge(opts)
-          |> preserve_instance_option(defaults, :storage)
-          |> preserve_instance_option(defaults, :storage_context)
+          |> preserve_instance_option(defaults, :backend)
+          |> preserve_instance_option(defaults, :backend_context)
           |> preserve_instance_option(defaults, :tenant_mode)
           |> Keyword.put(:task_supervisor, task_supervisor)
           |> Keyword.update(
@@ -445,7 +445,7 @@ defmodule Docket do
   end
 
   defp legacy_driver(opts) do
-    if Keyword.has_key?(opts, :storage) do
+    if Keyword.has_key?(opts, :backend) do
       {:error,
        Error.new(
          :invalid_operation,
@@ -458,7 +458,7 @@ defmodule Docket do
   end
 
   defp configured_backend(opts) do
-    case {Keyword.get(opts, :storage), Keyword.fetch(opts, :storage_context)} do
+    case {Keyword.get(opts, :backend), Keyword.fetch(opts, :backend_context)} do
       {backend, {:ok, context}} when is_atom(backend) ->
         {:ok, {backend, context}}
 
@@ -468,7 +468,7 @@ defmodule Docket do
 
       _ ->
         {:error,
-         Error.new(:invalid_storage, "runtime instance has an invalid durable backend context")}
+         Error.new(:invalid_backend, "runtime instance has an invalid durable backend context")}
     end
   end
 

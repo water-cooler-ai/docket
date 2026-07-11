@@ -9,6 +9,13 @@ This README describes the `0.0.x` core runtime line. The transition toward the
 `0.1.0` operational runtime with the `Docket.Postgres` backend is documented in
 [docs/architecture/docket-operational-transition-spec.md](docs/architecture/docket-operational-transition-spec.md).
 
+`0.1.0` will have one production lifecycle: every supervised Docket instance
+uses a `Docket.Backend`, with `Docket.Postgres` as the first-party paved road.
+The `0.0.1` host-owned `checkpoint:` driver and its `run`, `resume`, and live
+`get_run` facade remain documented below only as migration context and will not
+ship as a second v0.1.0 mode. DCKT-37 owns that removal after the operational
+backend and its deterministic test modes are complete.
+
 You describe a workflow as a graph document: nodes that do work, shared state
 fields they read and write, and edges (optionally guarded) that decide what
 runs next. Docket executes the graph in deterministic supersteps, emitting a
@@ -48,7 +55,7 @@ checkpoints; Docket can rebuild a live run from the last one at any time.
   process with real timeouts; a million concurrent waiting sessions is a
   normal Tuesday for the runtime.
 
-## Quick start
+## 0.0.1 quick start (migration reference)
 
 Define a node — a module that declares its config schema and does one unit of
 work against the shared state:
@@ -140,7 +147,7 @@ run = Docket.Run.from_map!(stored_run_map)
 {:ok, run} = MyApp.Docket.resume(graph, run)
 ```
 
-### Durable backend facade
+### v0.1.0 production facade
 
 A durable host configures one compatible backend bundle rather than mixing
 transaction and store modules:
@@ -148,7 +155,8 @@ transaction and store modules:
 ```elixir
 defmodule MyApp.DurableDocket do
   use Docket,
-    storage: MyApp.DocketBackend,
+    repo: MyApp.Repo,
+    backend: Docket.Postgres,
     tenant_mode: :required,
     checkpoint_observers: [MyApp.DocketObserver]
 end
@@ -182,10 +190,35 @@ operational facade also provides
 `retry_poisoned_run`, and bounded `await_run`. `tenant_mode: :none` permits
 only tenantless rows; `tenant_mode: :required` requires a non-empty
 `tenant_id` before storage access. Durable `checkpoint_observers:` run after
-commit, are best-effort, and cannot veto state. The legacy `checkpoint:`
-callback remains the veto-capable committer for the storage-free supervised
-driver. Durable consumers that cannot tolerate lost or duplicate delivery
-should consume retained events instead of observer callbacks.
+commit, are best-effort, and cannot veto state. Durable consumers that cannot
+tolerate lost or duplicate delivery should consume retained events instead of
+observer callbacks. The host-owned `checkpoint:` committer is a `0.0.1`
+migration concern and is removed from the v0.1.0 production facade by DCKT-37.
+
+### Migrating from 0.0.1
+
+The production-boundary break does not replace the graph programming model.
+Node modules and graph definitions carry over unchanged, including
+`Docket.Node`, `Docket.Graph`, `Docket.Schema`, reducers, interrupts, and
+executors. `Docket.Test.run_inline` and its related processless helpers remain
+the Postgres-free graph-semantics testing surface, and
+`Docket.Run.to_map` / `from_map` remain the public serialization boundary.
+
+The cutover is mechanical:
+
+1. Drain or terminate active `0.0.1` runs and stop old writers.
+2. Delete the host checkpoint committer and Docket-specific host tables.
+3. Install Docket's migration and configure `repo:` plus
+   `backend: Docket.Postgres`.
+4. Publish graphs with `save_graph` and retain the returned `GraphRef`.
+5. Replace `run` with `start_run`, `get_run` with `fetch_run` or
+   `inspect_run`, and remove host-owned `resume` orchestration.
+6. Use observers only for best-effort after-commit notifications; consume
+   retained events when delivery must survive crashes.
+
+Because `0.0.1` storage is application-defined, Docket cannot provide one
+universal database migration. The supported path is an explicit
+drain-and-cut-over rather than a transparent dual-driver period.
 
 ## Human-in-the-loop interrupts
 
@@ -236,7 +269,7 @@ Everything that crosses a boundary is a document. `Docket.Graph` and
 content-hashed, and every run records the graph ID and hash it was started
 from, so a resume against the wrong graph version is rejected.
 
-## Built on OTP
+## 0.0.1 resident-process architecture
 
 Each runtime instance is one supervision tree:
 

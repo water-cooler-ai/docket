@@ -16,9 +16,9 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
 
 ### Added
 
-- `Docket.Backend`: one backend bundle as the public storage substitution
-  boundary, supplying compatible transaction, graph, run-aggregate, event,
-  and supervision capabilities (DCKT-8, #12).
+- `Docket.Backend`: one backend bundle as the public durable backend
+  substitution boundary, supplying compatible transaction, graph,
+  run-aggregate, event, and supervision capabilities (DCKT-8, #12).
 - Substrate-neutral storage ports (DCKT-8, #12):
   - `Docket.Storage` — the shared backend transaction boundary
     (`transaction/2`);
@@ -127,11 +127,23 @@ the DCKT-1 issue tree; entries below reflect what has landed so far.
   poisoned-run operational halt (DCKT-12).
 - `Docket.Checkpoint.Observer`, configured through separate
   `checkpoint_observers:`, for isolated best-effort notification only after a
-  durable commit; the legacy `checkpoint:` callback remains the host-owned
-  veto-capable committer (DCKT-12).
+  durable commit. DCKT-12 temporarily retains the `0.0.1` host-owned
+  `checkpoint:` committer until the assembled backend and deterministic modes
+  unblock its removal in DCKT-37.
 
 ### Changed
 
+- Locked the final v0.1.0 production boundary to one required durable backend.
+  The `0.0.1` host-owned `checkpoint:` driver and its `run`, `resume`, and live
+  `get_run` facade will be removed by DCKT-37 only after backend assembly and
+  deterministic backend testing land. Node/graph/schema/reducer/executor APIs,
+  `Docket.Run` serialization, and Postgres-free `Docket.Test` helpers remain
+  public; the supported adopter path is a documented drain-and-cut-over.
+- Renamed the unreleased durable runtime configuration from `storage:` to
+  `backend:` because the configured `Docket.Backend` owns the transaction,
+  graph, run, event, context, and supervision capabilities rather than naming
+  one storage implementation. The pre-release `storage:` option is no longer
+  accepted (DCKT-12).
 - One `docket` package: `Docket.Postgres.*` compiles only when the host
   supplies optional `ecto_sql`/`postgrex`; the core keeps no hard Postgres
   dependency (DCKT-7, #8/#9).
