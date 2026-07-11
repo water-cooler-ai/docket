@@ -269,7 +269,7 @@ defmodule Docket.GraphTest do
     assert graph.edges["edge_start_draft"].id == "edge_start_draft"
   end
 
-  test "computes a SHA-256 graph hash from canonical graph content" do
+  test "computes a SHA-256 graph hash from versioned durable ETF" do
     graph =
       Docket.Graph.new!(id: "support-reply")
       |> Docket.Graph.put_input!("message", schema: Docket.Schema.string())
@@ -279,6 +279,11 @@ defmodule Docket.GraphTest do
     hash = Docket.Graph.hash(graph)
 
     assert hash =~ ~r/^[0-9a-f]{64}$/
+
+    assert hash ==
+             Docket.DurableCodec.encode!(:graph, graph)
+             |> then(&:crypto.hash(:sha256, &1))
+             |> Base.encode16(case: :lower)
 
     graph_with_diagnostics = %{
       graph
@@ -298,7 +303,7 @@ defmodule Docket.GraphTest do
     assert Docket.Graph.hash(renamed_graph) != hash
   end
 
-  test "keeps atoms in memory and canonicalizes them to strings at the boundary" do
+  test "keeps atoms in the authored graph and hashes the normalized durable graph" do
     atom_schema = Docket.Schema.enum([:low, :medium, :high], default: :medium)
 
     graph =
@@ -537,8 +542,8 @@ defmodule Docket.GraphTest do
     assert map["metadata"] == %{"owner" => "team_a"}
     assert map["nodes"]["n"]["config"] == %{"model" => "fast", "tags" => ["a", "b"]}
 
-    # The hash is computed from the canonical document, so it is identical
-    # before and after a storage round trip.
+    # Public interchange and the private durable projection share the same
+    # open-value normalization without sharing a persistence serializer.
     assert Docket.Graph.hash(Docket.Graph.from_map!(map)) == Docket.Graph.hash(graph)
     assert Docket.Graph.to_map(Docket.Graph.from_map!(map)) == map
   end

@@ -129,12 +129,8 @@ defmodule Docket.Runtime.RetryParkingTest do
       assert key1 == "#{task_id}:1"
       assert_received {:executed, "steady", 1}
 
-      # Crash during backoff: the wire round trip is the cold resume path.
-      restored = Docket.Run.from_map!(Docket.Run.to_map(parked))
-      assert restored == parked
-
       assert {:ok, resumed, _} =
-               Docket.Test.resume_inline(graph, restored, context: %{notify: self()})
+               Docket.Test.resume_inline(graph, parked, context: %{notify: self()})
 
       assert resumed.status == :done
       assert resumed.output == %{"flaky_out" => "flaky done", "steady_out" => "steady done"}
@@ -209,24 +205,24 @@ defmodule Docket.Runtime.RetryParkingTest do
 
       assert {:ok, parked, _} = Docket.Test.step_inline(initialized, opts)
 
-      # Corrupt the durable document so the parked sibling write targets an
-      # undeclared field; the codec is graph-agnostic, so this loads.
-      corrupted =
-        parked
-        |> Docket.Run.to_map()
-        |> update_in(["pending_writes"], fn pending ->
-          Enum.map(pending, fn
-            %{"kind" => "update"} = entry -> Map.put(entry, "update", %{"ghost" => "x"})
-            entry -> entry
-          end)
+      # Corrupt the durable state so the parked sibling write targets an
+      # undeclared field; the codec is graph-agnostic, so this remains durable.
+      pending_writes =
+        Enum.map(parked.pending_writes, fn
+          %Docket.Run.PendingWrite{kind: :update} = entry ->
+            %{entry | value: %{"ghost" => "x"}}
+
+          entry ->
+            entry
         end)
 
-      restored = Docket.Run.from_map!(corrupted)
+      corrupted = %{parked | pending_writes: pending_writes}
+      assert :ok = Docket.Run.validate_durable(corrupted)
 
       # The barrier re-validates parked results: the corrupted write fails
       # the run through the typed permanent path instead of crashing.
       assert {:ok, failed, _} =
-               Docket.Test.resume_inline(graph, restored, context: %{notify: self()})
+               Docket.Test.resume_inline(graph, corrupted, context: %{notify: self()})
 
       assert failed.status == :failed
       assert %Docket.Run.Failure{code: "node_failed"} = failed.failure

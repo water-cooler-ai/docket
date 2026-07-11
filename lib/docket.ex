@@ -85,11 +85,11 @@ defmodule Docket do
   end
 
   @doc """
-  Saves one effective, canonical, content-addressed graph version.
+  Saves one effective, content-addressed graph version.
 
   Publication snapshots each node implementation's configuration schema once
-  and materializes its defaults into the canonical document before hashing.
-  Storage keeps that effective document; execution loads and compiles it on
+  and materializes its defaults into the durable graph before hashing.
+  Storage keeps that effective graph; execution loads and compiles it on
   the node that performs the work.
   """
   def save_graph(runtime, graph, opts \\ [])
@@ -98,18 +98,7 @@ defmodule Docket do
     with {:ok, opts} <- instance_opts(runtime, opts),
          {:ok, {backend, context}} <- configured_backend(opts),
          {:ok, effective, rtg} <- compile_for_publication(graph),
-         {:ok, :saved} <-
-           backend.storage().transaction(context, fn tx ->
-             case backend.graphs().save_graph(
-                    tx,
-                    rtg.graph_id,
-                    rtg.graph_hash,
-                    Graph.to_map(effective)
-                  ) do
-               :ok -> {:ok, :saved}
-               {:error, reason} -> {:error, reason}
-             end
-           end) do
+         :ok <- backend.graphs().save_graph(context, rtg.graph_id, rtg.graph_hash, effective) do
       {:ok, %GraphRef{graph_id: rtg.graph_id, graph_hash: rtg.graph_hash}}
     end
   end
@@ -145,13 +134,12 @@ defmodule Docket do
   def start_run(runtime, %GraphRef{} = graph_ref, input, opts) do
     with {:ok, opts} <- instance_opts(runtime, opts),
          {:ok, {backend, context} = backend_ref, scope} <- durable_access(opts),
-         {:ok, document} <-
+         {:ok, graph} <-
            backend.graphs().fetch_graph(
              context,
              graph_ref.graph_id,
              graph_ref.graph_hash
            ),
-         {:ok, graph} <- Graph.from_map(document),
          {:ok, rtg} <- ensure_compiled_effective(graph, opts),
          :ok <- check_graph_ref(rtg, graph_ref),
          run = Loop.build_initial_run(rtg, input, opts),
@@ -213,7 +201,7 @@ defmodule Docket do
   Returns `{:ok, run}` after the sync `:interrupt_resolved` checkpoint is
   accepted. Unknown or already-resolved interrupts return
   `{:error, %Docket.Error{type: :not_found}}`; so do runs with no active
-  Runtime. With `backend:` configured, the stored effective canonical graph is
+  Runtime. With `backend:` configured, the stored effective graph is
   loaded and compiled on the executing node without injecting new defaults,
   the pure mutation and its events commit atomically, and tenant scope is enforced before storage access.
   Authorization remains host-owned.
@@ -496,8 +484,7 @@ defmodule Docket do
   defp durable_resolve_interrupt(opts, run_id, interrupt_id, value) do
     with {:ok, {backend, context} = backend_ref, scope} <- durable_access(opts),
          {:ok, run} <- backend.runs().fetch_run(context, scope, run_id),
-         {:ok, document} <- backend.graphs().fetch_graph(context, run.graph_id, run.graph_hash),
-         {:ok, graph} <- Graph.from_map(document),
+         {:ok, graph} <- backend.graphs().fetch_graph(context, run.graph_id, run.graph_hash),
          {:ok, rtg} <- ensure_compiled_effective(graph, opts),
          now = operation_now(opts),
          result <-

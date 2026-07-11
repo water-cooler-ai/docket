@@ -4,7 +4,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
-    alias Docket.Graph.Serializer
     alias Docket.Postgres.{GraphStore, RunStore, Storage}
     alias Docket.Postgres.LifecycleStorageTestRepo, as: TestRepo
     alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}
@@ -44,8 +43,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           node_id: event.node_id,
           channel_id: event.channel_id,
           task_id: event.task_id,
-          payload: event.payload,
-          metadata: event.metadata,
+          payload: :erlang.term_to_binary(event.payload, [:deterministic]),
+          metadata: :erlang.term_to_binary(event.metadata, [:deterministic]),
           occurred_at: event.timestamp
         }
       end
@@ -115,17 +114,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp publish_graph!(graph_id) do
-      document = %{"schema_version" => 1, "id" => graph_id, "metadata" => %{}}
-      graph_hash = canonical_hash(document)
+      graph = Docket.Graph.new!(id: graph_id)
+      graph_hash = Docket.Graph.hash(graph)
 
       assert {:ok, :published} =
                Storage.transaction(TestRepo, fn ctx ->
-                 with :ok <- GraphStore.save_graph(ctx, graph_id, graph_hash, document) do
+                 with :ok <- GraphStore.save_graph(ctx, graph_id, graph_hash, graph) do
                    {:ok, :published}
                  end
                end)
 
-      {graph_id, graph_hash, document}
+      {graph_id, graph_hash, graph}
     end
 
     defp initialization_moment(run_id, graph_id, graph_hash) do
@@ -146,13 +145,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         :continue,
         @now
       )
-    end
-
-    defp canonical_hash(document) do
-      document
-      |> Serializer.canonical_json_encode()
-      |> then(&:crypto.hash(:sha256, &1))
-      |> Base.encode16(case: :lower)
     end
   end
 end

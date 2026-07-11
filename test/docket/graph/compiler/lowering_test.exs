@@ -15,6 +15,26 @@ defmodule Docket.Graph.Compiler.LoweringTest do
              } = runtime_graph.channels["input:value"]
     end
 
+    test "atom enum values normalize consistently with runtime input values" do
+      graph =
+        Graph.put_input!(Graphs.minimal_linear(), "value",
+          schema: Schema.enum([:low]),
+          required: true
+        )
+
+      runtime_graph = compile!(graph)
+      assert runtime_graph.channels["input:value"].value_schema.values == ["low"]
+
+      assert {:ok, atom_run, _checkpoints} =
+               Docket.Test.run_inline(graph, %{"value" => :low})
+
+      assert {:ok, string_run, _checkpoints} =
+               Docket.Test.run_inline(graph, %{"value" => "low"})
+
+      assert atom_run.output == %{"result" => "low"}
+      assert string_run.output == atom_run.output
+    end
+
     test "state fields lower to last-value state channels with their reducer" do
       runtime_graph = compile!(Graphs.minimal_linear())
 
@@ -218,7 +238,7 @@ defmodule Docket.Graph.Compiler.LoweringTest do
       assert %Docket.Guard{op: :equals} = descriptor.guard
     end
 
-    test "guard literals canonicalize with the rest of the graph" do
+    test "guard literals normalize through the runtime value boundary" do
       guard = Docket.Guard.equals(Docket.Guard.path("user", ["tier"]), :premium)
 
       graph =
@@ -227,12 +247,11 @@ defmodule Docket.Graph.Compiler.LoweringTest do
 
       runtime_graph = compile!(graph)
 
-      # Atom literals become strings at the compile boundary, matching what
-      # a stored-and-reloaded graph would produce; the public graph keeps
-      # the atom.
       assert %Docket.Guard{op: :equals, args: [%Docket.Guard{op: :path}, "premium"]} =
                runtime_graph.edges["edge_premium"].guard
 
+      # Compilation returns an effective normalized graph without mutating
+      # the authored public document.
       assert %Docket.Guard{args: [_path, :premium]} = graph.edges["edge_premium"].guard
     end
 
@@ -282,10 +301,12 @@ defmodule Docket.Graph.Compiler.LoweringTest do
   describe "runtime graph document" do
     test "identifies its source graph and content hash" do
       graph = Graphs.minimal_linear()
-      runtime_graph = compile!(graph)
+
+      assert {:ok, effective, runtime_graph} =
+               Docket.Graph.Compiler.compile_for_publication(graph)
 
       assert runtime_graph.graph_id == "minimal-linear"
-      assert runtime_graph.graph_hash == Graph.hash(graph)
+      assert runtime_graph.graph_hash == Graph.hash(effective)
 
       assert runtime_graph.id ==
                "minimal-linear@" <> String.slice(runtime_graph.graph_hash, 0, 12)

@@ -95,20 +95,30 @@ defmodule Docket.Test.MemoryBackend do
   end
 
   @impl Docket.Storage.Graphs
-  def save_graph(backend, graph_id, graph_hash, document) do
-    state_get_and_update(backend, fn state ->
-      case Map.fetch(state.graphs, {graph_id, graph_hash}) do
-        :error ->
-          {:ok, put_in(state.graphs[{graph_id, graph_hash}], document)}
+  def save_graph(backend, graph_id, graph_hash, %Docket.Graph{id: id, diagnostics: []} = graph)
+      when id == graph_id do
+    if Docket.Graph.hash(graph) == graph_hash do
+      state_get_and_update(backend, fn state ->
+        case Map.fetch(state.graphs, {graph_id, graph_hash}) do
+          :error ->
+            {:ok, put_in(state.graphs[{graph_id, graph_hash}], graph)}
 
-        {:ok, ^document} ->
-          {:ok, state}
+          {:ok, ^graph} ->
+            {:ok, state}
 
-        {:ok, _other} ->
-          {{:error, :graph_content_conflict}, state}
-      end
-    end)
+          {:ok, _other} ->
+            {{:error, :graph_content_conflict}, state}
+        end
+      end)
+    else
+      {:error, :invalid_graph_hash}
+    end
+  rescue
+    _error in Docket.Error -> {:error, :invalid_graph_document}
   end
+
+  def save_graph(_backend, _graph_id, _graph_hash, _graph),
+    do: {:error, :invalid_graph_document}
 
   @impl Docket.Storage.Graphs
   def fetch_graph(backend, graph_id, graph_hash) do
@@ -362,7 +372,7 @@ defmodule Docket.Test.MemoryBackend do
     end
   end
 
-  def poison(backend, run_id, reason \\ %{"type" => "test"}) do
+  def poison(backend, run_id, reason \\ "test") do
     state_update(backend, fn state ->
       update_in(state.runs[run_id], fn
         nil ->
@@ -446,11 +456,7 @@ defmodule Docket.Test.MemoryBackend do
 
           {put_in(state.runs[run_id], record), [lease | leases], poisoned}
         else
-          reason = %{
-            "type" => "max_claim_attempts_exceeded",
-            "claim_attempts" => record.claim_attempts,
-            "max_claim_attempts" => policy.max_claim_attempts
-          }
+          reason = "max_claim_attempts_exceeded"
 
           record = %{
             record

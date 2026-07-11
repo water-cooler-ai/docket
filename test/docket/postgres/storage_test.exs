@@ -4,7 +4,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
-    alias Docket.Graph.Serializer
     alias Docket.Postgres.{GraphStore, Storage}
     alias Docket.Postgres.StorageTestRepo, as: TestRepo
 
@@ -29,6 +28,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     setup do
       TestRepo.delete_all(Docket.Postgres.Schemas.GraphVersion)
       :ok
+    end
+
+    test "accepts only prefixes safe for migration and raw claim SQL" do
+      assert Storage.context!(%{repo: TestRepo, prefix: "docket_private"}) ==
+               {TestRepo, "docket_private"}
+
+      assert Storage.context!(%{repo: TestRepo, prefix: "select"}) == {TestRepo, "select"}
+
+      for prefix <- ["Upper", "1leading", "has-dash", String.duplicate("a", 64), ""] do
+        assert_raise ArgumentError, fn -> Storage.context!(%{repo: TestRepo, prefix: prefix}) end
+      end
     end
 
     test "commits {:ok, value} and supplies one normalized store context" do
@@ -180,13 +190,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, ^document} = GraphStore.fetch_graph(TestRepo, "isolated", graph_hash)
     end
 
-    defp document(id), do: %{"schema_version" => 1, "id" => id, "metadata" => %{}}
-
-    defp hash(document) do
-      document
-      |> Serializer.canonical_json_encode()
-      |> then(&:crypto.hash(:sha256, &1))
-      |> Base.encode16(case: :lower)
-    end
+    defp document(id), do: Docket.Graph.new!(id: id)
+    defp hash(graph), do: Docket.Graph.hash(graph)
   end
 end

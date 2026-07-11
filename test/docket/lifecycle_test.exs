@@ -128,10 +128,9 @@ defmodule Docket.LifecycleTest do
     assert {:ok, calm_ref} = Host.save_graph(graph)
     assert Process.get({MutableDefaultsNode, :calls}) == 1
 
-    assert {:ok, calm_document} =
+    assert {:ok, calm_graph} =
              backend.graphs().fetch_graph(context, calm_ref.graph_id, calm_ref.graph_hash)
 
-    calm_graph = Docket.Graph.from_map!(calm_document)
     assert calm_graph.nodes["copy"].config["tone"] == "calm"
     assert Docket.Graph.hash(calm_graph) == calm_ref.graph_hash
 
@@ -154,10 +153,9 @@ defmodule Docket.LifecycleTest do
     Process.put({MutableDefaultsNode, :add_future_default}, false)
     assert {:ok, reference} = Host.save_graph(graph)
 
-    assert {:ok, document} =
+    assert {:ok, effective} =
              backend.graphs().fetch_graph(context, reference.graph_id, reference.graph_hash)
 
-    effective = Docket.Graph.from_map!(document)
     refute Map.has_key?(effective.nodes["copy"].config, "future")
 
     Process.put({MutableDefaultsNode, :add_future_default}, true)
@@ -364,7 +362,7 @@ defmodule Docket.LifecycleTest do
 
     assert {:error, :not_found} = backend.runs().fetch_run(context, :system, "bad-start")
 
-    assert {:ok, _document} =
+    assert {:ok, %Docket.Graph{}} =
              backend.graphs().fetch_graph(context, graph.id, rtg.graph_hash)
 
     assert {:ok, started} = Host.start_run(reference, %{"value" => "x"})

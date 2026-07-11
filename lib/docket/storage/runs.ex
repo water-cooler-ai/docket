@@ -60,7 +60,7 @@ defmodule Docket.Storage.Runs do
   @type poisoned_claim :: %{
           required(:run_id) => String.t(),
           required(:poisoned_at) => DateTime.t(),
-          required(:poison_reason) => map()
+          required(:poison_reason) => String.t()
         }
 
   @typedoc "Results of one claim scan. Poisoned candidates never appear as leases."

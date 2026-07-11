@@ -64,7 +64,7 @@ defmodule Docket.Supervised.CrashRecoveryTest do
     assert EtsSink.latest_run(table, "crashed-run").status == :done
   end
 
-  test "resume survives a run-document storage round trip", %{table: table} do
+  test "resume accepts the checkpointed durable run state", %{table: table} do
     graph = Graphs.interrupt_review()
 
     assert {:ok, _run} =
@@ -73,10 +73,7 @@ defmodule Docket.Supervised.CrashRecoveryTest do
     assert_receive {:checkpoint, %Checkpoint{type: :interrupt_requested}}
     kill_runtime("round-trip")
 
-    saved =
-      EtsSink.latest_run(table, "round-trip")
-      |> Docket.Run.to_map()
-      |> Docket.Run.from_map!()
+    saved = EtsSink.latest_run(table, "round-trip")
 
     assert {:ok, _resumed} = Docket.resume(@runtime, graph, saved, context: context(table))
 

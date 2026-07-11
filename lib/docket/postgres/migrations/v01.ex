@@ -9,8 +9,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
        "status IN ('running', 'waiting', 'done', 'failed', 'cancelled')"},
       {"docket_runs_finished_at_check",
        "(status IN ('done', 'failed', 'cancelled')) = (finished_at IS NOT NULL)"},
-      {"docket_runs_failure_check", "(status = 'failed') = (failure IS NOT NULL)"},
-      {"docket_runs_output_check", "output IS NULL OR status = 'done'"},
       {"docket_runs_claim_pair_check", "(claim_token IS NULL) = (claimed_at IS NULL)"},
       {"docket_runs_poison_pair_check", "(poisoned_at IS NULL) = (poison_reason IS NULL)"},
       {"docket_runs_waiting_terminal_idle_check",
@@ -24,16 +22,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     ]
 
     def up(%{prefix: prefix}) do
-      # Canonical Docket wire fragments use `json`, not `jsonb`. PostgreSQL
-      # `jsonb` normalizes numeric lexemes and Unicode escapes, which can
-      # change Elixir value types or a graph's canonical content hash on
-      # reload. Backend-owned operational maps may remain `jsonb` when their
-      # values are generated and queried as normalized Postgres data.
       create_if_not_exists table(:docket_graph_versions, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
         add(:graph_id, :text, null: false)
         add(:graph_hash, :text, null: false)
-        add(:graph, :json, null: false)
+        add(:graph, :binary, null: false)
         add(:inserted_at, :timestamptz, null: false)
       end
 
@@ -61,11 +54,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         add(:status, :text, null: false)
         add(:step, :integer, null: false, default: 0)
-        add(:input, :json, null: false)
-        add(:output, :json)
-        add(:failure, :json)
-        add(:metadata, :json, null: false, default: fragment("'{}'::json"))
-        add(:state, :json, null: false)
+        add(:state, :binary, null: false)
         add(:checkpoint_seq, :bigint, null: false, default: 0)
         add(:latest_checkpoint_type, :text)
         add(:claim_token, :uuid)
@@ -73,7 +62,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         add(:wake_at, :timestamptz)
         add(:claim_attempts, :integer, null: false, default: 0)
         add(:poisoned_at, :timestamptz)
-        add(:poison_reason, :jsonb)
+        add(:poison_reason, :text)
         add(:inserted_at, :timestamptz, null: false)
         add(:started_at, :timestamptz, null: false)
         add(:updated_at, :timestamptz, null: false)
@@ -142,8 +131,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         add(:node_id, :text)
         add(:channel_id, :text)
         add(:task_id, :text)
-        add(:payload, :json, null: false, default: fragment("'{}'::json"))
-        add(:metadata, :json, null: false, default: fragment("'{}'::json"))
+        add(:payload, :binary, null: false)
+        add(:metadata, :binary, null: false)
         add(:occurred_at, :timestamptz, null: false)
         add(:inserted_at, :timestamptz, null: false)
       end

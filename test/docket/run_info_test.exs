@@ -22,7 +22,7 @@ defmodule Docket.RunInfoTest do
           run: run(),
           claim_attempts: 3,
           poisoned_at: ~U[2026-07-09 10:00:00.000000Z],
-          poison_reason: %{"type" => "max_claim_attempts_exceeded"}
+          poison_reason: "max_claim_attempts_exceeded"
         )
 
       assert RunInfo.poisoned?(info)
@@ -40,7 +40,7 @@ defmodule Docket.RunInfoTest do
       end
 
       assert_raise ArgumentError, ~r/must be paired/, fn ->
-        RunInfo.new!(run: run(), poison_reason: %{"type" => "test"})
+        RunInfo.new!(run: run(), poison_reason: "test")
       end
     end
 

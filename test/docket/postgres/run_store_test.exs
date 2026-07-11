@@ -6,7 +6,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
-    alias Docket.Postgres.RunStore
+    alias Docket.DurableCodec
+    alias Docket.Postgres.{RunCodec, RunStore}
     alias Docket.Postgres.RunStoreTestRepo, as: TestRepo
     alias Docket.Postgres.Schemas.GraphVersion
     alias Docket.Postgres.Schemas.Run
@@ -182,7 +183,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {%{base | output: %{"premature" => true}}, :run_initialized, @now},
         {%{base | finished_at: @now}, :run_initialized, @now},
         {%{base | input: nil}, :run_initialized, @now},
-        {%{base | metadata: %{atom_key: "not durable"}}, :run_initialized, @now},
         {base, :step_committed, @now},
         {base, :run_initialized, nil}
       ]
@@ -223,9 +223,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       canonical_state = row!(run.id).state
 
       corrupt_states = [
-        Map.put(canonical_state, "status", "running"),
-        Map.put(canonical_state, "version", 1),
-        Map.put(canonical_state, "unknown_internal", true)
+        canonical_state <> <<0>>,
+        DurableCodec.encode!(:run, %{input: %{}})
       ]
 
       readers = [
@@ -535,11 +534,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert poison.run_id == "run"
       assert poison.poisoned_at == poison_time
 
-      assert poison.poison_reason == %{
-               "type" => "max_claim_attempts_exceeded",
-               "max_claim_attempts" => 3,
-               "claim_attempts" => 3
-             }
+      assert poison.poison_reason == "max_claim_attempts_exceeded"
 
       row = row!("run")
       assert row.claim_attempts == 3
@@ -802,7 +797,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp insert_graph!(prefix \\ nil) do
-      changeset = GraphVersion.changeset(%{graph_id: "graph", graph_hash: "hash", graph: %{}})
+      changeset =
+        GraphVersion.changeset(%{graph_id: "graph", graph_hash: "hash", graph: <<131, 106>>})
+
       TestRepo.insert!(changeset, prefix: prefix)
     end
 
@@ -822,18 +819,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp insert_run!(run_id, overrides \\ [], prefix \\ nil) do
+      {:ok, durable_attrs} =
+        run_id
+        |> initialized_run(checkpoint_seq: 7, started_at: @now, updated_at: @now)
+        |> RunCodec.dump()
+
       attrs =
-        %{
-          run_id: run_id,
-          graph_id: "graph",
-          graph_hash: "hash",
-          status: :running,
-          input: %{},
-          state: %{"version" => 2},
-          checkpoint_seq: 7,
-          started_at: @now,
-          wake_at: @now
-        }
+        durable_attrs
+        |> Map.put(:wake_at, @now)
         |> Map.merge(Map.new(overrides))
 
       attrs

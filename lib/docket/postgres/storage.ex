@@ -19,6 +19,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @type ctx :: module() | %{required(:repo) => module(), optional(:prefix) => String.t() | nil}
     @type normalized_ctx :: %{required(:repo) => module(), required(:prefix) => String.t() | nil}
 
+    @prefix_pattern ~r/^[a-z_][a-z0-9_]*$/
+
     @impl Docket.Storage
     def transaction(ctx, fun) when is_function(fun, 1) do
       {repo, prefix} = context!(ctx)
@@ -61,7 +63,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     def context!(%{repo: repo} = ctx) when is_atom(repo) do
       case Map.get(ctx, :prefix) do
-        prefix when is_binary(prefix) or is_nil(prefix) ->
+        nil ->
+          {repo, nil}
+
+        prefix when is_binary(prefix) ->
+          unless valid_prefix?(prefix) do
+            raise ArgumentError,
+                  "Postgres context prefix must be a lowercase identifier up to 63 bytes, got: " <>
+                    inspect(prefix)
+          end
+
           {repo, prefix}
 
         prefix ->
@@ -74,6 +85,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       raise ArgumentError,
             "Postgres context must be a Repo or contain :repo and optional :prefix, got: " <>
               inspect(ctx)
+    end
+
+    @doc false
+    @spec valid_prefix?(term()) :: boolean()
+    def valid_prefix?(prefix) do
+      is_binary(prefix) and byte_size(prefix) in 1..63 and Regex.match?(@prefix_pattern, prefix)
     end
   end
 end

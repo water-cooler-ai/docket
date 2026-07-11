@@ -41,8 +41,9 @@ The compiler described by this document is implemented.
 
 - `Docket.Graph` is the canonical editable graph document, and graph editing
   helpers clear stale diagnostics.
-- `Docket.Graph.hash/2` computes a SHA-256 hash over the canonical JSON
-  encoding of `Docket.Graph.to_map/1`, excluding diagnostics.
+- `Docket.Graph.hash/2` computes a SHA-256 hash over the exact private
+  versioned deterministic ETF encoding of the effective graph, excluding
+  diagnostics.
 - `Docket.Graph.verify/2` delegates to `Docket.Graph.Compiler.verify/2`.
 - `Docket.Graph.Compiler.verify/2` and `compile/2` run the real validation and
   lowering passes under `lib/docket/graph/compiler/`.

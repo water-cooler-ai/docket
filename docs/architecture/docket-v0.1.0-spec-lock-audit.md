@@ -153,15 +153,16 @@ Replacing them with `done_at` / `failed_at` / `cancelled_at` creates three
 nullable state columns plus exactly-one constraints. One enum plus
 `finished_at` is the smaller, stronger sum type.
 
-Keep the existing `done` spelling for 0.0.x compatibility. `created` is only a
-private initialization sentinel: never durable, never checkpointed, and never
-cancellable. `interrupted`, `retrying`, `scheduled`, `ready`, and `claimed`
-are derived facts, not statuses.
+Keep the concise `done` spelling as the v0.1.0 product vocabulary; this is not a
+v0.0.x compatibility promise. `created` is only a private initialization
+sentinel: never durable, never checkpointed, and never cancellable.
+`interrupted`, `retrying`, `scheduled`, `ready`, and `claimed` are derived
+facts, not statuses.
 
 ### Failure is data, not state inference
 
-Add a top-level JSON-safe `Docket.Run.failure` and promoted `failure` JSON
-column. It is present exactly when status is `failed`.
+Add a top-level durable `Docket.Run.failure` inside the private opaque state.
+Explicit Run validation requires it exactly when status is `failed`.
 
 Today `Runtime.Loop.fail/4` stores only `status: :failed` and `finished_at`; the
 reason exists only in a `:run_failed` event. Because event policy may be
@@ -543,15 +544,13 @@ the product boundary; Postgres is the first-party paved road, while the core
 runtime remains substrate-neutral behind `Docket.Backend` and
 `Docket.Lifecycle`.
 
-**Narrow compatibility break:** Node modules and graph definitions carry over
-unchanged. `Docket.Node`, `Docket.Graph`, `Docket.Schema`, reducers,
-interrupts, executors, compiler/serialization APIs, `Docket.Run.to_map` /
-`from_map`, and `Docket.Test.run_inline` and related processless helpers remain
-public. Adopters replace only lifecycle ownership: remove their checkpoint
-committer and host tables, install Docket's migration, configure
-`repo:`/`backend:`, publish graphs to `GraphRef`, replace `run` with
-`start_run`, replace `get_run` with `fetch_run`/`inspect_run`, and delete
-host-owned `resume` orchestration.
+**Intentional compatibility break:** Node modules and graph definitions carry
+over unchanged, including public Graph interchange. Host-owned Run
+serialization does not: `Docket.Run.to_map/from_map` and the old Run wire
+version are removed. Adopters remove their checkpoint committer and host run
+tables, install Docket's migration, configure `repo:`/`backend:`, publish
+graphs to `GraphRef`, replace `run` with `start_run`, replace `get_run` with
+`fetch_run`/`inspect_run`, and delete host-owned `resume` orchestration.
 
 **Migration:** Because `0.0.1` persistence is host-defined, the supported
 migration is an explicit drain-and-cut-over rather than a universal automatic

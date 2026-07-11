@@ -11,8 +11,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       graph_id: "g1",
       graph_hash: "abc123",
       status: :running,
-      input: %{"prompt" => "hello"},
-      state: %{"channels" => %{}, "version" => 1},
+      state: <<131, 106>>,
       started_at: ~U[2026-07-09 00:00:00.000000Z]
     }
 
@@ -40,42 +39,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert run.step == 0
         assert run.checkpoint_seq == 0
         assert run.claim_attempts == 0
-        assert run.metadata == %{}
-        assert run.failure == nil
         assert run.poisoned_at == nil
         assert run.poison_reason == nil
+        assert :state in Run.__schema__(:redact_fields)
       end
 
-      test "requires run identity, status, input, state, and started_at" do
+      test "requires run identity, status, state, and started_at" do
         changeset = Run.changeset(%{})
 
-        for field <- [:run_id, :graph_id, :graph_hash, :status, :input, :state, :started_at] do
+        for field <- [:run_id, :graph_id, :graph_hash, :status, :state, :started_at] do
           assert {_msg, [validation: :required]} = changeset.errors[field]
         end
       end
 
-      test "carries failure and poison facts" do
-        attrs =
-          Map.merge(@valid_run, %{
-            status: :failed,
-            failure: %{"code" => "node_failed", "message" => "boom"},
-            finished_at: ~U[2026-07-09 00:00:01.000000Z]
-          })
-
-        run = Ecto.Changeset.apply_changes(Run.changeset(attrs))
-
-        assert run.failure == %{"code" => "node_failed", "message" => "boom"}
-
+      test "carries operational poison facts" do
         poisoned =
           Map.merge(@valid_run, %{
             poisoned_at: ~U[2026-07-09 00:00:01.000000Z],
-            poison_reason: %{"kind" => "max_claim_attempts"}
+            poison_reason: "max_claim_attempts_exceeded"
           })
 
         poisoned_run = Ecto.Changeset.apply_changes(Run.changeset(poisoned))
 
         assert poisoned_run.poisoned_at == ~U[2026-07-09 00:00:01.000000Z]
-        assert poisoned_run.poison_reason == %{"kind" => "max_claim_attempts"}
+        assert poisoned_run.poison_reason == "max_claim_attempts_exceeded"
       end
 
       test "status values mirror Docket.Run.durable_statuses/0" do
@@ -112,7 +99,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert GraphVersion.changeset(%{
                  graph_id: "g1",
                  graph_hash: "abc123",
-                 graph: %{"nodes" => []}
+                 graph: <<131, 106>>
                }).valid?
       end
     end
@@ -123,19 +110,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         seq: 1,
         type: :node_completed,
         step: 3,
+        payload: <<131, 116, 0, 0, 0, 0>>,
+        metadata: <<131, 116, 0, 0, 0, 0>>,
         occurred_at: ~U[2026-07-09 00:00:00.000000Z]
       }
 
-      test "valid without optional origin columns; payload and metadata default" do
+      test "valid without optional origin columns" do
         changeset = Event.changeset(@valid_event)
 
         assert changeset.valid?
 
         event = Ecto.Changeset.apply_changes(changeset)
 
-        assert event.payload == %{}
-        assert event.metadata == %{}
+        assert is_binary(event.payload)
+        assert is_binary(event.metadata)
         assert event.node_id == nil
+        assert Enum.sort(Event.__schema__(:redact_fields)) == [:metadata, :payload]
       end
 
       test "type values mirror Docket.Event.types/0" do

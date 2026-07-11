@@ -20,7 +20,7 @@ defmodule Docket.Graph.Compiler do
     not declare a `"max_supersteps"` policy
   """
 
-  alias Docket.Graph
+  alias Docket.{DurableCodec, Graph}
 
   alias Docket.Graph.Compiler.{
     Diagnostics,
@@ -30,7 +30,6 @@ defmodule Docket.Graph.Compiler do
     Validation
   }
 
-  alias Docket.Graph.Serializer
   alias Docket.Runtime
 
   @type opts :: keyword()
@@ -92,6 +91,14 @@ defmodule Docket.Graph.Compiler do
   defp run_pipeline(graph, opts, mode) do
     {canonical, ingest_diagnostics} = ingest(graph)
 
+    if Diagnostics.blocking?(ingest_diagnostics) do
+      {:error, ingest_diagnostics}
+    else
+      run_canonical_pipeline(canonical, ingest_diagnostics, opts, mode)
+    end
+  end
+
+  defp run_canonical_pipeline(canonical, ingest_diagnostics, opts, mode) do
     # Config schemas are fetched exactly once per compile; validation and
     # lowering must see the same result even when config_schema/0 callbacks
     # are stateful, and lowering must never re-enter user code.
@@ -100,21 +107,29 @@ defmodule Docket.Graph.Compiler do
     {effective, materialization_diagnostics} =
       materialize(canonical, config_schemas, mode != :effective_document)
 
-    diagnostics =
-      ingest_diagnostics ++
-        materialization_diagnostics ++ Validation.run(effective, config_schemas, opts)
+    diagnostics = ingest_diagnostics ++ materialization_diagnostics
 
     if Diagnostics.blocking?(diagnostics) do
       {:error, diagnostics}
     else
-      runtime_graph = Lowering.run(effective, opts)
-      diagnostics = diagnostics ++ RuntimeValidation.run(runtime_graph, effective)
+      diagnostics = diagnostics ++ Validation.run(effective, config_schemas, opts)
 
       if Diagnostics.blocking?(diagnostics) do
         {:error, diagnostics}
       else
-        {:ok, effective, runtime_graph, diagnostics}
+        lower(effective, opts, diagnostics)
       end
+    end
+  end
+
+  defp lower(effective, opts, diagnostics) do
+    runtime_graph = Lowering.run(effective, opts)
+    diagnostics = diagnostics ++ RuntimeValidation.run(runtime_graph, effective)
+
+    if Diagnostics.blocking?(diagnostics) do
+      {:error, diagnostics}
+    else
+      {:ok, effective, runtime_graph, diagnostics}
     end
   end
 
@@ -126,45 +141,22 @@ defmodule Docket.Graph.Compiler do
     |> ingest()
   end
 
-  # Graphs are free-form in memory; the compiler is a serialization boundary.
-  # Ingest canonicalizes the document through the wire format (atom keys and
-  # values in open content become strings, exactly as storage would see them)
-  # and validates/lowers the canonical form. Graphs that cannot cross the
-  # boundary keep their in-memory shape so the validation passes can still
-  # produce granular, path-bearing diagnostics next to the ingest error.
-  #
-  # The v1 wire format only represents schema_version 1 (dump stamps it), so
-  # a graph claiming any other version is never canonicalized; validation
-  # rejects it against the in-memory document instead.
-  defp ingest(%Graph{schema_version: version} = graph) when version != 1 do
-    {graph, []}
-  end
-
+  # Compilation normalizes only open runtime values through Docket.Wire, then
+  # validates the direct durable term. Public JSON interchange is deliberately
+  # not part of persistence, hashing, or compiler ingest.
   defp ingest(graph) do
-    {Serializer.load!(Serializer.dump(graph, []), []), []}
+    {graph, _bytes} = DurableCodec.encode_graph!(graph)
+    {graph, []}
   rescue
-    exception in Docket.Graph.Error ->
-      {graph, [ingest_diagnostic(exception)]}
-
-    exception ->
+    exception in Docket.Error ->
       {graph,
        [
          Diagnostics.error(
            :non_durable_graph_value,
-           "graph cannot be canonically serialized",
-           metadata: %{error: inspect(exception)}
+           "graph contains state that cannot be durably encoded",
+           metadata: %{error: exception.message, details: exception.details}
          )
        ]}
-  end
-
-  defp ingest_diagnostic(%Docket.Graph.Error{} = error) do
-    code =
-      case error.code do
-        :non_durable_value -> :non_durable_graph_value
-        code -> code
-      end
-
-    Diagnostics.error(code, error.message, metadata: %{details: error.details})
   end
 
   defp validate_opts!(opts) do

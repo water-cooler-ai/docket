@@ -247,39 +247,32 @@ format_version: 1
 digest: lowercase SHA-256 hex digest
 ```
 
-The hash input is the canonical JSON encoding (object keys sorted by binary
-byte order, no insignificant whitespace, shortest round-tripping float
-representation) of `Docket.Graph.to_map/1`, the canonical graph document dump.
-Because the hash is computed over the wire document rather than the in-memory
-term, it is independent of Erlang term encoding, struct field additions, and
-host serialization round trips: `hash(from_map!(to_map(graph))) == hash(graph)`
-holds by construction.
+The hash input is the exact private versioned deterministic ETF encoding of the
+diagnostic-free effective `%Docket.Graph{}`. The stored bytes and hash input are
+identical; there is no second canonical digest format. Deterministic ETF byte
+stability is scoped to one codec version and OTP major, so incompatible struct
+or OTP changes require a codec-version bump and controlled rewrite.
 
-`to_map/1` excludes compiler diagnostics, and its durable value rules exclude
-transient runtime state by making it unrepresentable. The dump includes public
+The durable projection excludes compiler diagnostics and includes the public
 graph structure and semantics: input/state/output definitions, nodes, node
 names or labels, node branch groups, edges, edge guards, policies, and
-metadata.
+metadata. `Docket.Graph.to_map/1` remains a JSON-safe UI/interchange format but
+does not participate in persistence or hashing.
 
-Durable graph content is JSON-safe by contract: binaries, numbers, booleans,
-nil, lists, and string-keyed maps. Canonicalization happens only at the
-serialization boundary, Ecto/Jason-style: graphs are free-form in memory,
-editing helpers store content exactly as given, and `to_map/2` coerces open
-content the way a JSON encoder would - atom keys and atom values become
-strings, silently. Terms with no JSON representation (tuples, keyword lists,
-pids, refs, functions, structs) are rejected with `:non_durable_value`.
-Because the hash is computed from the canonical document and `to_map/2`
-re-canonicalizes on every call, hashes are stable across storage round trips
-for every dumpable graph; graphs whose open content is already canonical also
-round-trip on struct equality. Map keys starting with `$` are reserved for
-wire-format tags.
+Public graph interchange is JSON-safe by contract: binaries, numbers, booleans,
+nil, lists, and string-keyed maps. Graphs remain free-form while being edited,
+but public interchange and publication share the runtime open-value rule: atom
+keys and values normalize to strings and non-portable resources are rejected.
+The private persistence path applies that rule directly to the graph structs;
+it does not route through `to_map/2`, construct a JSON-shaped projection, or
+retain a second persistence codec. Graphs whose open content is already
+canonical round-trip through the public map interchange on struct equality.
+Map keys starting with `$` remain reserved for wire-format tags.
 
-The one caveat of boundary coercion: a graph built with atom keys in open
-content reloads with string keys in the struct, so `config[:model]` reads a
-value before persistence and `nil` after. Host-facing docs should state the
-rule of thumb: treat open content (config, metadata, policies, defaults) as
-string-keyed data on both write and read, and reloaded structs are
-indistinguishable from built ones.
+The one caveat of boundary coercion: an authored graph may still contain atom
+keys before publication, while its effective published graph uses strings.
+Host-facing docs should state the rule of thumb: treat open content (config,
+metadata, policies, defaults) as string-keyed data on both write and read.
 
 Public node IDs are stable and meaningful in v1, so the canonical dump hashes
 node and edge references directly. A node name or label change is considered a
@@ -829,58 +822,30 @@ If an application truly needs to change an existing published artifact, that
 should be an administrative repair operation with explicit audit logging, not
 the normal editing path.
 
-## 12. Docket Documents And App Persistence
+## 12. Public Documents And Durable Persistence
 
-Docket's public persistence contract is document-shaped, not adapter-shaped.
-The two durable documents are:
+`Docket.Graph` remains the editable public graph document. Its `to_map/2` and
+`from_map/2` functions provide JSON-safe UI/import/export interchange, but that
+map is not the durable backend format and does not define graph identity.
 
-```text
-Docket.Graph
-  Canonical graph definition document.
-  Built, edited, verified, saved, loaded, and versioned by the host application.
-  Passed to Docket when starting, resuming, or retrying a run.
-
-Docket.Run
-  Canonical run state document.
-  Emitted by Docket.Checkpoint callbacks.
-  Saved by the host application.
-  Passed back to Docket to resume or retry a run.
-```
-
-Host applications may embed those documents in larger records, store them as
-JSONB, save them to object storage, serialize them to files, or keep them in
-memory for tests. Docket does not define those tables, indexes, relationships,
-or storage adapters.
-
-Docket does define the serialized shape. `Docket.Graph.to_map/2` and
-`Docket.Graph.from_map/2` are the only entry/exit points for serialized graph
-documents: `to_map/2` produces the canonical JSON-safe wire map and
-`from_map/2` restores the struct from it. Hosts that persist anything other
-than the `to_map/2` document (hand-rolled projections, raw struct dumps) are
-outside the hash and resume-compatibility contract.
-
-Typical host records may include:
-
-- workflow, workflow version, or graph artifact records that contain a
-  `Docket.Graph` document
-- run, job, session, message, or task records that contain a `Docket.Run`
-  document
-- user, project, tenant, approval, billing, or audit relationships outside the
-  Docket document
+Publishing compiles an effective diagnostic-free `%Docket.Graph{}`, stores it
+through Docket's private versioned deterministic ETF codec, and returns a
+`Docket.GraphRef`. Applications normally retain that reference on their own
+workflow/version record. `Docket.Run` persistence is entirely backend-private;
+applications keep the Run ID and business projections rather than copying a
+second run document.
 
 Rules:
 
-- `Docket.Graph.new/1` accepts `id:`. If omitted, Docket generates `graph.id`.
-- `Docket.run/4` and `MyApp.Docket.run/3` accept `id:`. If omitted, Docket
-  generates `run.id`.
-- Apps may use Docket document IDs as primary keys or store them alongside their
-  own internal IDs.
-- Existing published graph documents should be treated as immutable by the host.
-- Docket's computed graph hash is part of the public run compatibility contract.
-- Compression, content addressing, secondary indexes, and compiled runtime
-  caches are host implementation details.
-- The required Docket contract is only canonical documents in, canonical
-  documents out.
+- `Docket.Graph.new/1` accepts `id:`; Docket generates one when omitted.
+- Publish through `save_graph` and treat the returned graph reference as
+  immutable content identity.
+- Start durable runs from `GraphRef`, and read them through
+  `fetch_run`/`inspect_run` under an explicit tenant scope.
+- Graph hashes cover the exact private ETF projection stored by the backend,
+  excluding compiler diagnostics.
+- The codec version and OTP-major deployment boundary are backend concerns,
+  not a public interchange compatibility promise.
 
 ## 13. UI Projection Boundary
 

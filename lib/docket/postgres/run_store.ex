@@ -292,11 +292,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             poison_reason =
               CASE
                 WHEN runs.claim_attempts < $4 THEN NULL
-                ELSE jsonb_build_object(
-                  'type', 'max_claim_attempts_exceeded',
-                  'max_claim_attempts', $4,
-                  'claim_attempts', runs.claim_attempts
-                )
+                ELSE 'max_claim_attempts_exceeded'
               END
         FROM candidates
         WHERE runs.id = candidates.id

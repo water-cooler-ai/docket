@@ -18,6 +18,7 @@ defmodule Docket.Graph do
   records back through the same editing API.
   """
 
+  alias Docket.DurableCodec
   alias Docket.Graph.{Diagnostic, Edge, Error, Field, Node, Output, Serializer}
 
   @id_pattern ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
@@ -224,10 +225,10 @@ defmodule Docket.Graph do
   @doc """
   Stores a graph-level policy value, raising on malformed arguments.
 
-  Content is stored as given. When the graph crosses the serialization
-  boundary (`to_map/2`, `hash/2`), atom keys and values are canonicalized to
-  strings and terms with no JSON representation are rejected. Keys starting
-  with `"$"` are reserved for the wire format.
+  Content is stored as given. Public interchange and publication normalize
+  open atom keys and values to strings through the same runtime value
+  boundary; terms without a portable representation are rejected. Keys
+  starting with `"$"` are reserved.
   """
   @spec policy!(t(), binary() | atom(), term(), keyword()) :: t()
   def policy!(graph, key, value, opts \\ [])
@@ -253,10 +254,10 @@ defmodule Docket.Graph do
   @doc """
   Stores graph-level application metadata, raising on malformed arguments.
 
-  Content is stored as given. When the graph crosses the serialization
-  boundary (`to_map/2`, `hash/2`), atom keys and values are canonicalized to
-  strings and terms with no JSON representation are rejected. Keys starting
-  with `"$"` are reserved for the wire format.
+  Content is stored as given. Public interchange and publication normalize
+  open atom keys and values to strings through the same runtime value
+  boundary; terms without a portable representation are rejected. Keys
+  starting with `"$"` are reserved.
   """
   @spec metadata!(t(), binary() | atom(), term(), keyword()) :: t()
   def metadata!(graph, key, value, opts \\ [])
@@ -285,18 +286,17 @@ defmodule Docket.Graph do
   Keys are strings and values are durable JSON-safe terms. Compiler diagnostics
   are transient and are never serialized.
 
-  Graphs are free-form in memory; this is the boundary where content is
-  canonicalized. Open content (metadata, policies, config, defaults, enum
-  values, guard arguments, branch groups) is coerced the way `Jason` would
-  encode it: atom keys and atom values become strings, silently. Terms with no
-  JSON representation - tuples, keyword lists, pids, refs, functions, structs -
-  raise `Docket.Graph.Error` (`:non_durable_value` and friends).
+  Graphs are free-form in memory. Open content (metadata, policies, config,
+  defaults, enum values, guard arguments, branch groups) is normalized at
+  interchange and publication: atom keys and values become strings. Terms
+  with no portable representation—tuples, keyword lists, pids, refs,
+  functions, structs—raise `Docket.Graph.Error` (`:non_durable_value` and
+  friends) here.
 
-  The graph hash is computed from this document, so for graphs built through
-  the editing API it is stable across storage round trips:
-  `hash(from_map!(to_map(graph))) == hash(graph)`. Graphs whose open content
-  is already canonical (string keys and values) also round-trip on struct
-  equality: `from_map!(to_map(graph)) == graph`.
+  This map is for public interchange only; durable persistence and graph
+  hashing use Docket's private ETF codec directly. Graphs whose open content
+  is already canonical (string keys and values) round-trip on struct equality:
+  `from_map!(to_map(graph)) == graph`.
   """
   @spec to_map(t(), keyword()) :: map()
   def to_map(%__MODULE__{} = graph, opts \\ []) do
@@ -322,12 +322,18 @@ defmodule Docket.Graph do
   @doc """
   Computes the SHA-256 graph hash used to bind runs to graph content.
 
-  The hash is a SHA-256 digest over the canonical JSON encoding of
-  `to_map/1`. It excludes host-owned versioning and compiler diagnostics.
+  The hash is a SHA-256 digest over the private codec's versioned,
+  deterministic ETF projection of the graph. The codec normalizes only open
+  runtime values—without a public map serialization round trip—and excludes
+  compiler diagnostics. Byte stability is scoped to the codec version and OTP
+  major version, matching Erlang's deterministic ETF guarantee. Node module
+  atoms must exist on a recovery node before safe ETF decoding.
   """
   @spec hash(t(), keyword()) :: String.t()
-  def hash(%__MODULE__{} = graph, opts \\ []) do
-    Serializer.hash(graph, opts)
+  def hash(%__MODULE__{} = graph, _opts \\ []) do
+    DurableCodec.encode!(:graph, graph)
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   @doc """

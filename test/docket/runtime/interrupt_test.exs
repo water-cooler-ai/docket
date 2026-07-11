@@ -84,15 +84,12 @@ defmodule Docket.Runtime.InterruptTest do
                )
     end
 
-    test "a waiting run survives a persistence round trip and resumes" do
+    test "a waiting durable run resumes" do
       {run, _} = waiting_run()
       [interrupt_id] = Map.keys(run.interrupts)
 
-      restored = Docket.Run.from_map!(Docket.Run.to_map(run))
-      assert restored == run
-
       assert {:ok, resumed, _} =
-               Docket.Test.resume_inline(Graphs.interrupt_review(), restored)
+               Docket.Test.resume_inline(Graphs.interrupt_review(), run)
 
       # Resume of a waiting run re-emits :run_initialized and waits again.
       assert resumed.status == :waiting

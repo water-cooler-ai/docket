@@ -1,40 +1,68 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.GraphStore do
-    @moduledoc """
-    Postgres persistence for immutable, content-addressed graph documents.
-
-    This store accepts only the effective canonical wire map produced before
-    publication. It verifies the document ID and SHA-256 content address
-    directly from canonical JSON; it deliberately does not deserialize the
-    document or load node implementation modules.
-
-    Inserts use Postgres conflict arbitration. After every insert attempt the
-    stored JSON document is read back and compared structurally, so an
-    existing equal version is idempotent while different content under the
-    same address is reported as a conflict.
-    """
+    @moduledoc "Postgres storage for immutable, content-addressed durable graphs."
 
     @behaviour Docket.Storage.Graphs
 
     import Ecto.Query
 
-    alias Docket.Graph.Serializer
+    alias Docket.{DurableCodec, Graph}
     alias Docket.Postgres.Schemas.GraphVersion
     alias Docket.Postgres.Storage
 
-    @id_pattern ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
-
     @impl Docket.Storage.Graphs
-    def save_graph(ctx, graph_id, graph_hash, document) do
-      with :ok <- validate_document(graph_id, document),
-           :ok <- validate_hash(graph_hash, document),
-           :ok <- insert_version(ctx, graph_id, graph_hash, document) do
-        verify_stored_document(ctx, graph_id, graph_hash, document)
+    def save_graph(ctx, graph_id, graph_hash, %Graph{id: id, diagnostics: []} = graph)
+        when id == graph_id do
+      with {:ok, bytes} <- encode(graph),
+           :ok <- verify_hash(bytes, graph_hash),
+           :ok <- insert(ctx, graph_id, graph_hash, bytes) do
+        verify_insert(ctx, graph_id, graph_hash, bytes)
       end
     end
 
+    def save_graph(_ctx, _graph_id, _graph_hash, _graph),
+      do: {:error, :invalid_graph_document}
+
     @impl Docket.Storage.Graphs
     def fetch_graph(ctx, graph_id, graph_hash) do
+      with {:ok, bytes} <- fetch_bytes(ctx, graph_id, graph_hash),
+           :ok <- verify_stored(bytes, graph_id, graph_hash),
+           {:ok, graph} <- decode(bytes),
+           true <- valid_decoded?(graph, graph_id, bytes) do
+        {:ok, graph}
+      else
+        {:error, :not_found} -> {:error, :not_found}
+        _invalid -> {:error, :corrupt_graph}
+      end
+    end
+
+    defp insert(ctx, graph_id, graph_hash, bytes) do
+      {repo, prefix} = Storage.context!(ctx)
+
+      changeset =
+        GraphVersion.changeset(%{graph_id: graph_id, graph_hash: graph_hash, graph: bytes})
+
+      opts =
+        maybe_put_prefix(
+          [on_conflict: :nothing, conflict_target: [:graph_id, :graph_hash]],
+          prefix
+        )
+
+      case repo.insert(changeset, opts) do
+        {:ok, _version} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    defp verify_insert(ctx, graph_id, graph_hash, bytes) do
+      case fetch_bytes(ctx, graph_id, graph_hash) do
+        {:ok, ^bytes} -> :ok
+        {:ok, _other} -> {:error, :graph_content_conflict}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    defp fetch_bytes(ctx, graph_id, graph_hash) do
       {repo, prefix} = Storage.context!(ctx)
 
       query =
@@ -45,82 +73,42 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       case repo.one(query) do
         nil -> {:error, :not_found}
-        document -> {:ok, document}
+        bytes when is_binary(bytes) -> {:ok, bytes}
+        _invalid -> {:error, :corrupt_graph}
       end
     end
 
-    defp insert_version(ctx, graph_id, graph_hash, document) do
-      {repo, prefix} = Storage.context!(ctx)
+    defp encode(graph) do
+      {:ok, DurableCodec.encode!(:graph, graph)}
+    rescue
+      _error in Docket.Error -> {:error, :invalid_graph_document}
+    end
 
-      changeset =
-        GraphVersion.changeset(%{
-          graph_id: graph_id,
-          graph_hash: graph_hash,
-          graph: document
-        })
-
-      opts =
-        [on_conflict: :nothing, conflict_target: [:graph_id, :graph_hash]]
-        |> maybe_put_prefix(prefix)
-
-      case repo.insert(changeset, opts) do
-        {:ok, _version} -> :ok
-        {:error, reason} -> {:error, reason}
+    defp decode(bytes) do
+      case DurableCodec.decode(bytes, :graph) do
+        {:ok, %Graph{} = graph} -> {:ok, graph}
+        {:ok, _other} -> {:error, :corrupt_graph}
+        {:error, %Docket.Error{}} -> {:error, :corrupt_graph}
       end
     end
 
-    defp verify_stored_document(ctx, graph_id, graph_hash, document) do
-      case fetch_graph(ctx, graph_id, graph_hash) do
-        {:ok, stored} when stored === document -> :ok
-        {:ok, _different} -> {:error, :graph_content_conflict}
-        {:error, reason} -> {:error, reason}
-      end
+    defp verify_stored(bytes, _graph_id, graph_hash), do: verify_hash(bytes, graph_hash)
+
+    defp verify_hash(bytes, graph_hash) when is_binary(graph_hash) do
+      if digest(bytes) == graph_hash, do: :ok, else: {:error, :invalid_graph_hash}
     end
 
-    defp validate_document(graph_id, document)
-         when is_binary(graph_id) and byte_size(graph_id) > 0 and
-                is_map(document) and not is_struct(document) do
-      if Regex.match?(@id_pattern, graph_id) and Map.get(document, "id") == graph_id and
-           canonical_json?(document) do
-        :ok
-      else
-        {:error, :invalid_graph_document}
-      end
+    defp verify_hash(_bytes, _graph_hash), do: {:error, :invalid_graph_hash}
+
+    defp valid_decoded?(%Graph{id: id, diagnostics: []} = graph, graph_id, bytes) do
+      id == graph_id and DurableCodec.encode!(:graph, graph) == bytes
+    rescue
+      _error in Docket.Error -> false
     end
 
-    defp validate_document(_graph_id, _document), do: {:error, :invalid_graph_document}
-
-    defp validate_hash(graph_hash, document) when is_binary(graph_hash) do
-      actual_hash =
-        document
-        |> Serializer.canonical_json_encode()
-        |> then(&:crypto.hash(:sha256, &1))
-        |> Base.encode16(case: :lower)
-
-      if graph_hash == actual_hash, do: :ok, else: {:error, :invalid_graph_hash}
-    end
-
-    defp validate_hash(_graph_hash, _document), do: {:error, :invalid_graph_hash}
-
-    defp canonical_json?(value)
-         when is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value),
-         do: true
-
-    defp canonical_json?(value) when is_binary(value), do: String.valid?(value)
-    defp canonical_json?(value) when is_list(value), do: Enum.all?(value, &canonical_json?/1)
-
-    defp canonical_json?(value) when is_map(value) and not is_struct(value) do
-      Enum.all?(value, fn
-        {key, nested} when is_binary(key) -> String.valid?(key) and canonical_json?(nested)
-        _other -> false
-      end)
-    end
-
-    defp canonical_json?(_value), do: false
-
+    defp digest(bytes), do: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
     defp with_prefix(query, nil), do: query
     defp with_prefix(query, prefix), do: put_query_prefix(query, prefix)
-
     defp maybe_put_prefix(opts, nil), do: opts
     defp maybe_put_prefix(opts, prefix), do: Keyword.put(opts, :prefix, prefix)
   end

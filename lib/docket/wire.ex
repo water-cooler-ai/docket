@@ -32,6 +32,21 @@ defmodule Docket.Wire do
     end
   end
 
+  @doc false
+  @spec dump_key!(term(), String.t()) :: String.t()
+  def dump_key!(key, location) do
+    case dump_value(%{key => nil}) do
+      {:ok, normalized} ->
+        normalized |> Map.keys() |> List.first()
+
+      {:error, reason} ->
+        raise Docket.Error,
+          type: :non_durable_value,
+          message: "#{location} contains a non-durable key: #{reason}",
+          details: %{location: location}
+    end
+  end
+
   @spec load_value!(term(), String.t()) :: term()
   def load_value!(value, _location)
       when is_binary(value) or is_number(value) or is_boolean(value) or is_nil(value),
@@ -79,7 +94,7 @@ defmodule Docket.Wire do
 
   defp durable!(atom) when is_atom(atom), do: Atom.to_string(atom)
 
-  defp durable!(list) when is_list(list), do: Enum.map(list, &durable!/1)
+  defp durable!(list) when is_list(list), do: durable_list!(list)
 
   defp durable!(%_struct{} = struct) do
     throw({:non_durable, "structs are not durable values, got #{inspect(struct)}"})
@@ -113,5 +128,12 @@ defmodule Docket.Wire do
 
   defp durable_key!(key) do
     throw({:non_durable, "map keys must be strings or atoms, got #{inspect(key)}"})
+  end
+
+  defp durable_list!([]), do: []
+  defp durable_list!([head | tail]), do: [durable!(head) | durable_list!(tail)]
+
+  defp durable_list!(tail) do
+    throw({:non_durable, "improper lists are not durable, got tail #{inspect(tail)}"})
   end
 end

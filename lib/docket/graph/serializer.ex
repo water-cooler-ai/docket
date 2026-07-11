@@ -16,13 +16,13 @@ defmodule Docket.Graph.Serializer do
   # - `load!/2` reconstructs a `Docket.Graph` from a wire map. It validates the
   #   document shape strictly and never creates new atoms from untrusted
   #   strings.
-  # - `canonical_json_encode/1` renders the wire map to a deterministic,
-  #   compact JSON binary used as the input to the graph hash.
+  # Graph hashing uses the private durable ETF codec directly; this JSON-safe
+  # map remains only the public interchange format.
   #
-  # Durability is handled only here, at the serialization boundary. Graphs
-  # are free-form in memory: the editing API stores content exactly as given
-  # and performs no validation or transformation (the one exception is the
-  # module / {module, function} implementation construction shorthand).
+  # This module validates only the public JSON-safe interchange boundary.
+  # Private persistence normalizes open runtime values and validates the
+  # direct graph term through `Docket.DurableCodec`; it never calls this map
+  # serializer. Graphs remain free-form while being edited.
   #
   # dump/2 canonicalizes open content with Jason-style coercion: atoms become
   # strings (both map keys and values), silently. Terms with no JSON
@@ -31,12 +31,7 @@ defmodule Docket.Graph.Serializer do
   # document therefore always contains only binaries, numbers, booleans,
   # `nil`, lists, and string-keyed maps.
   #
-  # Because dump/2 re-canonicalizes on every call, the hash is stable across
-  # storage round trips for graphs built through the editing API:
-  # `hash(from_map!(to_map(graph))) == hash(graph)`. (A hand-built node
-  # implementation map that omits :function dumps without "function", but
-  # load! defaults it to :call, so the re-dump - and hash - differ.) Struct
-  # equality
+  # Struct equality
   # `from_map!(to_map(graph)) == graph` holds for graphs whose open content is
   # already canonical (string keys/values); a graph built with atom content
   # reloads in canonical string form, exactly as a Jason/JSON round trip
@@ -49,7 +44,6 @@ defmodule Docket.Graph.Serializer do
   alias Docket.{Guard, Reducer, Schema}
 
   @schema_version 1
-  @hash_algorithm :sha256
 
   @start_id "$start"
   @finish_id "$finish"
@@ -133,8 +127,7 @@ defmodule Docket.Graph.Serializer do
 
   # Dumps a graph to the plain, JSON-safe v1 wire map, canonicalizing open
   # content (atoms become strings) and raising `Docket.Graph.Error` for terms
-  # with no JSON representation. This is the boundary where durability is
-  # handled.
+  # with no JSON representation. This is the public interchange boundary.
   @doc false
   @spec dump(Graph.t(), keyword()) :: map()
   def dump(%Graph{} = graph, _opts \\ []) do
@@ -180,22 +173,6 @@ defmodule Docket.Graph.Serializer do
       metadata: load_open_map!(map, "metadata", "graph"),
       diagnostics: []
     }
-  end
-
-  # ---------------------------------------------------------------------------
-  # Hash
-  # ---------------------------------------------------------------------------
-
-  # Computes the lowercase 64-char hex SHA-256 hash of a graph: a SHA-256
-  # digest over the canonical JSON encoding of `dump/2`.
-  @doc false
-  @spec hash(Graph.t(), keyword()) :: String.t()
-  def hash(%Graph{} = graph, opts \\ []) do
-    graph
-    |> dump(opts)
-    |> canonical_json_encode()
-    |> then(&:crypto.hash(@hash_algorithm, &1))
-    |> Base.encode16(case: :lower)
   end
 
   # ---------------------------------------------------------------------------
@@ -247,8 +224,7 @@ defmodule Docket.Graph.Serializer do
     |> put_open_map("metadata", edge.metadata)
   end
 
-  # Public so the run serializer can dump interrupt schemas with the same
-  # rules; not a host-facing API.
+  # Public Graph map-interchange helper; not used by persistence or compilation.
   @doc false
   def dump_schema(nil), do: nil
 
@@ -488,7 +464,7 @@ defmodule Docket.Graph.Serializer do
     }
   end
 
-  # Public counterpart of dump_schema/1 for the run serializer.
+  # Public Graph map-interchange counterpart of dump_schema/1.
   @doc false
   def load_schema!(nil, _location), do: nil
 
@@ -1081,89 +1057,6 @@ defmodule Docket.Graph.Serializer do
       "graph contains a non-durable value #{inspect(value)}: #{hint}",
       %{value: inspect(value), hint: hint}
     )
-  end
-
-  # ---------------------------------------------------------------------------
-  # Canonical JSON encoder
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Encodes the wire-map domain into deterministic, compact JSON.
-
-  Object keys are sorted by binary byte order, there is no insignificant
-  whitespace, and floats use the shortest round-tripping representation. Only
-  the `dump/2` output domain is supported: any other term raises.
-  """
-  @spec canonical_json_encode(term()) :: binary()
-  def canonical_json_encode(term) do
-    IO.iodata_to_binary(encode_json(term))
-  end
-
-  defp encode_json(nil), do: "null"
-  defp encode_json(true), do: "true"
-  defp encode_json(false), do: "false"
-  defp encode_json(value) when is_integer(value), do: Integer.to_string(value)
-  defp encode_json(value) when is_float(value), do: :erlang.float_to_binary(value, [:short])
-  defp encode_json(value) when is_binary(value), do: encode_json_string(value)
-
-  defp encode_json(list) when is_list(list) do
-    ["[", encode_json_elements(list), "]"]
-  end
-
-  defp encode_json(map) when is_map(map) and not is_struct(map) do
-    entries =
-      map
-      |> Enum.map(fn {key, value} -> {encode_json_key!(key), value} end)
-      |> Enum.sort_by(fn {key, _value} -> key end)
-      |> Enum.map(fn {key, value} -> [encode_json_string(key), ":", encode_json(value)] end)
-      |> Enum.intersperse(",")
-
-    ["{", entries, "}"]
-  end
-
-  defp encode_json(other) do
-    raise ArgumentError, "canonical JSON encoder received a non-JSON term: #{inspect(other)}"
-  end
-
-  defp encode_json_elements([]), do: []
-
-  defp encode_json_elements(list) do
-    list
-    |> Enum.map(&encode_json/1)
-    |> Enum.intersperse(",")
-  end
-
-  defp encode_json_key!(key) when is_binary(key), do: key
-
-  defp encode_json_key!(other) do
-    raise ArgumentError, "canonical JSON object keys must be binaries, got #{inspect(other)}"
-  end
-
-  defp encode_json_string(string) do
-    [?", escape_json(string, []), ?"]
-  end
-
-  defp escape_json(<<>>, acc), do: Enum.reverse(acc)
-
-  defp escape_json(<<?", rest::binary>>, acc), do: escape_json(rest, ["\\\"" | acc])
-  defp escape_json(<<?\\, rest::binary>>, acc), do: escape_json(rest, ["\\\\" | acc])
-
-  defp escape_json(<<char::utf8, rest::binary>>, acc) when char < 0x20 do
-    escape_json(rest, [unicode_escape(char) | acc])
-  end
-
-  defp escape_json(<<char::utf8, rest::binary>>, acc) do
-    escape_json(rest, [<<char::utf8>> | acc])
-  end
-
-  defp unicode_escape(char) do
-    hex =
-      char
-      |> Integer.to_string(16)
-      |> String.downcase()
-      |> String.pad_leading(4, "0")
-
-    "\\u" <> hex
   end
 
   defp invalid!(code, message, details \\ %{}) do
