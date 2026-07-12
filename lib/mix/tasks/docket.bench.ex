@@ -22,7 +22,7 @@ defmodule Mix.Tasks.Docket.Bench do
     Mix.Task.run("app.start")
 
     with {:ok, config} <- Docket.Benchmark.parse(argv) do
-      case Docket.Benchmark.run_for_cli(config) do
+      case Docket.Benchmark.run_for_cli(config, progress: :auto) do
         {:ok, result} ->
           print_result(result)
 

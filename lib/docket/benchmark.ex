@@ -116,9 +116,9 @@ defmodule Docket.Benchmark do
   end
 
   @doc false
-  def run_for_cli(config) do
+  def run_for_cli(config, opts \\ []) do
     if Code.ensure_loaded?(Docket.Benchmark.Postgres) do
-      apply(Docket.Benchmark.Postgres, :run_for_cli, [config])
+      apply(Docket.Benchmark.Postgres, :run_for_cli, [config, opts])
     else
       {:error, "Postgres benchmarks require the optional ecto_sql and postgrex dependencies"}
     end

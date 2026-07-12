@@ -15,7 +15,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
   defmodule Docket.Benchmark.Postgres do
     @moduledoc false
-    alias Docket.Benchmark.Repo
+    alias Docket.Benchmark.{Progress, Repo}
     alias Docket.Benchmark.Postgres.{Database, Scenario}
 
     @migration_version 20_260_711_000_038
@@ -45,10 +45,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    def run_for_cli(config) do
+    def run_for_cli(config, opts \\ []) do
       points = Docket.Benchmark.plan(config)
+      progress = Progress.start(length(points), mode: Keyword.get(opts, :progress, :off))
 
-      with {:ok, artifacts} <- run_points(points) do
+      execution =
+        try do
+          run_points(points, progress)
+        after
+          Progress.stop(progress)
+        end
+
+      with {:ok, artifacts} <- execution do
         payload = suite_summary_payload(artifacts)
         write_results!(config.output, config.format, artifacts, payload)
 
@@ -64,16 +72,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @doc false
-    def run_points(points) do
+    def run_points(points, progress \\ :off) do
       artifacts =
-        Enum.map(points, fn point ->
+        points
+        |> Enum.with_index(1)
+        |> Enum.map(fn {point, index} ->
+          Progress.point_started(progress, index, point)
+
           artifact =
             case run_point(point) do
               {:ok, artifact} -> artifact
               {:error, reason} -> failure_artifact(point, reason)
             end
 
-          Map.put(artifact, :headline, Docket.Benchmark.Headline.build(artifact))
+          artifact = Map.put(artifact, :headline, Docket.Benchmark.Headline.build(artifact))
+          Progress.point_finished(progress, index, artifact.success)
+          artifact
         end)
 
       {:ok, artifacts}

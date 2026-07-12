@@ -23,6 +23,12 @@ first durable commit, and uses p50/max instead of a tail label for distributions
 with fewer than 20 observations. The artifact remains the complete,
 machine-readable record.
 
+While trials run, the task reports live progress on standard error. An
+interactive terminal gets an animated ticker with a trial counter and the
+current trial's elapsed time; non-interactive output falls back to one
+started line and one PASS/FAIL line per trial, so long suites never look
+stalled.
+
 A repeated concurrency/pool matrix runs sequentially with one isolated
 database and Repo configuration per trial:
 
