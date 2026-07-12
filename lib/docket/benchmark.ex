@@ -7,8 +7,8 @@ defmodule Docket.Benchmark do
   remain explicit, manual work rather than ordinary test-suite work.
   """
 
-  @scenarios ~w(blocked_vehicles claim_only empty_one_step smoke)
-  @all_scenarios ~w(claim_only empty_one_step cyclic_drain blocked_vehicles mixed_fairness graph_cache freshness_split_brain multinode notify_poll amplification soak smoke)
+  @scenarios ~w(blocked_vehicles claim_only cyclic_vs_one_step empty_one_step mixed_service_times parked_wait_vs_blocking_wait smoke)
+  @all_scenarios ~w(claim_only empty_one_step cyclic_drain cyclic_vs_one_step blocked_vehicles mixed_fairness mixed_service_times parked_wait_vs_blocking_wait graph_cache freshness_split_brain multinode notify_poll amplification soak smoke)
 
   @defaults %{
     scenario: "smoke",
@@ -193,6 +193,24 @@ defmodule Docket.Benchmark do
     end
   end
 
+  defp scenario_options(%{scenario: scenario} = config)
+       when scenario in ["mixed_service_times", "parked_wait_vs_blocking_wait"] do
+    with :ok <- positive(config.hold_ms, "hold-ms"),
+         :ok <- at_least(config.runs, 2, "runs") do
+      if config.warmup == 0,
+        do: :ok,
+        else: {:error, "#{scenario} does not support warmup runs; use repetitions"}
+    end
+  end
+
+  defp scenario_options(%{scenario: "cyclic_vs_one_step"} = config) do
+    with :ok <- at_least(config.runs, 2, "runs") do
+      if config.warmup == 0,
+        do: :ok,
+        else: {:error, "cyclic_vs_one_step does not support warmup runs; use repetitions"}
+    end
+  end
+
   defp scenario_options(%{
          batch_size: nil,
          ready_ratio: nil,
@@ -206,7 +224,7 @@ defmodule Docket.Benchmark do
   defp scenario_options(_config),
     do:
       {:error,
-       "batch-size/ready-ratio are only valid for claim_only; hold/sample/probe options are only valid for blocked_vehicles"}
+       "batch-size/ready-ratio are only valid for claim_only; hold-ms is valid for blocked_vehicles and wait-comparison scenarios; sample/probe options are only valid for blocked_vehicles"}
 
   defp blocked_backlog(config) do
     maximum_concurrency = Enum.max(config.concurrencies)
@@ -336,6 +354,11 @@ defmodule Docket.Benchmark do
          max_samples: config.max_samples || 256,
          probe_count: config.probe_count || 3
      }}
+  end
+
+  defp normalize_scenario(%{scenario: scenario} = config)
+       when scenario in ["mixed_service_times", "parked_wait_vs_blocking_wait"] do
+    {:ok, %{config | hold_ms: config.hold_ms || 250}}
   end
 
   defp normalize_scenario(config), do: {:ok, config}

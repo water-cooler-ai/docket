@@ -18,21 +18,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  ~w(--scenario claim_only --runs 12 --concurrency 4 --pool-size 2 --batch-size 3 --ready-ratio 7:5 --output #{output})
                )
 
-      assert {:ok, %{artifact: artifact}} = Docket.Benchmark.run(config)
+      assert {:ok, %{artifact: suite, artifacts: [artifact]}} = Docket.Benchmark.run(config)
+      assert suite.kind == "benchmark_suite"
+      assert suite.trial_count == 1
       assert artifact.success
       assert artifact.workload.ready_count == 7
       assert artifact.workload.expired_count == 5
       assert artifact.measurements.collection.complete_sample_set
       assert artifact.measurements.counts.ready_claims == 7
       assert artifact.measurements.counts.expired_claims == 5
+      assert artifact.headline.ready_claims == 7
+      assert is_number(artifact.headline.burst_start_to_claim_p50_us)
+      assert is_number(artifact.headline.claim_query_p95_us)
       assert Enum.all?(artifact.invariants, & &1.pass)
       assert artifact.cleanup.isolated_database_removed
 
       encoded = File.read!(output)
       decoded = JSON.decode!(encoded)
       assert is_map(decoded)
-      assert decoded["schema_version"] == 3
+      assert decoded["kind"] == "benchmark_suite"
+      assert decoded["schema_version"] == 4
       assert decoded["scenario"] == "claim_only"
+      assert [point] = decoded["points"]
+      assert point["schema_version"] == 4
+      assert point["headline"]["ready_claims"] == 7
       refute encoded =~ config.database_url
       refute encoded =~ output
       refute encoded =~ "docket_bench_"
@@ -55,7 +64,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  ~w(--scenario claim_only --runs 1000 --concurrency 8 --pool-size 8 --batch-size 1000 --ready-ratio 1:0 --output #{output})
                )
 
-      assert {:ok, %{artifact: artifact}} = Docket.Benchmark.run(config)
+      assert {:ok, %{artifacts: [artifact]}} = Docket.Benchmark.run(config)
       assert artifact.success
       assert artifact.workload.ready_count == 1000
       assert artifact.workload.expired_count == 0
@@ -85,7 +94,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  ~w(--scenario claim_only --runs 12 --concurrency 4 --pool-size 4 --batch-size 12 --ready-ratio 0:1 --output #{output})
                )
 
-      assert {:ok, %{artifact: artifact}} = Docket.Benchmark.run(config)
+      assert {:ok, %{artifacts: [artifact]}} = Docket.Benchmark.run(config)
       assert artifact.success
       assert artifact.workload.ready_count == 0
       assert artifact.workload.expired_count == 12
@@ -126,9 +135,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  ~w(--scenario blocked_vehicles --runs 4 --concurrency 2 --pool-size 1 --hold-ms 30 --sample-interval-ms 5 --max-samples 8 --probe-count 2 --output #{output})
                )
 
-      assert {:ok, %{artifact: artifact}} = Docket.Benchmark.run(config)
+      assert {:ok, %{artifacts: [artifact]}} = Docket.Benchmark.run(config)
       assert artifact.success
       assert artifact.scenario == "blocked_vehicles"
+      assert is_number(artifact.headline.plateau_fill_duration_us)
+      assert is_number(artifact.headline.short_query_p50_us)
+      assert artifact.headline.orphan_ttl_ms == config.orphan_ttl_ms
       assert artifact.cleanup.isolated_database_removed
       assert artifact.measurements.blocked_vehicles.collection.complete_sample_set
       assert artifact.measurements.blocked_vehicles.plateau.active_claims == 2
@@ -200,12 +212,97 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:error, message} = Docket.Benchmark.run(config)
       assert message =~ "results were written"
 
-      artifact = output |> File.read!() |> JSON.decode!()
+      suite = output |> File.read!() |> JSON.decode!()
+      refute suite["success"]
+      assert suite["kind"] == "benchmark_suite"
+      assert [artifact] = suite["points"]
       refute artifact["success"]
       assert artifact["duration_us"] == nil
       assert artifact["cleanup"]["isolated_database_removed"]
       assert artifact["failure_stage"] == "setup_or_execution"
       assert artifact["error"] =~ "timed out before reaching its plateau"
+    end
+
+    test "comparative fairness scenarios preserve cohort samples" do
+      scenarios = [
+        {"mixed_service_times", ["--hold-ms", "10"], [:slow, :fast], 4},
+        {"parked_wait_vs_blocking_wait", ["--hold-ms", "10"], [:blocking, :parked], 6},
+        {"cyclic_vs_one_step", [], [:cyclic, :one_step], 4}
+      ]
+
+      for {scenario, extra, cohorts, expected_claims} <- scenarios do
+        output =
+          Path.join(
+            System.tmp_dir!(),
+            "docket-#{scenario}-#{System.unique_integer([:positive])}.json"
+          )
+
+        on_exit(fn -> File.rm(output) end)
+
+        argv =
+          ~w(--scenario #{scenario} --runs 4 --concurrency 2 --pool-size 2 --timeout-ms 10000 --output #{output}) ++
+            extra
+
+        assert {:ok, config} = Docket.Benchmark.parse(argv)
+        assert {:ok, %{artifacts: [artifact]}} = Docket.Benchmark.run(config)
+        assert artifact.success
+        assert artifact.scenario == scenario
+        assert artifact.measurements.collection.complete_sample_set
+
+        assert artifact.measurements.collection.expected_ready_claim_samples ==
+                 expected_claims
+
+        assert Map.keys(artifact.measurements.cohorts) |> Enum.sort() == Enum.sort(cohorts)
+
+        assert Enum.all?(artifact.measurements.cohorts, fn {_name, cohort} ->
+                 cohort.runs == cohort.completed_runs and
+                   cohort.activation_to_terminal_commit_offset_us.sample_count == cohort.runs and
+                   cohort.activation_to_first_claim_offset_us.sample_count == cohort.runs and
+                   cohort.first_claim_to_terminal_commit_us.sample_count == cohort.runs and
+                   is_number(cohort.queue_share_of_median_percent)
+               end)
+
+        for label <- cohorts do
+          assert is_number(artifact.headline[:"cohort_#{label}_activation_to_terminal_p50_us"])
+          assert is_number(artifact.headline[:"cohort_#{label}_first_claim_to_terminal_p50_us"])
+          assert is_number(artifact.headline[:"cohort_#{label}_queue_share_of_median_percent"])
+        end
+
+        assert Enum.all?(artifact.invariants, & &1.pass)
+        assert artifact.cleanup.isolated_database_removed
+      end
+    end
+
+    test "comparative fairness repetitions produce suite latency summaries" do
+      points = [
+        %{
+          measurements: %{
+            latency: comparative_suite_latency(10),
+            cohorts: comparative_suite_cohorts(10)
+          }
+        },
+        %{
+          measurements: %{
+            latency: comparative_suite_latency(20),
+            cohorts: comparative_suite_cohorts(20)
+          }
+        }
+      ]
+
+      for scenario <- ~w(mixed_service_times parked_wait_vs_blocking_wait cyclic_vs_one_step) do
+        summary = Docket.Benchmark.Postgres.suite_latency_summary(points, scenario)
+
+        assert summary.burst_activation_to_first_commit_p50_us.sample_count == 2
+        assert summary.burst_activation_to_first_commit_p50_us.median == 15.0
+        assert summary.first_commit_to_terminal_p95_us.sample_count == 2
+        assert summary.burst_activation_to_terminal_commit_p95_us.sample_count == 2
+
+        assert summary.cohorts.slow.activation_to_terminal_p50_us.sample_count == 2
+        assert summary.cohorts.slow.activation_to_terminal_p50_us.median == 150.0
+        assert summary.cohorts.slow.first_claim_to_terminal_p50_us.sample_count == 2
+        assert summary.cohorts.slow.queue_share_of_median_percent.median == 15.0
+        assert summary.cohorts.fast.activation_to_terminal_p95_us.sample_count == 2
+      end
     end
 
     test "warm repeated matrix writes raw NDJSON trials and one summary" do
@@ -254,8 +351,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert first.max <= terminal.max
         assert span.max <= terminal.max
         assert trial.duration_us == terminal.max
-        assert trial.schema_version == 3
+        assert trial.schema_version == 4
         assert trial.scenario == "empty_one_step"
+        assert is_number(trial.headline.throughput_per_second)
+        assert trial.headline.activation_to_terminal_p95_us == terminal.p95
         assert trial.measurements.amplification.durable_run_rows == 3
         assert trial.measurements.latency.vehicle_claim_held_ms.sample_count == 3
         assert trial.cleanup.isolated_database_removed
@@ -293,6 +392,29 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       refute encoded =~
                ~r/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i
+    end
+
+    defp comparative_suite_latency(value) do
+      %{
+        burst_activation_to_first_commit_offset_us: %{p50: value, p95: value + 1},
+        first_commit_to_terminal_us: %{p50: value + 2, p95: value + 3},
+        burst_activation_to_terminal_commit_offset_us: %{p50: value + 4, p95: value + 5}
+      }
+    end
+
+    defp comparative_suite_cohorts(value) do
+      %{
+        slow: %{
+          activation_to_terminal_commit_offset_us: %{p50: value * 10, p95: value * 11},
+          first_claim_to_terminal_commit_us: %{p50: value * 2},
+          queue_share_of_median_percent: value * 1.0
+        },
+        fast: %{
+          activation_to_terminal_commit_offset_us: %{p50: value * 20, p95: value * 21},
+          first_claim_to_terminal_commit_us: %{p50: value},
+          queue_share_of_median_percent: value * 2.0
+        }
+      }
     end
   end
 end

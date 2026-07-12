@@ -1,6 +1,57 @@
 defmodule Docket.BenchmarkTest do
   use ExUnit.Case, async: false
 
+  if Code.ensure_loaded?(Docket.Benchmark.Postgres.Scenario) do
+    test "Postgres scenarios have focused modules behind one registry" do
+      assert Docket.Benchmark.Postgres.Scenario.fetch!("smoke") ==
+               Docket.Benchmark.Postgres.Scenarios.EmptyOneStep
+
+      assert Docket.Benchmark.Postgres.Scenario.fetch!("claim_only") ==
+               Docket.Benchmark.Postgres.Scenarios.ClaimOnly
+
+      assert Docket.Benchmark.Postgres.Scenario.fetch!("blocked_vehicles") ==
+               Docket.Benchmark.Postgres.Scenarios.BlockedVehicles
+
+      assert Docket.Benchmark.Postgres.Scenario.fetch!("mixed_service_times") ==
+               Docket.Benchmark.Postgres.Scenarios.MixedServiceTimes
+
+      assert Docket.Benchmark.Postgres.Scenario.fetch!("parked_wait_vs_blocking_wait") ==
+               Docket.Benchmark.Postgres.Scenarios.ParkedWaitVsBlockingWait
+
+      assert Docket.Benchmark.Postgres.Scenario.fetch!("cyclic_vs_one_step") ==
+               Docket.Benchmark.Postgres.Scenarios.CyclicVsOneStep
+
+      assert Docket.Benchmark.Postgres.Scenario.canonical_name("smoke") == "empty_one_step"
+    end
+  end
+
+  test "normalizes comparative fairness scenarios" do
+    for scenario <- ~w(mixed_service_times parked_wait_vs_blocking_wait) do
+      assert {:ok, config} =
+               Docket.Benchmark.parse(~w(--scenario #{scenario} --runs 10 --hold-ms 75))
+
+      assert config.hold_ms == 75
+      assert config.warmup == 0
+    end
+
+    assert {:ok, config} =
+             Docket.Benchmark.parse(~w(--scenario cyclic_vs_one_step --runs 10))
+
+    assert config.scenario == "cyclic_vs_one_step"
+
+    assert {:error, too_small} =
+             Docket.Benchmark.parse(~w(--scenario mixed_service_times --runs 1))
+
+    assert too_small =~ "runs must be an integer >= 2"
+
+    assert {:error, warmup} =
+             Docket.Benchmark.parse(
+               ~w(--scenario parked_wait_vs_blocking_wait --runs 10 --warmup 1)
+             )
+
+    assert warmup =~ "does not support warmup"
+  end
+
   test "parses the bounded smoke contract" do
     assert {:ok, config} =
              Docket.Benchmark.parse(
@@ -122,7 +173,7 @@ defmodule Docket.BenchmarkTest do
     assert warmup =~ "does not support warmup"
 
     assert {:error, misplaced} = Docket.Benchmark.parse(~w(--scenario smoke --hold-ms 10))
-    assert misplaced =~ "only valid for blocked_vehicles"
+    assert misplaced =~ "hold-ms is valid for blocked_vehicles"
   end
 
   test "matrix plans cover every cell and rotate deterministically by seed" do
@@ -514,10 +565,12 @@ defmodule Docket.BenchmarkTest do
 
     events = Docket.Benchmark.Collector.stop(collector)
 
-    assert {[:docket, :postgres, :claim, :attempt], _, %{class: :ready, result: :acquired}, _} =
+    assert {[:docket, :postgres, :claim, :attempt], _, attempt_metadata, _} =
              Enum.find(events, fn {event, _, _, _} ->
                event == [:docket, :postgres, :claim, :attempt]
              end)
+
+    assert attempt_metadata == %{class: :ready, result: :acquired, correlation_id: nil}
 
     assert {[:docket, :benchmark, :repo, :query], _, %{benchmark_query: :workload}, _} =
              Enum.find(events, fn {event, _, _, _} ->
@@ -550,6 +603,13 @@ defmodule Docket.BenchmarkTest do
     }
 
     Docket.Telemetry.emit_events(%Docket.Run{id: "run-secret"}, [event])
+
+    :telemetry.execute(
+      [:docket, :postgres, :claim, :attempt],
+      %{count: 1, eligible_age_ms: 7, overdue_after_ttl_ms: 0},
+      %{class: :ready, result: :acquired, run_id: "run-secret"}
+    )
+
     events = Docket.Benchmark.Collector.stop(collector)
 
     assert {[:docket, :checkpoint, :committed], _,
@@ -558,6 +618,15 @@ defmodule Docket.BenchmarkTest do
              Enum.find(events, fn {name, _, _, _} ->
                name == [:docket, :checkpoint, :committed]
              end)
+
+    assert {[:docket, :postgres, :claim, :attempt], _,
+            %{class: :ready, result: :acquired, correlation_id: 1},
+            _} =
+             Enum.find(events, fn {name, _, _, _} ->
+               name == [:docket, :postgres, :claim, :attempt]
+             end)
+
+    refute inspect(events) =~ "run-secret"
   end
 
   test "collector wait counters count unique correlated terminal runs" do
@@ -690,6 +759,69 @@ defmodule Docket.BenchmarkTest do
     refute text =~ "release -> terminal p95"
   end
 
+  test "console summary compares cohorts for comparative scenarios" do
+    text =
+      "mixed_service_times"
+      |> console_point()
+      |> then(&Docket.Benchmark.Console.lines([&1]))
+      |> Enum.join("\n")
+
+    assert text =~ "Cohort offsets from common activation (queue-inclusive)"
+    assert text =~ "fast terminal"
+    assert text =~ "slow terminal"
+    assert text =~ "p50 5.69 s · p95 6.10 s"
+    assert text =~ "Per-run service after first claim"
+    assert text =~ "fast claim -> terminal"
+    assert text =~ "queue share of p50"
+    assert text =~ "fast 99.9% · slow 90.7%"
+  end
+
+  test "console suite compares cohort terminal medians per cell" do
+    first = console_point("mixed_service_times")
+    second = put_in(first, [:point, :repetition], 2)
+
+    text = Docket.Benchmark.Console.lines([first, second]) |> Enum.join("\n")
+
+    assert text =~ "fast terminal p95* 6.10 s · slow terminal p95* 5.14 s"
+    assert text =~ "* Cohort offsets include backlog waiting."
+  end
+
+  test "headline projects scenario measurements into flat stable keys" do
+    headline =
+      "empty_one_step"
+      |> console_point()
+      |> Docket.Benchmark.Headline.build()
+
+    assert headline.throughput_per_second == 1_327.346
+    assert headline.duration_us == 753_383
+    assert headline.activation_to_first_commit_p50_us == 441_088
+    assert headline.first_commit_to_terminal_p95_us == 1_210
+    assert headline.activation_to_terminal_p95_us == 723_008
+    assert headline.claim_scan_p95_us == 864
+    refute Map.has_key?(headline, :completed_runs)
+  end
+
+  test "headline flattens cohort comparisons and omits unproduced values" do
+    headline =
+      "mixed_service_times"
+      |> console_point()
+      |> Docket.Benchmark.Headline.build()
+
+    assert headline.cohort_fast_activation_to_terminal_p50_us == 5_685_113
+    assert headline.cohort_fast_first_claim_to_terminal_p50_us == 1_200
+    assert headline.cohort_slow_queue_share_of_median_percent == 90.7
+    refute Map.has_key?(headline, :activation_to_terminal_p50_us)
+
+    failure = %{
+      scenario: "blocked_vehicles",
+      duration_us: nil,
+      measurements: %{throughput_per_second: nil},
+      parameters: %{orphan_ttl_ms: 60_000}
+    }
+
+    assert Docket.Benchmark.Headline.build(failure) == %{orphan_ttl_ms: 60_000}
+  end
+
   test "console failure summary tolerates skeletal artifacts without exposing error details" do
     point = %{
       success: false,
@@ -761,6 +893,27 @@ defmodule Docket.BenchmarkTest do
           },
           counts: %{ready_claims: 600, expired_claims: 400},
           batches: %{mean_rows_per_nonempty_scan: 50.0}
+        })
+
+      "mixed_service_times" ->
+        put_in(base, [:measurements], %{
+          throughput_per_second: 162.906,
+          latency: %{},
+          cohorts: %{
+            fast: %{
+              activation_to_terminal_commit_offset_us:
+                distribution.(5_685_113, 6_100_585, 6_138_508, "us", 900),
+              first_claim_to_terminal_commit_us: distribution.(1_200, 3_400, 9_000, "us", 900),
+              queue_share_of_median_percent: 99.9
+            },
+            slow: %{
+              activation_to_terminal_commit_offset_us:
+                distribution.(2_711_165, 5_136_728, 5_410_657, "us", 100),
+              first_claim_to_terminal_commit_us:
+                distribution.(251_000, 260_000, 270_000, "us", 100),
+              queue_share_of_median_percent: 90.7
+            }
+          }
         })
 
       "blocked_vehicles" ->

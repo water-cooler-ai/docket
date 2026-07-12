@@ -2,6 +2,7 @@ defmodule Docket.Benchmark.Console do
   @moduledoc false
 
   @missing "—"
+  @comparative_scenarios ~w(cyclic_vs_one_step mixed_service_times parked_wait_vs_blocking_wait)
 
   def lines([]), do: ["No benchmark trials were produced."]
   def lines([point]), do: point_lines(point)
@@ -125,7 +126,49 @@ defmodule Docket.Benchmark.Console do
     ]
   end
 
+  defp scenario_lines(scenario, point) when scenario in @comparative_scenarios do
+    cohorts = sorted_cohorts(point)
+
+    if cohorts == [] do
+      []
+    else
+      terminal_lines =
+        Enum.map(cohorts, fn {label, cohort} ->
+          distribution_line(
+            "#{label} terminal",
+            cohort[:activation_to_terminal_commit_offset_us]
+          )
+        end)
+
+      service_lines =
+        Enum.map(cohorts, fn {label, cohort} ->
+          distribution_line(
+            "#{label} claim -> terminal",
+            cohort[:first_claim_to_terminal_commit_us]
+          )
+        end)
+
+      queue_shares =
+        Enum.map_join(cohorts, " · ", fn {label, cohort} ->
+          "#{label} #{format_percent(cohort[:queue_share_of_median_percent])}"
+        end)
+
+      ["", "Cohort offsets from common activation (queue-inclusive)"] ++
+        terminal_lines ++
+        ["Per-run service after first claim"] ++
+        service_lines ++
+        ["  #{String.pad_trailing("queue share of p50", 25)} #{queue_shares}"]
+    end
+  end
+
   defp scenario_lines(_scenario, _point), do: []
+
+  defp sorted_cohorts(point) do
+    point
+    |> get_in([:measurements, :cohorts])
+    |> Kernel.||(%{})
+    |> Enum.sort_by(fn {label, _cohort} -> to_string(label) end)
+  end
 
   defp check_lines(point) do
     invariants = point[:invariants] || []
@@ -214,10 +257,36 @@ defmodule Docket.Benchmark.Console do
     "    plateau fill #{format_duration(fill)} · release -> terminal #{release.statistic} #{format_duration(release.median)} · short query #{query.statistic} #{format_duration(query.median)}"
   end
 
+  defp cell_metric_line(scenario, points) when scenario in @comparative_scenarios do
+    labels =
+      points
+      |> Enum.flat_map(fn point ->
+        point |> get_in([:measurements, :cohorts]) |> Kernel.||(%{}) |> Map.keys()
+      end)
+      |> Enum.uniq()
+      |> Enum.sort_by(&to_string/1)
+
+    parts =
+      Enum.map(labels, fn label ->
+        terminal =
+          cell_distribution(points, [
+            :measurements,
+            :cohorts,
+            label,
+            :activation_to_terminal_commit_offset_us
+          ])
+
+        "#{label} terminal #{terminal.statistic}* #{format_duration(terminal.median)}"
+      end)
+
+    if parts == [], do: "", else: "    " <> Enum.join(parts, " · ")
+  end
+
   defp cell_metric_line(_scenario, _points), do: ""
 
-  defp cohort_note(scenario) when scenario in ["empty_one_step", "claim_only"],
-    do: ["* Cohort offsets include backlog waiting."]
+  defp cohort_note(scenario)
+       when scenario in ["empty_one_step", "claim_only"] or scenario in @comparative_scenarios,
+       do: ["* Cohort offsets include backlog waiting."]
 
   defp cohort_note(_scenario), do: []
 

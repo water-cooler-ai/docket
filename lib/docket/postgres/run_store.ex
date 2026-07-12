@@ -1048,7 +1048,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           },
           %{
             class: class,
-            result: if(lease.claim_attempt == 1, do: :acquired, else: :reacquired)
+            result: if(lease.claim_attempt == 1, do: :acquired, else: :reacquired),
+            run_id: lease.run_id
           }
         )
       end)

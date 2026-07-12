@@ -33,12 +33,21 @@ mix docket.bench --scenario smoke --runs 1000 --warmup 100 --repetitions 3 \
 ```
 
 NDJSON contains one point record per matrix cell per repetition followed by
-one suite-summary record. JSON preserves the original singleton artifact shape and wraps
-multi-point runs in a suite containing raw points and per-cell distributions.
+one suite-summary record. JSON always writes one suite envelope — `kind`
+`benchmark_suite` with raw points and per-cell summaries — even for a single
+trial, so consumers never branch on artifact shape.
 Per-cell repetition summaries report min, median, max, mean, and spread. They
 do not label a handful of repetition-level observations as p95/p99; the suite
 instead summarizes each trial's within-run p50/p95 latency values across
 repetitions.
+
+Each point carries a flat `headline` block: the scenario's most
+decision-relevant values under stable, unit-suffixed keys — throughput, the
+key p50/p95 offsets, and per-cohort comparisons where a scenario has cohorts.
+Values a trial did not produce are omitted rather than written as null. The
+headline is a convenience projection for scripted cross-run comparison; the
+nested measurement tree remains the complete record, and distribution sample
+counts and caveats live there.
 
 Each invocation creates a uniquely named Postgres database, migrates and seeds
 it, stages every run at one common future due time, starts the production
@@ -167,9 +176,49 @@ vehicle's reported claim-hold duration must remain below the orphan TTL. A
 point that has become stealable is written as a failed result rather than
 presented as a valid blocked-vehicle measurement.
 
-Only `smoke`, `empty_one_step`, `claim_only`, and `blocked_vehicles` are
-implemented today. Other benchmark suites
-(cyclic drain, fairness, cache, freshness,
+Three comparative fairness bursts exercise heterogeneous cohorts staged at a
+common due time. Runs alternate between cohorts so neither workload is hidden
+behind a deliberately homogeneous prefix:
+
+```console
+mix docket.bench --scenario mixed_service_times --runs 100 \
+  --concurrency 10 --pool-size 5 --hold-ms 500 \
+  --output results/mixed-service-times.json
+
+mix docket.bench --scenario parked_wait_vs_blocking_wait --runs 100 \
+  --concurrency 10 --pool-size 5 --hold-ms 500 \
+  --output results/parked-vs-blocking.json
+
+mix docket.bench --scenario cyclic_vs_one_step --runs 100 \
+  --concurrency 10 --pool-size 5 \
+  --output results/cyclic-vs-one-step.json
+```
+
+`mixed_service_times` assigns ten percent of the cohort (at least one run) a
+blocking node and keeps the remainder one-step fast runs.
+`parked_wait_vs_blocking_wait` splits the cohort between resident node sleeps
+and a one-failure retry whose backoff has the same duration; retry resumes are
+expected to produce a second ready claim. `cyclic_vs_one_step` compares a
+bounded ten-iteration cycle with one-step controls.
+
+Each artifact reports per-cohort activation-to-terminal,
+activation-to-first-claim, and first-claim-to-terminal distributions in
+addition to the aggregate measurements, plus each cohort's queue share: the
+median activation-to-first-claim offset as a percentage of the median
+activation-to-terminal offset. The first-claim/terminal split separates
+waiting for a vehicle from per-run service, so cohort convoys — one cohort's
+long node work occupying every vehicle while another cohort's ready backlog
+waits — are visible directly. First-claim observations use the claim-scan
+telemetry emit time, so leases from one batch share one observation
+timestamp. For retried runs the first acquired claim opens the service
+window, which therefore includes any retry backoff. Suite summaries carry
+per-cohort medians across repetitions, and the terminal summary prints
+cohort terminal offsets, per-run service, and queue share. These are burst
+characterizations, not a starvation-freedom or bounded-wait guarantee.
+
+Only `smoke`, `empty_one_step`, `claim_only`, `blocked_vehicles`, and those
+three comparative scenarios are implemented today. Other benchmark suites
+(replenished-arrival fairness, cache, freshness,
 real multi-node scaling, notify/poll, amplification, and soak) are rejected
 rather than silently approximated. `--event-policy none` is also rejected:
 v0.1 persists lifecycle events and has no production event-suppression mode.

@@ -138,6 +138,12 @@ defmodule Docket.Benchmark.Collector do
     }
   end
 
+  defp safe_metadata([:docket, :postgres, :claim, :attempt] = event, metadata, counters) do
+    event
+    |> Docket.Telemetry.metric_metadata(metadata)
+    |> Map.put(:correlation_id, correlation_id(counters, metadata[:run_id]))
+  end
+
   defp safe_metadata([:docket, :postgres, :run_store, :claim_query], _metadata, _counters),
     do: %{}
 
