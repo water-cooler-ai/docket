@@ -8,22 +8,21 @@ not ticket intent. The code and module documentation remain authoritative.
 
 ## Verdict
 
-The durable data model and transaction boundaries are implemented and closely
-match the locked architecture. The branch is not yet the proposed operational
-release: it lacks the public `Docket.Postgres` backend bundle that assembles
-the dispatcher and vehicle into one supervised configuration.
+The durable data model, transaction boundaries, and public PostgreSQL bundle
+are implemented and closely match the locked architecture. `Docket.Postgres`
+assembles the dispatcher, vehicles, notifier, and pruner into one supervised
+configuration while leaving Repo ownership with the host.
 
-The documentation previously obscured that distinction. It described the
-target configuration as usable, called the legacy lifecycle removed when it
-still exists, and mixed implementation details with future milestones. The
-PostgreSQL guide now documents the landed design and names the remaining gaps.
+The PostgreSQL guide documents the landed design and keeps the still-present
+legacy lifecycle and downstream release work distinct from this operational
+backend boundary.
 
 ## State by area
 
 | Area | Current state | Evidence |
 | --- | --- | --- |
 | Backend contract | Implemented | `Docket.Backend` bundles storage, graph, run, event, context, and supervision capabilities. |
-| Public PostgreSQL bundle | Missing | No `Docket.Postgres` module implements `Docket.Backend`. |
+| Public PostgreSQL bundle | Implemented | `Docket.Postgres` fixes the storage capabilities and owns their operational supervision. |
 | Versioned migration | Implemented | `Docket.Postgres.Migration` and schema version 1 create three tables with constraints and indexes. |
 | Graph store | Implemented | Immutable effective graph save/fetch with content-address conflict checks. |
 | Run aggregate store | Implemented | Scoped reads, insert, mutation, bounded claims, fencing, release, heartbeat, and poison retry. |
@@ -32,9 +31,9 @@ PostgreSQL guide now documents the landed design and names the remaining gaps.
 | Durable facade | Implemented against a backend | Publication, start, reads, signals, poison retry, and bounded await are exercised with the conformance backend. |
 | Dispatcher | Implemented | Demand-bounded, jittered polling and lease launch/release behavior exist. |
 | Execution vehicle | Implemented | `Docket.Postgres.Vehicle` fetches and compiles the graph for a lease (with an optional generation-checked cache), drains fenced moments, and abandons, releases, or parks the run. Claim freshness during long supersteps is configurable: strict timeout alignment by default, opt-in token-guarded heartbeat with stale-result rejection. |
-| Backend supervision assembly | Missing | Nothing wires Repo context, dispatcher, and vehicle launch into `Docket.Postgres.child_spec/1`. |
+| Backend supervision assembly | Implemented | A one-for-all execution subtree couples dispatcher accounting to its vehicle supervisor; notifier and pruner are isolated siblings. |
 | Deterministic backend test mode | Missing | There is no public PostgreSQL drain/manual testing API. |
-| Pruning/retention | Implemented substrate | `Docket.Postgres.Pruner` performs locked, bounded event/run cleanup and retains each graph ID's newest ten unreferenced revisions; DCKT-25 still owns public bundle configuration and supervision assembly. |
+| Pruning/retention | Implemented | `Docket.Postgres.Pruner` performs locked, bounded cleanup under the bundle's required explicit policy. |
 | Legacy production API removal | Not done | `run`, `resume`, `get_run`, and `checkpoint:` remain in the public supervised runtime. |
 
 ## Decisions verified in code
@@ -82,24 +81,29 @@ access.
 
 ## Important differences from the proposed release
 
-### The backend cannot currently be configured as documented
-
-This target does not work on the current branch:
+### The backend is configured as one bundle
 
 ```elixir
-use Docket, repo: MyApp.Repo, backend: Docket.Postgres
+use Docket,
+  repo: MyApp.Repo,
+  backend: Docket.Postgres,
+  pruner: [
+    interval_ms: :timer.hours(1),
+    event_retention_ms: :timer.hours(24 * 30),
+    run_retention_ms: :timer.hours(24 * 90),
+    batch_size: 1_000
+  ]
 ```
 
-`Docket.Runtime.Supervisor` validates the backend callbacks at startup, and
-`Docket.Postgres` does not exist. The individual PostgreSQL modules are a
-foundation, not yet the public bundle promised by the release design.
+The bundle validates Repo/prefix, tenant mode, operational policies, observer
+modules, notifier mode, and explicit retention at startup. Applications
+cannot substitute individual stores through this boundary.
 
-### Claiming does not yet advance a graph
+### Claiming advances through node-local vehicles
 
-The dispatcher accepts a `launch` callback and correctly accounts for
-capacity, polling, failures, and shutdown. There is no production callback
-implementation. Therefore the repository proves queue coordination but not
-end-to-end cold recovery or multi-node graph execution.
+The dispatcher launches `Docket.Postgres.Vehicle` under a dedicated task
+supervisor. Each uncached claim fetches and compiles its effective graph on the
+executing node, then reuses that runtime graph for its moment drain.
 
 ### The legacy lifecycle remains active
 
@@ -110,31 +114,21 @@ single-lifecycle release.
 
 ### Some operational promises remain design work
 
-The prior spec named notification-assisted wakes, pruning, deterministic drain
-modes, and production operational assembly. They have not landed and are not
-part of the current public contract. Polling exists; PostgreSQL notification
-does not. Retained events exist; a public consumer/export API does not.
+Notification-assisted wakes, pruning, bounded drains, and production assembly
+have landed. Deterministic manual/drain test modes and a retained-event export
+API remain separate product work.
 
 ## Release gate
 
-Before calling `0.1.0` an operational PostgreSQL release, the repository needs
-at minimum:
-
-1. `Docket.Postgres` implementing the backend bundle and validating its
-   configuration;
-2. supervision wiring and an end-to-end PostgreSQL test proving start,
-   dispatch, crash recovery, signal, and terminal completion;
-3. a documented deterministic test mode; and
-4. a deliberate decision to remove or explicitly retain the legacy facade.
-
-Pruning and notification-assisted wakeups may be separately scoped, but the
-release documentation must not imply they exist until their code lands.
+The remaining release work is downstream hardening and cutover: broader
+release-gate invariants and telemetry, documented deterministic test modes,
+and the deliberate DCKT-37 removal of the transitional legacy facade.
 
 ## Verification performed
 
-- `mix test --exclude integration` passes: 500 tests, 0 failures, 61 excluded.
-- The excluded set includes live PostgreSQL coverage, so that result verifies
-  the core and conformance behavior but is not an end-to-end database release
-  certification.
+- `mix test --include postgres` passes: 615 tests, 0 failures.
+- The suite includes live bundle assembly, facade, migration, lifecycle,
+  notification, vehicle, retention, tenant-isolation, and poison-recovery
+  coverage against PostgreSQL.
 - Repository inspection confirms that every PostgreSQL module is conditionally
   compiled behind optional `ecto_sql` and `postgrex` dependencies.
