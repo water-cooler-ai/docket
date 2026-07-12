@@ -76,7 +76,7 @@ generated_database_repos =
 # DOCKET_LIFECYCLE_STORAGE_TEST_DATABASE_URL, DOCKET_EVENT_STORE_TEST_DATABASE_URL,
 # DOCKET_VEHICLE_STORAGE_TEST_DATABASE_URL, DOCKET_NOTIFIER_TEST_DATABASE_URL,
 # DOCKET_PRUNER_TEST_DATABASE_URL, and DOCKET_BACKEND_TEST_DATABASE_URL.
-ExUnit.start(exclude: [:postgres], assert_receive_timeout: 1_000)
+ExUnit.start(exclude: [:postgres])
 
 ExUnit.after_suite(fn _result ->
   postgres_included? =

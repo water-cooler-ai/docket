@@ -21,6 +21,7 @@ defmodule Docket.TelemetryTest do
   test "lifecycle and nested store spans share correlation without leaking it to labels" do
     parent = self()
     id = "lifecycle-correlation-#{System.unique_integer([:positive])}"
+    tag = make_ref()
 
     :telemetry.attach_many(
       id,
@@ -30,8 +31,8 @@ defmodule Docket.TelemetryTest do
         [:docket, :store, :operation, :start],
         [:docket, :store, :operation, :stop]
       ],
-      &Docket.Test.TelemetryRelay.raw/4,
-      parent
+      &Docket.Test.TelemetryRelay.tagged_event/4,
+      {parent, tag}
     )
 
     on_exit(fn -> :telemetry.detach(id) end)
@@ -48,7 +49,7 @@ defmodule Docket.TelemetryTest do
     events =
       Enum.map(1..4, fn _ ->
         receive do
-          event -> event
+          {^tag, name, measurements, metadata} -> {name, measurements, metadata}
         after
           100 -> flunk("missing span")
         end
