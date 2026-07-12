@@ -75,6 +75,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         backend: Docket.Postgres,
         repo: TestRepo,
         context: %{coordinator: :docket_backend_vehicle_relay},
+        executor: Docket.Executor.Task,
         dispatcher: [concurrency: 1, poll_interval_ms: 60_000],
         pruner: @pruner
     end
@@ -198,14 +199,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, reference} = NotifyHost.save_graph(Graphs.blocking())
       started_at = System.monotonic_time(:millisecond)
       assert {:ok, _run} = NotifyHost.start_run(reference, %{})
-      assert_receive {:blocked, _node_pid, "blocker", 1}, 5_000
+      assert_receive {:blocked, node_pid, "blocker", 1}, 5_000
       assert System.monotonic_time(:millisecond) - started_at < 5_000
 
-      assert [vehicle] = Task.Supervisor.children(vehicle_supervisor)
+      assert [vehicle] = Task.Supervisor.children(vehicle_supervisor) -- [node_pid]
       vehicle_monitor = Process.monitor(vehicle)
+      node_monitor = Process.monitor(node_pid)
 
       Process.exit(dispatcher, :kill)
       assert_receive {:DOWN, ^vehicle_monitor, :process, ^vehicle, _reason}, 5_000
+      assert_receive {:DOWN, ^node_monitor, :process, ^node_pid, _reason}, 5_000
       assert is_pid(await_replacement(Docket.Postgres.dispatcher_name(backend_name), dispatcher))
 
       assert is_pid(

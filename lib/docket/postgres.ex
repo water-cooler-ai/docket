@@ -370,6 +370,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             task_supervisor: vehicle_supervisor
           )
 
+        executor_opts =
+          vehicle_opts
+          |> Keyword.get(:executor_opts, [])
+          |> Keyword.put_new(:task_supervisor, vehicle_supervisor)
+
+        vehicle_opts = Keyword.put(vehicle_opts, :executor_opts, executor_opts)
+
         launch = Docket.Postgres.Vehicle.launcher(vehicle_opts)
 
         dispatcher_opts =
