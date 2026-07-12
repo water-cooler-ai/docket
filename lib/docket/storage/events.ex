@@ -46,7 +46,10 @@ defmodule Docket.Storage.Events do
   Ownership is enforced through the owning run: a wrong tenant and an unknown
   run both report `{:error, :not_found}`. The page rows and the returned
   retention bounds are observed from one consistent snapshot. A corrupt or
-  undecodable stored row is a typed error and is never silently skipped.
+  undecodable stored row is a typed error and is never silently skipped: a
+  corrupt event row returns `{:error, %Docket.Error{type: :corrupt_event_row}}`,
+  while a corrupt owning-run row propagates the same way as run reads, by
+  raising the typed error.
 
   Options are trusted to be pre-validated by the caller: `after_seq` is a
   non-negative integer and `limit` is a positive integer. A backend may assert

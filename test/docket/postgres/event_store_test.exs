@@ -273,7 +273,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         append(run, [2, 3])
         TestRepo.update_all(from(e in Event, where: e.seq == 3), set: [payload: <<0, 1, 2>>])
 
-        assert {:error, %Docket.Error{type: :corrupt_event_row, details: %{seq: 3}}} =
+        assert {:error,
+                %Docket.Error{
+                  type: :corrupt_event_row,
+                  details: %{seq: 3, cause_type: :invalid_durable_state}
+                }} =
                  EventStore.list_events(TestRepo, :system, run.id, %{after_seq: 0, limit: 10})
       end
 
@@ -299,6 +303,29 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert Enum.map(second.events, & &1.seq) == [3, 4]
         assert second.latest_available_seq == 5
         assert second.has_more?
+      end
+
+      test "list_events visibility tracks run visibility across scopes", %{run: run} do
+        append(run, [2, 3])
+        opts = %{after_seq: 0, limit: 10}
+
+        for scope <- [:system, :tenantless, {:tenant, "t1"}, {:tenant, "t2"}] do
+          run_visible? =
+            case RunStore.fetch_run(TestRepo, scope, run.id) do
+              {:ok, _run} -> true
+              {:error, :not_found} -> false
+            end
+
+          events_visible? =
+            case EventStore.list_events(TestRepo, scope, run.id, opts) do
+              {:ok, %Docket.EventPage{}} -> true
+              {:error, :not_found} -> false
+            end
+
+          assert run_visible? == events_visible?,
+                 "scope #{inspect(scope)}: run visible=#{run_visible?} " <>
+                   "but events visible=#{events_visible?}"
+        end
       end
     end
 

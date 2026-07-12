@@ -375,20 +375,7 @@ defmodule Docket.Test.MemoryBackend do
       |> Enum.take(limit)
       |> Enum.map(&elem(&1, 1))
 
-    next_after_seq =
-      case events do
-        [] -> after_seq
-        _ -> List.last(events).seq
-      end
-
-    %Docket.EventPage{
-      events: events,
-      next_after_seq: next_after_seq,
-      has_more?: latest != nil and latest > next_after_seq,
-      oldest_available_seq: oldest,
-      latest_available_seq: latest,
-      latest_seq: record.run.event_seq
-    }
+    Docket.EventPage.new(events, after_seq, oldest, latest, record.run.event_seq)
   end
 
   # Conformance-test inspection helpers. These deliberately bypass public

@@ -60,4 +60,41 @@ defmodule Docket.EventPage do
     :latest_available_seq,
     :latest_seq
   ]
+
+  @doc """
+  Builds a page from a decoded event list and the bounds observed with it.
+
+  Derivation rules, shared by every backend so pagination cannot drift:
+
+    * `next_after_seq` is the last event's sequence, or `after_seq` when the
+      page is empty.
+    * `has_more?` is true when a retained event exists beyond `next_after_seq`,
+      i.e. `latest` is present and greater than `next_after_seq`.
+
+  `oldest`, `latest`, and `latest_seq` are recorded verbatim from the same
+  snapshot that produced `events`.
+  """
+  @spec new(
+          [Docket.Event.t()],
+          non_neg_integer(),
+          pos_integer() | nil,
+          pos_integer() | nil,
+          non_neg_integer()
+        ) :: t()
+  def new(events, after_seq, oldest, latest, latest_seq) do
+    next_after_seq =
+      case events do
+        [] -> after_seq
+        _ -> List.last(events).seq
+      end
+
+    %__MODULE__{
+      events: events,
+      next_after_seq: next_after_seq,
+      has_more?: latest != nil and latest > next_after_seq,
+      oldest_available_seq: oldest,
+      latest_available_seq: latest,
+      latest_seq: latest_seq
+    }
+  end
 end

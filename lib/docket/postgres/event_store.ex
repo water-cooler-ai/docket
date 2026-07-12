@@ -58,7 +58,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       result =
         case Ecto.Adapters.SQL.query(repo, list_statement(prefix, scope_sql), params) do
           {:ok, %{rows: []}} -> {:error, :not_found}
-          {:ok, %{rows: rows}} -> decode_page(rows, after_seq)
+          {:ok, %{rows: rows}} -> decode_page(rows, run_id, after_seq)
           {:error, reason} -> {:error, reason}
         end
 
@@ -67,11 +67,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp list_statement(prefix, scope_sql) do
-      runs = qualified_table(prefix, "docket_runs")
-      events = qualified_table(prefix, "docket_events")
+      runs = Storage.qualified_table(prefix, "docket_runs")
+      events = Storage.qualified_table(prefix, "docket_events")
 
       """
       SELECT
+        0 AS kind,
         runs.run_id,
         runs.graph_id,
         runs.graph_hash,
@@ -84,6 +85,37 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         runs.state,
         bounds.oldest,
         bounds.latest,
+        NULL AS seq,
+        NULL AS type,
+        NULL AS event_step,
+        NULL AS node_id,
+        NULL AS channel_id,
+        NULL AS task_id,
+        NULL AS payload,
+        NULL AS metadata,
+        NULL AS occurred_at
+      FROM #{runs} AS runs
+      LEFT JOIN LATERAL (
+        SELECT MIN(e.seq) AS oldest, MAX(e.seq) AS latest
+        FROM #{events} AS e
+        WHERE e.run_id = runs.run_id
+      ) AS bounds ON TRUE
+      WHERE runs.run_id = $1#{scope_sql}
+      UNION ALL
+      SELECT
+        1 AS kind,
+        NULL AS run_id,
+        NULL AS graph_id,
+        NULL AS graph_hash,
+        NULL AS status,
+        NULL AS run_step,
+        NULL AS checkpoint_seq,
+        NULL AS started_at,
+        NULL AS updated_at,
+        NULL AS finished_at,
+        NULL AS state,
+        NULL AS oldest,
+        NULL AS latest,
         page.seq,
         page.type,
         page.step,
@@ -94,12 +126,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         page.metadata,
         page.occurred_at
       FROM #{runs} AS runs
-      LEFT JOIN LATERAL (
-        SELECT MIN(e.seq) AS oldest, MAX(e.seq) AS latest
-        FROM #{events} AS e
-        WHERE e.run_id = runs.run_id
-      ) AS bounds ON TRUE
-      LEFT JOIN LATERAL (
+      JOIN LATERAL (
         SELECT e.seq, e.type, e.step, e.node_id, e.channel_id, e.task_id,
                e.payload, e.metadata, e.occurred_at
         FROM #{events} AS e
@@ -108,56 +135,41 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         LIMIT $3
       ) AS page ON TRUE
       WHERE runs.run_id = $1#{scope_sql}
-      ORDER BY page.seq
+      ORDER BY kind, seq
       """
     end
 
-    defp decode_page([first | _] = rows, after_seq) do
-      latest_seq = run_event_seq!(first)
-      oldest = Enum.at(first, 10)
-      latest = Enum.at(first, 11)
+    defp decode_page([header | detail_rows], run_id, after_seq) do
+      latest_seq = run_event_seq!(header)
+      oldest = Enum.at(header, 11)
+      latest = Enum.at(header, 12)
 
-      with {:ok, events} <- decode_events(rows) do
-        next_after_seq =
-          case events do
-            [] -> after_seq
-            _ -> List.last(events).seq
-          end
-
-        {:ok,
-         %Docket.EventPage{
-           events: events,
-           next_after_seq: next_after_seq,
-           has_more?: latest != nil and latest > next_after_seq,
-           oldest_available_seq: oldest,
-           latest_available_seq: latest,
-           latest_seq: latest_seq
-         }}
+      with {:ok, events} <- decode_events(detail_rows, run_id) do
+        {:ok, Docket.EventPage.new(events, after_seq, oldest, latest, latest_seq)}
       end
     end
 
     defp run_event_seq!(row) do
       attrs = %{
-        run_id: Enum.at(row, 0),
-        graph_id: Enum.at(row, 1),
-        graph_hash: Enum.at(row, 2),
-        status: load_status(Enum.at(row, 3)),
-        step: Enum.at(row, 4),
-        checkpoint_seq: Enum.at(row, 5),
-        started_at: Enum.at(row, 6),
-        updated_at: Enum.at(row, 7),
-        finished_at: Enum.at(row, 8),
-        state: Enum.at(row, 9)
+        run_id: Enum.at(row, 1),
+        graph_id: Enum.at(row, 2),
+        graph_hash: Enum.at(row, 3),
+        status: load_status(Enum.at(row, 4)),
+        step: Enum.at(row, 5),
+        checkpoint_seq: Enum.at(row, 6),
+        started_at: Enum.at(row, 7),
+        updated_at: Enum.at(row, 8),
+        finished_at: Enum.at(row, 9),
+        state: Enum.at(row, 10)
       }
 
       RunCodec.load!(attrs).event_seq
     end
 
-    defp decode_events(rows) do
+    defp decode_events(rows, run_id) do
       rows
-      |> Enum.reject(fn row -> is_nil(Enum.at(row, 12)) end)
       |> Enum.reduce_while({:ok, []}, fn row, {:ok, acc} ->
-        case decode_event_row(row) do
+        case decode_event_row(row, run_id) do
           {:ok, event} -> {:cont, {:ok, [event | acc]}}
           {:error, _reason} = error -> {:halt, error}
         end
@@ -168,21 +180,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    defp decode_event_row(row) do
-      seq = Enum.at(row, 12)
+    defp decode_event_row(row, run_id) do
+      seq = Enum.at(row, 13)
 
       try do
         event = %Docket.Event{
-          run_id: Enum.at(row, 0),
+          run_id: run_id,
           seq: seq,
-          type: load_event_type!(Enum.at(row, 13)),
-          step: Enum.at(row, 14),
-          node_id: Enum.at(row, 15),
-          channel_id: Enum.at(row, 16),
-          task_id: Enum.at(row, 17),
-          timestamp: Enum.at(row, 20),
-          payload: Docket.DurableCodec.decode!(Enum.at(row, 18), :event),
-          metadata: Docket.DurableCodec.decode!(Enum.at(row, 19), :event)
+          type: load_event_type!(Enum.at(row, 14)),
+          step: Enum.at(row, 15),
+          node_id: Enum.at(row, 16),
+          channel_id: Enum.at(row, 17),
+          task_id: Enum.at(row, 18),
+          timestamp: Enum.at(row, 21),
+          payload: Docket.DurableCodec.decode!(Enum.at(row, 19), :event),
+          metadata: Docket.DurableCodec.decode!(Enum.at(row, 20), :event)
         }
 
         {:ok, event}
@@ -210,7 +222,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp event_corruption(seq, %Docket.Error{} = reason) do
       Docket.Error.new(:corrupt_event_row, "Postgres event row is corrupt",
-        details: %{seq: seq},
+        details: %{seq: seq, cause_type: reason.type},
         reason: reason
       )
     end
@@ -247,13 +259,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           result: Docket.Telemetry.result_kind(result)
         })
       )
-    end
-
-    defp qualified_table(nil, name), do: ~s("#{name}")
-
-    defp qualified_table(prefix, name) do
-      quoted_prefix = String.replace(prefix, ~s("), ~s(""))
-      ~s("#{quoted_prefix}"."#{name}")
     end
 
     defp transactional_append(repo, prefix, scope, run_id, attrs) do

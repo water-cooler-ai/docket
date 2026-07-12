@@ -92,5 +92,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def valid_prefix?(prefix) do
       is_binary(prefix) and byte_size(prefix) in 1..63 and Regex.match?(@prefix_pattern, prefix)
     end
+
+    @doc false
+    @spec qualified_table(String.t() | nil, String.t()) :: String.t()
+    def qualified_table(nil, table), do: quote_identifier(table)
+
+    def qualified_table(prefix, table) when is_binary(prefix) do
+      quote_identifier(prefix) <> "." <> quote_identifier(table)
+    end
+
+    defp quote_identifier(identifier) do
+      ~s("#{String.replace(identifier, "\"", "\"\"")}")
+    end
   end
 end

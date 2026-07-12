@@ -188,13 +188,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       sql = """
       WITH candidates AS MATERIALIZED (
         SELECT id
-        FROM #{table(prefix, "docket_events")}
+        FROM #{Storage.qualified_table(prefix, "docket_events")}
         WHERE inserted_at < $1
         ORDER BY inserted_at, id
         LIMIT $2
         FOR UPDATE SKIP LOCKED
       )
-      DELETE FROM #{table(prefix, "docket_events")} AS events
+      DELETE FROM #{Storage.qualified_table(prefix, "docket_events")} AS events
       USING candidates
       WHERE events.id = candidates.id
       """
@@ -208,7 +208,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp select_runs(repo, prefix, cutoff, batch_size) do
       sql = """
       SELECT runs.id, runs.run_id, runs.graph_id, runs.graph_hash
-      FROM #{table(prefix, "docket_runs")} AS runs
+      FROM #{Storage.qualified_table(prefix, "docket_runs")} AS runs
       WHERE runs.status IN (#{@terminal_status_sql})
         AND runs.updated_at < $1
       ORDER BY runs.updated_at, runs.id
@@ -235,7 +235,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       sql = """
       SELECT run_id, count(*)::bigint
-      FROM #{table(prefix, "docket_events")}
+      FROM #{Storage.qualified_table(prefix, "docket_events")}
       WHERE run_id = ANY($1::text[])
       GROUP BY run_id
       """
@@ -256,7 +256,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ids = Enum.map(candidates, & &1.id)
 
       sql = """
-      DELETE FROM #{table(prefix, "docket_runs")}
+      DELETE FROM #{Storage.qualified_table(prefix, "docket_runs")}
       WHERE id = ANY($1::bigint[])
       RETURNING id
       """
@@ -278,16 +278,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  PARTITION BY graph_id
                  ORDER BY inserted_at DESC, id DESC
                ) AS revision_rank
-        FROM #{table(prefix, "docket_graph_versions")}
+        FROM #{Storage.qualified_table(prefix, "docket_graph_versions")}
       ),
       candidates AS MATERIALIZED (
         SELECT graphs.id
-        FROM #{table(prefix, "docket_graph_versions")} AS graphs
+        FROM #{Storage.qualified_table(prefix, "docket_graph_versions")} AS graphs
         JOIN ranked ON ranked.id = graphs.id
         WHERE ranked.revision_rank > #{@retained_graph_revisions}
           AND NOT EXISTS (
             SELECT 1
-            FROM #{table(prefix, "docket_runs")} AS runs
+            FROM #{Storage.qualified_table(prefix, "docket_runs")} AS runs
             WHERE runs.graph_id = graphs.graph_id
               AND runs.graph_hash = graphs.graph_hash
           )
@@ -308,11 +308,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp delete_graphs(repo, prefix, ids) do
       sql = """
-      DELETE FROM #{table(prefix, "docket_graph_versions")} AS graphs
+      DELETE FROM #{Storage.qualified_table(prefix, "docket_graph_versions")} AS graphs
       WHERE graphs.id = ANY($1::bigint[])
         AND NOT EXISTS (
           SELECT 1
-          FROM #{table(prefix, "docket_runs")} AS runs
+          FROM #{Storage.qualified_table(prefix, "docket_runs")} AS runs
           WHERE runs.graph_id = graphs.graph_id
             AND runs.graph_hash = graphs.graph_hash
         )
@@ -411,16 +411,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {:ok, %{rows: [[prefix]]}} when is_binary(prefix) -> prefix
         {:error, reason} -> repo.rollback(reason)
       end
-    end
-
-    defp table(nil, name), do: quote_identifier(name)
-
-    defp table(prefix, name) do
-      quote_identifier(prefix) <> "." <> quote_identifier(name)
-    end
-
-    defp quote_identifier(identifier) do
-      ~s("#{String.replace(identifier, "\"", "\"\"")}")
     end
   end
 end
