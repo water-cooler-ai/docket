@@ -236,6 +236,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> Keyword.merge(vehicle)
       |> Keyword.delete(:heartbeat)
       |> Keyword.put(:graph_cache, false)
+      |> Keyword.put(:task_supervisor, Keyword.fetch!(opts, :task_supervisor))
       |> Keyword.put(:backend, {__MODULE__, context})
     end
 

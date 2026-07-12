@@ -40,6 +40,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    defmodule RelayObserver do
+      @behaviour Docket.Checkpoint.Observer
+
+      @impl true
+      def observe(checkpoint, _context) do
+        if pid = Process.whereis(:docket_testing_observer_relay) do
+          send(pid, {:testing_observer_called, checkpoint.type})
+        end
+
+        :ok
+      end
+    end
+
     defmodule LegacyCheckpoint do
       @behaviour Docket.Checkpoint
 
@@ -139,6 +152,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         notifier: :none
     end
 
+    defmodule ObserverInlineHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        testing: :inline,
+        notifier: :none,
+        checkpoint_observers: [RelayObserver]
+    end
+
     setup_all do
       config = TestRepo.config()
       _ = Ecto.Adapters.Postgres.storage_down(config)
@@ -161,6 +183,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       stop_host(InlineHost)
       stop_host(ManualHost)
       stop_host(SandboxInlineHost)
+      stop_host(ObserverInlineHost)
 
       TestRepo.delete_all(Event)
       TestRepo.delete_all(Run)
@@ -184,6 +207,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, %Docket.Run{status: :done}} =
                InlineHost.start_run(reference, %{"value" => "inline"})
+    end
+
+    test "inline drained moments deliver configured checkpoint observers" do
+      Process.register(self(), :docket_testing_observer_relay)
+      start_supervised!(ObserverInlineHost)
+      assert {:ok, reference} = ObserverInlineHost.save_graph(Graphs.minimal_linear())
+
+      assert {:ok, %Docket.Run{status: :done}} =
+               ObserverInlineHost.start_run(reference, %{"value" => "observed"})
+
+      assert_receive {:testing_observer_called, :run_initialized}
+      assert_receive {:testing_observer_called, :run_completed}
     end
 
     test "inline testing completes a named interrupt through the durable facade" do
