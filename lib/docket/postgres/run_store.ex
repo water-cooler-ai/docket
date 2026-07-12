@@ -36,7 +36,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     Committed `Docket.Run` fields and backend-owned operational fields share a
     row but have separate clocks. In particular, `updated_at` belongs to the
-    last committed run document; claims, heartbeats, releases, and poison
+    last committed run document; claims, refreshes, releases, and poison
     transitions never rewrite it.
 
     Claim tokens are redacted from schema inspection, and token-bearing
@@ -246,7 +246,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       result = if count == 1, do: :ok, else: {:error, :claim_lost}
-      emit_claim_operation(:heartbeat, started, result)
+      emit_claim_operation(:refresh, started, result)
       result
     end
 

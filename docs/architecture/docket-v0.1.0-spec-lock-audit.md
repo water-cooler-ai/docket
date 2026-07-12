@@ -35,7 +35,7 @@ backend boundary.
 | Public PostgreSQL bundle | Implemented | `Docket.Postgres` fixes the storage capabilities and owns their operational supervision. |
 | Versioned migration | Implemented | `Docket.Postgres.Migration` and schema version 1 create three tables with constraints and indexes. |
 | Graph store | Implemented | Immutable effective graph save/fetch with content-address conflict checks. |
-| Run aggregate store | Implemented | Scoped reads, insert, mutation, bounded claims, fencing, release, heartbeat, and poison retry. |
+| Run aggregate store | Implemented | Scoped reads, insert, mutation, bounded claims, fencing, release, claim refresh, and poison retry. |
 | Event store | Implemented | Assigned event append in the lifecycle transaction. |
 | Lifecycle composer | Implemented | `Docket.Lifecycle` owns start, moment commit, and signal transaction recipes. |
 | Durable facade | Implemented against a backend | Publication, start, reads, signals, poison retry, and bounded await are exercised with the conformance backend. |

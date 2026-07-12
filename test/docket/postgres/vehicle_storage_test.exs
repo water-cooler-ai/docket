@@ -50,7 +50,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def refresh_claim(ctx, scope, run_id, token, now) do
         result = Docket.Postgres.RunStore.refresh_claim(ctx, scope, run_id, token, now)
 
-        case Process.whereis(:storage_heartbeat_relay) do
+        case Process.whereis(:storage_claim_refresh_relay) do
           nil -> :ok
           pid -> send(pid, {:refreshed, result})
         end
@@ -292,7 +292,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, %RunInfo{claimed_at: claimed_at}} =
                RunStore.inspect_run(context, :system, run.id)
 
-      # Heartbeat refreshes use the database clock. Advance from the durable
+      # Claim refreshes use the database clock. Advance from the durable
       # claim timestamp so the steal remains deterministic on every host.
       stolen_at = DateTime.add(claimed_at, 61, :second)
 

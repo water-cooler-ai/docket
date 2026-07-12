@@ -16,8 +16,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     configured headroom below orphan-TTL crash recovery. Token/sequence fencing
     remains the sole authority for commits after a crash or steal.
 
-    Legacy :heartbeat configuration is accepted as an ignored compatibility
-    no-op. Vehicles never refresh claims. Attempt timeout and retry remain
+    Vehicles never refresh claims. Attempt timeout and retry remain
     at-least-once boundaries: external effects and unlinked children cannot be
     retracted, so expected long work must park or detach durably.
     """
@@ -51,7 +50,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             | {:clock, (-> DateTime.t())}
             | {:monotonic_clock, (-> integer())}
             | {:drain_budget, drain_budget()}
-            | {:heartbeat, term()}
             | {:max_attempt_elapsed_ms, pos_integer()}
             | {:jitter, (pos_integer() -> non_neg_integer())}
             | {:abandon_backoff_ms, pos_integer()}

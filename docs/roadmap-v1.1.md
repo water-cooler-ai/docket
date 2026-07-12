@@ -347,10 +347,9 @@ This is deliberately separate from the two existing vehicle mechanisms:
   Once either budget is exhausted, the in-flight superstep finishes, and its
   commit atomically advances the run, releases the claim, and records an
   immediate wake. Nothing is preempted halfway through a superstep.
-- **Heartbeats provide claim freshness.** They refresh the exact token while a
-  long superstep is executing and cause stale results to be rejected. They do
-  not grant another scheduling quantum, reset the drain budget, or provide
-  tenant fairness.
+- **Finite attempt deadlines bound claim residency.** Runtime-owned activation
+  processes are terminated at their effective timeout; fencing rejects stale
+  results after crash recovery or steal.
 
 Together, the partition limit prevents one tenant's collection of runs from
 occupying the fleet, while the drain budget prevents one continuously runnable

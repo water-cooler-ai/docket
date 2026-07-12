@@ -19,8 +19,7 @@ entries below reflect what has landed so far.
 - Finite runtime-owned node attempt deadlines across Local, Task, and custom
   executors. Missing node timeouts inherit the host maximum; larger explicit
   graph limits are rejected before execution and rescheduled without poison.
-  Vehicle heartbeat execution is removed, with legacy heartbeat configuration
-  retained as an ignored compatibility no-op (DCKT-41).
+  Vehicles no longer refresh claims during node execution (DCKT-41).
 
 - An operator-facing PostgreSQL correctness guide covering durable status
   rationale, derived queue views, scope, claims and poison, failure recovery,
@@ -99,7 +98,7 @@ entries below reflect what has landed so far.
     save/fetch;
   - `Docket.Storage.Runs` — the run-row aggregate: insert/fetch/inspect,
     atomic batched due/expired claims with poison outcomes, token-guarded
-    heartbeat/release, mandatory token-and-sequence fenced commit, serialized
+    claim refresh/release, mandatory token-and-sequence fenced commit, serialized
     mutation, and poison recovery;
   - `Docket.Storage.Events` — append-only persistence of already-assigned
     events.
@@ -115,7 +114,7 @@ entries below reflect what has landed so far.
 - Postgres `Docket.Postgres.RunStore` atomic, demand-bounded claims over
   separately indexed ready and expired paths, including `SKIP LOCKED`
   dispatcher concurrency, exact claim-attempt poisoning, token-guarded
-  heartbeat/release, and the shared internal mandatory-commit token predicate
+  claim refresh/release, and the shared internal mandatory-commit token predicate
   (DCKT-15, #20).
 - Postgres atomic runtime-moment persistence: `RunStore.commit/3` enforces the
   sequence-and-claim fence while applying schedule state, and
@@ -247,7 +246,7 @@ entries below reflect what has landed so far.
   recorded wake is due at or before the database clock. Claim release and
   abandonment stay silent so launch-failure retries keep the poll interval as
   their backoff (DCKT-19).
-- Postgres claim, heartbeat, release, steal, and poison operations no longer
+- Postgres claim, refresh, release, steal, and poison operations no longer
   rewrite promoted `Docket.Run.updated_at`. Dedicated operational timestamps
   now carry those transitions, so `fetch_run` remains the exact last committed
   graph-run document while `inspect_run` reports delivery state (DCKT-14, #26).

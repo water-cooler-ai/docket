@@ -267,7 +267,6 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `dispatcher.drain_timeout_ms` | `30_000` | Shutdown wait for tracked vehicles. |
 | `vehicle.max_attempt_elapsed_ms` | `2_000` | Finite host maximum inherited by nodes without `timeout_ms`; larger explicit graph timeouts are rejected before execution. |
 | `vehicle.drain_budget` | 100 moments / 3 seconds | Cooperative moment-boundary yield; `max_elapsed_ms` must be finite, at least the attempt maximum, and below orphan TTL. |
-| `vehicle.heartbeat` | ignored | Legacy configuration is accepted as a no-op; vehicles never refresh claims. |
 | `vehicle.abandon_backoff_ms` | `30_000` | Delay before retrying a pre-execution graph incompatibility. |
 | `vehicle.max_claim_abandons` | `5` | Abandons allowed before incompatibility poison. |
 | `vehicle.executor` | `Docket.Executor.Local` | All executors run inside runtime-owned per-activation processes with the same hard deadline. |

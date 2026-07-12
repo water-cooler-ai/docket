@@ -59,7 +59,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :clock,
       :monotonic_clock,
       :drain_budget,
-      :heartbeat,
       :max_attempt_elapsed_ms,
       :jitter,
       :abandon_backoff_ms,
@@ -248,7 +247,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       opts
       |> Keyword.take(@vehicle_keys)
       |> Keyword.merge(vehicle)
-      |> Keyword.delete(:heartbeat)
       |> Keyword.put(:graph_cache, false)
       |> Keyword.put(:task_supervisor, Keyword.fetch!(opts, :task_supervisor))
       |> Keyword.put(:backend, {__MODULE__, context})
@@ -518,7 +516,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           host_opts
           |> Keyword.take(Docket.Postgres.vehicle_keys())
           |> Keyword.merge(vehicle_opts)
-          |> Keyword.delete(:heartbeat)
           |> Keyword.merge(
             backend: {Docket.Postgres, context},
             task_supervisor: vehicle_supervisor
