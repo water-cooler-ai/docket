@@ -367,13 +367,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       handler_id = {__MODULE__, self(), :fence_loser}
 
       :ok =
-        :telemetry.attach(
+        :telemetry.attach_many(
           handler_id,
-          [:docket, :checkpoint, :committed],
-          fn name, measurements, metadata, pid ->
-            send(pid, {:committed_telemetry, name, measurements, metadata})
-          end,
-          self()
+          [
+            [:docket, :checkpoint, :committed],
+            [:docket, :lifecycle, :transaction, :stop]
+          ],
+          &Docket.Test.TelemetryRelay.tagged_event/4,
+          {self(), :committed_telemetry}
         )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
@@ -402,7 +403,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:error, :stale_fence} = Task.await(advance_commit, 1_000)
 
-      refute_receive {:committed_telemetry, _, _, _}
+      assert_receive {:committed_telemetry, [:docket, :lifecycle, :transaction, :stop],
+                      %{duration: duration}, %{operation: :moment, result: :stale_fence}}
+
+      assert is_integer(duration) and duration >= 0
+      refute_receive {:committed_telemetry, [:docket, :checkpoint, :committed], _, _}
       refute_receive {:committed_observer, _}
       assert {:ok, ^cancelled} = RunStore.fetch_run(TestRepo, :tenantless, initial.run.id)
       assert TestRepo.aggregate(Event, :count) == 4

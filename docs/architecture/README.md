@@ -1,5 +1,8 @@
 # Docket Architecture Docs
 
+Operational instrumentation and correctness boundaries are documented in the
+[telemetry guide](../telemetry.md).
+
 These documents record the design rationale behind Docket. The code and its
 module docs are the authoritative reference for the current API; read these
 when you want to understand *why* the contracts are shaped the way they are.

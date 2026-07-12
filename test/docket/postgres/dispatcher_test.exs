@@ -1,6 +1,6 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.DispatcherTest do
-    use ExUnit.Case, async: true
+    use ExUnit.Case, async: false
 
     alias Docket.Postgres.Dispatcher
 
@@ -94,6 +94,58 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       Process.sleep(20)
       assert length(policies(agent)) == 2
+    end
+
+    @tag capture_log: true
+    test "telemetry exposes active, pending, completed, and worker-failure poll transitions", %{
+      agent: agent
+    } do
+      parent = self()
+      handler = "dispatcher-state-#{System.unique_integer([:positive])}"
+
+      events = [
+        [:docket, :postgres, :dispatcher, :state],
+        [:docket, :postgres, :dispatcher, :poll]
+      ]
+
+      :telemetry.attach_many(
+        handler,
+        events,
+        &Docket.Test.TelemetryRelay.raw/4,
+        parent
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      blocker = fn _policy ->
+        send(parent, {:blocked_poll, self()})
+        receive do: (:continue -> batch())
+      end
+
+      set_claims(agent, [blocker, fn _ -> raise "database worker failed" end, batch()])
+      dispatcher = start_dispatcher!(agent)
+
+      assert_receive {:blocked_poll, poll}
+
+      assert_receive {[:docket, :postgres, :dispatcher, :state],
+                      %{poll_active: 1, poll_pending: 0, demand: 1, in_flight: 0}, %{}}
+
+      Dispatcher.request_poll(dispatcher)
+
+      assert_receive {[:docket, :postgres, :dispatcher, :state],
+                      %{poll_active: 1, poll_pending: 1, demand: 1, in_flight: 0}, %{}}
+
+      send(poll, :continue)
+
+      assert_receive {[:docket, :postgres, :dispatcher, :poll], %{demand: 1},
+                      %{result: :ok, source: :initial}}
+
+      assert_receive {[:docket, :postgres, :dispatcher, :poll], %{demand: 1},
+                      %{result: :error, source: :notification}},
+                     1_000
+
+      assert Process.alive?(dispatcher)
+      assert eventually(fn -> length(policies(agent)) >= 2 end)
     end
 
     test "launches leases, observes poison without mutation, and releases failed launches", %{

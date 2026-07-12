@@ -60,6 +60,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         jitter: Keyword.get(opts, :jitter, &:rand.uniform/1),
         poll: nil,
         poll_pending?: false,
+        poll_pending_source: nil,
         poll_timer: nil,
         preference: :ready,
         vehicles: %{}
@@ -70,22 +71,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @impl true
-    def handle_continue(:initial_poll, state), do: {:noreply, request_poll_now(state)}
+    def handle_continue(:initial_poll, state), do: {:noreply, request_poll_now(state, :initial)}
 
     @impl true
-    def handle_cast(:request_poll, state), do: {:noreply, request_poll_now(state)}
+    def handle_cast(:request_poll, state), do: {:noreply, request_poll_now(state, :notification)}
 
     @impl true
     def handle_info({:scheduled_poll, token}, %{poll_timer: {_timer, token}} = state) do
-      {:noreply, request_poll_now(%{state | poll_timer: nil})}
+      {:noreply, request_poll_now(%{state | poll_timer: nil}, :scheduled)}
     end
 
     def handle_info({:scheduled_poll, _stale_token}, state), do: {:noreply, state}
 
     def handle_info(
           {:claim_result, request_ref, result},
-          %{poll: {_, _, request_ref, demand}} = state
+          %{poll: {_, _, request_ref, demand, started, source}} = state
         ) do
+      emit_poll(state, demand, started, source, result)
       state = finish_poll(state)
       state = alternate_preference(result, demand, state)
       state = consume_claim_result(result, state)
@@ -96,13 +98,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     def handle_info({:DOWN, monitor, :process, pid, _reason}, state) do
       cond do
-        match?({^pid, ^monitor, _, _}, state.poll) ->
+        match?({^pid, ^monitor, _, _, _, _}, state.poll) ->
+          {_pid, _monitor, _ref, demand, started, source} = state.poll
+          emit_poll(state, demand, started, source, {:error, :worker_down})
           state = %{state | poll: nil}
+          emit_state(state, demand)
           {:noreply, resume_polling(state)}
 
         Map.get(state.vehicles, monitor) == pid ->
           state = %{state | vehicles: Map.delete(state.vehicles, monitor)}
-          {:noreply, request_poll_now(state)}
+          emit_state(state, max(state.concurrency - map_size(state.vehicles), 0))
+          {:noreply, request_poll_now(state, :vehicle_exit)}
 
         true ->
           {:noreply, state}
@@ -115,22 +121,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl true
     def terminate(_reason, state) do
+      started = System.monotonic_time()
       cancel_timer(state.poll_timer)
       deadline = System.monotonic_time(:millisecond) + state.drain_timeout_ms
       state = settle_poll_for_shutdown(state, deadline)
-      await_vehicles(state.vehicles, deadline)
+      remaining = await_vehicles(state.vehicles, deadline)
+
+      :telemetry.execute(
+        [:docket, :postgres, :dispatcher, :shutdown],
+        %{duration: System.monotonic_time() - started, vehicles_remaining: map_size(remaining)},
+        %{result: if(map_size(remaining) == 0, do: :drained, else: :timeout)}
+      )
+
       :ok
     end
 
-    defp request_poll_now(%{poll: nil} = state), do: start_poll(cancel_poll_timer(state))
-    defp request_poll_now(state), do: %{state | poll_pending?: true}
+    defp request_poll_now(%{poll: nil} = state, source),
+      do: start_poll(cancel_poll_timer(state), source)
+
+    defp request_poll_now(state, source) do
+      next = %{state | poll_pending?: true, poll_pending_source: source}
+      emit_state(next, max(next.concurrency - map_size(next.vehicles), 0))
+      next
+    end
 
     defp resume_polling(%{poll_pending?: true} = state),
-      do: start_poll(%{state | poll_pending?: false})
+      do:
+        start_poll(
+          %{state | poll_pending?: false, poll_pending_source: nil},
+          state.poll_pending_source || :coalesced
+        )
 
     defp resume_polling(state), do: schedule_poll(state)
 
-    defp start_poll(state) do
+    defp start_poll(state, source) do
       demand = max(state.concurrency - map_size(state.vehicles), 0)
 
       if demand == 0 do
@@ -146,13 +170,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             send(parent, {:claim_result, request_ref, result})
           end)
 
-        %{state | poll: {pid, monitor, request_ref, demand}}
+        next = %{
+          state
+          | poll: {pid, monitor, request_ref, demand, System.monotonic_time(), source}
+        }
+
+        emit_state(next, demand)
+        next
       end
     end
 
-    defp finish_poll(%{poll: {_pid, monitor, _request_ref, _demand}} = state) do
+    defp finish_poll(%{poll: {_pid, monitor, _request_ref, demand, _started, _source}} = state) do
       Process.demonitor(monitor, [:flush])
-      %{state | poll: nil}
+      next = %{state | poll: nil}
+      emit_state(next, demand)
+      next
     end
 
     # Demand-1 polls alternate the preferred candidate class across
@@ -184,10 +216,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       if map_size(state.vehicles) >= state.concurrency do
         release_unlaunched(lease, state, :capacity_exhausted)
       else
+        started = System.monotonic_time()
+
         case launch(state.launch, lease) do
-          {:ok, pid} when is_pid(pid) -> monitor_vehicle(pid, state)
-          {:error, _reason} -> release_unlaunched(lease, state)
-          other -> release_unlaunched(lease, state, {:invalid_return, other})
+          {:ok, pid} when is_pid(pid) ->
+            emit_launch(started, :ok)
+            monitor_vehicle(pid, state)
+
+          {:error, _reason} ->
+            emit_launch(started, :error)
+            release_unlaunched(lease, state)
+
+          other ->
+            emit_launch(started, :invalid_return)
+            release_unlaunched(lease, state, {:invalid_return, other})
         end
       end
     end
@@ -231,7 +273,56 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp monitor_vehicle(pid, state) do
       monitor = Process.monitor(pid)
-      %{state | vehicles: Map.put(state.vehicles, monitor, pid)}
+      next = %{state | vehicles: Map.put(state.vehicles, monitor, pid)}
+      emit_state(next, max(next.concurrency - map_size(next.vehicles), 0))
+      next
+    end
+
+    defp emit_poll(state, demand, started, source, result) do
+      {leases, poisoned} =
+        case result do
+          {:ok, %{leases: leases, poisoned: poisoned}}
+          when is_list(leases) and is_list(poisoned) ->
+            {length(leases), length(poisoned)}
+
+          _ ->
+            {0, 0}
+        end
+
+      :telemetry.execute(
+        [:docket, :postgres, :dispatcher, :poll],
+        %{
+          duration: System.monotonic_time() - started,
+          demand: demand,
+          concurrency: state.concurrency,
+          in_flight: map_size(state.vehicles),
+          leases: leases,
+          poisoned: poisoned
+        },
+        %{result: Docket.Telemetry.result_kind(result), source: source}
+      )
+    end
+
+    defp emit_state(state, demand) do
+      :telemetry.execute(
+        [:docket, :postgres, :dispatcher, :state],
+        %{
+          concurrency: state.concurrency,
+          demand: demand,
+          in_flight: map_size(state.vehicles),
+          poll_active: if(state.poll, do: 1, else: 0),
+          poll_pending: if(state.poll_pending?, do: 1, else: 0)
+        },
+        %{}
+      )
+    end
+
+    defp emit_launch(started, result) do
+      :telemetry.execute(
+        [:docket, :postgres, :dispatcher, :launch],
+        %{duration: System.monotonic_time() - started},
+        %{result: result}
+      )
     end
 
     defp claim_policy(state, demand) do
@@ -266,7 +357,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp settle_poll_for_shutdown(%{poll: nil} = state, _deadline), do: state
 
     defp settle_poll_for_shutdown(
-           %{poll: {pid, monitor, request_ref, _demand}} = state,
+           %{poll: {pid, monitor, request_ref, demand, started, source}} = state,
            deadline
          ) do
       remaining = max(deadline - System.monotonic_time(:millisecond), 0)
@@ -277,23 +368,37 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           Process.demonitor(monitor, [:flush])
           observe_poisoned(state.on_poisoned, poisoned)
           state = Enum.reduce(leases, state, &release_unlaunched(&1, &2, :shutdown))
-          %{state | poll: nil}
 
-        {:claim_result, ^request_ref, _error} ->
+          shutdown_poll_finished(
+            state,
+            demand,
+            started,
+            source,
+            {:ok, %{leases: leases, poisoned: poisoned}}
+          )
+
+        {:claim_result, ^request_ref, error} ->
           Process.demonitor(monitor, [:flush])
-          %{state | poll: nil}
+          shutdown_poll_finished(state, demand, started, source, error)
 
         {:DOWN, ^monitor, :process, ^pid, _reason} ->
-          %{state | poll: nil}
+          shutdown_poll_finished(state, demand, started, source, {:error, :worker_down})
       after
         remaining ->
           Process.demonitor(monitor, [:flush])
           Process.exit(pid, :kill)
-          %{state | poll: nil}
+          shutdown_poll_finished(state, demand, started, source, {:error, :shutdown_timeout})
       end
     end
 
-    defp await_vehicles(vehicles, _deadline) when map_size(vehicles) == 0, do: :ok
+    defp shutdown_poll_finished(state, demand, started, source, result) do
+      emit_poll(state, demand, started, source, result)
+      next = %{state | poll: nil}
+      emit_state(next, demand)
+      next
+    end
+
+    defp await_vehicles(vehicles, _deadline) when map_size(vehicles) == 0, do: vehicles
 
     defp await_vehicles(vehicles, deadline) do
       remaining = max(deadline - System.monotonic_time(:millisecond), 0)
@@ -302,7 +407,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {:DOWN, monitor, :process, _pid, _reason} ->
           await_vehicles(Map.delete(vehicles, monitor), deadline)
       after
-        remaining -> :ok
+        remaining -> vehicles
       end
     end
 

@@ -24,6 +24,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert GraphCache.fetch("unknown", "hash-1") == :miss
     end
 
+    test "fetch telemetry distinguishes bounded cache outcomes without identities" do
+      parent = self()
+      id = "graph-cache-#{System.unique_integer([:positive])}"
+      event = [:docket, :postgres, :graph_cache, :fetch]
+
+      :telemetry.attach(
+        id,
+        event,
+        &Docket.Test.TelemetryRelay.raw/4,
+        parent
+      )
+
+      on_exit(fn -> :telemetry.detach(id) end)
+
+      assert :miss = GraphCache.fetch("unknown", "secret-hash")
+      assert_receive {^event, %{duration: duration}, %{result: :miss}}
+      assert is_integer(duration) and duration >= 0
+
+      rtg = compiled_minimal()
+      :ok = GraphCache.put_compiled("minimal-linear", "secret-hash", rtg)
+      assert {:ok, ^rtg} = GraphCache.fetch("minimal-linear", "secret-hash")
+      assert_receive {^event, _measurements, %{result: :hit}}
+    end
+
     test "an entry written under another generation is erased on read" do
       rtg = compiled_minimal()
 

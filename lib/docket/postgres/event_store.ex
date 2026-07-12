@@ -16,11 +16,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     def append_events(ctx, scope, run_id, events) when is_list(events) do
+      started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)
 
-      with {:ok, attrs} <- encode_events(events, run_id) do
-        transactional_append(repo, prefix, scope, run_id, attrs)
-      end
+      result =
+        with {:ok, attrs} <- encode_events(events, run_id) do
+          transactional_append(repo, prefix, scope, run_id, attrs)
+        end
+
+      bytes = Enum.reduce(events, 0, fn event, acc -> acc + event_bytes(event) end)
+
+      :telemetry.execute(
+        [:docket, :postgres, :store],
+        %{
+          duration: System.monotonic_time() - started,
+          attempted_rows: length(events),
+          encoded_bytes: bytes
+        },
+        Map.merge(Docket.Telemetry.correlation_metadata(), %{
+          operation: :event_append,
+          result: Docket.Telemetry.result_kind(result)
+        })
+      )
+
+      result
     end
 
     def append_events(_ctx, scope, _run_id, _events) do
@@ -154,6 +173,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     rescue
       _error in Docket.Error -> {:error, :invalid_events}
     end
+
+    defp event_bytes(%Docket.Event{} = event) do
+      byte_size(Docket.DurableCodec.encode!(:event, event.payload)) +
+        byte_size(Docket.DurableCodec.encode!(:event, event.metadata))
+    rescue
+      _ -> 0
+    end
+
+    defp event_bytes(_), do: 0
 
     defp ensure_visible(repo, prefix, scope, run_id) do
       query =

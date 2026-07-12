@@ -1,6 +1,8 @@
 defmodule Docket.LifecycleTest do
   use Docket.Test.Case, async: false
 
+  @moduletag capture_log: true
+
   alias Docket.Runtime.{Loop, Moment}
   alias Docket.Test.MemoryBackend
 

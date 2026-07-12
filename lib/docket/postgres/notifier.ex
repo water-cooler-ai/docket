@@ -81,9 +81,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl true
     def handle_info({:notification, _pid, _ref, channel, payload}, state) do
-      if channel == RunStore.wake_channel() and payload == state.payload do
+      matched? = channel == RunStore.wake_channel() and payload == state.payload
+
+      if matched? do
         Dispatcher.request_poll(state.dispatcher)
       end
+
+      :telemetry.execute(
+        [:docket, :postgres, :notification],
+        %{count: 1},
+        %{result: if(matched?, do: :received, else: :ignored)}
+      )
 
       {:noreply, state}
     end

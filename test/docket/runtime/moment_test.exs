@@ -35,7 +35,6 @@ defmodule Docket.Runtime.MomentTest do
 
   defp watch_telemetry(run_id) do
     handler_id = {__MODULE__, run_id, self()}
-    parent = self()
 
     names = [
       [:docket, :run, :initialized],
@@ -52,10 +51,8 @@ defmodule Docket.Runtime.MomentTest do
     :telemetry.attach_many(
       handler_id,
       names,
-      fn name, _measurements, metadata, _config ->
-        if metadata.run_id == run_id, do: send(parent, {:telemetry, name})
-      end,
-      nil
+      &Docket.Test.TelemetryRelay.filtered_name/4,
+      %{pid: self(), run_id: run_id}
     )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)

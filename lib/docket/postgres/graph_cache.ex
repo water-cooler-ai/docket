@@ -61,20 +61,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl Contract
     def fetch(graph_id, graph_hash, opts \\ []) do
+      started = System.monotonic_time()
       key = key(graph_id, graph_hash)
 
-      case :persistent_term.get(key, :miss) do
-        :miss ->
-          :miss
+      {result, cache_result} =
+        case :persistent_term.get(key, :miss) do
+          :miss ->
+            {:miss, :miss}
 
-        {:compiled, rtg, generation} ->
-          if current?(generation, opts), do: {:ok, rtg}, else: evict(key)
+          {:compiled, rtg, generation} ->
+            if current?(generation, opts),
+              do: {{:ok, rtg}, :hit},
+              else: {evict(key), :generation_invalidated}
 
-        {:incompatible, reason, generation} ->
-          if current?(generation, opts) and not expired?(generation),
-            do: {:incompatible, reason},
-            else: evict(key)
-      end
+          {:incompatible, reason, generation} ->
+            if current?(generation, opts) and not expired?(generation),
+              do: {{:incompatible, reason}, :incompatible},
+              else: {evict(key), :generation_invalidated}
+        end
+
+      :telemetry.execute(
+        [:docket, :postgres, :graph_cache, :fetch],
+        %{duration: System.monotonic_time() - started},
+        %{result: cache_result}
+      )
+
+      result
     end
 
     @impl Contract

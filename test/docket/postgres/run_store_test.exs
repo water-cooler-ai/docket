@@ -716,10 +716,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         :telemetry.attach(
           handler_id,
           [:docket, :postgres, :run_store, :claim],
-          fn _event, measurements, metadata, _config ->
-            send(parent, {:claim_telemetry, measurements, metadata})
-          end,
-          nil
+          &Docket.Test.TelemetryRelay.tagged/4,
+          {parent, :claim_telemetry}
         )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
@@ -732,19 +730,27 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         claimed_at: DateTime.add(@now, -30, :second)
       )
 
-      assert {:ok, %{leases: [_, _]}} = claim_due(@now, limit: 2)
+      insert_run!("expired-poison",
+        wake_at: nil,
+        claim_token: Ecto.UUID.generate(),
+        claimed_at: DateTime.add(@now, -40, :second),
+        claim_attempts: 3
+      )
+
+      assert {:ok, %{leases: [_, _], poisoned: [_]}} = claim_due(@now, limit: 3)
 
       assert_receive {:claim_telemetry, measurements, metadata}
-      assert measurements.demand == 2
+      assert measurements.demand == 3
       assert measurements.leases == 2
-      assert measurements.poisoned == 0
+      assert measurements.poisoned == 1
       assert measurements.ready_candidates == 1
-      assert measurements.expired_candidates == 1
+      assert measurements.expired_candidates == 2
       assert measurements.ready_selected == 1
-      assert measurements.expired_selected == 1
+      assert measurements.expired_selected == 2
+      assert measurements.steals == 1
       assert measurements.ready_oldest_age_ms == 20_000
-      assert measurements.expired_oldest_age_ms == 30_000
-      assert metadata == %{preference: nil, fallback: false}
+      assert measurements.expired_oldest_age_ms == 40_000
+      assert metadata == %{preference: nil, fallback: false, result: :ok}
 
       # Preferred-but-empty class reports the fallthrough.
       insert_run!("expired-2",
@@ -829,12 +835,35 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       first = claim_one(@now)
       expired_at = DateTime.add(@now, 2, :second)
 
+      parent = self()
+      handler = "claim-operation-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:docket, :postgres, :claim, :operation],
+        &Docket.Test.TelemetryRelay.raw/4,
+        parent
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
       original = row!("run")
 
       assert {:error, :claim_lost} =
                RunStore.refresh_claim(TestRepo, :system, "run", "wrong", @now)
 
+      assert_receive {[:docket, :postgres, :claim, :operation], %{duration: heartbeat_duration},
+                      %{operation: :heartbeat, result: :claim_lost}}
+
+      assert is_integer(heartbeat_duration) and heartbeat_duration >= 0
+
       assert :ok = RunStore.release_claim(TestRepo, :system, "run", "wrong", @now)
+
+      assert_receive {[:docket, :postgres, :claim, :operation],
+                      %{duration: release_duration, matched: 0},
+                      %{operation: :release, result: :claim_lost}}
+
+      assert is_integer(release_duration) and release_duration >= 0
       assert row!("run") == original
 
       assert :ok =

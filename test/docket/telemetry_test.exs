@@ -1,6 +1,87 @@
 defmodule Docket.TelemetryTest do
   use Docket.Test.Case, async: true
 
+  test "metric metadata drops identities and correlation references" do
+    metadata = %{
+      operation: :moment,
+      result: :ok,
+      lifecycle_ref: make_ref(),
+      run_id: "run-1",
+      claim_token: "secret"
+    }
+
+    assert Docket.Telemetry.metric_metadata(
+             [:docket, :lifecycle, :transaction, :stop],
+             metadata
+           ) == %{operation: :moment, result: :ok}
+
+    assert Docket.Telemetry.metric_metadata([:docket, :run, :completed], metadata) == %{}
+  end
+
+  test "lifecycle and nested store spans share correlation without leaking it to labels" do
+    parent = self()
+    id = "lifecycle-correlation-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach_many(
+      id,
+      [
+        [:docket, :lifecycle, :transaction, :start],
+        [:docket, :lifecycle, :transaction, :stop],
+        [:docket, :store, :operation, :start],
+        [:docket, :store, :operation, :stop]
+      ],
+      &Docket.Test.TelemetryRelay.raw/4,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+
+    assert :ok =
+             Docket.Telemetry.lifecycle_span(:moment, fn ->
+               metadata = Map.put(Docket.Telemetry.correlation_metadata(), :operation, :test)
+
+               Docket.Telemetry.span([:docket, :store, :operation], metadata, fn ->
+                 {:ok, %{result: :ok}}
+               end)
+             end)
+
+    events =
+      Enum.map(1..4, fn _ ->
+        receive do
+          event -> event
+        after
+          100 -> flunk("missing span")
+        end
+      end)
+
+    refs = Enum.map(events, fn {_name, _measurements, metadata} -> metadata.lifecycle_ref end)
+    assert length(Enum.uniq(refs)) == 1
+
+    assert Enum.map(events, &elem(&1, 0)) == [
+             [:docket, :lifecycle, :transaction, :start],
+             [:docket, :store, :operation, :start],
+             [:docket, :store, :operation, :stop],
+             [:docket, :lifecycle, :transaction, :stop]
+           ]
+  end
+
+  test "span exception telemetry is bounded" do
+    parent = self()
+    id = "bounded-exception-#{System.unique_integer([:positive])}"
+    name = [:docket, :store, :operation, :exception]
+    :telemetry.attach(id, name, &Docket.Test.TelemetryRelay.raw/4, parent)
+    on_exit(fn -> :telemetry.detach(id) end)
+
+    assert_raise RuntimeError, "secret token 123", fn ->
+      Docket.Telemetry.span([:docket, :store, :operation], %{operation: :test}, fn ->
+        raise "secret token 123"
+      end)
+    end
+
+    assert_receive {^name, %{duration: duration}, %{operation: :test, result: :exception}}
+    assert is_integer(duration) and duration >= 0
+  end
+
   # One telemetry event per run event, emitted only for committed
   # transitions, carrying run/graph identity but never channel values.
 
@@ -24,10 +105,8 @@ defmodule Docket.TelemetryTest do
     :telemetry.attach_many(
       handler_id,
       @events,
-      fn name, measurements, metadata, _config ->
-        send(parent, {:telemetry, name, measurements, metadata})
-      end,
-      nil
+      &Docket.Test.TelemetryRelay.event/4,
+      parent
     )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)

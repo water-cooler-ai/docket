@@ -60,6 +60,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @spec dump(Run.t()) :: {:ok, row_attrs()} | {:error, Docket.Error.t()}
     def dump(%Run{} = run) do
+      started = System.monotonic_time()
+
+      result = do_dump(run)
+
+      bytes =
+        case result do
+          {:ok, %{state: state}} -> byte_size(state)
+          _ -> 0
+        end
+
+      emit_codec(:dump, started, result, bytes)
+      result
+    end
+
+    defp do_dump(%Run{} = run) do
       with :ok <- Run.validate_durable(run) do
         validate_timestamps!(run)
 
@@ -78,6 +93,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @spec load(Docket.Postgres.Schemas.Run.t() | map()) ::
             {:ok, Run.t()} | {:error, Docket.Error.t()}
     def load(row) when is_map(row) do
+      started = System.monotonic_time()
+
+      bytes =
+        case Map.get(row, :state) do
+          state when is_binary(state) -> byte_size(state)
+          _ -> 0
+        end
+
+      result = do_load(row)
+      emit_codec(:load, started, result, bytes)
+      result
+    end
+
+    def load(other),
+      do: {:error, corruption("Postgres run row must be a map, got: #{inspect(other)}")}
+
+    defp do_load(row) do
       state = row |> fetch!(:state) |> DurableCodec.decode!(:run)
 
       unless is_map(state) and not is_struct(state) and
@@ -101,8 +133,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       error in Docket.Error -> {:error, as_corruption(error)}
     end
 
-    def load(other),
-      do: {:error, corruption("Postgres run row must be a map, got: #{inspect(other)}")}
+    defp emit_codec(operation, started, result, bytes) do
+      :telemetry.execute(
+        [:docket, :postgres, :run_codec],
+        %{duration: System.monotonic_time() - started, bytes: bytes},
+        %{operation: operation, result: Docket.Telemetry.result_kind(result)}
+      )
+    end
 
     @spec load!(Docket.Postgres.Schemas.Run.t() | map()) :: Run.t()
     def load!(row) do

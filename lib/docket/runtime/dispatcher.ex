@@ -36,32 +36,42 @@ defmodule Docket.Runtime.Dispatcher do
   end
 
   defp attempt(activation, node, run, config) do
+    started = System.monotonic_time()
     outcome = execute(activation, node, run, config)
 
-    case classify(outcome) do
-      {:final, status, value} ->
-        %TaskResult{
-          task_id: activation.task_id,
-          node_id: activation.node_id,
-          attempt: activation.attempt,
-          status: status,
-          value: value
-        }
+    result =
+      case classify(outcome) do
+        {:final, status, value} ->
+          %TaskResult{
+            task_id: activation.task_id,
+            node_id: activation.node_id,
+            attempt: activation.attempt,
+            status: status,
+            value: value
+          }
 
-      {:failure, retryable?, reason} ->
-        status =
-          if retryable? and activation.attempt < activation.retry.max_attempts,
-            do: :retry,
-            else: :error
+        {:failure, retryable?, reason} ->
+          status =
+            if retryable? and activation.attempt < activation.retry.max_attempts,
+              do: :retry,
+              else: :error
 
-        %TaskResult{
-          task_id: activation.task_id,
-          node_id: activation.node_id,
-          attempt: activation.attempt,
-          status: status,
-          value: reason
-        }
-    end
+          %TaskResult{
+            task_id: activation.task_id,
+            node_id: activation.node_id,
+            attempt: activation.attempt,
+            status: status,
+            value: reason
+          }
+      end
+
+    :telemetry.execute(
+      [:docket, :node, :execution],
+      %{duration: System.monotonic_time() - started, attempt: activation.attempt},
+      %{result: result.status}
+    )
+
+    result
   end
 
   defp execute(activation, node, run, config) do
