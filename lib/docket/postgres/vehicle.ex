@@ -7,8 +7,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     the committed run, loads and compiles the exact effective graph version
     the run references, then drains runtime moments one fenced commit at a
     time. Each iteration calculates exactly one `Docket.Runtime.Moment`,
-    commits it through `Docket.Lifecycle.commit_moment/5`, triggers
-    `Docket.Lifecycle.after_commit/2`, and consumes the committed disposition
+    commits it through the lifecycle's moment transaction, triggers its
+    after-commit observation, and consumes the committed disposition
     for loop control only: `:continue` drains the next moment under the
     retained claim; every park exits after its commit released the claim and
     recorded the run's next wake, when it has one.

@@ -8,8 +8,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     on the `docket_wake` channel, carrying the schema prefix (empty string
     when unprefixed) as payload. The notifier holds one dedicated LISTEN
     connection outside the Repo pool, and each notification whose payload
-    matches its own context prefix requests one immediate
-    `Docket.Postgres.Dispatcher` poll. Notification bursts collapse inside
+    matches its own context prefix requests one immediate dispatcher poll.
+    Notification bursts collapse inside
     the dispatcher.
 
     Polling remains the correctness mechanism. A lost notification, a dead

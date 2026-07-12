@@ -222,6 +222,13 @@ entries below reflect what has landed so far.
 
 ### Changed
 
+- The main README now leads with a complete Docket.Postgres quickstart covering
+  dependencies, migration, supervision, retention, publication, and durable
+  execution. Release documentation consistently describes the backend-owned
+  v0.1.0 lifecycle, processless waiting, required tenant scope, deterministic
+  testing modes, and current production vehicles. The Hex package includes its linked
+  examples, telemetry guide, architecture guides, and changelog, and the
+  historical pre-cutover audit is labeled at each obsolete finding (DCKT-26).
 - Runtime dispatch now executes every node selected for a superstep
   concurrently against the same committed snapshot, then collects results in
   deterministic activation order before crossing the existing update barrier.
