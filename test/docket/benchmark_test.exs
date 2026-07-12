@@ -74,6 +74,12 @@ defmodule Docket.BenchmarkTest do
       %{query: "SELECT secret", params: ["secret"]}
     )
 
+    :telemetry.execute(
+      [:docket, :benchmark, :repo, :query],
+      %{query_time: 10, queue_time: 2},
+      %{query: "SELECT secret", params: ["secret"]}
+    )
+
     events = Docket.Benchmark.Collector.stop(collector)
 
     assert {[:docket, :postgres, :claim, :attempt], _, %{class: :ready, result: :acquired}, _} =
@@ -83,6 +89,11 @@ defmodule Docket.BenchmarkTest do
 
     assert {[:docket, :benchmark, :repo, :query], _, %{}, _} =
              Enum.find(events, fn {event, _, _, _} ->
+               event == [:docket, :benchmark, :repo, :query]
+             end)
+
+    assert 2 ==
+             Enum.count(events, fn {event, _, _, _} ->
                event == [:docket, :benchmark, :repo, :query]
              end)
   end

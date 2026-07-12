@@ -22,7 +22,7 @@ defmodule Docket.Benchmark.Collector do
   ]
 
   def start do
-    table = :ets.new(__MODULE__, [:bag, :public, write_concurrency: true])
+    table = :ets.new(__MODULE__, [:ordered_set, :public, write_concurrency: true])
     handler_id = {__MODULE__, make_ref()}
 
     :ok = :telemetry.attach_many(handler_id, @events, &__MODULE__.handle/4, table)
@@ -31,7 +31,12 @@ defmodule Docket.Benchmark.Collector do
 
   def stop(%{table: table, handler_id: handler_id}) do
     :telemetry.detach(handler_id)
-    events = :ets.tab2list(table)
+
+    events =
+      Enum.map(:ets.tab2list(table), fn {_key, event, measurements, metadata, observed_at} ->
+        {event, measurements, metadata, observed_at}
+      end)
+
     :ets.delete(table)
     events
   end
@@ -39,7 +44,7 @@ defmodule Docket.Benchmark.Collector do
   def count(%{table: table}, event, metadata \\ %{}) do
     :ets.foldl(
       fn
-        {^event, _measurements, observed, _observed_at}, count ->
+        {_key, ^event, _measurements, observed, _observed_at}, count ->
           if Enum.all?(metadata, fn {key, value} -> observed[key] == value end),
             do: count + 1,
             else: count
@@ -63,7 +68,14 @@ defmodule Docket.Benchmark.Collector do
         Docket.Telemetry.metric_metadata(event, metadata)
       end
 
-    true = :ets.insert(table, {event, measurements, safe_metadata, System.monotonic_time()})
+    key = System.unique_integer([:monotonic, :positive])
+
+    true =
+      :ets.insert(
+        table,
+        {key, event, measurements, safe_metadata, System.monotonic_time()}
+      )
+
     :ok
   end
 
