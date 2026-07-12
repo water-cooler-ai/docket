@@ -14,18 +14,28 @@ defmodule Docket.Lifecycle do
     runs = backend.runs()
     events = backend.events()
 
-    storage.transaction(context, fn tx ->
-      with {:ok, _run} <-
-             runs.insert_run(
-               tx,
-               scope,
-               moment.run,
-               moment.checkpoint_type,
-               start_wake_at(moment)
-             ),
-           :ok <- events.append_events(tx, scope, moment.run.id, moment.events) do
-        {:ok, moment}
-      end
+    Docket.Telemetry.lifecycle_span(:start, fn ->
+      storage.transaction(context, fn tx ->
+        with {:ok, _run} <-
+               store_span(:run_insert, fn ->
+                 runs.insert_run(
+                   tx,
+                   scope,
+                   moment.run,
+                   moment.checkpoint_type,
+                   start_wake_at(moment)
+                 )
+               end),
+             :ok <-
+               store_span(
+                 :event_append,
+                 fn ->
+                   events.append_events(tx, scope, moment.run.id, moment.events)
+                 end
+               ) do
+          {:ok, moment}
+        end
+      end)
     end)
   end
 
@@ -55,11 +65,19 @@ defmodule Docket.Lifecycle do
       schedule: schedule(moment.disposition, :claimed)
     }
 
-    storage.transaction(context, fn tx ->
-      with {:ok, _run} <- runs.commit(tx, scope, proposal),
-           :ok <- events.append_events(tx, scope, moment.run.id, moment.events) do
-        {:ok, moment}
-      end
+    Docket.Telemetry.lifecycle_span(:moment, fn ->
+      storage.transaction(context, fn tx ->
+        with {:ok, _run} <- store_span(:run_commit, fn -> runs.commit(tx, scope, proposal) end),
+             :ok <-
+               store_span(
+                 :event_append,
+                 fn ->
+                   events.append_events(tx, scope, moment.run.id, moment.events)
+                 end
+               ) do
+          {:ok, moment}
+        end
+      end)
     end)
   end
 
@@ -75,21 +93,31 @@ defmodule Docket.Lifecycle do
     runs = backend.runs()
     events = backend.events()
 
-    storage.transaction(context, fn tx ->
-      case runs.mutate_run(tx, scope, run_id, fn run ->
-             mutation_decision(mutation.(run))
-           end) do
-        {:ok, {:committed, %Moment{} = moment}} ->
-          with :ok <- events.append_events(tx, scope, run_id, moment.events) do
-            {:ok, moment}
-          end
+    Docket.Telemetry.lifecycle_span(:signal, fn ->
+      storage.transaction(context, fn tx ->
+        case store_span(:run_mutation, fn ->
+               runs.mutate_run(tx, scope, run_id, fn run ->
+                 mutation_decision(mutation.(run))
+               end)
+             end) do
+          {:ok, {:committed, %Moment{} = moment}} ->
+            with :ok <-
+                   store_span(
+                     :event_append,
+                     fn ->
+                       events.append_events(tx, scope, run_id, moment.events)
+                     end
+                   ) do
+              {:ok, moment}
+            end
 
-        {:ok, {:unchanged, %Docket.Run{} = run}} ->
-          {:ok, run}
+          {:ok, {:unchanged, %Docket.Run{} = run}} ->
+            {:ok, run}
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+          {:error, reason} ->
+            {:error, reason}
+        end
+      end)
     end)
   end
 
@@ -109,6 +137,19 @@ defmodule Docket.Lifecycle do
   def after_commit(%Moment{} = moment, opts) do
     checkpoint = Moment.checkpoint(moment, :observer)
     context = Moment.context(moment, Keyword.get(opts, :context, %{}))
+
+    :telemetry.execute(
+      [:docket, :lifecycle, :committed],
+      Map.merge(
+        %{count: 1, checkpoint_seq: moment.run.checkpoint_seq, step: moment.run.step},
+        retry_measurements(moment)
+      ),
+      %{
+        checkpoint_type: moment.checkpoint_type,
+        disposition: disposition_kind(moment),
+        result: :committed
+      }
+    )
 
     Docket.Telemetry.emit_events(moment.run, moment.events)
 
@@ -144,7 +185,34 @@ defmodule Docket.Lifecycle do
   defp mutation_decision({:error, reason}), do: {:error, reason}
   defp mutation_decision(other), do: {:error, {:invalid_lifecycle_mutation, other}}
 
+  defp disposition_kind(%Moment{checkpoint_type: :retry_scheduled}), do: :retry
+  defp disposition_kind(%Moment{disposition: :continue}), do: :continue
+  defp disposition_kind(%Moment{disposition: {:park, :terminal, _}}), do: :terminal
+  defp disposition_kind(%Moment{disposition: {:park, :external, _}}), do: :external
+  defp disposition_kind(%Moment{disposition: {:park, :immediate, :drain_budget}}), do: :budget
+  defp disposition_kind(%Moment{disposition: {:park, :immediate, _}}), do: :immediate
+  defp disposition_kind(%Moment{disposition: {:park, {:at, _}, _}}), do: :timer
+
+  defp retry_measurements(%Moment{
+         checkpoint_type: :retry_scheduled,
+         disposition: {:park, {:at, at}, _},
+         proposed_at: proposed_at
+       }),
+       do: %{retry_delay_ms: max(DateTime.diff(at, proposed_at, :millisecond), 0)}
+
+  defp retry_measurements(_), do: %{}
+
+  defp store_span(operation, fun) do
+    metadata = Map.put(Docket.Telemetry.correlation_metadata(), :operation, operation)
+
+    Docket.Telemetry.span([:docket, :store, :operation], metadata, fn ->
+      result = fun.()
+      {result, %{result: Docket.Telemetry.result_kind(result)}}
+    end)
+  end
+
   defp start_observer(nil, observer, checkpoint, _context) do
+    emit_observer_failure(:supervisor_unavailable, checkpoint)
     log_observer_failure(observer, checkpoint, :observer_supervisor_unavailable)
   end
 
@@ -152,27 +220,60 @@ defmodule Docket.Lifecycle do
     case Task.Supervisor.start_child(task_supervisor, fn ->
            deliver_observer(observer, checkpoint, context)
          end) do
-      {:ok, _pid} -> :ok
-      {:error, reason} -> log_observer_failure(observer, checkpoint, {:not_started, reason})
+      {:ok, _pid} ->
+        :ok
+
+      {:error, reason} ->
+        emit_observer_failure(:not_started, checkpoint)
+        log_observer_failure(observer, checkpoint, {:not_started, reason})
     end
   catch
-    :exit, reason -> log_observer_failure(observer, checkpoint, {:not_started, reason})
+    :exit, reason ->
+      emit_observer_failure(:not_started, checkpoint)
+      log_observer_failure(observer, checkpoint, {:not_started, reason})
   end
 
   defp deliver_observer(observer, checkpoint, context) when is_atom(observer) do
-    case observer.observe(checkpoint, context) do
-      :ok -> :ok
-      {:error, reason} -> log_observer_failure(observer, checkpoint, reason)
-      other -> log_observer_failure(observer, checkpoint, {:invalid_return, other})
-    end
-  rescue
-    error -> log_observer_failure(observer, checkpoint, {:exception, error})
-  catch
-    kind, reason -> log_observer_failure(observer, checkpoint, {kind, reason})
+    Docket.Telemetry.span(
+      [:docket, :checkpoint, :observer],
+      %{checkpoint_type: checkpoint.type},
+      fn ->
+        case observe(observer, checkpoint, context) do
+          :ok ->
+            {:ok, %{result: :callback_completed, durable_success: true}}
+
+          {:error, class, reason} ->
+            emit_observer_failure(class, checkpoint)
+            log_observer_failure(observer, checkpoint, reason)
+            {:ok, %{result: class, durable_success: true}}
+        end
+      end
+    )
   end
 
   defp deliver_observer(observer, checkpoint, _context) do
+    emit_observer_failure(:invalid_observer, checkpoint)
     log_observer_failure(observer, checkpoint, :invalid_observer)
+  end
+
+  defp observe(observer, checkpoint, context) do
+    case observer.observe(checkpoint, context) do
+      :ok -> :ok
+      {:error, reason} -> {:error, :callback_error, reason}
+      other -> {:error, :invalid_return, {:invalid_return, other}}
+    end
+  rescue
+    error -> {:error, :exception, {:exception, error}}
+  catch
+    kind, reason -> {:error, :throw, {kind, reason}}
+  end
+
+  defp emit_observer_failure(result, checkpoint) do
+    :telemetry.execute(
+      [:docket, :checkpoint, :observer, :failure],
+      %{count: 1},
+      %{checkpoint_type: checkpoint.type, result: result, durable_success: true}
+    )
   end
 
   defp log_observer_failure(observer, checkpoint, reason) do

@@ -131,11 +131,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @spec fetch_run(ctx(), Docket.Storage.scope(), String.t()) ::
             {:ok, Docket.Run.t()} | {:error, :not_found}
     def fetch_run(ctx, scope, run_id) do
-      {repo, prefix} = Storage.context!(ctx)
+      store_operation(:run_fetch, fn ->
+        {repo, prefix} = Storage.context!(ctx)
 
-      with {:ok, row} <- fetch_scoped_row(repo, prefix, scope, run_id) do
-        {:ok, RunCodec.load!(row)}
-      end
+        with {:ok, row} <- fetch_scoped_row(repo, prefix, scope, run_id) do
+          {:ok, RunCodec.load!(row)}
+        end
+      end)
     end
 
     @doc """
@@ -144,22 +146,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @spec inspect_run(ctx(), Docket.Storage.scope(), String.t()) ::
             {:ok, Docket.RunInfo.t()} | {:error, :not_found}
     def inspect_run(ctx, scope, run_id) do
-      {repo, prefix} = Storage.context!(ctx)
+      store_operation(:run_inspect, fn ->
+        {repo, prefix} = Storage.context!(ctx)
 
-      with {:ok, row} <- fetch_scoped_row(repo, prefix, scope, run_id) do
-        info =
-          Docket.RunInfo.new!(
-            run: RunCodec.load!(row),
-            wake_at: row.wake_at,
-            claimed_at: row.claimed_at,
-            claim_attempts: row.claim_attempts,
-            claim_abandons: row.claim_abandons,
-            poisoned_at: row.poisoned_at,
-            poison_reason: row.poison_reason
-          )
+        with {:ok, row} <- fetch_scoped_row(repo, prefix, scope, run_id) do
+          info =
+            Docket.RunInfo.new!(
+              run: RunCodec.load!(row),
+              wake_at: row.wake_at,
+              claimed_at: row.claimed_at,
+              claim_attempts: row.claim_attempts,
+              claim_abandons: row.claim_abandons,
+              poisoned_at: row.poisoned_at,
+              poison_reason: row.poison_reason
+            )
 
-        {:ok, info}
-      end
+          {:ok, info}
+        end
+      end)
     end
 
     @doc """
@@ -177,6 +181,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @spec claim_due(ctx(), :system, Docket.Storage.Runs.claim_policy()) ::
             {:ok, Docket.Storage.Runs.claim_batch()} | {:error, term()}
     def claim_due(ctx, :system, policy) do
+      started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)
 
       %{now: now, limit: limit, orphan_ttl_ms: ttl, max_claim_attempts: max} =
@@ -189,10 +194,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       case Ecto.Adapters.SQL.query(repo, claim_statement(prefix), params) do
         {:ok, %{rows: rows}} ->
           {batch, stats} = decode_claim_batch(rows, now, ttl)
-          emit_claim_telemetry({batch, stats}, limit, preference)
+          emit_claim_telemetry({batch, stats}, limit, preference, started)
           {:ok, batch}
 
         {:error, reason} ->
+          emit_claim_error(limit, preference, started)
           {:error, reason}
       end
     end
@@ -222,6 +228,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           ) ::
             :ok | {:error, :claim_lost}
     def refresh_claim(ctx, :system, run_id, claim_token, %DateTime{}) do
+      started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)
 
       {count, _} =
@@ -238,7 +245,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           log: false
         )
 
-      if count == 1, do: :ok, else: {:error, :claim_lost}
+      result = if count == 1, do: :ok, else: {:error, :claim_lost}
+      emit_claim_operation(:heartbeat, started, result)
+      result
     end
 
     def refresh_claim(_ctx, :system, _run_id, _claim_token, now) do
@@ -265,13 +274,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           ) ::
             :ok
     def release_claim(ctx, :system, run_id, claim_token, %DateTime{} = now) do
+      started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)
       now = normalize_database_datetime(now)
 
-      run_id
-      |> current_claim(claim_token)
-      |> claim_query(prefix)
-      |> repo.update_all([set: [claim_token: nil, claimed_at: nil, wake_at: now]], log: false)
+      {matched, _} =
+        run_id
+        |> current_claim(claim_token)
+        |> claim_query(prefix)
+        |> repo.update_all([set: [claim_token: nil, claimed_at: nil, wake_at: now]], log: false)
+
+      emit_claim_operation(
+        :release,
+        started,
+        if(matched == 1, do: :ok, else: {:error, :claim_lost}),
+        %{matched: matched}
+      )
 
       :ok
     end
@@ -301,6 +319,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             Docket.Storage.Runs.abandon_policy()
           ) :: Docket.Storage.Runs.abandon_result()
     def abandon_claim(ctx, :system, run_id, claim_token, policy) do
+      started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)
 
       %{expected_checkpoint_seq: seq, now: now, retry_at: retry_at, max_claim_abandons: max} =
@@ -365,11 +384,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         |> claim_query(prefix)
         |> select([run], run.poisoned_at)
 
-      case repo.update_all(query, updates, log: false) do
-        {0, _} -> {:ok, :stale}
-        {1, [nil]} -> {:ok, :rescheduled}
-        {1, [%DateTime{}]} -> {:ok, :poisoned}
+      result =
+        case repo.update_all(query, updates, log: false) do
+          {0, _} -> {:ok, :stale}
+          {1, [nil]} -> {:ok, :rescheduled}
+          {1, [%DateTime{}]} -> {:ok, :poisoned}
+        end
+
+      emit_claim_operation(:abandon, started, result, %{})
+
+      if result == {:ok, :poisoned} do
+        :telemetry.execute(
+          [:docket, :postgres, :claim, :poisoned],
+          %{count: 1},
+          %{reason: :max_claim_abandons}
+        )
       end
+
+      result
     end
 
     def abandon_claim(_ctx, scope, _run_id, _claim_token, _policy) do
@@ -443,47 +475,54 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             DateTime.t()
           ) :: {:ok, Docket.Run.t()} | {:error, :not_found | :inactive_run}
     def retry_poisoned_run(ctx, scope, run_id, %DateTime{} = now) do
+      started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)
       validate_scope!(scope)
 
-      case repo.transaction(fn ->
-             with {:ok, row} <- fetch_locked_scoped_row(repo, prefix, scope, run_id) do
-               run = RunCodec.load!(row)
+      result =
+        case repo.transaction(fn ->
+               with {:ok, row} <- fetch_locked_scoped_row(repo, prefix, scope, run_id) do
+                 run = RunCodec.load!(row)
 
-               cond do
-                 Docket.Run.terminal?(run) ->
-                   {:error, :inactive_run}
+                 cond do
+                   Docket.Run.terminal?(run) ->
+                     {:error, :inactive_run}
 
-                 is_nil(row.poisoned_at) ->
-                   {:ok, run}
+                   is_nil(row.poisoned_at) ->
+                     {:ok, run}
 
-                 true ->
-                   updates = [
-                     set: [
-                       claim_token: nil,
-                       claimed_at: nil,
-                       wake_at: normalize_database_datetime(now),
-                       claim_attempts: 0,
-                       claim_abandons: 0,
-                       poisoned_at: nil,
-                       poison_reason: nil
+                   true ->
+                     updates = [
+                       set: [
+                         claim_token: nil,
+                         claimed_at: nil,
+                         wake_at: normalize_database_datetime(now),
+                         claim_attempts: 0,
+                         claim_abandons: 0,
+                         poisoned_at: nil,
+                         poison_reason: nil
+                       ]
                      ]
-                   ]
 
-                   case repo.update_all(scoped_row_query(row, scope, prefix), updates, log: false) do
-                     {1, _} ->
-                       notify_wake(repo, prefix)
-                       {:ok, run}
+                     case repo.update_all(scoped_row_query(row, scope, prefix), updates,
+                            log: false
+                          ) do
+                       {1, _} ->
+                         notify_wake(repo, prefix)
+                         {:ok, run}
 
-                     {0, _} ->
-                       {:error, :not_found}
-                   end
+                       {0, _} ->
+                         {:error, :not_found}
+                     end
+                 end
                end
-             end
-           end) do
-        {:ok, result} -> result
-        {:error, reason} -> {:error, reason}
-      end
+             end) do
+          {:ok, result} -> result
+          {:error, reason} -> {:error, reason}
+        end
+
+      emit_claim_operation(:poison_recovery, started, result, %{})
+      result
     end
 
     def retry_poisoned_run(_ctx, _scope, _run_id, now) do
@@ -951,7 +990,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    defp emit_claim_telemetry({batch, stats}, demand, preference) do
+    defp emit_claim_telemetry({batch, stats}, demand, preference, started) do
       fallback? =
         demand == 1 and preference != nil and
           ((preference == :ready and stats.expired_selected > 0) or
@@ -960,13 +999,89 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :telemetry.execute(
         [:docket, :postgres, :run_store, :claim],
         Map.merge(stats, %{
+          duration: System.monotonic_time() - started,
           demand: demand,
           leases: length(batch.leases),
-          poisoned: length(batch.poisoned)
+          poisoned: length(batch.poisoned),
+          steals: stats.expired_selected,
+          claim_attempts: Enum.sum(Enum.map(batch.leases, & &1.claim_attempt))
         }),
-        %{preference: preference, fallback: fallback?}
+        %{preference: preference, fallback: fallback?, result: :ok}
+      )
+
+      Enum.each(batch.leases, fn lease ->
+        :telemetry.execute(
+          [:docket, :postgres, :claim, :attempt],
+          %{count: 1, claim_attempts: lease.claim_attempt},
+          %{result: if(lease.claim_attempt == 1, do: :acquired, else: :reacquired)}
+        )
+      end)
+
+      Enum.each(batch.poisoned, fn poison ->
+        :telemetry.execute(
+          [:docket, :postgres, :claim, :poisoned],
+          %{count: 1},
+          %{reason: poison_reason(poison.poison_reason)}
+        )
+      end)
+    end
+
+    defp emit_claim_error(demand, preference, started) do
+      :telemetry.execute(
+        [:docket, :postgres, :run_store, :claim],
+        %{
+          duration: System.monotonic_time() - started,
+          demand: demand,
+          leases: 0,
+          poisoned: 0,
+          steals: 0,
+          claim_attempts: 0
+        },
+        %{preference: preference, fallback: false, result: :error}
       )
     end
+
+    defp emit_claim_operation(operation, started, result, measurements \\ %{}) do
+      :telemetry.execute(
+        [:docket, :postgres, :claim, :operation],
+        Map.put(measurements, :duration, System.monotonic_time() - started),
+        %{operation: operation, result: claim_operation_result(result)}
+      )
+    end
+
+    defp store_operation(operation, fun) do
+      started = System.monotonic_time()
+      result = fun.()
+
+      :telemetry.execute(
+        [:docket, :postgres, :store],
+        %{
+          duration: System.monotonic_time() - started,
+          selected_rows: if(match?({:ok, _}, result), do: 1, else: 0)
+        },
+        Map.merge(Docket.Telemetry.correlation_metadata(), %{
+          operation: operation,
+          result: Docket.Telemetry.result_kind(result)
+        })
+      )
+
+      result
+    end
+
+    defp claim_operation_result(:ok), do: :ok
+
+    defp claim_operation_result({:ok, disposition})
+         when disposition in [:stale, :rescheduled, :poisoned],
+         do: disposition
+
+    defp claim_operation_result({:error, :claim_lost}), do: :claim_lost
+    defp claim_operation_result({:error, :inactive_run}), do: :inactive
+    defp claim_operation_result({:error, _}), do: :error
+    defp claim_operation_result(_), do: :ok
+
+    defp poison_reason("max_claim_attempts_exceeded"), do: :max_claim_attempts
+    defp poison_reason("max_claim_abandons_exceeded"), do: :max_claim_abandons
+    defp poison_reason(_), do: :other
 
     defp load_uuid!(token) do
       case Ecto.UUID.load(token) do

@@ -284,6 +284,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     """
     @spec drain(Docket.Storage.Runs.claim_lease(), [option()]) :: outcome()
     def drain(lease, opts) do
+      try do
+        Docket.Telemetry.span([:docket, :postgres, :vehicle], %{}, fn ->
+          result = do_drain(lease, opts)
+          {result, %{result: drain_result(result)}}
+        end)
+      rescue
+        error ->
+          emit_vehicle_crash(lease)
+          reraise error, __STACKTRACE__
+      catch
+        kind, reason ->
+          emit_vehicle_crash(lease)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+    end
+
+    defp do_drain(lease, opts) do
       state = build(lease, opts)
 
       case heartbeat_misalignment(state) do
@@ -299,6 +316,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         details ->
           finish(state, nil, nil, abandon(state, {:heartbeat_misaligned, details}))
       end
+    end
+
+    defp drain_result({:ok, {:parked, kind}}), do: kind
+    defp drain_result({:ok, outcome}), do: outcome_kind(outcome)
+    defp drain_result(_), do: :error
+
+    defp emit_vehicle_crash(lease) do
+      :telemetry.execute(
+        [:docket, :postgres, :vehicle, :crash],
+        %{
+          count: 1,
+          claim_held_ms:
+            max(DateTime.diff(DateTime.utc_now(), lease.claimed_at, :millisecond), 0),
+          claim_attempt: lease.claim_attempt
+        },
+        %{result: :crashed}
+      )
     end
 
     defp drain_claimed(state) do
@@ -351,6 +385,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp claimed_run(%{lease: lease} = state) do
       case state.runs.fetch_run(state.context, :system, lease.run_id) do
         {:ok, %Run{checkpoint_seq: seq}} when seq != lease.checkpoint_seq ->
+          emit_fence_loss(:pre_fetch, :stale_fence)
           :fence_lost
 
         {:ok, %Run{status: :running} = run} ->
@@ -384,7 +419,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp fetch_and_compile(%{lease: lease} = state) do
-      case state.graphs.fetch_graph(state.context, lease.graph_id, lease.graph_hash) do
+      result =
+        Docket.Telemetry.span([:docket, :postgres, :graph, :fetch], %{}, fn ->
+          result = state.graphs.fetch_graph(state.context, lease.graph_id, lease.graph_hash)
+          {result, %{result: Docket.Telemetry.result_kind(result)}}
+        end)
+
+      case result do
         {:ok, graph} ->
           compile(state, graph)
 
@@ -401,7 +442,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp compile(%{lease: lease} = state, graph) do
-      case state.compiler.(graph, profile: :run) do
+      result =
+        Docket.Telemetry.span([:docket, :postgres, :graph, :compile], %{}, fn ->
+          result = state.compiler.(graph, profile: :run)
+          {result, %{result: Docket.Telemetry.result_kind(result)}}
+        end)
+
+      case result do
         {:ok, rtg} ->
           if rtg.graph_id == lease.graph_id and rtg.graph_hash == lease.graph_hash do
             cache_put_compiled(state, rtg)
@@ -453,8 +500,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp commit(state, rtg, run, moment, budget) do
       case heartbeat_status(state) do
-        :fresh -> fresh_commit(state, rtg, run, moment, budget)
-        reason -> finish(state, budget, nil, release(state, {:discarded, reason}))
+        :fresh ->
+          fresh_commit(state, rtg, run, moment, budget)
+
+        reason ->
+          if reason == :claim_lost,
+            do: emit_fence_loss(:heartbeat, reason),
+            else: emit_discard(:heartbeat, reason)
+
+          finish(state, budget, nil, release(state, {:discarded, reason}))
       end
     end
 
@@ -480,6 +534,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 )
 
         {:error, reason} ->
+          if reason == :stale_fence,
+            do: emit_fence_loss(:commit, reason),
+            else: emit_discard(:commit, reason)
+
           finish(state, budget, nil, release(state, {:discarded, reason}))
       end
     end
@@ -547,7 +605,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       :telemetry.execute(
         [:docket, :postgres, :vehicle, :drain],
-        %{committed_moments: committed, elapsed_ms: elapsed},
+        %{
+          committed_moments: committed,
+          elapsed_ms: elapsed,
+          claim_held_ms: claim_held_ms(state),
+          claim_attempt: state.lease.claim_attempt
+        },
         %{outcome: outcome_kind(outcome), budget: fired}
       )
 
@@ -559,6 +622,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp outcome_kind({:discarded, _reason}), do: :discarded
     defp outcome_kind({:abandoned, _disposition, _reason}), do: :abandoned
     defp outcome_kind({:deferred, _disposition}), do: :deferred
+
+    defp claim_held_ms(%{lease: %{claimed_at: claimed_at}, clock: clock}) do
+      max(DateTime.diff(clock.(), claimed_at, :millisecond), 0)
+    end
+
+    defp emit_fence_loss(stage, reason) do
+      :telemetry.execute(
+        [:docket, :postgres, :claim, :fence_lost],
+        %{count: 1},
+        %{stage: stage, result: reason}
+      )
+    end
+
+    defp emit_discard(stage, reason) do
+      result = if reason == :heartbeat_down, do: :heartbeat_down, else: :error
+
+      :telemetry.execute(
+        [:docket, :postgres, :vehicle, :discard],
+        %{count: 1},
+        %{stage: stage, result: result}
+      )
+    end
 
     defp first_advance_opts(state),
       do: Keyword.put(state.moment_opts, :resume_floor, state.lease.claimed_at)

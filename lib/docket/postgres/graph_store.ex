@@ -13,11 +13,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @impl Docket.Storage.Graphs
     def save_graph(ctx, graph_id, graph_hash, %Graph{id: id, diagnostics: []} = graph)
         when id == graph_id do
-      with {:ok, bytes} <- encode(graph),
-           :ok <- verify_hash(bytes, graph_hash),
-           :ok <- insert(ctx, graph_id, graph_hash, bytes) do
-        verify_insert(ctx, graph_id, graph_hash, bytes)
-      end
+      started = System.monotonic_time()
+
+      result =
+        with {:ok, bytes} <- encode(graph),
+             :ok <- verify_hash(bytes, graph_hash),
+             :ok <- insert(ctx, graph_id, graph_hash, bytes) do
+          verify_insert(ctx, graph_id, graph_hash, bytes)
+        end
+
+      emit_store(:graph_save, started, result, graph_bytes(result, graph))
+      result
     end
 
     def save_graph(_ctx, _graph_id, _graph_hash, _graph),
@@ -25,16 +31,44 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl Docket.Storage.Graphs
     def fetch_graph(ctx, graph_id, graph_hash) do
-      with {:ok, bytes} <- fetch_bytes(ctx, graph_id, graph_hash),
-           :ok <- verify_stored(bytes, graph_id, graph_hash),
-           {:ok, graph} <- decode(bytes),
-           true <- valid_decoded?(graph, graph_id, bytes) do
-        {:ok, graph}
-      else
-        {:error, :not_found} -> {:error, :not_found}
-        _invalid -> {:error, :corrupt_graph}
-      end
+      started = System.monotonic_time()
+
+      result =
+        with {:ok, bytes} <- fetch_bytes(ctx, graph_id, graph_hash),
+             :ok <- verify_stored(bytes, graph_id, graph_hash),
+             {:ok, graph} <- decode(bytes),
+             true <- valid_decoded?(graph, graph_id, bytes) do
+          {:ok, graph}
+        else
+          {:error, :not_found} -> {:error, :not_found}
+          _invalid -> {:error, :corrupt_graph}
+        end
+
+      emit_store(:graph_fetch, started, result, 0)
+      result
     end
+
+    defp emit_store(operation, started, result, bytes) do
+      :telemetry.execute(
+        [:docket, :postgres, :store],
+        %{
+          duration: System.monotonic_time() - started,
+          encoded_bytes: bytes,
+          attempted_rows: if(operation == :graph_save, do: 1, else: 0),
+          selected_rows:
+            if(operation == :graph_fetch and match?({:ok, _}, result), do: 1, else: 0)
+        },
+        Map.merge(Docket.Telemetry.correlation_metadata(), %{
+          operation: operation,
+          result: Docket.Telemetry.result_kind(result)
+        })
+      )
+    end
+
+    defp graph_bytes(:ok, graph),
+      do: graph |> then(&DurableCodec.encode!(:graph, &1)) |> byte_size()
+
+    defp graph_bytes(_, _), do: 0
 
     defp insert(ctx, graph_id, graph_hash, bytes) do
       {repo, prefix} = Storage.context!(ctx)
