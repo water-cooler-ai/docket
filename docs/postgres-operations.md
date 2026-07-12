@@ -136,10 +136,10 @@ inside the backend dispatcher and recovery paths.
 ## Claims, fences, and poison
 
 The run row is the queue, and `RunStore` owns the whole aggregate transition:
-claim, heartbeat, release, fenced commit, serialized mutation, and poison
+claim, release, fenced commit, serialized mutation, and poison
 recovery. A claim token remains authoritative after TTL expiry until another
 claimant actually steals it. A steal changes the token, invalidating stale
-commit and heartbeat; stale release is an idempotent no-op.
+commit; stale release is an idempotent no-op.
 
 `claim_attempts` counts consecutive launched claims without committed graph
 progress. With maximum `N`, exactly `N` launches are allowed; the next recovery
@@ -262,14 +262,15 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
 | `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
 | `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
-| `dispatcher.orphan_ttl_ms` | `60_000` | Must exceed the longest unrefreshed execution stretch. |
+| `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
 | `dispatcher.max_claim_attempts` | `5` | Launches allowed before the next recovery need poisons. |
 | `dispatcher.drain_timeout_ms` | `30_000` | Shutdown wait for tracked vehicles. |
-| `vehicle.drain_budget` | 100 moments / 1 second | Bounds one claim drain before a committed immediate yield. |
-| `vehicle.heartbeat` | disabled | Enable with an interval strictly inside the orphan TTL for long supersteps. |
+| `vehicle.max_attempt_elapsed_ms` | `2_000` | Finite host maximum inherited by nodes without `timeout_ms`; larger explicit graph timeouts are rejected before execution. |
+| `vehicle.drain_budget` | 100 moments / 3 seconds | Cooperative moment-boundary yield; `max_elapsed_ms` must be finite, at least the attempt maximum, and below orphan TTL. |
+| `vehicle.heartbeat` | ignored | Legacy configuration is accepted as a no-op; vehicles never refresh claims. |
 | `vehicle.abandon_backoff_ms` | `30_000` | Delay before retrying a pre-execution graph incompatibility. |
 | `vehicle.max_claim_abandons` | `5` | Abandons allowed before incompatibility poison. |
-| `vehicle.executor` | `Docket.Executor.Local` | Runtime dispatch still fans out activations; configure `Docket.Executor.Task` when per-node task isolation and timeout enforcement are required. |
+| `vehicle.executor` | `Docket.Executor.Local` | All executors run inside runtime-owned per-activation processes with the same hard deadline. |
 | `vehicle.executor_opts` | `[]` | Passed to the configured executor. |
 | `max_supersteps` | unbounded | Optional host safety ceiling; publish a graph policy when it is graph identity. |
 | dispatcher/vehicle `clock`, `jitter` | system clock/random jitter | Injection points for deterministic tests; production overrides must stay monotonic and distribute polling/backoff. |
@@ -284,6 +285,12 @@ Node retry policy belongs to the published graph. A retryable failure commits
 `:retry_scheduled` while graph status remains `running`; durable attempt state,
 sibling results, and the future wake survive process recovery. The dispatcher
 does not sleep on behalf of retrying work.
+Attempt timeout bounds executor callback residency, not exact claim-hold time.
+The drain budget is cooperative, orphan TTL recovers crashed hosts, dispatcher
+shutdown timeout bounds graceful waiting, and client watchdogs are external.
+Killing an attempt cannot retract external effects or unlinked children;
+expected long work must use a durable external wait/interrupt until native
+detached await support is available.
 Without a retry policy, a node gets one attempt and no backoff. A configured
 retry policy defaults `max_attempts` to `1` and `backoff_ms` to `0`; raise the
 attempt count and choose a positive backoff to enable durable retry parking.

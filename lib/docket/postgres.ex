@@ -40,7 +40,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       max_claim_attempts: 5,
       drain_timeout_ms: 30_000
     ]
-    @default_vehicle [drain_budget: [max_moments: 100, max_elapsed_ms: 1_000]]
+    @default_vehicle [
+      max_attempt_elapsed_ms: 2_000,
+      drain_budget: [max_moments: 100, max_elapsed_ms: 3_000]
+    ]
 
     @dispatcher_keys [
       :concurrency,
@@ -57,6 +60,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :monotonic_clock,
       :drain_budget,
       :heartbeat,
+      :max_attempt_elapsed_ms,
       :jitter,
       :abandon_backoff_ms,
       :max_claim_abandons,
@@ -121,8 +125,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       validate_observers!(opts)
       validate_nested!(Keyword.get(opts, :dispatcher, []), :dispatcher)
       validate_nested!(Keyword.get(opts, :vehicle, []), :vehicle)
-      validate_dispatcher!(Keyword.merge(@default_dispatcher, Keyword.get(opts, :dispatcher, [])))
+      dispatcher = Keyword.merge(@default_dispatcher, Keyword.get(opts, :dispatcher, []))
+      validate_dispatcher!(dispatcher)
+      vehicle = effective_vehicle(opts, Keyword.get(opts, :vehicle, []))
       validate_vehicle!(opts, Keyword.get(opts, :vehicle, []))
+      validate_runtime_limits!(dispatcher, vehicle)
 
       children = children(opts, name)
 
@@ -155,6 +162,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc "Synchronously claims and drains due runs in the calling process."
     def drain_runs(opts) when is_list(opts) do
       validate_testing!(opts)
+      validate_nested!(Keyword.get(opts, :dispatcher, []), :dispatcher)
+      validate_nested!(Keyword.get(opts, :vehicle, []), :vehicle)
+      dispatcher_config = Keyword.merge(@default_dispatcher, Keyword.get(opts, :dispatcher, []))
+      vehicle_config = effective_vehicle(opts, Keyword.get(opts, :vehicle, []))
+      validate_dispatcher!(dispatcher_config)
+      validate_vehicle!(opts, Keyword.get(opts, :vehicle, []))
+      validate_runtime_limits!(dispatcher_config, vehicle_config)
 
       max_runs = Keyword.get(opts, :max_runs, 100)
 
@@ -406,7 +420,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         raise ArgumentError, ":vehicle #{key} must be a function of arity #{arity}"
       end
 
-      for key <- [:max_supersteps, :abandon_backoff_ms, :max_claim_abandons],
+      for key <- [
+            :max_supersteps,
+            :max_attempt_elapsed_ms,
+            :abandon_backoff_ms,
+            :max_claim_abandons
+          ],
           value = Keyword.get(effective, key),
           value != nil and not (is_integer(value) and value > 0) do
         raise ArgumentError, ":vehicle #{key} must be a positive integer"
@@ -432,6 +451,33 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       validate_observer_modules!(Keyword.get(effective, :checkpoint_observers, []))
+    end
+
+    defp validate_runtime_limits!(dispatcher, vehicle) do
+      maximum = Keyword.fetch!(vehicle, :max_attempt_elapsed_ms)
+      budget = Docket.Postgres.Vehicle.drain_budget!(vehicle)
+      elapsed = budget.max_elapsed_ms
+      orphan_ttl = Keyword.fetch!(dispatcher, :orphan_ttl_ms)
+
+      unless is_integer(maximum) and maximum > 0 do
+        raise ArgumentError, ":vehicle max_attempt_elapsed_ms must be a positive finite integer"
+      end
+
+      unless is_integer(elapsed) and maximum <= elapsed do
+        raise ArgumentError,
+              ":vehicle drain_budget max_elapsed_ms must be finite and at least max_attempt_elapsed_ms"
+      end
+
+      unless elapsed < orphan_ttl do
+        raise ArgumentError,
+              ":vehicle drain_budget max_elapsed_ms must leave headroom below dispatcher orphan_ttl_ms"
+      end
+    end
+
+    defp effective_vehicle(host_opts, nested) do
+      host_opts
+      |> Keyword.take(@vehicle_keys)
+      |> Keyword.merge(Keyword.merge(@default_vehicle, nested))
     end
 
     defp assert_keyword!(value, key) do
@@ -472,6 +518,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           host_opts
           |> Keyword.take(Docket.Postgres.vehicle_keys())
           |> Keyword.merge(vehicle_opts)
+          |> Keyword.delete(:heartbeat)
           |> Keyword.merge(
             backend: {Docket.Postgres, context},
             task_supervisor: vehicle_supervisor

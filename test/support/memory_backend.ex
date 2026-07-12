@@ -455,6 +455,17 @@ defmodule Docket.Test.MemoryBackend do
       record.run.checkpoint_seq != policy.expected_checkpoint_seq ->
         {{:ok, :stale}, state}
 
+      Map.get(policy, :non_poisoning, false) ->
+        record = %{
+          record
+          | claim_token: nil,
+            claimed_at: nil,
+            claim_attempts: max(record.claim_attempts - 1, 0),
+            wake_at: policy.retry_at
+        }
+
+        {{:ok, :rescheduled}, put_in(state.runs[run_id], record)}
+
       record.claim_abandons < policy.max_claim_abandons ->
         record = %{
           record

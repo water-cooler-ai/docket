@@ -914,369 +914,55 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    describe "claim freshness heartbeat" do
-      test "malformed heartbeat configuration raises at the launcher and in drain", %{
-        backend_ref: backend_ref
-      } do
-        for bad <- [
-              :strict,
-              %{interval_ms: 5},
-              [],
-              [interval_ms: 0],
-              [interval_ms: :fast],
-              [interval_ms: 5, bogus: true],
-              [bogus: true]
-            ] do
-          assert_raise ArgumentError, fn ->
-            Vehicle.launcher(
-              backend: backend_ref,
-              task_supervisor: @task_sup,
-              heartbeat: bad
-            )
-          end
-        end
+    test "legacy heartbeat configuration is ignored and never refreshes the claim", %{
+      backend_ref: backend_ref
+    } do
+      {_run, lease} = start_claimed!(backend_ref, Graphs.minimal_linear(), %{"value" => "x"})
 
-        {_run, lease} = start_claimed!(backend_ref, Graphs.minimal_linear(), %{"value" => "x"})
+      assert {:ok, {:parked, :terminal}} =
+               Vehicle.drain(lease, vehicle_opts(backend_ref, heartbeat: [interval_ms: 1]))
+    end
 
-        assert_raise ArgumentError, fn ->
-          Vehicle.drain(lease, vehicle_opts(backend_ref, heartbeat: [interval_ms: -1]))
-        end
+    test "host timeout incompatibility releases without abandon or poison state", %{
+      backend_ref: backend_ref
+    } do
+      graph = Graphs.minimal_linear()
+      node = graph.nodes["copy"]
+
+      graph = %{
+        graph
+        | nodes: Map.put(graph.nodes, "copy", %{node | policies: %{"timeout_ms" => 101}})
+      }
+
+      {run, lease} = start_claimed!(backend_ref, graph, %{"value" => "x"})
+
+      assert {:ok, {:host_incompatible, %Docket.Error{type: :incompatible_execution_policy}}} =
+               Vehicle.drain(lease, vehicle_opts(backend_ref, max_attempt_elapsed_ms: 100))
+
+      assert {:ok, info} = Host.inspect_run(run.id)
+      assert info.claimed_at == nil
+      assert info.claim_abandons == 0
+      assert info.claim_attempts == 0
+      assert %DateTime{} = info.wake_at
+
+      for _ <- 1..3 do
+        assert {:ok, current} = Host.inspect_run(run.id)
+        [lease] = claim!(backend_ref, current.wake_at)
+
+        assert {:ok, {:host_incompatible, %Docket.Error{}}} =
+                 Vehicle.drain(lease, vehicle_opts(backend_ref, max_attempt_elapsed_ms: 100))
+
+        assert {:ok, next} = Host.inspect_run(run.id)
+        assert next.claim_abandons == 0
+        assert next.claim_attempts == 0
+        refute next.poisoned_at
       end
 
-      test "an interval that cannot fit the lease TTL abandons the claim before execution", %{
-        backend_ref: backend_ref,
-        context: context
-      } do
-        {run, lease} = start_claimed!(backend_ref, Graphs.minimal_linear(), %{"value" => "x"})
-
-        assert {:ok, {:abandoned, :rescheduled, {:heartbeat_misaligned, details}}} =
-                 Vehicle.drain(lease, vehicle_opts(backend_ref, heartbeat: [interval_ms: 30_000]))
-
-        assert details == %{interval_ms: 30_000, orphan_ttl_ms: 60_000}
-
-        assert {:ok, info} = MemoryBackend.inspect_run(context, :system, run.id)
-        assert info.claimed_at == nil
-        assert info.claim_attempts == 0
-        assert info.claim_abandons == 1
-        assert %DateTime{} = info.wake_at
-
-        # Nothing executed: the committed run never advanced.
-        assert {:ok, after_abandon} = Host.fetch_run(run.id)
-        assert after_abandon.status == :running
-        assert after_abandon.checkpoint_seq == lease.checkpoint_seq
-      end
-
-      test "an interval exactly at the alignment boundary drains normally", %{
-        backend_ref: backend_ref
-      } do
-        {run, lease} = start_claimed!(backend_ref, Graphs.minimal_linear(), %{"value" => "ok"})
-
-        assert {:ok, {:parked, :terminal}} =
-                 Vehicle.drain(lease, vehicle_opts(backend_ref, heartbeat: [interval_ms: 20_000]))
-
-        assert {:ok, done} = Host.fetch_run(run.id)
-        assert done.status == :done
-      end
-
-      test "the heartbeat keeps a long-executing claim fresh", %{
-        backend_ref: backend_ref,
-        context: context
-      } do
-        test_pid = self()
-        Process.register(test_pid, :vehicle_heartbeat_relay)
-
-        {run, lease} = start_claimed!(backend_ref, Graphs.blocking(), %{})
-
-        opts =
-          vehicle_opts({RelayRunsBackend, context},
-            heartbeat: [interval_ms: 10],
-            context: %{coordinator: test_pid}
-          )
-
-        task = Task.Supervisor.async_nolink(@task_sup, fn -> Vehicle.drain(lease, opts) end)
-
-        assert_receive {:blocked, node_pid, "blocker", 1}
-        # Heartbeat delivery crosses a real timer and a monitored store
-        # worker, so its scheduling budget is explicit and local.
-        assert_receive {:refreshed, _heartbeat, :ok}, 1_000
-        assert_receive {:refreshed, _heartbeat, :ok}, 1_000
-
-        # The claim was stamped slightly in the future; keep consuming ticks
-        # until one lands past it, proving claimed_at advances while the
-        # node is still executing.
-        advanced? =
-          Enum.reduce_while(1..300, false, fn _tick, _acc ->
-            assert_receive {:refreshed, _heartbeat, :ok}, 1_000
-            assert {:ok, info} = MemoryBackend.inspect_run(context, :system, run.id)
-
-            if DateTime.compare(info.claimed_at, lease.claimed_at) == :gt do
-              {:halt, true}
-            else
-              {:cont, false}
-            end
-          end)
-
-        assert advanced?
-
-        send(node_pid, :release)
-        assert {:ok, {:parked, :terminal}} = Task.await(task)
-
-        assert {:ok, done} = Host.fetch_run(run.id)
-        assert done.status == :done
-      end
-
-      test "a heartbeat that loses its token stops the vehicle accepting the result", %{
-        backend_ref: backend_ref,
-        context: context
-      } do
-        test_pid = self()
-        Process.register(test_pid, :vehicle_heartbeat_relay)
-
-        {run, lease} =
-          start_claimed!(backend_ref, Graphs.blocking(), %{})
-
-        opts =
-          vehicle_opts({RelayRunsBackend, context},
-            heartbeat: [interval_ms: 10],
-            context: %{coordinator: test_pid, notify: test_pid},
-            checkpoint_observers: [RecordingObserver],
-            task_supervisor: @task_sup
-          )
-
-        task = Task.Supervisor.async_nolink(@task_sup, fn -> Vehicle.drain(lease, opts) end)
-        assert_receive {:blocked, node_pid, "blocker", 1}
-
-        [stolen] = claim!(backend_ref, DateTime.add(DateTime.utc_now(), 120, :second))
-        assert stolen.claim_token != lease.claim_token
-
-        # The loss flag is written before the heartbeat exits, so its DOWN
-        # guarantees the vehicle's pre-commit check observes the loss.
-        assert_receive {:refreshed, heartbeat, {:error, :claim_lost}}, 1_000
-        monitor = Process.monitor(heartbeat)
-        assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
-
-        send(node_pid, :release)
-        assert {:ok, {:discarded, :claim_lost}} = Task.await(task)
-
-        assert {:ok, current} = MemoryBackend.fetch_run(context, :system, run.id)
-        assert current.checkpoint_seq == lease.checkpoint_seq
-        refute_received {:observed, _type}
-
-        assert {:ok, info} = MemoryBackend.inspect_run(context, :system, run.id)
-        assert info.claimed_at == stolen.claimed_at
-        assert info.claim_attempts == 2
-      end
-
-      test "two workers execute the same run and exactly one commits durable state", %{
-        backend_ref: backend_ref,
-        context: context
-      } do
-        test_pid = self()
-        Process.register(test_pid, :vehicle_heartbeat_relay)
-
-        {run, lease_a} =
-          start_claimed!(backend_ref, Graphs.blocking(), %{})
-
-        opts_a =
-          vehicle_opts({RelayRunsBackend, context},
-            heartbeat: [interval_ms: 10],
-            context: %{coordinator: test_pid}
-          )
-
-        task_a = Task.Supervisor.async_nolink(@task_sup, fn -> Vehicle.drain(lease_a, opts_a) end)
-        assert_receive {:blocked, node_a, "blocker", 1}
-
-        [lease_b] = claim!(backend_ref, DateTime.add(DateTime.utc_now(), 120, :second))
-        assert lease_b.claim_token != lease_a.claim_token
-
-        opts_b = vehicle_opts(backend_ref, context: %{coordinator: test_pid})
-        task_b = Task.Supervisor.async_nolink(@task_sup, fn -> Vehicle.drain(lease_b, opts_b) end)
-
-        # The uncommitted superstep re-plans with identical task identity, so
-        # the second worker announces the same attempt number.
-        assert_receive {:blocked, node_b, "blocker", 1}
-        assert node_b != node_a
-
-        send(node_b, :release)
-        assert {:ok, {:parked, :terminal}} = Task.await(task_b)
-
-        # Wait for the heartbeat to exit before releasing the node: the loss
-        # flag is written before the exit, so DOWN guarantees the vehicle's
-        # pre-commit check observes it.
-        assert_receive {:refreshed, heartbeat, {:error, :claim_lost}}, 1_000
-        monitor = Process.monitor(heartbeat)
-        assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
-
-        send(node_a, :release)
-        assert {:ok, {:discarded, :claim_lost}} = Task.await(task_a)
-
-        assert {:ok, done} = MemoryBackend.fetch_run(context, :system, run.id)
-        assert done.status == :done
-        assert done.checkpoint_seq > lease_b.checkpoint_seq
-      end
-
-      test "persistent refresh failure discards the moment and releases the claim", %{
-        backend_ref: backend_ref,
-        context: context
-      } do
-        test_pid = self()
-        Process.register(test_pid, :vehicle_heartbeat_relay)
-
-        {run, lease} =
-          start_claimed!(backend_ref, Graphs.blocking(), %{})
-
-        opts =
-          vehicle_opts({RaisingRefreshBackend, context},
-            heartbeat: [interval_ms: 200],
-            context: %{coordinator: test_pid},
-            # Both racing first draws (heartbeat last_ok, drain budget
-            # start) are 0 by design; the tick's staleness_remaining draws
-            # 30_000 (a live attempt budget), and the failure check then
-            # draws the sticky 100_000 and exhausts the 60s staleness
-            # budget. Do not shorten the list - it reintroduces races.
-            monotonic_clock: scripted_monotonic([0, 0, 30_000, 100_000])
-          )
-
-        task = Task.Supervisor.async_nolink(@task_sup, fn -> Vehicle.drain(lease, opts) end)
-        assert_receive {:blocked, node_pid, "blocker", 1}
-
-        # This notification follows the intentionally real 200 ms heartbeat
-        # timer. Keep its scheduling budget local instead of widening every
-        # receive assertion in the suite.
-        assert_receive {:refresh_attempted, heartbeat}, 1_000
-        monitor = Process.monitor(heartbeat)
-        assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
-
-        send(node_pid, :release)
-        assert {:ok, {:discarded, :heartbeat_down}} = Task.await(task)
-
-        assert {:ok, info} = MemoryBackend.inspect_run(context, :system, run.id)
-        assert info.claimed_at == nil
-        assert %DateTime{} = info.wake_at
-      end
-
-      test "a refresh call stuck past the staleness budget stops the drain", %{
-        backend_ref: backend_ref,
-        context: context
-      } do
-        test_pid = self()
-        Process.register(test_pid, :vehicle_heartbeat_relay)
-
-        {run, lease} = start_claimed!(backend_ref, Graphs.blocking(), %{})
-
-        opts =
-          vehicle_opts({StuckRefreshBackend, context},
-            heartbeat: [interval_ms: 200],
-            context: %{coordinator: test_pid},
-            # Draw order: heartbeat arm (0), drain-budget start (0), the
-            # tick's staleness_remaining (59_990 -> a 10ms attempt budget
-            # for the stuck call), then the sticky exhaustion check.
-            monotonic_clock: scripted_monotonic([0, 0, 59_990, 100_000])
-          )
-
-        task = Task.Supervisor.async_nolink(@task_sup, fn -> Vehicle.drain(lease, opts) end)
-        assert_receive {:blocked, node_pid, "blocker", 1}
-
-        # This notification follows the intentionally real 200 ms heartbeat
-        # timer. Keep its scheduling budget local instead of widening every
-        # receive assertion in the suite.
-        assert_receive {:refresh_started, worker, heartbeat}, 1_000
-        worker_monitor = Process.monitor(worker)
-        monitor = Process.monitor(heartbeat)
-
-        # The stuck store call is killed at the staleness bound, and the
-        # heartbeat gives up loudly (flag written before it exits).
-        assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _killed}
-        assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
-
-        send(node_pid, :release)
-        assert {:ok, {:discarded, :heartbeat_down}} = Task.await(task)
-
-        assert {:ok, info} = MemoryBackend.inspect_run(context, :system, run.id)
-        assert info.claimed_at == nil
-        assert %DateTime{} = info.wake_at
-      end
-
-      test "the heartbeat dies with a killed vehicle", %{
-        backend_ref: backend_ref,
-        context: context
-      } do
-        test_pid = self()
-        Process.register(test_pid, :vehicle_heartbeat_relay)
-
-        {_run, lease} =
-          start_claimed!(backend_ref, Graphs.blocking(), %{})
-
-        opts =
-          vehicle_opts({RelayRunsBackend, context},
-            heartbeat: [interval_ms: 10],
-            context: %{coordinator: test_pid},
-            task_supervisor: @task_sup
-          )
-
-        assert {:ok, vehicle} = Vehicle.launch(lease, opts)
-
-        assert_receive {:blocked, _node_pid, "blocker", 1}
-        assert_receive {:refreshed, heartbeat, :ok}, 1_000
-        monitor = Process.monitor(heartbeat)
-
-        Process.exit(vehicle, :kill)
-        assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
-      end
-
-      @tag capture_log: true
-      test "a drain that raises still stops its heartbeat", %{
-        backend_ref: backend_ref,
-        context: context
-      } do
-        test_pid = self()
-        Process.register(test_pid, :vehicle_heartbeat_relay)
-
-        {_run, lease} = start_claimed!(backend_ref, Graphs.minimal_linear(), %{"value" => "x"})
-
-        opts =
-          vehicle_opts({BlockingDoneFetchBackend, context}, heartbeat: [interval_ms: 10])
-
-        {vehicle, vehicle_monitor} = spawn_monitor(fn -> Vehicle.drain(lease, opts) end)
-
-        assert_receive {:fetching, fetcher}
-        assert_receive {:refreshed, heartbeat, :ok}, 1_000
-        heartbeat_monitor = Process.monitor(heartbeat)
-
-        send(fetcher, :go)
-
-        assert_receive {:DOWN, ^vehicle_monitor, :process, ^vehicle, {%Docket.Error{}, _stack}}
-        assert_receive {:DOWN, ^heartbeat_monitor, :process, ^heartbeat, :killed}
-      end
-
-      test "strict alignment is the default and performs no refreshes", %{
-        context: context
-      } do
-        Process.register(self(), :vehicle_heartbeat_relay)
-
-        {:ok, reference} = Host.save_graph(Graphs.minimal_linear())
-        {:ok, run} = Host.start_run(reference, %{"value" => "hello"})
-
-        # A zero-TTL lease can never satisfy the heartbeat alignment rule,
-        # so an accidentally armed heartbeat would abandon instead of
-        # draining - strict mode must not care about the TTL at all.
-        {:ok, %{leases: [lease], poisoned: []}} =
-          MemoryBackend.claim_due(context, :system, %{
-            now: DateTime.add(DateTime.utc_now(), 1, :second),
-            limit: 1,
-            orphan_ttl_ms: 0,
-            max_claim_attempts: 3
-          })
-
-        assert lease.run_id == run.id
-
-        assert {:ok, {:parked, :terminal}} =
-                 Vehicle.drain(lease, vehicle_opts({RelayRunsBackend, context}))
-
-        assert {:ok, done} = Host.fetch_run(run.id)
-        assert done.status == :done
-        refute_received {:refreshed, _heartbeat, _result}
-      end
+      assert {:ok, latest} = Host.inspect_run(run.id)
+      [compatible] = claim!(backend_ref, latest.wake_at)
+
+      assert {:ok, {:parked, :terminal}} =
+               Vehicle.drain(compatible, vehicle_opts(backend_ref, max_attempt_elapsed_ms: 101))
     end
 
     def telemetry_relay(event, _measurements, _metadata, %{pid: pid}) do

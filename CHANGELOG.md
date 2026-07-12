@@ -16,6 +16,12 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- Finite runtime-owned node attempt deadlines across Local, Task, and custom
+  executors. Missing node timeouts inherit the host maximum; larger explicit
+  graph limits are rejected before execution and rescheduled without poison.
+  Vehicle heartbeat execution is removed, with legacy heartbeat configuration
+  retained as an ignored compatibility no-op (DCKT-41).
+
 - An operator-facing PostgreSQL correctness guide covering durable status
   rationale, derived queue views, scope, claims and poison, failure recovery,
   configuration defaults, checkpoint/event delivery boundaries, and the

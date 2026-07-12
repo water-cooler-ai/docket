@@ -12,6 +12,7 @@ defmodule Docket.Runtime.Config do
           clock: (-> DateTime.t()),
           id_generator: (atom() -> String.t()),
           sleeper: (non_neg_integer() -> :ok),
+          max_attempt_elapsed_ms: pos_integer(),
           max_supersteps: pos_integer() | nil,
           context: map()
         }
@@ -24,12 +25,19 @@ defmodule Docket.Runtime.Config do
   def resolve_moment(opts) when is_list(opts), do: build(opts)
 
   defp build(opts) do
+    max_attempt_elapsed_ms = Keyword.get(opts, :max_attempt_elapsed_ms, 2_000)
+
+    unless is_integer(max_attempt_elapsed_ms) and max_attempt_elapsed_ms > 0 do
+      raise ArgumentError, ":max_attempt_elapsed_ms must be a positive finite integer"
+    end
+
     %{
       executor: Keyword.get(opts, :executor, Docket.Executor.Local),
       executor_opts: Keyword.get(opts, :executor_opts, []),
       clock: Keyword.get(opts, :clock, &DateTime.utc_now/0),
       id_generator: Keyword.get(opts, :id_generator, &default_id/1),
       sleeper: Keyword.get(opts, :sleeper, &sleep/1),
+      max_attempt_elapsed_ms: max_attempt_elapsed_ms,
       max_supersteps: Keyword.get(opts, :max_supersteps),
       context: Keyword.get(opts, :context, %{})
     }

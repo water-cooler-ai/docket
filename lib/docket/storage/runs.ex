@@ -97,7 +97,8 @@ defmodule Docket.Storage.Runs do
           required(:expected_checkpoint_seq) => non_neg_integer(),
           required(:now) => DateTime.t(),
           required(:retry_at) => DateTime.t(),
-          required(:max_claim_abandons) => pos_integer()
+          required(:max_claim_abandons) => pos_integer(),
+          optional(:non_poisoning) => boolean()
         }
 
   @typedoc "Disposition applied by one pre-execution claim abandon."

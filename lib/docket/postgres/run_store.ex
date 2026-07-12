@@ -320,10 +320,48 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           ) :: Docket.Storage.Runs.abandon_result()
     def abandon_claim(ctx, :system, run_id, claim_token, policy) do
       started = System.monotonic_time()
-      {repo, prefix} = Storage.context!(ctx)
 
       %{expected_checkpoint_seq: seq, now: now, retry_at: retry_at, max_claim_abandons: max} =
         validate_abandon_policy!(policy)
+
+      if Map.get(policy, :non_poisoning, false) do
+        non_poisoning_abandon(ctx, run_id, claim_token, seq, retry_at, started)
+      else
+        poisoning_abandon(ctx, run_id, claim_token, seq, now, retry_at, max, started)
+      end
+    end
+
+    def abandon_claim(_ctx, scope, _run_id, _claim_token, _policy) do
+      raise ArgumentError, "abandon_claim scope must be :system, got: #{inspect(scope)}"
+    end
+
+    defp non_poisoning_abandon(ctx, run_id, claim_token, seq, retry_at, started) do
+      {repo, prefix} = Storage.context!(ctx)
+
+      {matched, _} =
+        run_id
+        |> current_claim(claim_token)
+        |> where([run], run.checkpoint_seq == ^seq)
+        |> claim_query(prefix)
+        |> repo.update_all(
+          [
+            set: [
+              claim_token: nil,
+              claimed_at: nil,
+              claim_attempts: dynamic([run], fragment("GREATEST(? - 1, 0)", run.claim_attempts)),
+              wake_at: retry_at
+            ]
+          ],
+          log: false
+        )
+
+      result = if matched == 1, do: {:ok, :rescheduled}, else: {:ok, :stale}
+      emit_claim_operation(:abandon, started, result, %{reason: :host_incompatible})
+      result
+    end
+
+    defp poisoning_abandon(ctx, run_id, claim_token, seq, now, retry_at, max, started) do
+      {repo, prefix} = Storage.context!(ctx)
 
       predicate =
         dynamic(
@@ -402,10 +440,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       result
-    end
-
-    def abandon_claim(_ctx, scope, _run_id, _claim_token, _policy) do
-      raise ArgumentError, "abandon_claim scope must be :system, got: #{inspect(scope)}"
     end
 
     @doc "Commits an exact-next run document under the current claim fence."

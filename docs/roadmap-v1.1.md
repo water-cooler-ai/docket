@@ -395,7 +395,7 @@ more parallel node work than another.
 
 v0.1.0 gives blocking node work two freshness strategies (DCKT-22): keep each
 between-commit stretch under the orphan TTL (strict alignment — commits are
-the heartbeat) or hold a token-guarded heartbeat. Work an external system
+the finite runtime-owned attempt deadline. Work an external system
 durably owns parks as an external wait instead. The remaining shape is work a
 node started **in-process** but wants to hand back to the runtime — stop
 holding a vehicle slot and claim while it finishes. The execution contract

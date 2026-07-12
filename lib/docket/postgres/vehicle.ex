@@ -3,179 +3,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduledoc """
     Ephemeral execution shell for one claimed run.
 
-    A vehicle turns one dispatcher claim lease into runtime progress: it loads
-    the committed run, loads and compiles the exact effective graph version
-    the run references, then drains runtime moments one fenced commit at a
-    time. Each iteration calculates exactly one `Docket.Runtime.Moment`,
-    commits it through the lifecycle's moment transaction, triggers its
-    after-commit observation, and consumes the committed disposition
-    for loop control only: `:continue` drains the next moment under the
-    retained claim; every park exits after its commit released the claim and
-    recorded the run's next wake, when it has one.
+    Each vehicle loads and compiles the run's exact graph, validates every
+    explicit node timeout against the host's finite attempt maximum, and
+    commits one fenced runtime moment at a time. Host-policy incompatibility
+    reschedules the claim with a non-poisoning backoff, reversing the claim
+    attempt increment and leaving graph-incompatibility counters unchanged.
+    Deployments should still use homogeneous limits and audit stored graphs
+    before rollout so compatible work is not needlessly delayed.
 
-    Graph compilation happens at most once per drain. The stored document is
-    already effective: it is validated against the locally installed node
-    contracts and compiled without materializing configuration defaults, so
-    defaults introduced after publication never reach a running graph. The
-    optional `:graph_cache` reuses compiled graphs across drains and remembers
-    versions this node cannot run.
+    Node attempt deadlines are enforced by the runtime dispatcher. The
+    cooperative drain budget is checked only at moment boundaries and includes
+    configured headroom below orphan-TTL crash recovery. Token/sequence fencing
+    remains the sole authority for commits after a crash or steal.
 
-    Failure boundaries:
-
-      * Deterministic pre-execution failure - the stored document does not
-        decode, validate, or compile against local node contracts, or the
-        configured heartbeat interval does not fit the lease's orphan TTL -
-        hands the claim back through `c:Docket.Storage.Runs.abandon_claim/5`
-        with a jittered future retry, and is never reported as node
-        execution failure.
-      * A lost commit fence, failed event append, heartbeat-reported claim
-        loss, or heartbeat failure discards the calculated moment, releases
-        the claim if it is still current, and stops; no checkpoint observer
-        or telemetry ever fires for a discarded moment.
-      * Everything else crashes the vehicle process and leaves the claim to
-        expire into recovery.
-
-    A claimed run that is not runnable under the lease's committed sequence
-    is an invariant violation and raises.
-
-    ## Drain budget
-
-    A continuously runnable graph is valid and would otherwise retain one
-    dispatcher slot indefinitely. The optional `:drain_budget` bounds
-    consecutive commits per drain at durable moment boundaries:
-
-        drain_budget: [max_moments: 100, max_elapsed_ms: 1_000]
-
-    `:infinity` (the default for both) disables a limit. Enabled limits must
-    be positive integers. When the proposed moment's disposition is exactly
-    `:continue` and either committing it would reach `:max_moments` for this
-    drain, or the injectable `:monotonic_clock` observes `:max_elapsed_ms`
-    expired at the pre-commit boundary, the vehicle narrows the moment with
-    `Docket.Runtime.Moment.yield(moment, :drain_budget)` and commits it as an
-    immediate park: one transaction persists the advanced run and events,
-    clears the claim, records an immediate wake, and notifies. The run stays
-    `:running` and re-enters the global eligible queue. Both limits firing
-    together produce one yield.
-
-    Budget scope and non-promises:
-
-      * Elapsed decisions come only from `:monotonic_clock` (milliseconds,
-        defaults to `System.monotonic_time/1`); the DateTime `:clock` never
-        participates, so frozen or backward wall clocks cannot affect them.
-      * The budget starts at the first moment calculation; claim fetch and
-        graph load/compile never consume it.
-      * The elapsed limit stops *starting* new supersteps once expiry is
-        observed; the in-flight superstep is never preempted and runs to its
-        commit boundary, so a single long node execution can overshoot the
-        elapsed budget without bound.
-      * Terminal, retry, timer, interrupt, external-wait, failure, and
-        cancellation dispositions always win at an exact budget boundary;
-        `max_supersteps` remains separate graph/runtime safety that
-        terminally fails the run.
-      * This bounds slot monopolization only. It promises no strict FIFO or
-        round robin, no fixed maximum queue wait, no starvation freedom
-        under sustained arrivals, and no tenant or workload fairness.
-      * Every budget yield triggers both a transactional wake notification
-        and the vehicle-exit poll; the dispatcher coalesces them, but tight
-        budgets on cyclic runs make claim/launch/notify churn the steady
-        state. Size limits deliberately.
-
-    Each completed drain emits `[:docket, :postgres, :vehicle, :drain]` with
-    measurements `%{committed_moments, elapsed_ms}` (the yield commit
-    included) and metadata `%{outcome, budget}`, where `budget` is
-    `:max_moments`, `:max_elapsed_ms`, or `:both` only when a budget yield
-    durably committed, else `nil`. No run, task, token, tenant, or graph
-    identity appears in the event.
-
-    ## Claim freshness
-
-    A drain's claim stays visible to other dispatchers through the run's
-    claimed time: `c:Docket.Storage.Runs.claim_due/3` steals any claim older
-    than its `orphan_ttl_ms`. Claim acquisition and every `:retain_claim`
-    commit refresh that time, but commits may be minutes apart when node
-    execution is long. Two freshness strategies are supported; strict
-    timeout alignment is the default.
-
-    **Strict timeout alignment** (default; no `:heartbeat` option). Nothing
-    refreshes the claim between commits, so the deployment must keep every
-    stretch of node execution between two commits shorter than the
-    dispatcher's `orphan_ttl_ms`: bound node work with per-node `timeout_ms`
-    policies under an executor that enforces them (`Docket.Executor.Task`;
-    `Docket.Executor.Local` cannot). Activations in a superstep run
-    concurrently, so the between-commit stretch is governed by the slowest
-    activation. The vehicle does not verify this alignment: per-node
-    timeouts cannot bound a superstep, so a runtime check would promise
-    freshness it cannot deliver.
-
-    **Token-guarded heartbeat** (`heartbeat: [interval_ms: 5_000]`). The
-    vehicle spawns one companion process per drain that refreshes the claim
-    through `c:Docket.Storage.Runs.refresh_claim/5` under the lease's exact
-    current token every `interval_ms` while the drain runs. Node execution
-    holds no database connection, so refreshes never contend with node work,
-    and refresh writes never move the claimed time backward. The interval
-    must fit three times into the lease's TTL (`3 * interval_ms <=
-    orphan_ttl_ms`) to leave headroom for refresh latency, scheduler delay,
-    and clock skew. A lease whose TTL is too small for the configured
-    interval - a zero TTL can never fit - is handed back through
-    `c:Docket.Storage.Runs.abandon_claim/5` with reason
-    `{:heartbeat_misaligned, details}`: a corrected deployment self-heals,
-    and a persistently misaligned fleet poisons the run after the abandon
-    budget instead of looping.
-
-    A heartbeat whose token goes stale has been stolen from; it stops
-    refreshing and tells the vehicle to stop accepting results. The vehicle
-    never preempts the in-flight superstep; it discards the calculated
-    moment at the next pre-commit boundary with `{:discarded, :claim_lost}`
-    and stops, firing no observers. If loss lands while a commit is already
-    in flight, the commit fence rejects it - the fence, not the heartbeat,
-    is the arbiter. The pre-commit freshness check is advisory throughout:
-    it exists to stop early and skip observers for doomed moments; the
-    token-and-sequence fence remains the sole arbiter of every commit, so
-    an undetected steal is still rejected durably.
-
-    A heartbeat that cannot reach the store retries every tick while the
-    lease could still be fresh; once staleness can no longer be ruled out
-    it gives up, and the vehicle stops with `{:discarded, :heartbeat_down}`,
-    which widens the at-least-once duplication window by the one discarded
-    superstep. Transient refresh failures inside that budget never disturb
-    a drain. Each refresh attempt is itself bounded by the remaining
-    staleness budget: a store call that blocks past it - pool starvation,
-    an unresponsive database - is abandoned and counted as a failure, so an
-    alive-but-stuck heartbeat can never vouch for freshness beyond the
-    bound. Keep store call timeouts finite and below the TTL so slow calls
-    surface as retryable failures rather than abandoned attempts.
-
-    ## Durable-state safety versus external-effect dedupe
-
-    A claim is a lease on commit authority, not an exactly-once execution
-    guarantee. A steal after the orphan TTL may leave two processes
-    executing the same work concurrently; the heartbeat narrows that window
-    but cannot close it. The token-and-sequence fence guarantees at most one
-    of them commits durable state - the loser's commit fails `:stale_fence`
-    and its moment is discarded. Node external effects remain at-least-once
-    around claim expiry and steal: Docket never deduplicates them and never
-    promises exactly-once effects. Integrations that need deduplication must
-    cooperate, keying on the stable task and idempotency identity in the
-    node context, which is committed run state and therefore byte-identical
-    when an uncommitted superstep re-executes.
-
-    Operational notes:
-
-      * Node execution holds no checked-out database connection; connections
-        are used only inside each commit's transaction and each heartbeat
-        refresh.
-      * Node code runs under the vehicle's dispatcher tasks; node code that
-        traps or ignores exit signals can stall a graceful shutdown until
-        the supervisor's kill timeout, and a configured heartbeat keeps the
-        claim fresh until the vehicle actually dies.
-      * Assemblies should start the vehicle `Task.Supervisor` before the
-        dispatcher and give its children a shutdown of at least the
-        dispatcher's drain timeout, so graceful drain outlives supervisor
-        shutdown ordering.
-      * Wire the dispatcher's `:launch` through `launcher/1` so malformed
-        vehicle configuration raises where the supervision tree is built.
-        Configuration this module validates raises inside the vehicle task
-        otherwise - loud, but per claim rather than at boot.
+    Legacy :heartbeat configuration is accepted as an ignored compatibility
+    no-op. Vehicles never refresh claims. Attempt timeout and retry remain
+    at-least-once boundaries: external effects and unlinked children cannot be
+    retracted, so expected long work must park or detach durably.
     """
 
     alias Docket.{Error, Lifecycle, Run}
@@ -188,6 +32,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moment_option_keys [
       :executor,
       :executor_opts,
+      :max_attempt_elapsed_ms,
       :max_supersteps,
       :context,
       :id_generator,
@@ -200,15 +45,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             | {:max_elapsed_ms, pos_integer() | :infinity}
           ]
 
-    @type heartbeat :: [{:interval_ms, pos_integer()}]
-
     @type option ::
             {:backend, {module(), Docket.Storage.ctx()}}
             | {:task_supervisor, Supervisor.supervisor()}
             | {:clock, (-> DateTime.t())}
             | {:monotonic_clock, (-> integer())}
             | {:drain_budget, drain_budget()}
-            | {:heartbeat, heartbeat()}
+            | {:heartbeat, term()}
+            | {:max_attempt_elapsed_ms, pos_integer()}
             | {:jitter, (pos_integer() -> non_neg_integer())}
             | {:abandon_backoff_ms, pos_integer()}
             | {:max_claim_abandons, pos_integer()}
@@ -228,18 +72,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Result of one drain.
 
     `{:parked, kind}` drained to a committed park. `:fence_lost` and
-    `{:discarded, reason}` stopped without commit authority - the reason is
-    `:claim_lost` when the heartbeat observed a steal, `:heartbeat_down`
-    when the heartbeat could no longer vouch for freshness, and otherwise
-    the commit's rejection. `{:abandoned, disposition, reason}` handed the
-    claim back before execution. `{:deferred, disposition}` handed back a
-    claim whose active superstep has no due attempt yet.
+    `{:discarded, reason}` stopped without commit authority.
+    `{:host_incompatible, error}` released without poisoning because this
+    host's attempt maximum cannot execute the graph. `{:abandoned, ...}` is
+    a stored-graph incompatibility; `{:deferred, ...}` has no due attempt yet.
     """
     @type outcome ::
             {:ok,
              {:parked, Docket.Runtime.Moment.park_kind()}
              | :fence_lost
              | {:discarded, term()}
+             | {:host_incompatible, Docket.Error.t()}
              | {:abandoned, :rescheduled | :poisoned | :stale, term()}
              | {:deferred, :rescheduled | :poisoned | :stale}}
 
@@ -257,7 +100,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def launcher(opts) do
       _drain_budget = drain_budget!(opts)
       _monotonic_clock = monotonic_clock!(opts)
-      _heartbeat = heartbeat!(opts)
+      _max_attempt_elapsed_ms = max_attempt_elapsed_ms!(opts)
       _task_supervisor = Keyword.fetch!(opts, :task_supervisor)
       {_backend, _context} = Keyword.fetch!(opts, :backend)
 
@@ -302,20 +145,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp do_drain(lease, opts) do
       state = build(lease, opts)
-
-      case heartbeat_misalignment(state) do
-        nil ->
-          state = arm_heartbeat(state)
-
-          try do
-            drain_claimed(state)
-          after
-            disarm_heartbeat(state)
-          end
-
-        details ->
-          finish(state, nil, nil, abandon(state, {:heartbeat_misaligned, details}))
-      end
+      drain_claimed(state)
     end
 
     defp drain_result({:ok, {:parked, kind}}), do: kind
@@ -345,6 +175,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
             {:incompatible, reason} ->
               finish(state, nil, nil, abandon(state, reason))
+
+            {:host_incompatible, error} ->
+              finish(state, nil, nil, host_incompatible(state, error))
           end
 
         :fence_lost ->
@@ -364,8 +197,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         clock: Keyword.get(opts, :clock, &DateTime.utc_now/0),
         monotonic_clock: monotonic_clock!(opts),
         drain_budget: drain_budget!(opts),
-        heartbeat_config: heartbeat!(opts),
-        heartbeat: nil,
+        max_attempt_elapsed_ms: max_attempt_elapsed_ms!(opts),
         jitter: Keyword.get(opts, :jitter, &:rand.uniform/1),
         abandon_backoff_ms: Keyword.get(opts, :abandon_backoff_ms, @default_abandon_backoff_ms),
         max_claim_abandons: Keyword.get(opts, :max_claim_abandons, @default_max_claim_abandons),
@@ -412,7 +244,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp runtime_graph(state) do
       case cache_fetch(state) do
-        {:ok, rtg} -> {:ok, rtg}
+        {:ok, rtg} -> validate_execution_policy(state, rtg)
         {:incompatible, reason} -> {:incompatible, reason}
         :miss -> fetch_and_compile(state)
       end
@@ -451,8 +283,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       case result do
         {:ok, rtg} ->
           if rtg.graph_id == lease.graph_id and rtg.graph_hash == lease.graph_hash do
-            cache_put_compiled(state, rtg)
-            {:ok, rtg}
+            case validate_execution_policy(state, rtg) do
+              {:ok, rtg} = ok ->
+                cache_put_compiled(state, rtg)
+                ok
+
+              host_incompatible ->
+                host_incompatible
+            end
           else
             incompatible(state, graph, :effective_identity_mismatch)
           end
@@ -465,6 +303,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp incompatible(state, source, reason) do
       cache_put_incompatible(state, source, reason)
       {:incompatible, reason}
+    end
+
+    defp validate_execution_policy(state, rtg) do
+      case Docket.Runtime.ExecutionPolicy.validate_graph(rtg, state.max_attempt_elapsed_ms) do
+        :ok -> {:ok, rtg}
+        {:error, error} -> {:host_incompatible, error}
+      end
     end
 
     # ---------------------------------------------------------------------
@@ -499,20 +344,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp commit(state, rtg, run, moment, budget) do
-      case heartbeat_status(state) do
-        :fresh ->
-          fresh_commit(state, rtg, run, moment, budget)
-
-        reason ->
-          if reason == :claim_lost,
-            do: emit_fence_loss(:heartbeat, reason),
-            else: emit_discard(:heartbeat, reason)
-
-          finish(state, budget, nil, release(state, {:discarded, reason}))
-      end
-    end
-
-    defp fresh_commit(state, rtg, run, moment, budget) do
       {moment, fired} = maybe_yield(state, budget, moment)
 
       case Lifecycle.commit_moment(
@@ -622,6 +453,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp outcome_kind({:discarded, _reason}), do: :discarded
     defp outcome_kind({:abandoned, _disposition, _reason}), do: :abandoned
     defp outcome_kind({:deferred, _disposition}), do: :deferred
+    defp outcome_kind({:host_incompatible, _error}), do: :host_incompatible
 
     defp claim_held_ms(%{lease: %{claimed_at: claimed_at}, clock: clock}) do
       max(DateTime.diff(clock.(), claimed_at, :millisecond), 0)
@@ -636,12 +468,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp emit_discard(stage, reason) do
-      result = if reason == :heartbeat_down, do: :heartbeat_down, else: :error
-
       :telemetry.execute(
         [:docket, :postgres, :vehicle, :discard],
         %{count: 1},
-        %{stage: stage, result: result}
+        %{stage: stage, result: reason}
       )
     end
 
@@ -701,215 +531,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    @doc false
-    @spec heartbeat!([option()]) :: %{interval_ms: pos_integer()} | nil
-    def heartbeat!(opts) do
-      case Keyword.get(opts, :heartbeat) do
-        nil ->
-          nil
-
-        config ->
-          unless Keyword.keyword?(config) do
-            raise ArgumentError, ":heartbeat must be a keyword list, got: #{inspect(config)}"
-          end
-
-          case Keyword.keys(config) -- [:interval_ms] do
-            [] -> :ok
-            unknown -> raise ArgumentError, ":heartbeat has unknown keys: #{inspect(unknown)}"
-          end
-
-          case Keyword.get(config, :interval_ms) do
-            interval when is_integer(interval) and interval > 0 ->
-              %{interval_ms: interval}
-
-            other ->
-              raise ArgumentError,
-                    ":heartbeat interval_ms must be a positive integer, got: #{inspect(other)}"
-          end
+    defp max_attempt_elapsed_ms!(opts) do
+      case Keyword.get(opts, :max_attempt_elapsed_ms, 2_000) do
+        value when is_integer(value) and value > 0 -> value
+        _ -> raise ArgumentError, ":max_attempt_elapsed_ms must be a positive finite integer"
       end
-    end
-
-    # ---------------------------------------------------------------------
-    # Heartbeat
-    # ---------------------------------------------------------------------
-
-    # The one-word :atomics flag is the loss channel: 0 = fresh, 1 = the
-    # token went stale, 2 = freshness can no longer be vouched for. The
-    # vehicle's mailbox carries executor coordination traffic and is not a
-    # safe channel, so no monitor message is load-bearing on the vehicle
-    # side; the flag is always written before its writer exits.
-    @heartbeat_fresh 0
-    @heartbeat_claim_lost 1
-    @heartbeat_down 2
-
-    defp heartbeat_misalignment(%{heartbeat_config: nil}), do: nil
-
-    defp heartbeat_misalignment(%{heartbeat_config: %{interval_ms: interval}, lease: lease}) do
-      ttl =
-        case lease do
-          %{orphan_ttl_ms: ttl} when is_integer(ttl) and ttl >= 0 ->
-            ttl
-
-          _missing ->
-            raise ArgumentError,
-                  "heartbeat mode requires a lease with :orphan_ttl_ms, got: #{inspect(Map.keys(lease))}"
-        end
-
-      if 3 * interval <= ttl do
-        nil
-      else
-        %{interval_ms: interval, orphan_ttl_ms: ttl}
-      end
-    end
-
-    defp arm_heartbeat(%{heartbeat_config: nil} = state), do: state
-
-    defp arm_heartbeat(%{heartbeat_config: %{interval_ms: interval}, lease: lease} = state) do
-      flag = :atomics.new(1, [])
-      vehicle = self()
-
-      pid =
-        spawn(fn ->
-          heartbeat_loop(%{
-            vehicle_ref: Process.monitor(vehicle),
-            flag: flag,
-            interval_ms: interval,
-            orphan_ttl_ms: lease.orphan_ttl_ms,
-            runs: state.runs,
-            context: state.context,
-            run_id: lease.run_id,
-            claim_token: lease.claim_token,
-            clock: state.clock,
-            monotonic_clock: state.monotonic_clock,
-            # Arm time, slightly after the claim stamp; the 3x alignment
-            # margin absorbs the launch delay.
-            last_ok: state.monotonic_clock.()
-          })
-        end)
-
-      %{state | heartbeat: %{pid: pid, flag: flag}}
-    end
-
-    defp disarm_heartbeat(%{heartbeat: nil}), do: :ok
-
-    defp disarm_heartbeat(%{heartbeat: %{pid: pid}}) do
-      Process.exit(pid, :kill)
-      :ok
-    end
-
-    defp heartbeat_status(%{heartbeat: nil}), do: :fresh
-
-    defp heartbeat_status(%{heartbeat: %{pid: pid, flag: flag}}) do
-      case :atomics.get(flag, 1) do
-        @heartbeat_fresh ->
-          if Process.alive?(pid), do: :fresh, else: dead_heartbeat_status(flag)
-
-        @heartbeat_claim_lost ->
-          :claim_lost
-
-        @heartbeat_down ->
-          :heartbeat_down
-      end
-    end
-
-    # The flag write happens before the heartbeat exits, so once the process
-    # is observed dead a second read is authoritative; a fresh flag then
-    # means the heartbeat died without ever reporting.
-    defp dead_heartbeat_status(flag) do
-      case :atomics.get(flag, 1) do
-        @heartbeat_claim_lost -> :claim_lost
-        _fresh_or_down -> :heartbeat_down
-      end
-    end
-
-    defp heartbeat_loop(hb) do
-      vehicle_ref = hb.vehicle_ref
-
-      receive do
-        {:DOWN, ^vehicle_ref, :process, _vehicle, _reason} -> :ok
-      after
-        hb.interval_ms -> heartbeat_refresh(hb)
-      end
-    end
-
-    # A stale token is authoritative loss. Anything else is a transient
-    # store failure: retry every tick while the next attempt could still
-    # land inside the lease's staleness bound, then give up loudly.
-    defp heartbeat_refresh(hb) do
-      case attempt_refresh(hb, staleness_remaining(hb)) do
-        :ok ->
-          heartbeat_loop(%{hb | last_ok: hb.monotonic_clock.()})
-
-        :halt ->
-          :ok
-
-        {:error, :claim_lost} ->
-          # The refresh worker wrote the flag before it exited.
-          :ok
-
-        {:error, _transient} ->
-          if hb.monotonic_clock.() + hb.interval_ms - hb.last_ok < hb.orphan_ttl_ms do
-            heartbeat_loop(hb)
-          else
-            # Never overwrite an already-recorded claim loss.
-            :atomics.compare_exchange(hb.flag, 1, @heartbeat_fresh, @heartbeat_down)
-            :ok
-          end
-      end
-    end
-
-    defp staleness_remaining(hb) do
-      max(hb.orphan_ttl_ms - (hb.monotonic_clock.() - hb.last_ok), 0)
-    end
-
-    # One refresh attempt, bounded by the remaining staleness budget. The
-    # store call runs in a monitored worker so a call that blocks - pool
-    # starvation, an unresponsive database - cannot leave an alive-but-stuck
-    # heartbeat vouching for freshness past the bound; at the bound the
-    # worker is killed and the attempt counts as a failure. The worker
-    # itself records a stale token before it exits, so observing its death
-    # implies the flag is visible.
-    defp attempt_refresh(hb, budget_ms) do
-      flag = hb.flag
-      vehicle_ref = hb.vehicle_ref
-
-      {pid, ref} =
-        spawn_monitor(fn ->
-          result = store_refresh(hb)
-
-          if result == {:error, :claim_lost} do
-            :atomics.put(flag, 1, @heartbeat_claim_lost)
-          end
-
-          exit({:refresh_result, result})
-        end)
-
-      receive do
-        {:DOWN, ^ref, :process, ^pid, {:refresh_result, result}} ->
-          result
-
-        {:DOWN, ^ref, :process, ^pid, reason} ->
-          {:error, reason}
-
-        {:DOWN, ^vehicle_ref, :process, _vehicle, _reason} ->
-          Process.exit(pid, :kill)
-          Process.demonitor(ref, [:flush])
-          :halt
-      after
-        budget_ms ->
-          Process.exit(pid, :kill)
-          Process.demonitor(ref, [:flush])
-          {:error, :refresh_timeout}
-      end
-    end
-
-    defp store_refresh(hb) do
-      hb.runs.refresh_claim(hb.context, :system, hb.run_id, hb.claim_token, hb.clock.())
-    rescue
-      error -> {:error, error}
-    catch
-      :exit, reason -> {:error, reason}
-      :throw, value -> {:error, {:throw, value}}
     end
 
     # ---------------------------------------------------------------------
@@ -922,6 +548,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       {:ok,
        {:abandoned, hand_back(state, now, DateTime.add(now, backoff_ms, :millisecond)), reason}}
+    end
+
+    defp host_incompatible(state, error) do
+      now = state.clock.()
+      retry_at = DateTime.add(now, state.abandon_backoff_ms, :millisecond)
+
+      {:ok, :rescheduled} =
+        state.runs.abandon_claim(
+          state.context,
+          :system,
+          state.lease.run_id,
+          state.lease.claim_token,
+          %{
+            expected_checkpoint_seq: state.lease.checkpoint_seq,
+            now: now,
+            retry_at: retry_at,
+            max_claim_abandons: state.max_claim_abandons,
+            non_poisoning: true
+          }
+        )
+
+      {:ok, {:host_incompatible, error}}
     end
 
     defp defer(state, park) do

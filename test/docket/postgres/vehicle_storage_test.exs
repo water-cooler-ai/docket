@@ -143,44 +143,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert done.status == :done
     end
 
-    test "heartbeat refreshes the claim from a companion process while node work blocks", %{
-      context: context,
-      backend: backend
-    } do
-      rtg = publish!(context, Graphs.blocking())
-      run = start_run!(backend, rtg, %{})
-      lease = claim!(context, DateTime.utc_now())
-      supervisor = start_supervised!({Task.Supervisor, name: __MODULE__.HeartbeatSup})
-      Process.register(self(), :storage_heartbeat_relay)
-
-      opts =
-        [backend: {RelayBackend, context}, graph_cache: false]
-        |> Keyword.merge(
-          context: %{coordinator: self()},
-          task_supervisor: supervisor,
-          heartbeat: [interval_ms: 50]
-        )
-
-      assert {:ok, vehicle} = Vehicle.launch(lease, opts)
-      monitor = Process.monitor(vehicle)
-
-      assert_receive {:blocked, node_pid, "blocker", 1}, 5_000
-
-      # Pool size is 1 and node work holds no connection, so the companion
-      # heartbeat's refresh gets the pool to itself while the node blocks.
-      assert_receive {:refreshed, :ok}, 5_000
-      assert_receive {:refreshed, :ok}, 5_000
-
-      assert {:ok, info} = RunStore.inspect_run(context, :system, run.id)
-      assert DateTime.compare(info.claimed_at, lease.claimed_at) == :gt
-
-      send(node_pid, :release)
-      assert_receive {:DOWN, ^monitor, :process, ^vehicle, :normal}, 5_000
-
-      assert {:ok, done} = RunStore.fetch_run(context, :system, run.id)
-      assert done.status == :done
-    end
-
     test "killed vehicle leaves the claim; recovery resumes from the last committed moment", %{
       context: context,
       backend: backend
