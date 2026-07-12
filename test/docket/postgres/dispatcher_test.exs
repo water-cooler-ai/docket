@@ -96,6 +96,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert length(policies(agent)) == 2
     end
 
+    @tag capture_log: true
     test "telemetry exposes active, pending, completed, and worker-failure poll transitions", %{
       agent: agent
     } do
@@ -110,8 +111,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :telemetry.attach_many(
         handler,
         events,
-        fn name, measurements, metadata, _ -> send(parent, {name, measurements, metadata}) end,
-        nil
+        &Docket.Test.TelemetryRelay.raw/4,
+        parent
       )
 
       on_exit(fn -> :telemetry.detach(handler) end)

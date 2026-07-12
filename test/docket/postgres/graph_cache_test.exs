@@ -32,10 +32,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :telemetry.attach(
         id,
         event,
-        fn name, measurements, metadata, _ ->
-          send(parent, {name, measurements, metadata})
-        end,
-        nil
+        &Docket.Test.TelemetryRelay.raw/4,
+        parent
       )
 
       on_exit(fn -> :telemetry.detach(id) end)

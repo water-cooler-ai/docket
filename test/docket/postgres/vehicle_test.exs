@@ -598,16 +598,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       defp watch_drains do
         handler_id = "vehicle-drain-#{System.unique_integer([:positive])}"
-        parent = self()
 
         :ok =
           :telemetry.attach(
             handler_id,
             @drain_event,
-            fn _event, measurements, metadata, _config ->
-              send(parent, {:drain, measurements, metadata})
-            end,
-            nil
+            &Docket.Test.TelemetryRelay.tagged/4,
+            {self(), :drain}
           )
 
         on_exit(fn -> :telemetry.detach(handler_id) end)
@@ -1219,6 +1216,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
       end
 
+      @tag capture_log: true
       test "a drain that raises still stops its heartbeat", %{
         backend_ref: backend_ref,
         context: context

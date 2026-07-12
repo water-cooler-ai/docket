@@ -898,6 +898,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       expired_candidates: 0,
       ready_selected: 0,
       expired_selected: 0,
+      steals: 0,
       ready_oldest_age_ms: 0,
       expired_oldest_age_ms: 0
     }
@@ -932,8 +933,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               orphan_ttl_ms: orphan_ttl_ms
             }
 
-            {{[lease | leases], poisoned},
-             observe_outcome(stats, class, eligible_at, ready_candidates, expired_candidates, now)}
+            stats =
+              stats
+              |> observe_outcome(class, eligible_at, ready_candidates, expired_candidates, now)
+              |> observe_steal(class)
+
+            {{[lease | leases], poisoned}, stats}
 
           [
             run_id,
@@ -990,6 +995,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    defp observe_steal(stats, "expired"), do: %{stats | steals: stats.steals + 1}
+    defp observe_steal(stats, _class), do: stats
+
     defp emit_claim_telemetry({batch, stats}, demand, preference, started) do
       fallback? =
         demand == 1 and preference != nil and
@@ -1003,7 +1011,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           demand: demand,
           leases: length(batch.leases),
           poisoned: length(batch.poisoned),
-          steals: stats.expired_selected,
           claim_attempts: Enum.sum(Enum.map(batch.leases, & &1.claim_attempt))
         }),
         %{preference: preference, fallback: fallback?, result: :ok}

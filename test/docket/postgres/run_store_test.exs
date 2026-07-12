@@ -716,10 +716,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         :telemetry.attach(
           handler_id,
           [:docket, :postgres, :run_store, :claim],
-          fn _event, measurements, metadata, _config ->
-            send(parent, {:claim_telemetry, measurements, metadata})
-          end,
-          nil
+          &Docket.Test.TelemetryRelay.tagged/4,
+          {parent, :claim_telemetry}
         )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
@@ -732,18 +730,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         claimed_at: DateTime.add(@now, -30, :second)
       )
 
-      assert {:ok, %{leases: [_, _]}} = claim_due(@now, limit: 2)
+      insert_run!("expired-poison",
+        wake_at: nil,
+        claim_token: Ecto.UUID.generate(),
+        claimed_at: DateTime.add(@now, -40, :second),
+        claim_attempts: 3
+      )
+
+      assert {:ok, %{leases: [_, _], poisoned: [_]}} = claim_due(@now, limit: 3)
 
       assert_receive {:claim_telemetry, measurements, metadata}
-      assert measurements.demand == 2
+      assert measurements.demand == 3
       assert measurements.leases == 2
-      assert measurements.poisoned == 0
+      assert measurements.poisoned == 1
       assert measurements.ready_candidates == 1
-      assert measurements.expired_candidates == 1
+      assert measurements.expired_candidates == 2
       assert measurements.ready_selected == 1
-      assert measurements.expired_selected == 1
+      assert measurements.expired_selected == 2
+      assert measurements.steals == 1
       assert measurements.ready_oldest_age_ms == 20_000
-      assert measurements.expired_oldest_age_ms == 30_000
+      assert measurements.expired_oldest_age_ms == 40_000
       assert metadata == %{preference: nil, fallback: false, result: :ok}
 
       # Preferred-but-empty class reports the fallthrough.
@@ -835,8 +841,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :telemetry.attach(
         handler,
         [:docket, :postgres, :claim, :operation],
-        fn name, measurements, metadata, _ -> send(parent, {name, measurements, metadata}) end,
-        nil
+        &Docket.Test.TelemetryRelay.raw/4,
+        parent
       )
 
       on_exit(fn -> :telemetry.detach(handler) end)

@@ -373,10 +373,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             [:docket, :checkpoint, :committed],
             [:docket, :lifecycle, :transaction, :stop]
           ],
-          fn name, measurements, metadata, pid ->
-            send(pid, {:committed_telemetry, name, measurements, metadata})
-          end,
-          self()
+          &Docket.Test.TelemetryRelay.tagged_event/4,
+          {self(), :committed_telemetry}
         )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)

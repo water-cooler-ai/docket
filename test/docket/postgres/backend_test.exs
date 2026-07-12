@@ -5,6 +5,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     import Ecto.Query
 
     @moduletag :postgres
+    @moduletag capture_log: true
 
     alias Docket.Postgres.BackendTestRepo, as: TestRepo
     alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}

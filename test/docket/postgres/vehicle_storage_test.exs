@@ -669,13 +669,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         :telemetry.attach(
           handler,
           [:docket, :postgres, :vehicle_storage_test_repo, :query],
-          fn _event, _measurements, metadata, _config ->
-            Agent.update(
-              __MODULE__.QueryCounter,
-              &Map.update(&1, metadata.query, 1, fn count -> count + 1 end)
-            )
-          end,
-          nil
+          &Docket.Test.TelemetryRelay.count_query/4,
+          __MODULE__.QueryCounter
         )
 
       handler

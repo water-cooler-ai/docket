@@ -30,8 +30,8 @@ defmodule Docket.TelemetryTest do
         [:docket, :store, :operation, :start],
         [:docket, :store, :operation, :stop]
       ],
-      fn name, measurements, metadata, _ -> send(parent, {name, measurements, metadata}) end,
-      nil
+      &Docket.Test.TelemetryRelay.raw/4,
+      parent
     )
 
     on_exit(fn -> :telemetry.detach(id) end)
@@ -69,7 +69,7 @@ defmodule Docket.TelemetryTest do
     parent = self()
     id = "bounded-exception-#{System.unique_integer([:positive])}"
     name = [:docket, :store, :operation, :exception]
-    :telemetry.attach(id, name, fn n, m, md, _ -> send(parent, {n, m, md}) end, nil)
+    :telemetry.attach(id, name, &Docket.Test.TelemetryRelay.raw/4, parent)
     on_exit(fn -> :telemetry.detach(id) end)
 
     assert_raise RuntimeError, "secret token 123", fn ->
@@ -105,10 +105,8 @@ defmodule Docket.TelemetryTest do
     :telemetry.attach_many(
       handler_id,
       @events,
-      fn name, measurements, metadata, _config ->
-        send(parent, {:telemetry, name, measurements, metadata})
-      end,
-      nil
+      &Docket.Test.TelemetryRelay.event/4,
+      parent
     )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
