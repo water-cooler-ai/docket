@@ -19,6 +19,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @migration_version 20_260_711_000_038
     @runtime Docket.Benchmark.Runtime
+    @minimum_runtime_ready_lead_ms 250
     @pruner [
       interval_ms: 86_400_000,
       event_retention_ms: 86_400_000,
@@ -67,6 +68,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp failure_artifact(config, reason) do
+      {reason, cleanup, failure_stage} =
+        case reason do
+          %{message: message, cleanup: cleanup, stage: stage} -> {message, cleanup, stage}
+          other -> {other, %{isolated_database_removed: nil}, "setup_or_execution"}
+        end
+
       %{
         schema_version: 3,
         classification: "exploratory",
@@ -89,8 +96,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         workload: nil,
         runtime_configuration: nil,
         environment: nil,
-        cleanup: %{isolated_database_removed: nil},
-        failure_stage: "setup_or_execution",
+        cleanup: cleanup,
+        failure_stage: failure_stage,
         error: if(is_binary(reason), do: reason, else: inspect(reason))
       }
     end
@@ -135,10 +142,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp run_created_database(config, database, primary) do
       execution =
         try do
-          {:ok, repo} = Repo.start_link()
+          {:ok, migration_repo} = Repo.start_link(pool_size: max(config.pool_size, 2))
 
           try do
             :ok = Ecto.Migrator.up(Repo, @migration_version, Migration, log: false)
+          after
+            if Process.alive?(migration_repo),
+              do: GenServer.stop(migration_repo, :normal, 5_000)
+          end
+
+          {:ok, repo} = Repo.start_link()
+
+          try do
             execute(config, database, repo)
           after
             if Process.alive?(repo), do: GenServer.stop(repo, :normal, 5_000)
@@ -171,16 +186,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
        |> Map.update!(:invariants, &(&1 ++ [cleanup_invariant]))}
     end
 
-    defp merge_database_cleanup({:error, reason}, :ok), do: {:error, reason}
+    defp merge_database_cleanup({:error, reason}, :ok) do
+      {:error,
+       %{
+         message: reason,
+         cleanup: %{isolated_database_removed: true},
+         stage: "setup_or_execution"
+       }}
+    end
 
-    defp merge_database_cleanup({:error, reason}, {:error, cleanup_reason}),
-      do: {:error, "#{reason}; isolated database cleanup also failed: #{cleanup_reason}"}
+    defp merge_database_cleanup({:error, reason}, {:error, cleanup_reason}) do
+      {:error,
+       %{
+         message: "#{reason}; isolated database cleanup also failed: #{cleanup_reason}",
+         cleanup: %{isolated_database_removed: false, error: cleanup_reason},
+         stage: "setup_execution_and_cleanup"
+       }}
+    end
 
     defp restore_repo_config({:ok, config}), do: Application.put_env(:docket, Repo, config)
     defp restore_repo_config(:error), do: Application.delete_env(:docket, Repo)
 
     defp execute(%{scenario: "claim_only"} = config, database, repo),
       do: execute_claim_only(config, database, repo)
+
+    defp execute(%{scenario: "blocked_vehicles"} = config, database, repo),
+      do: execute_blocked_vehicles(config, database, repo)
 
     defp execute(config, database, repo), do: execute_empty_one_step(config, database, repo)
 
@@ -220,6 +251,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       started_at = activation_at
 
       try do
+        runtime_ready_lead_us =
+          ensure_activation_lead!(t0, @minimum_runtime_ready_lead_ms)
+
         sleep_until(t0)
         wait_for_completion(collector, config.runs, config.timeout_ms)
         duration_native = System.monotonic_time() - t0
@@ -275,6 +309,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             max_claim_attempts: 5,
             drain_budget: %{max_moments: 100, max_elapsed_ms: 1_000},
             heartbeat: "disabled",
+            staged_activation_target_lead_ms: 500,
+            minimum_runtime_ready_lead_ms: @minimum_runtime_ready_lead_ms,
+            observed_runtime_ready_lead_us: runtime_ready_lead_us,
             dispatcher_concurrency: config.concurrency,
             repo_pool_size: config.pool_size,
             node_count: config.nodes
@@ -294,6 +331,201 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           Docket.Benchmark.Collector.stop(collector)
         end
 
+        Docket.Postgres.GraphCache.clear()
+      end
+    end
+
+    defp execute_blocked_vehicles(config, _database, _repo) do
+      manual_opts = runtime_opts(config, testing: :manual)
+
+      run_ids =
+        with_manual_runtime(manual_opts, fn ->
+          {:ok, ref} = Docket.save_graph(@runtime, blocked_graph())
+          seed_runs(ref, config.runs)
+        end)
+
+      Docket.Postgres.GraphCache.clear()
+      initial_event_rows = scalar("SELECT count(*) FROM docket_events")
+
+      initial_checkpoint_sum =
+        scalar("SELECT coalesce(sum(checkpoint_seq), 0)::bigint FROM docket_runs")
+
+      {activation_at, t0, physical_before} = prepare_measured_activation(1_000)
+
+      gate =
+        Docket.Benchmark.BlockingGate.start(
+          owner: self(),
+          allowed_run_ids: run_ids,
+          target: config.concurrency
+        )
+
+      collector = Docket.Benchmark.Collector.start(run_ids)
+
+      try do
+        sampler =
+          Docket.Benchmark.Sampler.start(
+            start_at: t0,
+            interval_ms: config.sample_interval_ms,
+            max_buckets: config.max_samples,
+            sample: fn gauges -> blocked_system_sample(config, gate, gauges, t0) end
+          )
+
+        try do
+          runtime_opts =
+            runtime_opts(config,
+              context: %{blocking_benchmark: %{gate: gate.pid, token: gate.token}},
+              executor: Docket.Executor.Task
+            )
+
+          runtime = start_runtime!(runtime_opts, collector)
+
+          try do
+            runtime_ready_lead_us =
+              ensure_activation_lead!(t0, @minimum_runtime_ready_lead_ms)
+
+            sleep_until(t0)
+            plateau_at = wait_for_blocking_plateau(gate, config.concurrency, config.timeout_ms)
+            topology = wait_for_blocked_topology(gate, config.concurrency, config.timeout_ms)
+
+            plateau =
+              blocked_plateau_snapshot(
+                config,
+                collector,
+                topology,
+                initial_event_rows,
+                initial_checkpoint_sum
+              )
+
+            stable_hold_started_at = System.monotonic_time()
+            stable_start_sample = Docket.Benchmark.Sampler.force_sample(sampler)
+            probes = run_short_work_probes(config)
+
+            sleep_until_strict(
+              stable_hold_started_at +
+                System.convert_time_unit(config.hold_ms, :millisecond, :native)
+            )
+
+            pre_release_sample = Docket.Benchmark.Sampler.force_sample(sampler)
+            maximum_claim_age_ms_at_release = benchmark_maximum_claim_age_ms()
+            release = Docket.Benchmark.BlockingGate.open(gate)
+            wait_for_completion(collector, config.runs, config.timeout_ms)
+            wait_for_vehicle_quiescence(collector, sampler, config.runs, config.timeout_ms)
+            quiescence_at = System.monotonic_time()
+            control_duration = quiescence_at - t0
+            timeline = Docket.Benchmark.Sampler.stop(sampler)
+            finished_at = DateTime.utc_now()
+            Supervisor.stop(runtime, :normal, 5_000)
+            collector_stats = Docket.Benchmark.Collector.stats(collector)
+            events = Docket.Benchmark.Collector.stop(collector)
+            physical_after = physical_snapshot()
+            gate_final = Docket.Benchmark.BlockingGate.snapshot(gate)
+
+            measurements =
+              measurements(
+                events,
+                t0,
+                control_duration,
+                config,
+                physical_before,
+                physical_after,
+                collector_stats
+              )
+
+            blocked =
+              blocked_measurements(
+                events,
+                t0,
+                plateau_at,
+                stable_hold_started_at,
+                release,
+                run_ids,
+                probes,
+                plateau,
+                gate_final,
+                timeline,
+                %{
+                  stable_start: stable_start_sample,
+                  pre_release: pre_release_sample
+                },
+                maximum_claim_age_ms_at_release,
+                quiescence_at,
+                config
+              )
+
+            measurements = Map.put(measurements, :blocked_vehicles, blocked)
+
+            invariants =
+              invariants(config) ++
+                blocked_invariants(config, plateau, gate_final, blocked, measurements)
+
+            passed =
+              Enum.all?(invariants, & &1.pass) and
+                measurements.collection.complete_sample_set and
+                blocked.collection.complete_sample_set
+
+            {:ok,
+             %{
+               schema_version: 3,
+               classification: "exploratory",
+               success: passed,
+               scenario: "blocked_vehicles",
+               point: %{
+                 concurrency: config.concurrency,
+                 pool_size: config.pool_size,
+                 repetition: config.repetition
+               },
+               parameters: artifact_parameters(config),
+               started_at: DateTime.to_iso8601(activation_at),
+               finished_at: DateTime.to_iso8601(finished_at),
+               timing_scope:
+                 "common-due-time burst, saturated blocked-vehicle plateau, gate release, and terminal commit",
+               warmup: %{
+                 requested_runs: 0,
+                 completed_runs: 0,
+                 graph_cache_state: "cold"
+               },
+               workload: %{
+                 backlog: config.runs,
+                 blocked_plateau_target: config.concurrency,
+                 stable_hold_ms: config.hold_ms,
+                 short_work_probe_count: config.probe_count,
+                 post_release_gate: "open_for_remaining_backlog",
+                 graph_shape: %{nodes: 1, edges: 2, kind: "blocking_one_step"},
+                 input_state_bytes: 0,
+                 event_policy: config.event_policy,
+                 initial_graph_cache_state: "cold"
+               },
+               runtime_configuration: %{
+                 notifier: "poll_only",
+                 poll_interval_ms: config.poll_interval_ms,
+                 orphan_ttl_ms: config.orphan_ttl_ms,
+                 max_claim_attempts: 5,
+                 drain_budget: %{max_moments: 100, max_elapsed_ms: 1_000},
+                 heartbeat: "disabled",
+                 node_executor: "Docket.Executor.Task",
+                 staged_activation_target_lead_ms: 1_000,
+                 minimum_runtime_ready_lead_ms: @minimum_runtime_ready_lead_ms,
+                 observed_runtime_ready_lead_us: runtime_ready_lead_us,
+                 dispatcher_concurrency: config.concurrency,
+                 repo_pool_size: config.pool_size,
+                 node_count: config.nodes
+               },
+               duration_us: measurements.burst_duration_us,
+               measurements: measurements,
+               environment: environment(config),
+               invariants: invariants,
+               warnings: blocked_warnings(config)
+             }}
+          after
+            _release = Docket.Benchmark.BlockingGate.open(gate)
+            if Process.alive?(runtime), do: Supervisor.stop(runtime, :normal, 5_000)
+          end
+        after
+          cleanup_sampler(sampler)
+        end
+      after
+        cleanup_collector(collector)
+        Docket.Benchmark.BlockingGate.stop(gate)
         Docket.Postgres.GraphCache.clear()
       end
     end
@@ -488,6 +720,551 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    defp wait_for_blocking_plateau(%{pid: gate}, expected, timeout_ms) do
+      receive do
+        {:docket_benchmark_blocking_plateau, ^gate, ^expected, observed_at} -> observed_at
+      after
+        timeout_ms -> raise "blocked-vehicle benchmark timed out before reaching its plateau"
+      end
+    end
+
+    defp wait_for_blocked_topology(gate, expected, timeout_ms) do
+      deadline = System.monotonic_time(:millisecond) + timeout_ms
+      do_wait_for_blocked_topology(gate, expected, deadline)
+    end
+
+    defp do_wait_for_blocked_topology(gate, expected, deadline) do
+      blocked = Docket.Benchmark.BlockingGate.blocked_pids(gate) |> MapSet.new()
+      children = Task.Supervisor.children(vehicle_supervisor_name()) |> MapSet.new()
+      vehicles = MapSet.difference(children, blocked)
+
+      snapshot = %{
+        blocked_node_processes: MapSet.size(blocked),
+        vehicle_processes: MapSet.size(vehicles),
+        supervised_dynamic_children: MapSet.size(children)
+      }
+
+      cond do
+        snapshot.blocked_node_processes == expected and snapshot.vehicle_processes == expected ->
+          snapshot
+
+        System.monotonic_time(:millisecond) >= deadline ->
+          raise "blocked-vehicle benchmark topology did not stabilize: #{inspect(snapshot)}"
+
+        true ->
+          Process.sleep(1)
+          do_wait_for_blocked_topology(gate, expected, deadline)
+      end
+    end
+
+    defp blocked_plateau_snapshot(
+           config,
+           collector,
+           topology,
+           initial_event_rows,
+           initial_checkpoint_sum
+         ) do
+      %{
+        active_claims:
+          benchmark_scalar("SELECT count(*) FROM docket_runs WHERE claim_token IS NOT NULL"),
+        distinct_active_claim_tokens:
+          benchmark_scalar(
+            "SELECT count(DISTINCT claim_token) FROM docket_runs WHERE claim_token IS NOT NULL"
+          ),
+        ready_unclaimed_runs:
+          benchmark_scalar(
+            "SELECT count(*) FROM docket_runs WHERE status = 'running' AND claim_token IS NULL AND wake_at IS NOT NULL"
+          ),
+        summed_claim_attempts:
+          benchmark_scalar("SELECT coalesce(sum(claim_attempts), 0)::bigint FROM docket_runs"),
+        maximum_claim_attempt:
+          benchmark_scalar("SELECT coalesce(max(claim_attempts), 0) FROM docket_runs"),
+        maximum_claim_age_ms: benchmark_maximum_claim_age_ms(),
+        poisoned_runs:
+          benchmark_scalar("SELECT count(*) FROM docket_runs WHERE poisoned_at IS NOT NULL"),
+        durable_event_rows: benchmark_scalar("SELECT count(*) FROM docket_events"),
+        expected_initial_event_rows: initial_event_rows,
+        checkpoint_sequence_sum:
+          benchmark_scalar("SELECT coalesce(sum(checkpoint_seq), 0)::bigint FROM docket_runs"),
+        expected_initial_checkpoint_sequence_sum: initial_checkpoint_sum,
+        correlated_terminal_commits:
+          Docket.Benchmark.Collector.count(
+            collector,
+            [:docket, :checkpoint, :committed],
+            %{checkpoint_type: "run_completed"}
+          ),
+        correlated_completion_events:
+          Docket.Benchmark.Collector.count(collector, [:docket, :run, :completed]),
+        repo_pool: repo_pool_snapshot(config),
+        topology: topology
+      }
+    end
+
+    defp run_short_work_probes(config) do
+      Enum.map(1..config.probe_count, fn _probe ->
+        before = repo_pool_snapshot(config)
+        started = System.monotonic_time()
+
+        %{rows: [[1]]} =
+          Ecto.Adapters.SQL.query!(Repo, "SELECT 1", [],
+            telemetry_options: [benchmark_query: :probe]
+          )
+
+        duration = System.monotonic_time() - started
+        after_snapshot = repo_pool_snapshot(config)
+
+        %{
+          success: true,
+          duration: duration,
+          busy_or_unavailable_before: before.busy_or_unavailable_connections,
+          queue_before: before.checkout_queue_length,
+          busy_or_unavailable_after: after_snapshot.busy_or_unavailable_connections,
+          queue_after: after_snapshot.checkout_queue_length
+        }
+      end)
+    end
+
+    defp blocked_system_sample(config, gate, event_gauges, activation_at) do
+      gate_gauges = Docket.Benchmark.BlockingGate.gauges(gate)
+      pool = repo_pool_snapshot(config)
+      memory = :erlang.memory()
+      scheduler_queues = :erlang.statistics(:run_queue_lengths)
+      unclaimed = max(config.runs - event_gauges.cumulative_claim_leases, 0)
+
+      wake_age_ms =
+        if unclaimed > 0 do
+          max(System.monotonic_time() - activation_at, 0)
+          |> System.convert_time_unit(:native, :millisecond)
+        else
+          0
+        end
+
+      %{
+        blocked_node_calls: gate_gauges.currently_blocked,
+        maximum_blocked_node_calls: gate_gauges.maximum_blocked,
+        derived_unclaimed_common_due_backlog: unclaimed,
+        derived_oldest_unclaimed_wake_at_age_ms: wake_age_ms,
+        repo_ready_connections: pool.ready_connections,
+        repo_checkout_queue_length: pool.checkout_queue_length,
+        repo_busy_or_unavailable_connections: pool.busy_or_unavailable_connections,
+        beam_run_queue_total: :erlang.statistics(:run_queue),
+        beam_normal_scheduler_run_queue_max:
+          scheduler_queues
+          |> Enum.take(System.schedulers_online())
+          |> Enum.max(fn -> 0 end),
+        beam_process_count: :erlang.system_info(:process_count),
+        beam_memory_total_bytes: memory[:total],
+        beam_memory_processes_bytes: memory[:processes],
+        beam_memory_binary_bytes: memory[:binary],
+        beam_memory_ets_bytes: memory[:ets],
+        runtime_mailbox_length: mailbox_length(@runtime),
+        dispatcher_mailbox_length: mailbox_length(dispatcher_name()),
+        vehicle_supervisor_mailbox_length: mailbox_length(vehicle_supervisor_name()),
+        repo_pool_mailbox_length: mailbox_length(repo_pool_pid())
+      }
+    end
+
+    defp blocked_measurements(
+           events,
+           t0,
+           plateau_at,
+           stable_hold_started_at,
+           release,
+           run_ids,
+           probes,
+           plateau,
+           gate_final,
+           timeline,
+           phase_samples,
+           maximum_claim_age_ms_at_release,
+           quiescence_at,
+           config
+         ) do
+      events =
+        Enum.filter(events, fn {_event, _measurements, _metadata, observed_at} ->
+          observed_at >= t0
+        end)
+
+      checkpoints = event_records(events, [:docket, :checkpoint, :committed])
+      first_commit_times = correlation_times(checkpoints, :first)
+
+      terminal_commit_times =
+        checkpoints
+        |> Enum.filter(fn {_measurements, metadata, _observed_at} ->
+          metadata.checkpoint_type == "run_completed"
+        end)
+        |> correlation_times(:last)
+
+      ordinals = run_ids |> Enum.with_index(1) |> Map.new()
+      blocked_ordinals = release.blocked_run_ids |> Enum.map(&ordinals[&1]) |> MapSet.new()
+
+      release_to_first =
+        for {ordinal, observed_at} <- first_commit_times,
+            MapSet.member?(blocked_ordinals, ordinal),
+            do: observed_at - release.release_started_at
+
+      release_to_terminal =
+        for {ordinal, observed_at} <- terminal_commit_times,
+            MapSet.member?(blocked_ordinals, ordinal),
+            do: observed_at - release.release_started_at
+
+      node_executions = event_measurements(events, [:docket, :node, :execution])
+      drains = event_measurements(events, [:docket, :postgres, :vehicle, :drain])
+      probe_durations = Enum.map(probes, & &1.duration)
+
+      probe_query_measurements =
+        events
+        |> event_records([:docket, :benchmark, :repo, :query])
+        |> Enum.filter(fn {_measurement, metadata, _at} -> metadata.benchmark_query == :probe end)
+        |> Enum.map(fn {measurement, _metadata, _at} -> measurement end)
+
+      invalid_negative_release_offsets =
+        Enum.count(release_to_first ++ release_to_terminal, &(&1 < 0))
+
+      maximum_probe_busy =
+        probes
+        |> Enum.flat_map(&[&1.busy_or_unavailable_before, &1.busy_or_unavailable_after])
+        |> Enum.max(fn -> 0 end)
+
+      maximum_probe_queue =
+        probes
+        |> Enum.flat_map(&[&1.queue_before, &1.queue_after])
+        |> Enum.max(fn -> 0 end)
+
+      complete =
+        gate_final.observed_runs == config.runs and gate_final.duplicate_runs == 0 and
+          gate_final.unknown_runs == 0 and gate_final.invalid_attempts == 0 and
+          gate_final.invalid_nodes == 0 and length(node_executions) == config.runs and
+          length(drains) == config.runs and length(release_to_first) == config.concurrency and
+          length(release_to_terminal) == config.concurrency and
+          length(release.blocked_arrival_times) == config.concurrency and
+          Enum.count(probes, & &1.success) == config.probe_count and
+          length(probe_query_measurements) == config.probe_count and
+          invalid_negative_release_offsets == 0
+
+      %{
+        plateau_fill_duration_us:
+          System.convert_time_unit(plateau_at - t0, :native, :microsecond),
+        stable_hold_duration_us:
+          System.convert_time_unit(
+            release.release_started_at - stable_hold_started_at,
+            :native,
+            :microsecond
+          ),
+        release_fanout_duration_us:
+          System.convert_time_unit(release.fanout_duration, :native, :microsecond),
+        latency: %{
+          activation_to_blocked_node_offset_us:
+            Docket.Benchmark.Stats.native_distribution(
+              Enum.map(release.blocked_arrival_times, &(&1 - t0))
+            ),
+          gate_release_to_first_commit_us:
+            Docket.Benchmark.Stats.native_distribution(release_to_first),
+          gate_release_to_terminal_commit_us:
+            Docket.Benchmark.Stats.native_distribution(release_to_terminal),
+          unrelated_short_query_round_trip_us:
+            Docket.Benchmark.Stats.native_distribution(probe_durations),
+          unrelated_short_query_query_time_us:
+            native_metric_distribution(probe_query_measurements, :query_time),
+          unrelated_short_query_queue_time_us:
+            native_metric_distribution(probe_query_measurements, :queue_time),
+          unrelated_short_query_decode_time_us:
+            native_metric_distribution(probe_query_measurements, :decode_time)
+        },
+        phase_boundaries_us: %{
+          activation: 0,
+          plateau_reached: System.convert_time_unit(plateau_at - t0, :native, :microsecond),
+          stable_hold_started:
+            System.convert_time_unit(stable_hold_started_at - t0, :native, :microsecond),
+          gate_release_started:
+            System.convert_time_unit(release.release_started_at - t0, :native, :microsecond),
+          gate_release_completed:
+            System.convert_time_unit(release.release_completed_at - t0, :native, :microsecond),
+          vehicle_quiescence: System.convert_time_unit(quiescence_at - t0, :native, :microsecond)
+        },
+        plateau_resource_samples: phase_samples,
+        claim_freshness: %{
+          maximum_claim_age_ms_at_release: maximum_claim_age_ms_at_release,
+          maximum_vehicle_reported_claim_held_ms: max_value(drains, :claim_held_ms)
+        },
+        probes: %{
+          requested: config.probe_count,
+          successful: Enum.count(probes, & &1.success),
+          maximum_busy_or_unavailable_connections_before_or_after: maximum_probe_busy,
+          maximum_checkout_queue_length_before_or_after: maximum_probe_queue,
+          caveat:
+            "Pool capacity minus ready connections is busy-or-unavailable capacity, not an exact checkout count."
+        },
+        plateau: plateau,
+        gate: Map.drop(gate_final, [:open]),
+        timeline:
+          Map.merge(timeline, %{
+            sampling_scope: "activation through vehicle-drain quiescence before runtime shutdown",
+            whole_run_summary: true,
+            derived_common_due_metrics: [
+              :derived_unclaimed_common_due_backlog,
+              :derived_oldest_unclaimed_wake_at_age_ms
+            ],
+            derived_common_due_source: "common_due_activation_boundary_and_cumulative_leases"
+          }),
+        collection: %{
+          expected_blocked_arrivals: config.concurrency,
+          observed_blocked_arrivals: length(release.blocked_arrival_times),
+          expected_gate_observations: config.runs,
+          observed_gate_observations: gate_final.observed_runs,
+          expected_node_execution_samples: config.runs,
+          observed_node_execution_samples: length(node_executions),
+          expected_vehicle_drain_samples: config.runs,
+          observed_vehicle_drain_samples: length(drains),
+          expected_plateau_release_pairs: config.concurrency,
+          observed_release_to_first_pairs: length(release_to_first),
+          observed_release_to_terminal_pairs: length(release_to_terminal),
+          expected_probe_query_telemetry_samples: config.probe_count,
+          observed_probe_query_telemetry_samples: length(probe_query_measurements),
+          invalid_negative_release_offsets: invalid_negative_release_offsets,
+          complete_sample_set: complete
+        }
+      }
+    end
+
+    defp blocked_invariants(config, plateau, gate, blocked, measurements) do
+      sampled_in_flight_max =
+        get_in(blocked, [
+          :timeline,
+          :summary,
+          :dispatcher_in_flight_vehicles,
+          :max
+        ])
+
+      sampled_blocked_max = get_in(blocked, [:timeline, :summary, :blocked_node_calls, :max])
+      scheduled_samples = blocked.timeline.scheduled_sample_count
+
+      sampling_quality? =
+        blocked.timeline.missed_ticks <= max(scheduled_samples, 1) and
+          blocked.timeline.observer_diagnostics.serial_sampler_duty_cycle_percent <= 50.0
+
+      [
+        invariant(
+          "blocked plateau reaches configured concurrency",
+          plateau.active_claims,
+          config.concurrency
+        ),
+        invariant(
+          "blocked plateau claim tokens are distinct",
+          plateau.distinct_active_claim_tokens,
+          config.concurrency
+        ),
+        invariant(
+          "unclaimed backlog remains ready during the plateau",
+          plateau.ready_unclaimed_runs,
+          config.runs - config.concurrency
+        ),
+        invariant(
+          "plateau claims are first attempts",
+          plateau.summed_claim_attempts,
+          config.concurrency
+        ),
+        invariant("plateau maximum claim attempt is one", plateau.maximum_claim_attempt, 1),
+        invariant(
+          "claims remain younger than the orphan TTL at the plateau snapshot",
+          plateau.maximum_claim_age_ms < config.orphan_ttl_ms,
+          true
+        ),
+        invariant("plateau has no poisoned runs", plateau.poisoned_runs, 0),
+        invariant(
+          "blocked node work appends no durable events before release",
+          plateau.durable_event_rows,
+          plateau.expected_initial_event_rows
+        ),
+        invariant(
+          "blocked node work advances no checkpoint before release",
+          plateau.checkpoint_sequence_sum,
+          plateau.expected_initial_checkpoint_sequence_sum
+        ),
+        invariant(
+          "no terminal commit occurs before release",
+          plateau.correlated_terminal_commits,
+          0
+        ),
+        invariant(
+          "no completion event occurs before release",
+          plateau.correlated_completion_events,
+          0
+        ),
+        invariant(
+          "blocked node process count matches concurrency",
+          plateau.topology.blocked_node_processes,
+          config.concurrency
+        ),
+        invariant(
+          "resident vehicle process count matches concurrency",
+          plateau.topology.vehicle_processes,
+          config.concurrency
+        ),
+        invariant(
+          "vehicle supervisor contains one vehicle and node task per slot",
+          plateau.topology.supervised_dynamic_children,
+          config.concurrency * 2
+        ),
+        invariant(
+          "Repo has no busy-or-unavailable capacity at the stable blocked snapshot",
+          plateau.repo_pool.busy_or_unavailable_connections,
+          0
+        ),
+        invariant(
+          "Repo checkout queue is empty at the stable blocked snapshot",
+          plateau.repo_pool.checkout_queue_length,
+          0
+        ),
+        invariant("gate observes every run exactly once", gate.observed_runs, config.runs),
+        invariant("gate sees no duplicate runs", gate.duplicate_runs, 0),
+        invariant("gate sees no unknown runs", gate.unknown_runs, 0),
+        invariant("gate sees only first attempts", gate.invalid_attempts, 0),
+        invariant("gate sees only the blocking node", gate.invalid_nodes, 0),
+        invariant(
+          "gate reaches the configured blocked maximum",
+          gate.maximum_blocked,
+          config.concurrency
+        ),
+        invariant(
+          "stable hold lasts at least the requested duration",
+          blocked.stable_hold_duration_us >= config.hold_ms * 1_000,
+          true
+        ),
+        invariant(
+          "claims remain younger than the orphan TTL at release",
+          blocked.claim_freshness.maximum_claim_age_ms_at_release < config.orphan_ttl_ms,
+          true
+        ),
+        invariant(
+          "vehicle-reported claim hold stays below the orphan TTL",
+          blocked.claim_freshness.maximum_vehicle_reported_claim_held_ms <
+            config.orphan_ttl_ms,
+          true
+        ),
+        invariant("all short-work probes succeed", blocked.probes.successful, config.probe_count),
+        invariant(
+          "short-work probes observe no pre/post queue",
+          blocked.probes.maximum_checkout_queue_length_before_or_after,
+          0
+        ),
+        invariant(
+          "short-work probes observe no pre/post busy-or-unavailable capacity",
+          blocked.probes.maximum_busy_or_unavailable_connections_before_or_after,
+          0
+        ),
+        invariant(
+          "sampler observes the current in-flight plateau",
+          sampled_in_flight_max,
+          config.concurrency
+        ),
+        invariant(
+          "sampler observes the current blocked-node plateau",
+          sampled_blocked_max,
+          config.concurrency
+        ),
+        invariant(
+          "stable-start milestone observes the in-flight plateau",
+          get_in(blocked, [
+            :plateau_resource_samples,
+            :stable_start,
+            :metrics,
+            :dispatcher_in_flight_vehicles
+          ]),
+          config.concurrency
+        ),
+        invariant(
+          "pre-release milestone observes the blocked plateau",
+          get_in(blocked, [
+            :plateau_resource_samples,
+            :pre_release,
+            :metrics,
+            :blocked_node_calls
+          ]),
+          config.concurrency
+        ),
+        invariant(
+          "sampler records both plateau milestones",
+          blocked.timeline.forced_phase_sample_count,
+          2
+        ),
+        invariant(
+          "sampler buckets represent every captured sample",
+          blocked.timeline.represented_sample_count,
+          blocked.timeline.raw_sample_count
+        ),
+        invariant("sampler cadence remains usable", sampling_quality?, true),
+        invariant("sampler records no failed samples", blocked.timeline.failed_samples, 0),
+        invariant(
+          "release-to-commit offsets remain non-negative",
+          blocked.collection.invalid_negative_release_offsets,
+          0
+        ),
+        invariant(
+          "blocked workload retains complete correlated samples",
+          blocked.collection.complete_sample_set,
+          true
+        ),
+        invariant(
+          "benchmark probes are excluded from workload Repo query counts",
+          measurements.counts.benchmark_probe_queries_excluded,
+          config.probe_count
+        ),
+        invariant(
+          "plateau control queries are excluded from workload Repo query counts",
+          measurements.counts.benchmark_control_queries_excluded,
+          10
+        )
+      ]
+    end
+
+    defp repo_pool_snapshot(config) do
+      metrics = DBConnection.get_connection_metrics(repo_pool_pid())
+      ready = Enum.reduce(metrics, 0, &(&1.ready_conn_count + &2))
+      queued = Enum.reduce(metrics, 0, &(&1.checkout_queue_length + &2))
+      capacity = config.pool_size * (Repo.config()[:pool_count] || 1)
+
+      %{
+        capacity: capacity,
+        ready_connections: ready,
+        checkout_queue_length: queued,
+        busy_or_unavailable_connections: max(capacity - ready, 0),
+        source: "DBConnection.get_connection_metrics"
+      }
+    end
+
+    defp repo_pool_pid do
+      %{pid: pool} = Ecto.Adapter.lookup_meta(Repo.get_dynamic_repo())
+      pool
+    end
+
+    defp mailbox_length(name_or_pid) do
+      pid = if is_pid(name_or_pid), do: name_or_pid, else: Process.whereis(name_or_pid)
+
+      case pid && Process.info(pid, :message_queue_len) do
+        {:message_queue_len, length} -> length
+        _ -> nil
+      end
+    end
+
+    defp backend_name, do: Module.concat(@runtime, "Backend")
+    defp dispatcher_name, do: Docket.Postgres.dispatcher_name(backend_name())
+    defp vehicle_supervisor_name, do: Docket.Postgres.vehicle_supervisor_name(backend_name())
+
+    defp cleanup_sampler(sampler) do
+      if Process.alive?(sampler.pid) do
+        try do
+          Docket.Benchmark.Sampler.stop(sampler)
+        rescue
+          _error -> :ok
+        catch
+          _kind, _reason -> :ok
+        end
+      else
+        :telemetry.detach(sampler.handler_id)
+      end
+    end
+
     defp runtime_opts(config, extra \\ []) do
       [
         name: @runtime,
@@ -513,6 +1290,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp wait_for_completion(collector, expected, timeout_ms) do
       deadline = System.monotonic_time(:millisecond) + timeout_ms
       wait(collector, expected, deadline)
+    end
+
+    defp wait_for_vehicle_quiescence(collector, sampler, expected, timeout_ms) do
+      deadline = System.monotonic_time(:millisecond) + timeout_ms
+      do_wait_for_vehicle_quiescence(collector, sampler, expected, deadline)
+    end
+
+    defp do_wait_for_vehicle_quiescence(collector, sampler, expected, deadline) do
+      drains =
+        Docket.Benchmark.Collector.count(collector, [:docket, :postgres, :vehicle, :drain])
+
+      in_flight = Docket.Benchmark.Sampler.snapshot(sampler).dispatcher_in_flight_vehicles
+
+      cond do
+        drains >= expected and in_flight == 0 ->
+          :ok
+
+        System.monotonic_time(:millisecond) >= deadline ->
+          raise "benchmark timed out with #{drains}/#{expected} vehicle drains and #{in_flight} vehicles still in flight"
+
+        true ->
+          Process.sleep(1)
+          do_wait_for_vehicle_quiescence(collector, sampler, expected, deadline)
+      end
     end
 
     defp wait(collector, expected, deadline) do
@@ -581,13 +1382,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       }
     end
 
-    defp prepare_measured_activation(lead_ms \\ 250) do
+    defp prepare_measured_activation(lead_ms \\ 500) do
       activation_at = DateTime.add(DateTime.utc_now(), lead_ms, :millisecond)
       stage_activation(activation_at)
       physical_before = physical_snapshot()
       remaining_ms = DateTime.diff(activation_at, DateTime.utc_now(), :millisecond)
 
-      if remaining_ms >= 100 do
+      if remaining_ms >= @minimum_runtime_ready_lead_ms do
         t0 =
           System.monotonic_time() +
             System.convert_time_unit(remaining_ms, :millisecond, :native)
@@ -598,11 +1399,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    defp ensure_activation_lead!(activation_monotonic, minimum_ms) do
+      remaining = activation_monotonic - System.monotonic_time()
+      minimum = System.convert_time_unit(minimum_ms, :millisecond, :native)
+
+      if remaining < minimum do
+        raise "benchmark runtime setup left less than #{minimum_ms} ms before activation"
+      end
+
+      System.convert_time_unit(remaining, :native, :microsecond)
+    end
+
     defp sleep_until(activation_monotonic) do
       remaining = activation_monotonic - System.monotonic_time()
 
       if remaining > 0 do
         Process.sleep(System.convert_time_unit(remaining, :native, :millisecond))
+      end
+    end
+
+    defp sleep_until_strict(deadline) do
+      remaining = deadline - System.monotonic_time()
+
+      if remaining > 0 do
+        remaining_us = System.convert_time_unit(remaining, :native, :microsecond)
+        Process.sleep(div(remaining_us + 999, 1_000))
+        sleep_until_strict(deadline)
       end
     end
 
@@ -679,7 +1501,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       completions = event_records(events, [:docket, :run, :completed])
       checkpoints = event_records(events, [:docket, :checkpoint, :committed])
       committed = event_measurements(events, [:docket, :lifecycle, :committed])
-      repo_queries = event_measurements(events, [:docket, :benchmark, :repo, :query])
+      repo_query_records = event_records(events, [:docket, :benchmark, :repo, :query])
+
+      repo_queries =
+        repo_query_records
+        |> Enum.filter(fn {_measurement, metadata, _at} ->
+          metadata.benchmark_query == :workload
+        end)
+        |> Enum.map(fn {measurement, _metadata, _at} -> measurement end)
+
+      benchmark_probe_queries =
+        Enum.count(repo_query_records, fn {_measurement, metadata, _at} ->
+          metadata.benchmark_query == :probe
+        end)
+
+      benchmark_control_queries =
+        Enum.count(repo_query_records, fn {_measurement, metadata, _at} ->
+          metadata.benchmark_query == :control
+        end)
+
       store = event_measurements(events, [:docket, :postgres, :store])
 
       completion_event_times = correlation_times(completions, :last)
@@ -798,7 +1638,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           empty_polls: Enum.count(polls, &(&1.leases == 0 and &1.poisoned == 0)),
           maximum_in_flight_vehicles: max_value(states, :in_flight),
           committed_moments: sum(committed, :count),
-          repo_queries: length(repo_queries)
+          repo_queries: length(repo_queries),
+          benchmark_probe_queries_excluded: benchmark_probe_queries,
+          benchmark_control_queries_excluded: benchmark_control_queries
         },
         amplification:
           amplification(
@@ -1164,6 +2006,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ]
     end
 
+    defp blocked_warnings(config) do
+      [
+        "Blocked vehicles remain running and claimed; they are not durably parked runs.",
+        "Only the first saturated wave is held; the gate opens for the remaining backlog after the plateau.",
+        "This point is repetition #{config.repetition} of #{config.repetitions} with a #{config.hold_ms} ms stable hold.",
+        "Pool busy-or-unavailable capacity is derived from public pool readiness metrics and is not an exact checkout count.",
+        "Short-work probe and plateau-control queries are excluded from workload query counts but remain in physical Postgres deltas.",
+        "The in-process sampler is observational work; inspect its missed ticks, self-time, and duty cycle and use paired controls before making capacity claims.",
+        "Run in a dedicated, quiescent BEAM; unrelated global Docket telemetry can contaminate operational distributions."
+      ]
+    end
+
     defp warnings(config) do
       [
         "Observed throughput is environment-specific and is not a capacity maximum.",
@@ -1204,6 +2058,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> Docket.Graph.put_edge!("noop-finish", from: "noop", to: "$finish")
     end
 
+    defp blocked_graph do
+      Docket.Graph.new!(id: "docket-bench-blocked-vehicles")
+      |> Docket.Graph.put_node!("blocker", implementation: Docket.Benchmark.BlockingNode)
+      |> Docket.Graph.put_edge!("start-blocker", from: "$start", to: "blocker")
+      |> Docket.Graph.put_edge!("blocker-finish", from: "blocker", to: "$finish")
+    end
+
     defp canonical_scenario("smoke"), do: "empty_one_step"
     defp canonical_scenario(scenario), do: scenario
 
@@ -1236,6 +2097,29 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp scalar(sql) do
       %{rows: [[value]]} = Ecto.Adapters.SQL.query!(Repo, sql, [])
       value
+    end
+
+    defp benchmark_scalar(sql) do
+      %{rows: [[value]]} =
+        Ecto.Adapters.SQL.query!(Repo, sql, [], telemetry_options: [benchmark_query: :control])
+
+      value
+    end
+
+    defp benchmark_scalar_with(sql, params) do
+      %{rows: [[value]]} =
+        Ecto.Adapters.SQL.query!(Repo, sql, params,
+          telemetry_options: [benchmark_query: :control]
+        )
+
+      value
+    end
+
+    defp benchmark_maximum_claim_age_ms do
+      benchmark_scalar_with(
+        "SELECT coalesce(max(floor(greatest(extract(epoch FROM ($1::timestamptz - claimed_at)), 0) * 1000)), 0)::bigint FROM docket_runs WHERE claim_token IS NOT NULL",
+        [DateTime.utc_now()]
+      )
     end
 
     defp git_metadata do
@@ -1417,6 +2301,65 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         claim_scan_total_p50_us: repetition_latency_summary(points, :claim_scan_total_us, :p50),
         claim_scan_total_p95_us: repetition_latency_summary(points, :claim_scan_total_us, :p95)
       }
+    end
+
+    defp suite_latency_summary(points, "blocked_vehicles") do
+      %{
+        plateau_fill_duration_us:
+          repetition_value_summary(
+            points,
+            [:measurements, :blocked_vehicles, :plateau_fill_duration_us],
+            "us"
+          ),
+        activation_to_blocked_node_p95_us:
+          repetition_value_summary(
+            points,
+            [
+              :measurements,
+              :blocked_vehicles,
+              :latency,
+              :activation_to_blocked_node_offset_us,
+              :p95
+            ],
+            "us"
+          ),
+        gate_release_to_terminal_p95_us:
+          repetition_value_summary(
+            points,
+            [
+              :measurements,
+              :blocked_vehicles,
+              :latency,
+              :gate_release_to_terminal_commit_us,
+              :p95
+            ],
+            "us"
+          ),
+        unrelated_short_query_p95_us:
+          repetition_value_summary(
+            points,
+            [
+              :measurements,
+              :blocked_vehicles,
+              :latency,
+              :unrelated_short_query_round_trip_us,
+              :p95
+            ],
+            "us"
+          )
+      }
+    end
+
+    defp repetition_value_summary(points, path, unit) do
+      values =
+        Enum.flat_map(points, fn point ->
+          case get_in(point, path) do
+            value when is_number(value) -> [value]
+            _other -> []
+          end
+        end)
+
+      Docket.Benchmark.Stats.repetition_summary(values, unit)
     end
 
     defp repetition_latency_summary(points, metric, statistic) do

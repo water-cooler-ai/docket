@@ -7,7 +7,7 @@ defmodule Docket.Benchmark do
   remain explicit, manual work rather than ordinary test-suite work.
   """
 
-  @scenarios ~w(claim_only empty_one_step smoke)
+  @scenarios ~w(blocked_vehicles claim_only empty_one_step smoke)
   @all_scenarios ~w(claim_only empty_one_step cyclic_drain blocked_vehicles mixed_fairness graph_cache freshness_split_brain multinode notify_poll amplification soak smoke)
 
   @defaults %{
@@ -23,6 +23,10 @@ defmodule Docket.Benchmark do
     pool_size_matrix: nil,
     batch_size: nil,
     ready_ratio: nil,
+    hold_ms: nil,
+    sample_interval_ms: nil,
+    max_samples: nil,
+    probe_count: nil,
     orphan_ttl_ms: 60_000,
     seed: 1,
     repetitions: 1,
@@ -41,6 +45,10 @@ defmodule Docket.Benchmark do
     pool_size_matrix: :string,
     batch_size: :integer,
     ready_ratio: :string,
+    hold_ms: :integer,
+    sample_interval_ms: :integer,
+    max_samples: :integer,
+    probe_count: :integer,
     orphan_ttl_ms: :integer,
     nodes: :integer,
     duration: :string,
@@ -163,15 +171,62 @@ defmodule Docket.Benchmark do
     end
   end
 
-  defp scenario_options(%{batch_size: nil, ready_ratio: nil}), do: :ok
+  defp scenario_options(%{scenario: "blocked_vehicles"} = config) do
+    with :ok <- positive(config.hold_ms, "hold-ms"),
+         :ok <- at_least(config.sample_interval_ms, 5, "sample-interval-ms"),
+         :ok <- positive(config.max_samples, "max-samples"),
+         :ok <- positive(config.probe_count, "probe-count"),
+         :ok <- blocked_backlog(config),
+         :ok <- blocked_ttl(config) do
+      if config.warmup == 0,
+        do: :ok,
+        else: {:error, "blocked_vehicles does not support warmup runs; use repetitions"}
+    end
+  end
+
+  defp scenario_options(%{
+         batch_size: nil,
+         ready_ratio: nil,
+         hold_ms: nil,
+         sample_interval_ms: nil,
+         max_samples: nil,
+         probe_count: nil
+       }),
+       do: :ok
 
   defp scenario_options(_config),
-    do: {:error, "batch-size and ready-ratio are only valid for claim_only"}
+    do:
+      {:error,
+       "batch-size/ready-ratio are only valid for claim_only; hold/sample/probe options are only valid for blocked_vehicles"}
+
+  defp blocked_backlog(config) do
+    maximum_concurrency = Enum.max(config.concurrencies)
+
+    if config.runs >= maximum_concurrency do
+      :ok
+    else
+      {:error,
+       "blocked_vehicles requires runs >= maximum configured concurrency (#{maximum_concurrency})"}
+    end
+  end
+
+  defp blocked_ttl(config) do
+    if config.hold_ms <= div(config.orphan_ttl_ms, 2) do
+      :ok
+    else
+      {:error, "blocked_vehicles hold-ms must be at most half of orphan-ttl-ms"}
+    end
+  end
 
   defp positive(value, _name) when is_integer(value) and value > 0, do: :ok
 
   defp positive(value, name),
     do: {:error, "#{name} must be a positive integer, got: #{inspect(value)}"}
+
+  defp at_least(value, minimum, _name) when is_integer(value) and value >= minimum, do: :ok
+
+  defp at_least(value, minimum, name),
+    do: {:error, "#{name} must be an integer >= #{minimum}, got: #{inspect(value)}"}
 
   defp non_negative(value, _name) when is_integer(value) and value >= 0, do: :ok
 
@@ -261,6 +316,17 @@ defmodule Docket.Benchmark do
     with {:ok, ratio} <- parse_ratio(config.ready_ratio || "1:1") do
       {:ok, %{config | batch_size: config.batch_size || 50, ready_ratio: ratio}}
     end
+  end
+
+  defp normalize_scenario(%{scenario: "blocked_vehicles"} = config) do
+    {:ok,
+     %{
+       config
+       | hold_ms: config.hold_ms || 250,
+         sample_interval_ms: config.sample_interval_ms || 20,
+         max_samples: config.max_samples || 256,
+         probe_count: config.probe_count || 3
+     }}
   end
 
   defp normalize_scenario(config), do: {:ok, config}

@@ -112,6 +112,102 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Enum.all?(artifact.invariants, & &1.pass)
     end
 
+    test "blocked vehicles expose a bounded saturated plateau without holding the Repo" do
+      output =
+        Path.join(
+          System.tmp_dir!(),
+          "docket-blocked-bench-#{System.unique_integer([:positive])}.json"
+        )
+
+      on_exit(fn -> File.rm(output) end)
+
+      assert {:ok, config} =
+               Docket.Benchmark.parse(
+                 ~w(--scenario blocked_vehicles --runs 4 --concurrency 2 --pool-size 1 --hold-ms 30 --sample-interval-ms 5 --max-samples 8 --probe-count 2 --output #{output})
+               )
+
+      assert {:ok, %{artifact: artifact}} = Docket.Benchmark.run(config)
+      assert artifact.success
+      assert artifact.scenario == "blocked_vehicles"
+      assert artifact.cleanup.isolated_database_removed
+      assert artifact.measurements.blocked_vehicles.collection.complete_sample_set
+      assert artifact.measurements.blocked_vehicles.plateau.active_claims == 2
+      assert artifact.measurements.blocked_vehicles.plateau.ready_unclaimed_runs == 2
+      assert artifact.measurements.blocked_vehicles.plateau.repo_pool.capacity == 1
+
+      assert artifact.measurements.blocked_vehicles.plateau.repo_pool.busy_or_unavailable_connections ==
+               0
+
+      assert artifact.measurements.blocked_vehicles.plateau.repo_pool.checkout_queue_length == 0
+
+      assert artifact.measurements.blocked_vehicles.latency.unrelated_short_query_round_trip_us.sample_count ==
+               2
+
+      assert artifact.measurements.blocked_vehicles.latency.unrelated_short_query_queue_time_us.sample_count ==
+               2
+
+      assert artifact.measurements.blocked_vehicles.stable_hold_duration_us >= 30_000
+
+      assert artifact.measurements.blocked_vehicles.claim_freshness.maximum_claim_age_ms_at_release <
+               config.orphan_ttl_ms
+
+      phase = artifact.measurements.blocked_vehicles.phase_boundaries_us
+      assert phase.activation <= phase.plateau_reached
+      assert phase.plateau_reached <= phase.stable_hold_started
+      assert phase.stable_hold_started <= phase.gate_release_started
+      assert phase.gate_release_started <= phase.gate_release_completed
+      assert phase.gate_release_completed <= phase.vehicle_quiescence
+
+      timeline = artifact.measurements.blocked_vehicles.timeline
+      assert timeline.raw_sample_count > 0
+      assert timeline.retained_bucket_count <= 8
+      assert timeline.max_retained_buckets == 8
+      assert timeline.represented_sample_count == timeline.raw_sample_count
+      assert timeline.forced_phase_sample_count == 2
+      assert timeline.forced_final_sample_count == 1
+      assert timeline.summary.dispatcher_in_flight_vehicles.max == 2
+      assert timeline.summary.blocked_node_calls.max == 2
+      assert timeline.summary.dispatcher_maximum_in_flight_vehicles.max == 2
+      assert timeline.summary.maximum_blocked_node_calls.max == 2
+      assert timeline.failed_samples == 0
+      assert artifact.measurements.counts.benchmark_probe_queries_excluded == 2
+      assert artifact.measurements.counts.benchmark_control_queries_excluded == 10
+      assert Enum.all?(artifact.invariants, & &1.pass)
+
+      encoded = File.read!(output)
+      refute encoded =~ config.database_url
+      refute encoded =~ output
+      refute encoded =~ "docket_bench_"
+
+      refute encoded =~
+               ~r/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i
+    end
+
+    test "blocked timeout artifacts preserve verified database cleanup" do
+      output =
+        Path.join(
+          System.tmp_dir!(),
+          "docket-blocked-timeout-#{System.unique_integer([:positive])}.json"
+        )
+
+      on_exit(fn -> File.rm(output) end)
+
+      assert {:ok, config} =
+               Docket.Benchmark.parse(
+                 ~w(--scenario blocked_vehicles --runs 4 --concurrency 2 --pool-size 1 --hold-ms 10 --sample-interval-ms 5 --max-samples 8 --probe-count 1 --timeout-ms 1 --output #{output})
+               )
+
+      assert {:error, message} = Docket.Benchmark.run(config)
+      assert message =~ "results were written"
+
+      artifact = output |> File.read!() |> JSON.decode!()
+      refute artifact["success"]
+      assert artifact["duration_us"] == nil
+      assert artifact["cleanup"]["isolated_database_removed"]
+      assert artifact["failure_stage"] == "setup_or_execution"
+      assert artifact["error"] =~ "timed out before reaching its plateau"
+    end
+
     test "warm repeated matrix writes raw NDJSON trials and one summary" do
       output =
         Path.join(

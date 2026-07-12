@@ -1,10 +1,13 @@
 # Postgres benchmarks
 
-`mix docket.bench` provides two production-backed measurements. The
+`mix docket.bench` provides three production-backed measurements. The
 `empty_one_step`/`smoke` scenario exercises the assembled `Docket.Postgres`
 runtime from dispatcher claim through supervised vehicle and fenced lifecycle
 commit. The `claim_only` scenario deliberately bypasses dispatcher and vehicle
-work to isolate concurrent `RunStore.claim_due` behavior.
+work to isolate concurrent `RunStore.claim_due` behavior. The
+`blocked_vehicles` scenario holds a saturated first wave inside production
+node execution, samples BEAM and Repo pressure, probes unrelated short SQL
+work, then releases the gate and drains the backlog.
 
 The current bounded smoke slice is intentionally exploratory:
 
@@ -75,6 +78,9 @@ the capture mode and event count, but do not estimate observer cost; summed
 concurrent callback time is not a valid wall-time correction. Run benchmarks
 in a dedicated, otherwise quiescent BEAM because non-correlated global Docket
 telemetry from another runtime can contaminate operational distributions.
+The blocked-vehicle timeline compacts online to `--max-samples`, but full
+event capture still grows with emitted telemetry; very large/long suites need
+the planned streaming collector before they are memory-bounded end to end.
 
 Warmup is expressed as runs per repetition and is excluded from measured rows,
 events, WAL, and timing. A nonzero warmup leaves the compiled graph cache warm;
@@ -105,8 +111,58 @@ deltas, and exact claim/token/attempt/event invariants. Ready age in this
 scenario is explicitly age at the frozen claim clock; the burst-to-claim
 offset is the metric for backlog waiting after activation.
 
-Only `smoke`, `empty_one_step`, and `claim_only` are implemented today. Other benchmark suites
-(cyclic drain, blocked vehicles, fairness, cache, freshness,
+To measure resident vehicles during slow external-style node work:
+
+```console
+mix docket.bench --scenario blocked_vehicles --runs 100 \
+  --concurrency 50 --pool-size 5 --hold-ms 500 \
+  --sample-interval-ms 20 --max-samples 256 --probe-count 3 \
+  --output results/blocked.json
+```
+
+`--runs` must be at least the largest configured concurrency, and the hold
+must be at most half the orphan TTL to leave a reclaim-safety margin.
+`--sample-interval-ms` is at least 5 ms. The first
+saturated wave blocks behind a benchmark-controlled gate for at least
+`--hold-ms`; once released, the gate remains open so the remaining backlog can
+drain. These are running, claimed vehicles—not durably parked runs. The report
+records activation-to-block, release-to-first-commit, release-to-terminal,
+short-query round-trip/query/queue/decode latency, exact plateau
+SQL/process/freshness invariants, and a bounded time
+series of dispatcher in-flight work, blocked calls, Repo readiness/queueing,
+derived unclaimed common-due backlog and `wake_at` age, run queues, process
+counts, memory, sampler lateness/self-time, and key mailboxes. Forced samples
+at stable-hold start and immediately before release guarantee plateau resource
+coverage even when the periodic interval is longer than the hold. Explicit
+phase offsets locate plateau fill, stable hold, gate fan-out, and vehicle
+quiescence; the timeline's summary covers the whole sampled run. Runtime
+configuration records both the staged activation target and the observed
+ready-to-activation lead, with a 250 ms minimum enforced before every measured
+burst.
+
+Repo pool samples use `DBConnection.get_connection_metrics`. Capacity minus
+ready connections is deliberately labeled `busy_or_unavailable_connections`;
+it is not claimed to be an exact checkout count. The stable plateau also runs
+tagged `SELECT 1` probes. Their timings and Ecto query/queue/decode components
+are reported separately. Probe and plateau-control queries are excluded from
+workload Repo-query counts, while both remain inside physical Postgres deltas.
+Timeline compaction merges the lowest-weight adjacent pair, retaining balanced
+temporal coverage while preserving each bucket's start/end, represented
+sample count, numeric first/last/delta/min/max, last-observed offset, and
+sample-count-weighted mean. Counter and high-watermark semantics are declared
+separately. Missed ticks, unavailable metrics, forced/scheduled sample counts,
+sampling-end offset, sampler self-time, and serial duty cycle make sampling
+quality visible. Those diagnostics do not replace a paired sampler-on/off
+control when making capacity claims.
+
+Claim age is checked at the plateau and immediately before release, and every
+vehicle's reported claim-hold duration must remain below the orphan TTL. A
+point that has become stealable is written as a failed result rather than
+presented as a valid blocked-vehicle measurement.
+
+Only `smoke`, `empty_one_step`, `claim_only`, and `blocked_vehicles` are
+implemented today. Other benchmark suites
+(cyclic drain, fairness, cache, freshness,
 real multi-node scaling, notify/poll, amplification, and soak) are rejected
 rather than silently approximated. `--event-policy none` is also rejected:
 v0.1 persists lifecycle events and has no production event-suppression mode.

@@ -129,12 +129,17 @@ defmodule Docket.Benchmark.Collector do
     }
   end
 
-  defp safe_metadata(event, _metadata, _counters)
-       when event in [
-              [:docket, :benchmark, :repo, :query],
-              [:docket, :postgres, :run_store, :claim_query]
-            ],
-       do: %{}
+  defp safe_metadata([:docket, :benchmark, :repo, :query], metadata, _counters) do
+    classification = Keyword.get(metadata[:options] || [], :benchmark_query, :workload)
+
+    %{
+      benchmark_query:
+        if(classification in [:control, :probe], do: classification, else: :workload)
+    }
+  end
+
+  defp safe_metadata([:docket, :postgres, :run_store, :claim_query], _metadata, _counters),
+    do: %{}
 
   defp safe_metadata(event, metadata, _counters),
     do: Docket.Telemetry.metric_metadata(event, metadata)
