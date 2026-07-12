@@ -6,7 +6,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     alias Docket.{Graph, Lifecycle, Reducer, RunInfo, Schema}
     alias Docket.Graph.Compiler
-    alias Docket.Postgres.{GraphStore, RunStore, Vehicle}
+    alias Docket.Postgres.{Dispatcher, GraphStore, RunStore, Vehicle}
     alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}
     alias Docket.Postgres.VehicleStorageTestRepo, as: TestRepo
     alias Docket.Runtime.{Loop, RunMutation}
@@ -251,6 +251,136 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert seqs == Enum.to_list(1..length(seqs))
       completed_nodes = for event <- events, event.type == :node_completed, do: event.node_id
       assert Enum.count(completed_nodes, &(&1 == "writer")) == 1
+    end
+
+    test "a second dispatcher steals a killed worker and fences the stale lease", %{
+      context: context,
+      backend: backend
+    } do
+      graph =
+        Graph.new!(id: "two-dispatcher-worker-kill")
+        |> Graph.put_field!("first", schema: Schema.string(), reducer: Reducer.last_value())
+        |> Graph.put_field!("out", schema: Schema.string(), reducer: Reducer.last_value())
+        |> Graph.put_node!("writer",
+          implementation: Nodes.WriteStatic,
+          config: %{field: "first", value: "committed"}
+        )
+        |> Graph.put_node!("blocker",
+          implementation: Nodes.SleepsUntilReleased,
+          config: %{field: "out", value: "released"}
+        )
+        |> Graph.put_edge!("edge_start_writer", from: "$start", to: "writer")
+        |> Graph.put_edge!("edge_writer_blocker", from: "writer", to: "blocker")
+        |> Graph.put_edge!("edge_blocker_finish", from: "blocker", to: "$finish")
+        |> Graph.put_output!("out", [])
+
+      rtg = publish!(context, graph)
+      run = start_run!(backend, rtg, %{}, @now)
+      task_supervisor = start_supervised!({Task.Supervisor, name: __MODULE__.DispatcherSup})
+      parent = self()
+
+      launch = fn dispatcher, lease ->
+        opts =
+          vehicle_opts(context,
+            context: %{coordinator: parent},
+            task_supervisor: task_supervisor,
+            clock: fn -> @now end
+          )
+
+        case Vehicle.launch(lease, opts) do
+          {:ok, vehicle} = launched ->
+            send(parent, {:dispatcher_launched, dispatcher, lease, vehicle})
+            launched
+
+          error ->
+            error
+        end
+      end
+
+      common = [
+        context: context,
+        concurrency: 1,
+        poll_interval_ms: 60_000,
+        orphan_ttl_ms: 60_000,
+        max_claim_attempts: 3,
+        drain_timeout_ms: 100,
+        jitter: & &1
+      ]
+
+      start_supervised!(
+        {Dispatcher,
+         Keyword.merge(common,
+           name: __MODULE__.DispatcherA,
+           clock: fn -> @now end,
+           launch: &launch.(:a, &1)
+         )}
+      )
+
+      assert_receive {:dispatcher_launched, :a, first_lease, first_vehicle}, 5_000
+      first_monitor = Process.monitor(first_vehicle)
+      assert_receive {:blocked, _node_pid, "blocker", 1}, 5_000
+
+      Process.exit(first_vehicle, :kill)
+      assert_receive {:DOWN, ^first_monitor, :process, ^first_vehicle, :killed}, 5_000
+
+      assert {:ok, killed} = RunStore.fetch_run(context, :system, run.id)
+      assert killed.status == :running
+      assert killed.channels["state:first"].value == "committed"
+
+      assert {:ok, %RunInfo{claimed_at: claimed_at}} =
+               RunStore.inspect_run(context, :system, run.id)
+
+      # Heartbeat refreshes use the database clock. Advance from the durable
+      # claim timestamp so the steal remains deterministic on every host.
+      stolen_at = DateTime.add(claimed_at, 61, :second)
+
+      start_supervised!(
+        {Dispatcher,
+         Keyword.merge(common,
+           name: __MODULE__.DispatcherB,
+           clock: fn -> stolen_at end,
+           launch: &launch.(:b, &1)
+         )}
+      )
+
+      assert_receive {:dispatcher_launched, :b, second_lease, second_vehicle}, 5_000
+      refute second_lease.claim_token == first_lease.claim_token
+      second_monitor = Process.monitor(second_vehicle)
+      assert_receive {:blocked, node_pid, "blocker", 1}, 5_000
+
+      assert {:error, :claim_lost} =
+               RunStore.refresh_claim(
+                 context,
+                 :system,
+                 run.id,
+                 first_lease.claim_token,
+                 stolen_at
+               )
+
+      assert :ok =
+               RunStore.release_claim(
+                 context,
+                 :system,
+                 run.id,
+                 first_lease.claim_token,
+                 stolen_at
+               )
+
+      assert TestRepo.get_by!(Run, run_id: run.id).claim_token == second_lease.claim_token
+
+      send(node_pid, :release)
+      assert_receive {:DOWN, ^second_monitor, :process, ^second_vehicle, :normal}, 5_000
+
+      assert {:ok, done} = RunStore.fetch_run(context, :system, run.id)
+      assert done.status == :done
+      assert done.output["out"] == "released"
+
+      events = TestRepo.all(Event)
+      seqs = events |> Enum.map(& &1.seq) |> Enum.sort()
+      assert seqs == Enum.to_list(1..length(seqs))
+      completed_nodes = for event <- events, event.type == :node_completed, do: event.node_id
+      assert Enum.count(completed_nodes, &(&1 == "writer")) == 1
+      assert Enum.count(completed_nodes, &(&1 == "blocker")) == 1
     end
 
     test "retryable failure parks with :retry_scheduled and resumes at the deadline", %{

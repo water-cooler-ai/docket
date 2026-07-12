@@ -40,14 +40,17 @@ Rules:
 
 ### CI matrix
 
-CI builds and tests two legs (`.github/workflows/ci.yml`):
+CI builds and tests three release gates (`.github/workflows/ci.yml`):
 
 - **full** — optional deps present, the default local experience.
 - **core** — `DOCKET_CORE_ONLY=1`, which drops `ecto_sql`/`postgrex` from
   `deps/0` in `mix.exs` to mirror a core-only host.
+- **live Postgres** — PostgreSQL 17 exercises migrations, constraints,
+  concurrency, recovery, retention, notification fallback, and query plans.
 
-Both legs must pass `mix compile --warnings-as-errors` and the full test
-suite. To reproduce the core leg locally:
+Every gate compiles with `--warnings-as-errors`. The full and core gates run
+the default suite; the live Postgres gate includes the tests tagged
+`:postgres`. To reproduce the core gate locally:
 
 ```sh
 DOCKET_CORE_ONLY=1 mix deps.get
@@ -75,12 +78,17 @@ databases are left in place. The defaults are
 `docket_storage_test_<os-pid>`, `docket_graph_store_test_<os-pid>`,
 `docket_lifecycle_storage_test_<os-pid>`, `docket_event_store_test_<os-pid>`,
 `docket_vehicle_storage_test_<os-pid>`, and `docket_notifier_test_<os-pid>`.
+Additional assembled-backend and retention suites use
+`docket_pruner_test_<os-pid>`, `docket_backend_test_<os-pid>`, and
+`docket_backend_sandbox_test_<os-pid>`.
 Override them with the corresponding `DOCKET_TEST_DATABASE_URL`,
 `DOCKET_RUN_STORE_TEST_DATABASE_URL`, `DOCKET_STORAGE_TEST_DATABASE_URL`,
 `DOCKET_GRAPH_STORE_TEST_DATABASE_URL`,
 `DOCKET_LIFECYCLE_STORAGE_TEST_DATABASE_URL`,
 `DOCKET_EVENT_STORE_TEST_DATABASE_URL`,
 `DOCKET_VEHICLE_STORAGE_TEST_DATABASE_URL`, and
-`DOCKET_NOTIFIER_TEST_DATABASE_URL`. PostgreSQL 13 is the
+`DOCKET_NOTIFIER_TEST_DATABASE_URL`, `DOCKET_PRUNER_TEST_DATABASE_URL`,
+`DOCKET_BACKEND_TEST_DATABASE_URL`, and
+`DOCKET_BACKEND_SANDBOX_TEST_DATABASE_URL`. PostgreSQL 13 is the
 implementation minimum because claim SQL uses materialized CTEs and the
 built-in `gen_random_uuid()`.
