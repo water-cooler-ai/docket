@@ -217,9 +217,8 @@ entries below reflect what has landed so far.
   poisoned-run operational halt (DCKT-12).
 - `Docket.Checkpoint.Observer`, configured through separate
   `checkpoint_observers:`, for isolated best-effort notification only after a
-  durable commit. DCKT-12 temporarily retains the `0.0.1` host-owned
-  `checkpoint:` committer until the assembled backend and deterministic modes
-  unblock its removal in DCKT-37.
+  durable commit. The `0.0.1` host-owned `checkpoint:` committer is no longer
+  a production configuration path.
 
 ### Changed
 
@@ -237,8 +236,8 @@ entries below reflect what has landed so far.
   graph-run document while `inspect_run` reports delivery state (DCKT-14, #26).
 - Locked the final v0.1.0 production boundary to one required durable backend.
   The `0.0.1` host-owned `checkpoint:` driver and its `run`, `resume`, and live
-  `get_run` facade will be removed by DCKT-37 only after backend assembly and
-  deterministic backend testing land. Node/graph/schema/reducer/executor APIs
+  `get_run` facade were removed after backend assembly and deterministic
+  backend testing landed. Node/graph/schema/reducer/executor APIs
   and Postgres-free `Docket.Test` helpers remain public; Run persistence is a
   backend-private boundary and the supported adopter path is drain-and-cut-over.
 - Renamed the unreleased durable runtime configuration from `storage:` to

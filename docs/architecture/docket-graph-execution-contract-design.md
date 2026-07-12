@@ -5,10 +5,9 @@ Date: 2026-06-25
 
 Release note: this document records the `0.0.1` host-owned supervised driver.
 Its node, graph, executor, loop, interrupt, run-document, and inline-test
-semantics carry forward. On `0.1.0-dev`, its public `run` / `resume` / live
-`get_run` and checkpoint-committer lifecycle still exist while the required
-backend-owned vehicle is unfinished. See the PostgreSQL backend guide and
-current implementation audit.
+semantics carry forward. Its public `run` / `resume` / live `get_run` and
+checkpoint-committer lifecycle are superseded for v0.1.0 production. See the
+PostgreSQL backend guide and module docs for the backend-owned lifecycle.
 
 Related documents:
 

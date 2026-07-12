@@ -28,7 +28,7 @@ defmodule Docket.Runtime.Loop do
 
   @doc false
   # Builds the fresh `:created` run document consumed by `init/3`. Shared by
-  # `Docket.run/4` and `Docket.Test.run_inline/3` so both entry points create
+  # backend lifecycle starts and `Docket.Test.run_inline/3` so both entry points create
   # byte-identical initial runs.
   def build_initial_run(rtg, input, opts) do
     config = Config.resolve_moment(opts)

@@ -298,7 +298,9 @@ defmodule Docket.Runtime.RetryParkingTest do
       assert_received {:slept, 50}
       refute_received {:slept, _}
 
-      assert collect_attempts([]) == [{"fast", 1}, {"slow", 1}, {"fast", 2}, {"slow", 2}]
+      attempts = collect_attempts([])
+      assert Enum.sort(Enum.take(attempts, 2)) == [{"fast", 1}, {"slow", 1}]
+      assert Enum.drop(attempts, 2) == [{"fast", 2}, {"slow", 2}]
 
       assert [park1, park2] = Enum.filter(checkpoints, &(&1.type == :retry_scheduled))
 

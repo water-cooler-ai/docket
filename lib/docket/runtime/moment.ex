@@ -19,9 +19,9 @@ defmodule Docket.Runtime.Moment do
     discards the moment; no committed checkpoint value ever exists for a
     discarded moment, and observer failure after commit cannot change
     durable state.
-  - The host-owned drivers (supervised runtime and inline test shell)
-    present the moment to their configured sync checkpoint committer, which
-    may veto the transition before it becomes the run's in-memory truth.
+  - The processless `Docket.Test` shell may present the moment to a configured
+    sync checkpoint sink, which may veto the transition before it becomes the
+    returned run value. Production supervision has no host-owned committer.
 
   Dispositions:
 

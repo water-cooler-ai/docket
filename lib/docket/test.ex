@@ -44,7 +44,7 @@ defmodule Docket.Test do
 
   @doc """
   Compiles (when given a `Docket.Graph`), builds a fresh run from `input`,
-  initializes through the same durable barrier as `Docket.run/4`, and
+  initializes through the same processless transition barrier used by backend vehicles, and
   executes supersteps until the run is terminal, waiting, or the step limit
   is reached.
   """

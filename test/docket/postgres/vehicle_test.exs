@@ -253,7 +253,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     setup do
       start_supervised!(Host)
       start_supervised!({Task.Supervisor, name: @task_sup})
-      {:ok, defaults} = Docket.Runtime.Registry.defaults(Host)
+      {:ok, defaults} = Docket.Runtime.Instance.defaults(Host)
 
       backend_ref =
         {Keyword.fetch!(defaults, :backend), Keyword.fetch!(defaults, :backend_context)}
