@@ -1,13 +1,13 @@
 # Docket v1.1 Roadmap — Composability & Ergonomics
 
-Status: slices 1–5 implemented (PR #6, 2026-07-05): schema-v1.1, reducers,
+Status: slices 1–5 implemented for v1.1: schema-v1.1, reducers,
 schema-shorthand, inline-fields, telemetry-events. The reducer contract
 rationale moved to `docs/architecture/docket-reducers-design.md`; API truth
 lives in module docs. Themes 6 (graph module DSL) and 7 (subgraph
 composition) remain open design space, recorded below. Theme 9 records the
 tenant-claim fairness follow-up targeted at v0.1.1. Theme 10 records the
-`{:await}` late-completion protocol (DCKT-40), sized during the DCKT-22
-claim-freshness review.
+`{:await}` late-completion protocol, sized during the v0.1.0 claim-freshness
+review.
 
 The v1.1 theme: **make building graphs feel natural without adding a second
 canonical model.** Every proposal below is sugar or extension over the existing
@@ -391,9 +391,9 @@ more parallel node work than another.
 
 ---
 
-## Theme 10 — `{:await}` late-completion protocol (detached execution, DCKT-40)
+## Theme 10 — `{:await}` late-completion protocol (detached execution)
 
-v0.1.0 gives blocking node work two freshness strategies (DCKT-22): keep each
+v0.1.0 gives blocking node work two freshness strategies: keep each
 between-commit stretch under the orphan TTL (strict alignment — commits are
 the heartbeat) or hold a token-guarded heartbeat. Work an external system
 durably owns parks as an external wait instead. The remaining shape is work a
@@ -402,8 +402,7 @@ holding a vehicle slot and claim while it finishes. The execution contract
 reserves `{:await, term()}` for exactly this; v1 rejects it as permanent
 failure. This theme promotes it to a specified protocol.
 
-Design skeleton (established adversarially during DCKT-22; see the epic for
-the full constraint list):
+Design skeleton:
 
 - Detachment is voluntary. The runtime can never extract an await from opaque
   blocking code — any TTL-fired takeover is a timeout in disguise. The
@@ -429,8 +428,8 @@ the full constraint list):
 Epic-sized (~15+ files: executor behaviour and both executors, runtime
 dispatcher, TaskResult/TaskState/Moment, Loop/Algorithm, RunMutation,
 Lifecycle, RunStore schedule + sweeper, Postgres dispatcher/vehicle, a holder
-module, MemoryBackend, both contract docs). Tracked as DCKT-40; targets v1.1
-after the v0.1.0 line ships.
+module, MemoryBackend, both contract docs). This targets v1.1 after the v0.1.0
+line ships.
 
 ---
 
@@ -453,7 +452,7 @@ value-per-risk:
    limits, fair partition selection, optional spare-capacity bursting, and
    contention/pool benchmarks (Theme 9; v0.1.1 operational follow-up).
 7. **await-protocol** — `{:await, term()}` late-completion protocol for
-   detached node execution (Theme 10; epic DCKT-40, after the v0.1.0 line
+   detached node execution (Theme 10, after the v0.1.0 line
    ships — breaks down into its own slices when scheduled).
 
 ## Open questions (need a call before their slice starts)

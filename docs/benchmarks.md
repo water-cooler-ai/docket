@@ -24,7 +24,7 @@ parameters, observed throughput, and invariant results. They are classified
 as `exploratory`; observed throughput is not a maximum or a portable capacity
 claim.
 
-Only `smoke` and `empty_one_step` are implemented today. Other DCKT-38 suites
+Only `smoke` and `empty_one_step` are implemented today. Other benchmark suites
 (claim ceiling, cyclic drain, blocked vehicles, fairness, cache, freshness,
 real multi-node scaling, notify/poll, amplification, and soak) are rejected
 rather than silently approximated. `--event-policy none` is also rejected:

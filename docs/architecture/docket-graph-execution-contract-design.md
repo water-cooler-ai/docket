@@ -940,7 +940,7 @@ Resolved v1 contract:
   duplicate. This invariant has a dedicated inline-execution test gate:
   re-planning a superstep after a failed checkpoint must produce
   byte-identical idempotency keys.
-- Persisted sibling writes: durable retry parking (transition spec revision 8)
+- Persisted sibling writes: durable retry parking in v0.1.0
   retains completed sibling results as pending writes on the run document —
   invisible to channels until the barrier — so recovery after a committed
   retry park does not redo nodes that already succeeded (LangGraph's

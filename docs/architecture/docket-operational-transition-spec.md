@@ -110,7 +110,7 @@ introduced after publication. The initial run and its events commit in one
 transaction through `Docket.Lifecycle`.
 
 These facade functions work with any conforming bundle and are exercised
-end-to-end with `backend: Docket.Postgres` against the revision-8 schema.
+end-to-end with `backend: Docket.Postgres` against the v0.1.0 schema.
 
 ## Claiming and recovery
 
