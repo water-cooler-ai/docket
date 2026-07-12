@@ -16,6 +16,13 @@ mix docket.bench --scenario smoke --runs 10 --concurrency 2 \
   --pool-size 5 --output results/smoke.json
 ```
 
+After atomically writing the complete JSON or NDJSON artifact, the task prints
+a compact scenario-aware summary to the terminal. It labels activation-based
+values as queue-inclusive cohort offsets, separates terminalization after the
+first durable commit, and uses p50/max instead of a tail label for distributions
+with fewer than 20 observations. The artifact remains the complete,
+machine-readable record.
+
 A repeated concurrency/pool matrix runs sequentially with one isolated
 database and Repo configuration per trial:
 
@@ -62,8 +69,8 @@ The activation-based distributions describe a whole staged cohort, not just
 per-run service time. Their maximum is the last run to reach that milestone;
 the activation-to-terminal maximum therefore equals the measured burst
 duration by definition and will grow as a backlog waits behind limited
-vehicle concurrency. Use `first_commit_to_terminal_us` to separate the
-post-admission durable execution span from that pre-first-commit queueing.
+vehicle concurrency. `first_commit_to_terminal_us` isolates terminalization
+after the first durable checkpoint; it is not the whole per-run service time.
 
 Claim scan timing is the complete client-side store operation. Claim query
 timing is Ecto/Postgrex-observed protocol timing, not server-exclusive SQL

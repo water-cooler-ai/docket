@@ -34,6 +34,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     def run(config) do
+      case run_for_cli(config) do
+        {:ok, result} -> {:ok, result}
+        {:invalid, _result, reason} -> {:error, reason}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    def run_for_cli(config) do
       points = Docket.Benchmark.plan(config)
 
       with {:ok, artifacts} <- run_points(points) do
@@ -49,7 +57,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         if payload.success do
           {:ok, result}
         else
-          {:error,
+          {:invalid, result,
            "one or more benchmark trials failed; results were written to #{result.output}"}
         end
       end

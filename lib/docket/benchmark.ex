@@ -116,6 +116,15 @@ defmodule Docket.Benchmark do
   end
 
   @doc false
+  def run_for_cli(config) do
+    if Code.ensure_loaded?(Docket.Benchmark.Postgres) do
+      apply(Docket.Benchmark.Postgres, :run_for_cli, [config])
+    else
+      {:error, "Postgres benchmarks require the optional ecto_sql and postgrex dependencies"}
+    end
+  end
+
+  @doc false
   def plan(config) do
     cells =
       for concurrency <- config.concurrencies,

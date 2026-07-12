@@ -21,11 +21,29 @@ defmodule Mix.Tasks.Docket.Bench do
   def run(argv) do
     Mix.Task.run("app.start")
 
-    with {:ok, config} <- Docket.Benchmark.parse(argv),
-         {:ok, result} <- Docket.Benchmark.run(config) do
-      Mix.shell().info("wrote #{result.output}")
+    with {:ok, config} <- Docket.Benchmark.parse(argv) do
+      case Docket.Benchmark.run_for_cli(config) do
+        {:ok, result} ->
+          print_result(result)
+
+        {:invalid, result, reason} ->
+          print_result(result)
+          Mix.raise(reason)
+
+        {:error, reason} ->
+          Mix.raise(reason)
+      end
     else
-      {:error, reason} -> Mix.raise(reason)
+      {:error, reason} ->
+        Mix.raise(reason)
     end
+  end
+
+  defp print_result(result) do
+    result.artifacts
+    |> Docket.Benchmark.Console.lines()
+    |> Enum.each(&Mix.shell().info/1)
+
+    Mix.shell().info("Artifact #{result.output}")
   end
 end

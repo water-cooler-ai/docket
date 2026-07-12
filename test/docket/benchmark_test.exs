@@ -597,6 +597,195 @@ defmodule Docket.BenchmarkTest do
     Docket.Benchmark.Collector.stop(collector)
   end
 
+  test "console summary labels smoke cohort and post-first-commit metrics" do
+    text =
+      "empty_one_step"
+      |> console_point()
+      |> then(&Docket.Benchmark.Console.lines([&1]))
+      |> Enum.join("\n")
+
+    assert text =~ "PASS exploratory · empty_one_step · 1,000 runs · concurrency 5 · pool 8"
+    assert text =~ "Burst 753.4 ms · 1,327.3 runs/s"
+    assert text =~ "Cohort offsets from common activation (queue-inclusive)"
+    assert text =~ "first durable commit"
+    assert text =~ "p50 441.1 ms · p95 722.2 ms"
+    assert text =~ "After first durable commit"
+    assert text =~ "first commit -> terminal"
+    assert text =~ "p50 872 us · p95 1.2 ms"
+    assert text =~ "ready age at scan"
+    assert text =~ "Checks 2/2 · cleanup passed"
+    refute text =~ "activation_to_terminal_commit_us"
+  end
+
+  test "console summary uses p50 and max for small blocked probe samples" do
+    text =
+      "blocked_vehicles"
+      |> console_point()
+      |> then(&Docket.Benchmark.Console.lines([&1]))
+      |> Enum.join("\n")
+
+    assert text =~ "Blocked plateau / release"
+    assert text =~ "fill 80.0 ms · stable hold 30.0 ms"
+    assert text =~ "unrelated short query"
+    assert text =~ "p50 420 us · max 610 us · n=3"
+    assert text =~ "claim age at release 111.0 ms / TTL 60.00 s"
+    assert text =~ "sampler missed 1 ticks · duty 9.0%"
+  end
+
+  test "console summary reports claim drain, database path, and class counts" do
+    text =
+      "claim_only"
+      |> console_point()
+      |> then(&Docket.Benchmark.Console.lines([&1]))
+      |> Enum.join("\n")
+
+    assert text =~ "1,000 claims"
+    assert text =~ "Claim drain 753.4 ms · 1,327.3 claims/s"
+    assert text =~ "Claim offsets from burst start (backlog-inclusive)"
+    assert text =~ "all claims"
+    assert text =~ "Postgres claim path"
+    assert text =~ "claim query"
+    assert text =~ "pool queue"
+    assert text =~ "Claims ready 600 · expired 400 · mean rows/nonempty scan 50.0"
+  end
+
+  test "console suite reports valid repetitions and deterministic cell medians" do
+    first = console_point("empty_one_step")
+
+    second =
+      first
+      |> put_in([:point, :repetition], 2)
+      |> put_in([:measurements, :throughput_per_second], 1_200.0)
+      |> Map.put(:duration_us, 800_000)
+      |> Map.put(:success, false)
+      |> Map.put(:invariants, [%{name: "durable rows match", pass: false}])
+
+    other_cell =
+      first
+      |> put_in([:point, :concurrency], 1)
+      |> put_in([:point, :pool_size], 2)
+      |> put_in([:measurements, :throughput_per_second], 240.0)
+
+    text =
+      Docket.Benchmark.Console.lines([first, second, other_cell])
+      |> Enum.join("\n")
+
+    assert text =~ "FAIL exploratory · empty_one_step · 2 cells · 2/3 trials valid"
+    assert text =~ "c=1 pool=2 · 1/1 valid · 240.0 runs/s median"
+    assert text =~ "c=5 pool=8 · 1/2 valid · 1,327.3 runs/s median"
+    assert text =~ "distribution columns use p95 only when every trial has n>=20, otherwise max"
+    assert text =~ "* Cohort offsets include backlog waiting."
+
+    assert :binary.match(text, "c=1 pool=2") < :binary.match(text, "c=5 pool=8")
+  end
+
+  test "console matrix uses max rather than p95 for small distributions" do
+    first = console_point("blocked_vehicles")
+    second = put_in(first, [:point, :repetition], 2)
+
+    text = Docket.Benchmark.Console.lines([first, second]) |> Enum.join("\n")
+
+    assert text =~ "release -> terminal max 2.1 ms"
+    assert text =~ "short query max 610 us"
+    refute text =~ "release -> terminal p95"
+  end
+
+  test "console failure summary tolerates skeletal artifacts without exposing error details" do
+    point = %{
+      success: false,
+      classification: "exploratory",
+      scenario: "blocked_vehicles",
+      point: %{concurrency: 2, pool_size: 1, repetition: 1},
+      parameters: %{runs: 4, orphan_ttl_ms: 60_000},
+      duration_us: nil,
+      measurements: %{throughput_per_second: nil},
+      invariants: [],
+      cleanup: %{isolated_database_removed: true},
+      failure_stage: "setup_or_execution",
+      error: "postgres://secret@localhost/private\nSELECT secret"
+    }
+
+    text = Docket.Benchmark.Console.lines([point]) |> Enum.join("\n")
+    assert text =~ "FAIL exploratory"
+    assert text =~ "Burst — · —"
+    assert text =~ "failure stage setup_or_execution"
+    refute text =~ "secret"
+    refute text =~ "SELECT"
+  end
+
+  defp console_point(scenario) do
+    distribution = fn p50, p95, max, unit, count ->
+      %{p50: p50, p95: p95, max: max, unit: unit, sample_count: count}
+    end
+
+    base = %{
+      success: true,
+      classification: "exploratory",
+      scenario: scenario,
+      point: %{concurrency: 5, pool_size: 8, repetition: 1},
+      parameters: %{runs: 1_000, orphan_ttl_ms: 60_000},
+      duration_us: 753_383,
+      measurements: %{
+        throughput_per_second: 1_327.346,
+        latency: %{
+          burst_activation_to_first_commit_offset_us:
+            distribution.(441_088, 722_231, 752_719, "us", 1_000),
+          burst_activation_to_terminal_commit_offset_us:
+            distribution.(441_900, 723_008, 753_383, "us", 1_000),
+          first_commit_to_terminal_us: distribution.(872, 1_210, 4_026, "us", 1_000),
+          claim_scan_total_us: distribution.(641, 864, 49_640, "us", 832),
+          selected_ready_age_at_scan_start_ms: distribution.(407, 754, 790, "ms", 1_000),
+          vehicle_claim_held_ms: distribution.(5, 13, 20, "ms", 1_000)
+        }
+      },
+      invariants: [
+        %{name: "durable rows match", pass: true},
+        %{name: "terminal rows match", pass: true}
+      ],
+      cleanup: %{isolated_database_removed: true}
+    }
+
+    case scenario do
+      "claim_only" ->
+        put_in(base, [:measurements], %{
+          throughput_per_second: 1_327.346,
+          latency: %{
+            burst_start_to_claim_offset_us: distribution.(400_000, 700_000, 753_000, "us", 1_000),
+            ready_burst_start_to_claim_offset_us:
+              distribution.(390_000, 690_000, 750_000, "us", 600),
+            expired_burst_start_to_claim_offset_us:
+              distribution.(410_000, 710_000, 753_000, "us", 400),
+            claim_scan_total_us: distribution.(600, 900, 1_400, "us", 20),
+            claim_query_time_us: distribution.(400, 700, 1_100, "us", 20),
+            claim_queue_time_us: distribution.(100, 200, 400, "us", 20)
+          },
+          counts: %{ready_claims: 600, expired_claims: 400},
+          batches: %{mean_rows_per_nonempty_scan: 50.0}
+        })
+
+      "blocked_vehicles" ->
+        put_in(base, [:measurements, :blocked_vehicles], %{
+          plateau_fill_duration_us: 80_000,
+          stable_hold_duration_us: 30_000,
+          latency: %{
+            gate_release_to_terminal_commit_us: distribution.(1_100, 1_900, 2_100, "us", 5),
+            unrelated_short_query_round_trip_us: distribution.(420, 610, 610, "us", 3)
+          },
+          claim_freshness: %{maximum_claim_age_ms_at_release: 111},
+          timeline: %{
+            missed_ticks: 1,
+            observer_diagnostics: %{serial_sampler_duty_cycle_percent: 9.0},
+            summary: %{
+              derived_oldest_unclaimed_wake_at_age_ms: %{max: 112}
+            }
+          }
+        })
+
+      _other ->
+        base
+    end
+  end
+
   defp wait_until_dead(pid, attempts \\ 100)
   defp wait_until_dead(pid, 0), do: refute(Process.alive?(pid))
 
