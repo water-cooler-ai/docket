@@ -18,41 +18,70 @@ fields they read and write, and edges (optionally guarded) that decide what
 runs next. Docket executes the graph in deterministic supersteps, emitting a
 checkpoint at every durable transition boundary.
 
-## Goals
+## Docket.Postgres quickstart
 
-- **Durable by contract.** State changes are proposed at explicit checkpoint
-  boundaries and the backend commits them with a token-and-sequence fence.
-- **Deterministic semantics.** Superstep planning, write conflict resolution,
-  and guard evaluation are pure and ordered; replanning after a crash produces
-  byte-identical task identities. Integrations can persist and check those
-  identities to deduplicate external effects; Docket does not automatically
-  make arbitrary external calls exactly-once.
-- **Explicit durable boundaries.** Docket owns execution semantics and the
-  private backend storage codec. Applications own graph versioning,
-  authorization and UI; the PostgreSQL stores encode opaque state as
-  versioned ETF while preserving operational facts in relational columns.
-- **One interpreter.** Backend vehicles and inline tests run the same loop
-  code, so processless tests exercise production graph semantics.
+This path starts a durable, tenantless runtime in an existing Ecto application.
+It uses polling only, which keeps the first setup independent of a dedicated
+LISTEN connection; notifications can be enabled later without changing
+correctness.
 
-## Inspirations
+### 1. Install Docket and its optional PostgreSQL dependencies
 
-- **[Pregel](https://research.google/pubs/pregel-a-system-for-large-scale-graph-processing/)** —
-  execution proceeds in supersteps with barrier semantics: every node
-  activated in a step sees the same committed state snapshot, all writes
-  commit together at the step boundary, and same-step conflicts resolve
-  deterministically.
-- **[LangGraph](https://github.com/langchain-ai/langgraph)** — the
-  programming model: a graph of nodes over shared state channels with
-  reducers, checkpointing as the durability primitive, and first-class
-  human-in-the-loop interrupts.
-- **OTP** — where Python-based graph runtimes have to bolt on execution
-  supervision, the BEAM already provides it. Dispatchers launch ephemeral,
-  supervised vehicles only while claimed runs are advancing; waiting runs live
-  durably in PostgreSQL without retaining a per-run process. Nodes selected in
-  the same superstep execute concurrently against one committed snapshot, and
-  node code runs in isolated supervised tasks with real timeouts.
+Until 0.1.0 is published to Hex, pin the release branch:
 
-## Quick start
+```elixir
+def deps do
+  [
+    {:docket, github: "water-cooler-ai/docket", branch: "v0.1.0"},
+    {:ecto_sql, "~> 3.10"},
+    {:postgrex, "~> 0.17"}
+  ]
+end
+```
+
+```sh
+mix deps.get
+mix docket.gen.migration -r MyApp.Repo
+mix ecto.migrate -r MyApp.Repo
+```
+
+The generated host migration delegates to Docket's pinned schema version.
+Commit that migration with the application; do not call the migration module
+directly from application startup.
+
+### 2. Configure and supervise one durable runtime
+
+Retention is required and explicit. These example values retain events for 30
+days and terminal runs for 90 days:
+
+```elixir
+defmodule MyApp.DurableDocket do
+  use Docket,
+    repo: MyApp.Repo,
+    backend: Docket.Postgres,
+    tenant_mode: :none,
+    notifier: :none,
+    pruner: [
+      interval_ms: :timer.hours(1),
+      event_retention_ms: :timer.hours(24 * 30),
+      run_retention_ms: :timer.hours(24 * 90),
+      batch_size: 1_000
+    ]
+end
+```
+
+Start the Repo before Docket in the application's supervision tree:
+
+```elixir
+children = [
+  MyApp.Repo,
+  MyApp.DurableDocket
+]
+
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+### 3. Define a node and graph
 
 Define a node — a module that declares its config schema and does one unit of
 work against the shared state:
@@ -92,7 +121,7 @@ graph =
   |> Docket.Graph.put_output!("result", [])
 ```
 
-Run it inline (no processes — great for tests and exploration):
+Before publishing, the same graph can run processlessly in a unit test:
 
 ```elixir
 {:ok, run, checkpoints} = Docket.Test.run_inline(graph, %{"message" => "hello world"})
@@ -103,39 +132,38 @@ Enum.map(checkpoints, & &1.type)
 #=> [:run_initialized, :step_committed, :run_completed]
 ```
 
-### PostgreSQL facade
+### 4. Publish and start a durable run
 
 `Docket.Postgres` assembles the durable stores, dispatcher, vehicles,
 LISTEN/NOTIFY fast path, and retention pruner behind one backend boundary.
-The application owns and supervises its Ecto Repo. Retention is explicit so
-the library never silently chooses when durable records are deleted:
+The application owns and supervises its Ecto Repo. Publish an immutable graph
+version, then start work from the returned reference:
 
 ```elixir
-defmodule MyApp.DurableDocket do
-  use Docket,
-    repo: MyApp.Repo,
-    backend: Docket.Postgres,
-    tenant_mode: :required,
-    checkpoint_observers: [MyApp.DocketObserver],
-    pruner: [
-      interval_ms: :timer.hours(1),
-      event_retention_ms: :timer.hours(24 * 30),
-      run_retention_ms: :timer.hours(24 * 90),
-      batch_size: 1_000
-    ]
-end
-
 {:ok, graph_ref} = MyApp.DurableDocket.save_graph(graph)
 
 {:ok, run} =
-  MyApp.DurableDocket.start_run(graph_ref, %{"message" => "hello world"},
-    tenant_id: account.id,
-    metadata: %{"workflow_id" => workflow.id}
-  )
+  MyApp.DurableDocket.start_run(graph_ref, %{"message" => "hello world"})
 
-{:ok, run} = MyApp.DurableDocket.fetch_run(run.id, tenant_id: account.id)
-{:ok, info} = MyApp.DurableDocket.inspect_run(run.id, tenant_id: account.id)
+{:ok, finished} = MyApp.DurableDocket.await_run(run.id, timeout: 5_000)
+finished.status #=> :done
+finished.output #=> %{"result" => "HELLO WORLD"}
+
+{:ok, committed} = MyApp.DurableDocket.fetch_run(run.id)
+{:ok, operational} = MyApp.DurableDocket.inspect_run(run.id)
 ```
+
+`start_run` returns after the initialized run is durably committed; production
+advancement is asynchronous. `await_run` is a bounded convenience for callers
+that need to wait until a run pauses or terminates. Use `fetch_run` for the last
+committed graph state and `inspect_run` for scheduling and poison health.
+
+For multi-tenant applications, configure `tenant_mode: :required` and pass a
+non-empty `tenant_id` to every run, read, and signal call. See the
+[parent-application example](examples/parent-app-integration.md). To enable the
+LISTEN/NOTIFY latency fast path, remove `notifier: :none`; deployments behind
+PgBouncer transaction or statement pooling must give the notifier a direct or
+session-pooled connection. Polling always remains the correctness path.
 
 `save_graph` snapshots node configuration schemas, materializes their defaults,
 and validates and compiles the effective graph before storing its canonical,
@@ -217,9 +245,7 @@ human answers:
 
 ```elixir
 {:ok, run} =
-  MyApp.DurableDocket.resolve_interrupt(run_id, interrupt_id, "approved",
-    tenant_id: account.id
-  )
+  MyApp.DurableDocket.resolve_interrupt(run_id, interrupt_id, "approved")
 ```
 
 The value is validated against the interrupt's schema (if any), written to
@@ -277,23 +303,11 @@ Docket deliberately leaves these to the host application:
 The configured backend exclusively owns graph/run persistence, scheduling,
 recovery, signals, and production supervision.
 
-## Installation
+## Package status
 
-Docket 0.1.0 is not yet published to Hex. During release development, pin the
-release branch as a git dependency:
-
-```elixir
-def deps do
-  [
-    {:docket, github: "water-cooler-ai/docket", branch: "v0.1.0"}
-  ]
-end
-```
-
-After publication, prefer the Hex requirement documented on the package page.
-Production hosts using `Docket.Postgres` must also provide `ecto_sql`,
-`postgrex`, and a configured Ecto Repo; Docket keeps those dependencies
-optional so PostgreSQL-free `Docket.Test` consumers do not pull them in.
+Docket 0.1.0 is not yet published to Hex. The quickstart pins the active
+release branch; after publication, prefer the Hex requirement documented on
+the package page.
 
 ## Learn more
 

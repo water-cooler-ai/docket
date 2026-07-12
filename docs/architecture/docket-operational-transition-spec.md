@@ -95,6 +95,10 @@ Graph publication and run creation are separate boundaries:
 {:ok, run} = MyApp.Docket.start_run(graph_ref, input)
 ```
 
+This example uses the default `tenant_mode: :none`. With
+`tenant_mode: :required`, pass the same non-empty binary `tenant_id` to
+`start_run` and every subsequent read or signal.
+
 `save_graph/2` validates the graph, snapshots schema defaults, computes its
 private hash, and stores the immutable effective document. Concurrent saves of
 the same identity are idempotent; a conflicting document for the same identity
@@ -262,8 +266,8 @@ end
 Generate it with:
 
 ```console
-mix docket.gen.migration
-mix ecto.migrate
+mix docket.gen.migration -r MyApp.Repo
+mix ecto.migrate -r MyApp.Repo
 ```
 
 For a PostgreSQL schema other than `public`, pass the same prefix to both
@@ -272,6 +276,24 @@ directions:
 ```elixir
 def up, do: Docket.Postgres.Migration.up(version: 1, prefix: "automation")
 def down, do: Docket.Postgres.Migration.down(version: 1, prefix: "automation")
+```
+
+The generator has no prefix switch: edit both functions in the generated
+migration, then configure the runtime with the same `prefix: "automation"`:
+
+```elixir
+defmodule MyApp.Docket do
+  use Docket,
+    repo: MyApp.Repo,
+    backend: Docket.Postgres,
+    prefix: "automation",
+    pruner: [
+      interval_ms: :timer.hours(1),
+      event_retention_ms: :timer.hours(24 * 30),
+      run_retention_ms: :timer.hours(24 * 90),
+      batch_size: 1_000
+    ]
+end
 ```
 
 The migration records its installed version in a comment on `docket_runs` and
@@ -286,6 +308,9 @@ The public durable read surfaces are designed around two views:
 {:ok, run} = MyApp.Docket.fetch_run(run_id)
 {:ok, info} = MyApp.Docket.inspect_run(run_id)
 ```
+
+These reads are tenantless. A required-tenant facade must receive the run's
+non-empty binary `tenant_id` on both calls.
 
 `fetch_run/2` returns the exact last committed `%Docket.Run{}`. Claim and
 release operations don't rewrite `run.updated_at`.
