@@ -76,7 +76,7 @@ defmodule Docket.Benchmark do
   @doc "Runs a validated benchmark configuration."
   def run(config) do
     if Code.ensure_loaded?(Docket.Benchmark.Postgres) do
-      Docket.Benchmark.Postgres.run(config)
+      apply(Docket.Benchmark.Postgres, :run, [config])
     else
       {:error, "Postgres benchmarks require the optional ecto_sql and postgrex dependencies"}
     end

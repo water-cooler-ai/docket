@@ -21,7 +21,8 @@ labels. Claim tokens are never emitted.
 | `[:docket, :postgres, :dispatcher, :shutdown]` | `duration`, `vehicles_remaining` | `result` |
 | `[:docket, :postgres, :notification]` | `count` | `result` |
 | `[:docket, :postgres, :run_store, :claim]` | duration, candidate/selection ages and counts, `demand`, `leases`, `poisoned`, `steals`, `claim_attempts` | `preference`, `fallback`, `result` |
-| `[:docket, :postgres, :claim, :attempt]` | `count`, `claim_attempts` | `result` |
+| `[:docket, :postgres, :run_store, :claim_query]` | Ecto `query_time`, `queue_time`, `decode_time`, `idle_time`, `total_time` when available | none |
+| `[:docket, :postgres, :claim, :attempt]` | `count`, `claim_attempts`, `eligible_age_ms`, `overdue_after_ttl_ms` | `class`, `result` |
 | `[:docket, :postgres, :claim, :poisoned]` | `count` | `reason` |
 | `[:docket, :postgres, :claim, :operation]` | `duration`, optionally `matched` | `operation`, `result` |
 | `[:docket, :postgres, :claim, :fence_lost]` | `count` | `stage`, `result` |

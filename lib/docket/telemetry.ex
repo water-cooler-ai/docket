@@ -61,7 +61,7 @@ defmodule Docket.Telemetry do
     [:docket, :postgres, :notification] => [:result],
     [:docket, :postgres, :run_store, :claim] => [:preference, :fallback, :result],
     [:docket, :postgres, :claim, :operation] => [:operation, :result],
-    [:docket, :postgres, :claim, :attempt] => [:result],
+    [:docket, :postgres, :claim, :attempt] => [:class, :result],
     [:docket, :postgres, :claim, :poisoned] => [:reason],
     [:docket, :postgres, :claim, :fence_lost] => [:stage, :result],
     [:docket, :postgres, :graph_cache, :fetch] => [:result],

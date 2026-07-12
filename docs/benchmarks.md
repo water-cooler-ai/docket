@@ -13,16 +13,37 @@ mix docket.bench --scenario smoke --runs 10 --concurrency 2 \
 ```
 
 Each invocation creates a uniquely named Postgres database, migrates and seeds
-it before timing, starts the production supervision tree, waits for durable
-completion, verifies SQL invariants, writes JSON atomically, and removes the
-database. Set `--database-url` to a Postgres server on which the configured user
-may create databases. Never point the task at production credentials.
+it, stages every run at one common future due time, starts the production
+supervision tree, and begins measurement at that due boundary. It then waits
+for terminal telemetry without polling the database, verifies SQL invariants,
+writes JSON atomically, and removes the database. Set `--database-url` to a
+Postgres server on which the configured user may create databases. Never point
+the task at production credentials.
 
 Artifacts include the commit and dirty state, runtime and database versions,
 durability-related Postgres settings, effective pool and dispatcher settings,
-parameters, observed throughput, and invariant results. They are classified
-as `exploratory`; observed throughput is not a maximum or a portable capacity
-claim.
+parameters, observed throughput, and invariant results. Timing distributions
+use nearest-rank percentiles and always include the sample count. The report
+separates:
+
+- per-lease ready `wake_at`-to-claim lag and expired-claim overdue age;
+- claim scan, claim query/queue/decode, dispatcher poll/launch, vehicle,
+  lifecycle transaction, node, graph, and Repo timings;
+- claims, empty polls, maximum in-flight vehicles, committed moments, and
+  query counts;
+- durable rows/events, logical encoded bytes, database size, WAL, and
+  `pg_stat_database` deltas.
+
+Claim scan timing is the complete client-side store operation. Claim query
+timing is Ecto/Postgrex-observed protocol timing, not server-exclusive SQL
+execution. WAL and database-statistics deltas can include concurrent server
+activity and delayed statistics updates.
+
+Artifacts are classified as `exploratory` because the smoke scenario is one
+small staged burst on uncontrolled hardware, without warmup, repetitions,
+steady-state load, saturation points, fault injection, or multi-node coverage.
+Its observed throughput and tail percentiles are useful diagnostics, not a
+maximum or portable capacity claim.
 
 Only `smoke` and `empty_one_step` are implemented today. Other benchmark suites
 (claim ceiling, cyclic drain, blocked vehicles, fairness, cache, freshness,

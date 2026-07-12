@@ -42,4 +42,48 @@ defmodule Docket.BenchmarkTest do
     assert {:error, duration} = Docket.Benchmark.parse(~w(--duration 10m))
     assert duration =~ "steady-state scenarios"
   end
+
+  test "nearest-rank distributions retain sample counts and units" do
+    assert %{
+             unit: "ms",
+             sample_count: 5,
+             min: 1,
+             p50: 3,
+             p95: 100,
+             p99: 100,
+             max: 100,
+             mean: 22.0
+           } = Docket.Benchmark.Stats.millisecond_distribution([1, 2, 3, 4, 100])
+
+    assert %{unit: "us", sample_count: 0} =
+             Docket.Benchmark.Stats.native_distribution([])
+  end
+
+  test "collector keeps bounded metric metadata and drops query details" do
+    collector = Docket.Benchmark.Collector.start()
+
+    :telemetry.execute(
+      [:docket, :postgres, :claim, :attempt],
+      %{count: 1, eligible_age_ms: 7, overdue_after_ttl_ms: 0},
+      %{class: :ready, result: :acquired, run_id: "secret", claim_token: "secret"}
+    )
+
+    :telemetry.execute(
+      [:docket, :benchmark, :repo, :query],
+      %{query_time: 10, queue_time: 2},
+      %{query: "SELECT secret", params: ["secret"]}
+    )
+
+    events = Docket.Benchmark.Collector.stop(collector)
+
+    assert {[:docket, :postgres, :claim, :attempt], _, %{class: :ready, result: :acquired}, _} =
+             Enum.find(events, fn {event, _, _, _} ->
+               event == [:docket, :postgres, :claim, :attempt]
+             end)
+
+    assert {[:docket, :benchmark, :repo, :query], _, %{}, _} =
+             Enum.find(events, fn {event, _, _, _} ->
+               event == [:docket, :benchmark, :repo, :query]
+             end)
+  end
 end

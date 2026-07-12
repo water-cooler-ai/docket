@@ -191,10 +191,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       cutoff = DateTime.add(now, -ttl, :millisecond)
       params = [now, cutoff, limit, max, preference && Atom.to_string(preference)]
 
-      case Ecto.Adapters.SQL.query(repo, claim_statement(prefix), params) do
+      case Ecto.Adapters.SQL.query(repo, claim_statement(prefix), params,
+             telemetry_event: [:docket, :postgres, :run_store, :claim_query]
+           ) do
         {:ok, %{rows: rows}} ->
-          {batch, stats} = decode_claim_batch(rows, now, ttl)
-          emit_claim_telemetry({batch, stats}, limit, preference, started)
+          {batch, stats, observations} = decode_claim_batch(rows, now, ttl)
+          emit_claim_telemetry({batch, stats, observations}, limit, preference, started)
           {:ok, batch}
 
         {:error, reason} ->
@@ -904,8 +906,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     }
 
     defp decode_claim_batch(rows, now, orphan_ttl_ms) do
-      {{leases, poisoned}, stats} =
-        Enum.reduce(rows, {{[], []}, @empty_claim_stats}, fn
+      {{leases, poisoned}, stats, observations} =
+        Enum.reduce(rows, {{[], []}, @empty_claim_stats, []}, fn
           [
             run_id,
             graph_id,
@@ -921,7 +923,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             ready_candidates,
             expired_candidates
           ],
-          {{leases, poisoned}, stats} ->
+          {{leases, poisoned}, stats, observations} ->
             lease = %{
               run_id: run_id,
               graph_id: graph_id,
@@ -938,7 +940,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               |> observe_outcome(class, eligible_at, ready_candidates, expired_candidates, now)
               |> observe_steal(class)
 
-            {{[lease | leases], poisoned}, stats}
+            age_ms = DateTime.diff(now, eligible_at, :millisecond)
+            observation = %{class: class, eligible_age_ms: age_ms, orphan_ttl_ms: orphan_ttl_ms}
+
+            {{[lease | leases], poisoned}, stats, [observation | observations]}
 
           [
             run_id,
@@ -955,7 +960,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             ready_candidates,
             expired_candidates
           ],
-          {{leases, poisoned}, stats} ->
+          {{leases, poisoned}, stats, observations} ->
             result = %{
               run_id: run_id,
               poisoned_at: poisoned_at,
@@ -963,10 +968,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             }
 
             {{leases, [result | poisoned]},
-             observe_outcome(stats, class, eligible_at, ready_candidates, expired_candidates, now)}
+             observe_outcome(
+               stats,
+               class,
+               eligible_at,
+               ready_candidates,
+               expired_candidates,
+               now
+             ), observations}
         end)
 
-      {%{leases: Enum.reverse(leases), poisoned: Enum.reverse(poisoned)}, stats}
+      {%{leases: Enum.reverse(leases), poisoned: Enum.reverse(poisoned)}, stats,
+       Enum.reverse(observations)}
     end
 
     defp observe_outcome(stats, class, eligible_at, ready_candidates, expired_candidates, now) do
@@ -998,7 +1011,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp observe_steal(stats, "expired"), do: %{stats | steals: stats.steals + 1}
     defp observe_steal(stats, _class), do: stats
 
-    defp emit_claim_telemetry({batch, stats}, demand, preference, started) do
+    defp emit_claim_telemetry({batch, stats, observations}, demand, preference, started) do
       fallback? =
         demand == 1 and preference != nil and
           ((preference == :ready and stats.expired_selected > 0) or
@@ -1016,11 +1029,27 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         %{preference: preference, fallback: fallback?, result: :ok}
       )
 
-      Enum.each(batch.leases, fn lease ->
+      Enum.zip(batch.leases, observations)
+      |> Enum.each(fn {lease, observation} ->
+        class = if observation.class == "ready", do: :ready, else: :expired
+        eligible_age_ms = observation.eligible_age_ms
+
         :telemetry.execute(
           [:docket, :postgres, :claim, :attempt],
-          %{count: 1, claim_attempts: lease.claim_attempt},
-          %{result: if(lease.claim_attempt == 1, do: :acquired, else: :reacquired)}
+          %{
+            count: 1,
+            claim_attempts: lease.claim_attempt,
+            eligible_age_ms: eligible_age_ms,
+            overdue_after_ttl_ms:
+              if(class == :expired,
+                do: eligible_age_ms - observation.orphan_ttl_ms,
+                else: 0
+              )
+          },
+          %{
+            class: class,
+            result: if(lease.claim_attempt == 1, do: :acquired, else: :reacquired)
+          }
         )
       end)
 

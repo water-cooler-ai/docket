@@ -766,6 +766,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                       %{preference: :ready, fallback: true}}
     end
 
+    test "claim attempts emit per-lease ready lag and expired overdue age without identities" do
+      handler_id = "claim-attempt-lag-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:docket, :postgres, :claim, :attempt],
+          &Docket.Test.TelemetryRelay.tagged/4,
+          {parent, :claim_attempt_lag}
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      insert_run!("ready-lag", wake_at: DateTime.add(@now, -20, :second))
+      assert {:ok, %{leases: [_], poisoned: []}} = claim_due(@now)
+
+      assert_receive {:claim_attempt_lag, %{eligible_age_ms: 20_000, overdue_after_ttl_ms: 0},
+                      %{class: :ready, result: :acquired}}
+
+      insert_run!("expired-lag",
+        wake_at: nil,
+        claim_token: Ecto.UUID.generate(),
+        claimed_at: DateTime.add(@now, -90, :second)
+      )
+
+      assert {:ok, %{leases: [_], poisoned: []}} =
+               claim_due(@now, orphan_ttl_ms: 60_000)
+
+      assert_receive {:claim_attempt_lag,
+                      %{eligible_age_ms: 90_000, overdue_after_ttl_ms: 30_000},
+                      %{class: :expired, result: :acquired}}
+    end
+
     test "leases and poison outcomes across both paths share one limit" do
       insert_run!("poison-ready",
         wake_at: DateTime.add(@now, -30, :second),
