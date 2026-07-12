@@ -146,7 +146,7 @@ defmodule Docket do
          {:ok, moment} <- Loop.propose_init(rtg, run, opts),
          {:ok, moment} <- Lifecycle.start(backend_ref, scope, moment) do
       :ok = Lifecycle.after_commit(moment, opts)
-      {:ok, moment.run}
+      maybe_inline_drain(backend, opts, scope, moment.run)
     end
   end
 
@@ -243,7 +243,23 @@ defmodule Docket do
   def retry_poisoned_run(runtime, run_id, opts \\ []) do
     with {:ok, opts} <- instance_opts(runtime, opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
-      backend.runs().retry_poisoned_run(context, scope, run_id, operation_now(opts))
+      case backend.runs().retry_poisoned_run(context, scope, run_id, operation_now(opts)) do
+        {:ok, run} -> maybe_inline_drain(backend, opts, scope, run)
+        other -> other
+      end
+    end
+  end
+
+  @doc "Synchronously claims and drains due durable runs in a backend testing mode."
+  def drain_runs(runtime, opts \\ []) do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, {backend, _context}, _scope} <- durable_access(opts) do
+      if function_exported?(backend, :drain_runs, 1) do
+        backend.drain_runs(opts)
+      else
+        {:error,
+         Error.new(:unsupported_operation, "configured backend does not support drain_runs")}
+      end
     end
   end
 
@@ -333,6 +349,7 @@ defmodule Docket do
       def fetch_run(run_id, opts \\ []), do: Docket.fetch_run(__MODULE__, run_id, opts)
       def inspect_run(run_id, opts \\ []), do: Docket.inspect_run(__MODULE__, run_id, opts)
       def await_run(run_id, opts \\ []), do: Docket.await_run(__MODULE__, run_id, opts)
+      def drain_runs(opts \\ []), do: Docket.drain_runs(__MODULE__, opts)
     end
   end
 
@@ -400,6 +417,7 @@ defmodule Docket do
           |> preserve_instance_option(defaults, :backend)
           |> preserve_instance_option(defaults, :backend_context)
           |> preserve_instance_option(defaults, :tenant_mode)
+          |> preserve_instance_option(defaults, :testing)
           |> Keyword.put(:task_supervisor, task_supervisor)
           |> Keyword.update(
             :executor_opts,
@@ -497,11 +515,47 @@ defmodule Docket do
 
   defp finish_signal({:ok, %Docket.Runtime.Moment{} = moment}, opts) do
     :ok = Lifecycle.after_commit(moment, opts)
-    {:ok, moment.run}
+    {:ok, {backend, _context}, scope} = durable_access(opts)
+    maybe_inline_drain(backend, opts, scope, moment.run)
   end
 
   defp finish_signal({:ok, %Run{} = run}, _opts), do: {:ok, run}
   defp finish_signal({:error, reason}, _opts), do: {:error, reason}
+
+  defp maybe_inline_drain(backend, opts, scope, run) do
+    if not Run.terminal?(run) and function_exported?(backend, :testing_mode, 1) and
+         backend.testing_mode(opts) == :inline do
+      case backend.drain_runs(opts) do
+        {:ok, summary} -> inline_result(backend, opts, scope, run.id, summary)
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, run}
+    end
+  end
+
+  defp inline_result(backend, opts, scope, run_id, summary) do
+    context = backend.context(opts)
+
+    with {:ok, current} <- backend.runs().fetch_run(context, scope, run_id) do
+      if summary.limit_reached and current.status == :running do
+        case backend.runs().inspect_run(context, scope, run_id) do
+          {:ok, %RunInfo{wake_at: %DateTime{} = wake_at}} ->
+            if DateTime.compare(wake_at, operation_now(opts)) in [:lt, :eq],
+              do: {:error, {:inline_drain_limit_reached, summary}},
+              else: {:ok, current}
+
+          {:ok, %RunInfo{}} ->
+            {:ok, current}
+
+          error ->
+            error
+        end
+      else
+        {:ok, current}
+      end
+    end
+  end
 
   defp operation_now(opts), do: Keyword.get(opts, :clock, &DateTime.utc_now/0).()
 

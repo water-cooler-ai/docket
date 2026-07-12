@@ -8,6 +8,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduletag capture_log: true
 
     alias Docket.Postgres.BackendTestRepo, as: TestRepo
+    alias Docket.Postgres.BackendSandboxTestRepo, as: SandboxRepo
     alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}
     alias Docket.Test.Fixtures.Graphs
 
@@ -114,12 +115,41 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         pruner: @pruner
     end
 
+    defmodule InlineHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        testing: :inline,
+        notifier: :none
+    end
+
+    defmodule ManualHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        testing: :manual,
+        notifier: :none
+    end
+
+    defmodule SandboxInlineHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: SandboxRepo,
+        testing: :inline,
+        notifier: :none
+    end
+
     setup_all do
       config = TestRepo.config()
       _ = Ecto.Adapters.Postgres.storage_down(config)
       :ok = Ecto.Adapters.Postgres.storage_up(config)
       start_supervised!(TestRepo)
       :ok = Ecto.Migrator.up(TestRepo, @migration_version, InstallDocket, log: false)
+      sandbox_config = SandboxRepo.config()
+      _ = Ecto.Adapters.Postgres.storage_down(sandbox_config)
+      :ok = Ecto.Adapters.Postgres.storage_up(sandbox_config)
+      start_supervised!(SandboxRepo)
+      :ok = Ecto.Migrator.up(SandboxRepo, @migration_version, InstallDocket, log: false)
       :ok
     end
 
@@ -128,6 +158,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       stop_host(NotifyHost)
       stop_host(TenantHost)
       stop_host(PoisonHost)
+      stop_host(InlineHost)
+      stop_host(ManualHost)
+      stop_host(SandboxInlineHost)
 
       TestRepo.delete_all(Event)
       TestRepo.delete_all(Run)
@@ -135,6 +168,132 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       Docket.Postgres.GraphCache.clear()
       on_exit(&Docket.Postgres.GraphCache.clear/0)
       :ok
+    end
+
+    test "inline testing drains in the caller without background backend children" do
+      start_supervised!(InlineHost)
+      backend_name = Module.concat(InlineHost, Backend)
+
+      refute Process.whereis(Docket.Postgres.runner_name(backend_name))
+      refute Process.whereis(Docket.Postgres.dispatcher_name(backend_name))
+      refute Process.whereis(Docket.Postgres.vehicle_supervisor_name(backend_name))
+      refute Process.whereis(Docket.Postgres.notifier_name(backend_name))
+      refute Process.whereis(Docket.Postgres.pruner_name(backend_name))
+
+      assert {:ok, reference} = InlineHost.save_graph(Graphs.minimal_linear())
+
+      assert {:ok, %Docket.Run{status: :done}} =
+               InlineHost.start_run(reference, %{"value" => "inline"})
+    end
+
+    test "inline testing completes a named interrupt through the durable facade" do
+      start_supervised!(InlineHost)
+      assert {:ok, reference} = InlineHost.save_graph(Graphs.interrupt_review())
+      assert {:ok, %Docket.Run{status: :waiting} = waiting} = InlineHost.start_run(reference, %{})
+      assert [{interrupt_id, %{status: :open}}] = Map.to_list(waiting.interrupts)
+
+      assert {:ok, %Docket.Run{status: :done} = done} =
+               InlineHost.resolve_interrupt(waiting.id, interrupt_id, "approved")
+
+      assert {:ok, %Docket.RunInfo{run: ^done}} = InlineHost.inspect_run(waiting.id)
+
+      assert {:error, %Docket.Error{type: :inactive_run}} =
+               InlineHost.resolve_interrupt(waiting.id, interrupt_id, "again")
+    end
+
+    test "SQL Sandbox owner completes inline named interrupt flow in the caller" do
+      :ok = Ecto.Adapters.SQL.Sandbox.checkout(SandboxRepo)
+      start_supervised!(SandboxInlineHost)
+      assert {:ok, reference} = SandboxInlineHost.save_graph(Graphs.interrupt_review())
+
+      assert {:ok, %Docket.Run{status: :waiting} = waiting} =
+               SandboxInlineHost.start_run(reference, %{})
+
+      assert [{interrupt_id, %{status: :open}}] = Map.to_list(waiting.interrupts)
+
+      assert {:ok, %Docket.Run{status: :done}} =
+               SandboxInlineHost.resolve_interrupt(waiting.id, interrupt_id, "sandbox-approved")
+    end
+
+    test "manual testing advances only through bounded drain_runs" do
+      start_supervised!(ManualHost)
+      assert {:ok, reference} = ManualHost.save_graph(Graphs.minimal_linear())
+
+      assert {:ok, %Docket.Run{status: :running} = started} =
+               ManualHost.start_run(reference, %{"value" => "manual"})
+
+      assert {:ok,
+              %{
+                drained: 1,
+                poisoned: [],
+                outcomes: [{:ok, {:parked, :terminal}}],
+                limit_reached: true
+              }} = ManualHost.drain_runs(max_runs: 1)
+
+      assert {:ok, %Docket.Run{status: :done}} = ManualHost.fetch_run(started.id)
+
+      assert {:ok, %{drained: 0, poisoned: [], outcomes: [], limit_reached: false}} =
+               ManualHost.drain_runs(max_runs: 10)
+    end
+
+    test "manual drains preserve retry attempt state across separate claims" do
+      start_supervised!(ManualHost)
+      assert {:ok, reference} = ManualHost.save_graph(Graphs.retry_then_continue())
+      assert {:ok, started} = ManualHost.start_run(reference, %{})
+
+      assert {:ok, %{drained: 1, limit_reached: true}} = ManualHost.drain_runs(max_runs: 1)
+
+      assert {:ok, %Docket.Run{status: :running, active_tasks: first_tasks}} =
+               ManualHost.fetch_run(started.id)
+
+      assert first_tasks != %{}
+      assert {:ok, %{drained: 1, limit_reached: true}} = ManualHost.drain_runs(max_runs: 1)
+
+      assert {:ok, %Docket.Run{status: :running, active_tasks: second_tasks}} =
+               ManualHost.fetch_run(started.id)
+
+      assert second_tasks != %{}
+      assert second_tasks != first_tasks
+      assert {:ok, %{drained: 1}} = ManualHost.drain_runs(max_runs: 1)
+
+      assert {:ok, %Docket.Run{status: :done, active_tasks: %{}}} =
+               ManualHost.fetch_run(started.id)
+    end
+
+    test "manual cancel, poison halt, inspection, and recovery are deterministic" do
+      start_supervised!(ManualHost)
+      assert {:ok, reference} = ManualHost.save_graph(Graphs.minimal_linear())
+      assert {:ok, cancellable} = ManualHost.start_run(reference, %{"value" => "cancel"})
+      assert {:ok, %Docket.Run{status: :cancelled}} = ManualHost.cancel_run(cancellable.id)
+
+      assert {:ok, %Docket.RunInfo{run: %Docket.Run{status: :cancelled}}} =
+               ManualHost.inspect_run(cancellable.id)
+
+      assert {:ok, poisoned} = ManualHost.start_run(reference, %{"value" => "recover"})
+      now = DateTime.utc_now()
+
+      TestRepo.update_all(
+        from(row in Run, where: row.run_id == ^poisoned.id),
+        set: [wake_at: nil, poisoned_at: now, poison_reason: "manual_test"]
+      )
+
+      assert {:error, {:poisoned, %Docket.RunInfo{}}} =
+               ManualHost.await_run(poisoned.id, timeout: 0)
+
+      assert {:ok, %Docket.Run{status: :running}} = ManualHost.retry_poisoned_run(poisoned.id)
+      assert {:ok, %{drained: 1}} = ManualHost.drain_runs(max_runs: 2)
+      assert {:ok, %Docket.Run{status: :done}} = ManualHost.fetch_run(poisoned.id)
+    end
+
+    test "testing mode is instance-owned and cannot activate draining on production" do
+      start_supervised!(ManualHost)
+      start_supervised!(PollHost)
+      assert {:ok, reference} = ManualHost.save_graph(Graphs.minimal_linear())
+
+      assert {:ok, %Docket.Run{status: :running}} =
+               ManualHost.start_run(reference, %{"value" => "manual"}, testing: :inline)
+
+      assert {:error, :testing_mode_required} = PollHost.drain_runs(testing: :manual)
     end
 
     test "the bundle fixes every capability and assembles poll-only execution plus pruning" do

@@ -169,6 +169,17 @@ the PostgreSQL-free graph-semantics testing surface. Run persistence is
 backend-private. The v0.0.1 host Run map codec is not part
 of v0.1.0 and there is no compatibility decoder or dual-write path.
 
+Durable integration tests use the production lifecycle and PostgreSQL stores.
+Configure `testing: :inline` to commit `start_run` and named signals in the
+caller and synchronously drain due work to its next park, without starting a
+dispatcher, notifier, vehicle task, or pruner. Configure `testing: :manual` to
+disable automatic advancement and call `MyApp.Docket.drain_runs(max_runs: 100)`
+after starts, signals, or manual clock changes. The bound prevents cyclic
+graphs that remain immediately due from hanging a test. Both modes keep one
+production `Docket.Lifecycle`/storage transaction per logical moment; neither
+wraps node execution or a whole drain in a Docket transaction. An SQL Sandbox
+owner transaction may still surround the test itself.
+
 The intended cutover is:
 
 1. Drain or terminate active `0.0.1` runs and stop old writers.
