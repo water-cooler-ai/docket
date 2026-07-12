@@ -996,15 +996,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         task = Task.Supervisor.async_nolink(@task_sup, fn -> Vehicle.drain(lease, opts) end)
 
         assert_receive {:blocked, node_pid, "blocker", 1}
-        assert_receive {:refreshed, _heartbeat, :ok}
-        assert_receive {:refreshed, _heartbeat, :ok}
+        # Heartbeat delivery crosses a real timer and a monitored store
+        # worker, so its scheduling budget is explicit and local.
+        assert_receive {:refreshed, _heartbeat, :ok}, 1_000
+        assert_receive {:refreshed, _heartbeat, :ok}, 1_000
 
         # The claim was stamped slightly in the future; keep consuming ticks
         # until one lands past it, proving claimed_at advances while the
         # node is still executing.
         advanced? =
           Enum.reduce_while(1..300, false, fn _tick, _acc ->
-            assert_receive {:refreshed, _heartbeat, :ok}
+            assert_receive {:refreshed, _heartbeat, :ok}, 1_000
             assert {:ok, info} = MemoryBackend.inspect_run(context, :system, run.id)
 
             if DateTime.compare(info.claimed_at, lease.claimed_at) == :gt do
@@ -1049,7 +1051,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         # The loss flag is written before the heartbeat exits, so its DOWN
         # guarantees the vehicle's pre-commit check observes the loss.
-        assert_receive {:refreshed, heartbeat, {:error, :claim_lost}}
+        assert_receive {:refreshed, heartbeat, {:error, :claim_lost}}, 1_000
         monitor = Process.monitor(heartbeat)
         assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
 
@@ -1101,7 +1103,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         # Wait for the heartbeat to exit before releasing the node: the loss
         # flag is written before the exit, so DOWN guarantees the vehicle's
         # pre-commit check observes it.
-        assert_receive {:refreshed, heartbeat, {:error, :claim_lost}}
+        assert_receive {:refreshed, heartbeat, {:error, :claim_lost}}, 1_000
         monitor = Process.monitor(heartbeat)
         assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
 
@@ -1138,7 +1140,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         task = Task.Supervisor.async_nolink(@task_sup, fn -> Vehicle.drain(lease, opts) end)
         assert_receive {:blocked, node_pid, "blocker", 1}
 
-        assert_receive {:refresh_attempted, heartbeat}
+        # This notification follows the intentionally real 200 ms heartbeat
+        # timer. Keep its scheduling budget local instead of widening every
+        # receive assertion in the suite.
+        assert_receive {:refresh_attempted, heartbeat}, 1_000
         monitor = Process.monitor(heartbeat)
         assert_receive {:DOWN, ^monitor, :process, ^heartbeat, _reason}
 
@@ -1172,7 +1177,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         task = Task.Supervisor.async_nolink(@task_sup, fn -> Vehicle.drain(lease, opts) end)
         assert_receive {:blocked, node_pid, "blocker", 1}
 
-        assert_receive {:refresh_started, worker, heartbeat}
+        # This notification follows the intentionally real 200 ms heartbeat
+        # timer. Keep its scheduling budget local instead of widening every
+        # receive assertion in the suite.
+        assert_receive {:refresh_started, worker, heartbeat}, 1_000
         worker_monitor = Process.monitor(worker)
         monitor = Process.monitor(heartbeat)
 
@@ -1209,7 +1217,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert {:ok, vehicle} = Vehicle.launch(lease, opts)
 
         assert_receive {:blocked, _node_pid, "blocker", 1}
-        assert_receive {:refreshed, heartbeat, :ok}
+        assert_receive {:refreshed, heartbeat, :ok}, 1_000
         monitor = Process.monitor(heartbeat)
 
         Process.exit(vehicle, :kill)
@@ -1232,7 +1240,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {vehicle, vehicle_monitor} = spawn_monitor(fn -> Vehicle.drain(lease, opts) end)
 
         assert_receive {:fetching, fetcher}
-        assert_receive {:refreshed, heartbeat, :ok}
+        assert_receive {:refreshed, heartbeat, :ok}, 1_000
         heartbeat_monitor = Process.monitor(heartbeat)
 
         send(fetcher, :go)
