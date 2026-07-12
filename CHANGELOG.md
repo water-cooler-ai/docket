@@ -16,6 +16,38 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- `Docket.list_events/3` and the generated `list_events/2` host wrapper: a
+  tenant-scoped, keyset-paged reader over retained durable events, backed by a
+  new `Docket.Storage.Events.list_events/4` callback with memory and Postgres
+  implementations. Events return in ascending sequence order (`:after_seq`
+  default `0`, `:limit` default `250` in `1..1000`); a wrong tenant and an
+  unknown run both report `{:error, :not_found}`, invalid options are rejected
+  before storage, and an undecodable stored row surfaces as a typed
+  `%Docket.Error{type: :corrupt_event_row}`. The Postgres reader observes the
+  page rows, MIN/MAX retention bounds, and run state from one snapshot.
+  Sequence gaps from persistence filtering and pruning are legal; pages are
+  never promised contiguous (DCKT-43).
+- `Docket.EventPage`: the public page struct returned by the retained-event
+  reader — `events`, `next_after_seq`, `has_more?`, `oldest_available_seq`,
+  `latest_available_seq`, and `latest_seq` (the owning run's latest committed
+  event sequence, so a fully pruned history is detectable as `latest_seq > 0`
+  with `latest_available_seq == nil`), all observed from one consistent
+  snapshot (DCKT-43).
+- Restored authored graph map interchange: `Docket.Graph.to_map/2`,
+  `from_map/2`, and `from_map!/2` through a strict `Docket.Graph.Serializer`.
+  It produces JSON-safe, string-keyed maps with an explicit `schema_version: 1`
+  and strictly rejects unknown keys/enums/versions and non-portable values;
+  `$`-prefixed keys are reserved for tagged expressions. Executable node
+  implementations resolve only through an explicit host `implementations:`
+  registry (validated for unambiguous reverse mapping), so loading a document
+  never creates or reaches implementation atoms; failures are typed
+  `Docket.Graph.Error` codes `:invalid_registry`, `:unregistered_implementation`,
+  and `:unknown_implementation`. Hosts own JSON encode/decode, so there is no
+  Jason dependency. This is the editable AUTHORED graph and carries no
+  `Docket.GraphRef` hash; `save_graph` still materializes node defaults and
+  privately encodes and hashes the effective graph, so re-saving after defaults
+  change may yield a different effective reference. `Docket.Run.to_map/from_map`
+  and the public `Docket.Graph.hash` remain removed (DCKT-43).
 - Finite runtime-owned node attempt deadlines across Local, Task, and custom
   executors. Missing node timeouts inherit the host maximum; larger explicit
   graph limits are rejected before execution and rescheduled without poison,

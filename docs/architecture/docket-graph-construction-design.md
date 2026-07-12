@@ -293,6 +293,36 @@ compiled_effective_graph.graph_hash == run.graph_hash
 Store the full SHA-256 digest. UI and logs may display a short prefix, but
 internal equality checks should use the full hash.
 
+#### Why the authored graph has a public map interchange
+
+The authored graph carries a public map codec (`Docket.Graph.to_map/from_map`,
+signatures in the `Docket.Graph` module docs) even though run persistence does
+not. The two are not symmetric. A run is Docket-owned execution state whose
+shape is a private implementation detail; exposing a run wire format would leak
+that detail and invite hosts to persist internals independently. An authored
+graph is the opposite: its schema is *already* a public contract that hosts
+build against field by field, so serializing it introduces no new coupling. A
+second codec is therefore acceptable here because it maps a surface that is
+already promised, and it lets hosts keep authored documents in their own
+editors and stores with any JSON library rather than forcing an in-process
+`%Docket.Graph{}` value across every boundary. Docket takes no JSON dependency;
+the host owns encode and decode.
+
+Executable node implementations resolve through an explicit host registry of
+stable string identifiers rather than `String.to_existing_atom`. Loading a
+document must never mint or reach a module/function atom from untrusted input:
+`String.to_existing_atom` still couples the document to whichever modules happen
+to be loaded and turns a rename into silent breakage, and it offers no stable
+identity a host can version. The registry makes the identifier the durable
+contract, keeps reverse mapping unambiguous, and fails closed on anything
+unregistered.
+
+The authored document carries no hash because it is pre-effective. Publication —
+not authoring — is where defaults are materialized and identity is computed, and
+the same authored document can produce different effective graphs as node
+defaults evolve. Attaching a hash to the authored form would imply a stability
+it does not have; identity belongs only to the effective graph at `save_graph`.
+
 ### 6.2 ID Rules
 
 All IDs stored in `Docket.Graph` are binaries in v1.
