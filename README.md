@@ -5,9 +5,9 @@ built for long-running, interruptible work like agentic LLM sessions, where a
 run may pause for a human decision, survive a deploy, and resume exactly where
 it left off.
 
-This branch is `0.1.0-dev`. The graph runtime is usable inline, through the
-transitional supervised checkpoint driver, and through the assembled
-`Docket.Postgres` durable backend. The PostgreSQL bundle owns its stores,
+This branch is `0.1.0-dev`. Graph semantics are usable processlessly through
+`Docket.Test`; supervised production requires the assembled `Docket.Postgres`
+durable backend. The PostgreSQL bundle owns its stores,
 transaction recipes, claim fencing, dispatcher, claimed-run vehicles,
 notification fast path, and retention pruner. See the
 [PostgreSQL backend guide](docs/architecture/docket-operational-transition-spec.md)
@@ -21,8 +21,7 @@ checkpoint at every durable transition boundary.
 ## Goals
 
 - **Durable by contract.** State changes are proposed at explicit checkpoint
-  boundaries. The legacy driver hands them to host storage; the developing
-  PostgreSQL backend commits them with a token-and-sequence fence.
+  boundaries and the backend commits them with a token-and-sequence fence.
 - **Deterministic semantics.** Superstep planning, write conflict resolution,
   and guard evaluation are pure and ordered; replanning after a crash produces
   byte-identical task identities, so external effects can be deduplicated.
@@ -30,9 +29,8 @@ checkpoint at every durable transition boundary.
   private backend storage codec. Applications own graph versioning,
   authorization and UI; the PostgreSQL stores encode opaque state as
   versioned ETF while preserving operational facts in relational columns.
-- **One interpreter.** The supervised runtime and the inline test runtime run
-  the same loop code — tests exercise real semantics, synchronously, in the
-  calling process.
+- **One interpreter.** Backend vehicles and inline tests run the same loop
+  code, so processless tests exercise production graph semantics.
 
 ## Inspirations
 
@@ -156,10 +154,11 @@ only tenantless rows; `tenant_mode: :required` requires a non-empty
 `tenant_id` before storage access. Durable `checkpoint_observers:` run after
 commit, are best-effort, and cannot veto state. Durable consumers that cannot
 tolerate lost or duplicate delivery should consume retained events instead of
-observer callbacks. The host-owned `checkpoint:` committer remains on this
-branch and is planned for removal from the final v0.1.0 production facade.
+observer callbacks. Production `checkpoint:` configuration is rejected;
+`Docket.Test` returns read-only checkpoint values for processless semantic
+assertions; those values cannot affect execution.
 
-### Planned migration from 0.0.1
+### Migration from 0.0.1
 
 The production-boundary break does not replace the graph programming model.
 Node modules and graph definitions carry over unchanged, including
@@ -210,9 +209,8 @@ def call(state, _config, _context) do
 end
 ```
 
-The run checkpoints as `:waiting` and its process sits idle — a paused
-agentic session is just a cheap BEAM process (or no process at all: you can
-let it finish and resume later). When the human answers:
+The run commits as `:waiting` without retaining a per-run process. When the
+human answers:
 
 ```elixir
 {:ok, run} = MyApp.Docket.resolve_interrupt(run_id, interrupt_id, "approved")
@@ -246,35 +244,20 @@ ETF bytes are hashed once and stored. Graph hashing is private, and every run
 records the published graph ID and hash it was started from. Recovery validates
 strict collection key/value shapes and fails closed on malformed stored terms.
 
-## Current supervised architecture
+## Production architecture
 
-Each runtime instance is one supervision tree:
+Each instance supervises one backend bundle and shared execution resources:
 
 ```text
 MyApp.Docket (Supervisor, :one_for_all)
-├── Registry            — run_id → runtime process; pids never leave the library
-├── Task.Supervisor     — isolated node execution, async checkpoint delivery
-└── DynamicSupervisor   — one Docket.Runtime process per active run
-    ├── Docket.Runtime (run "a3f…")
-    └── Docket.Runtime (run "9c1…")
+├── Docket.Postgres     — stores, dispatcher, vehicles, notifier, pruner
+├── Runtime.Instance    — immutable facade configuration
+└── Task.Supervisor     — isolated node execution and observer delivery
 ```
 
-This shape is what makes durable agentic sessions natural on the BEAM:
-
-- **A session is a process.** Each run is owned by exactly one lightweight
-  GenServer that drives the loop on self-scheduled ticks, staying responsive
-  to `get_run` and `resolve_interrupt` between supersteps. Thousands of
-  concurrent sessions are just thousands of processes.
-- **Isolation where it matters.** With `Docket.Executor.Task`, node code runs
-  in a separate supervised task process — a hung LLM call gets a real
-  timeout, and a crashing node fails one activation, not the runtime.
-- **Crash recovery is resume.** Because every committed transition was
-  checkpointed to host storage first, the failure story has one answer at
-  every level: node crash → retry policy; runtime crash → resume from the
-  last checkpoint; whole-tree restart → resume from the last checkpoint.
-- **No external orchestrator.** No queue, no scheduler service, no polling
-  loop. The BEAM's preemptive scheduler runs the sessions; your database
-  holds the truth.
+Backend vehicles claim persisted work and execute nodes in isolated supervised
+tasks. Claim fencing protects commits, and recovery reclaims persisted runs
+after process or node failure without a host-owned resume path.
 
 ## Current boundaries
 
@@ -285,9 +268,8 @@ Docket deliberately leaves these to the host application:
 - UI projections for editors and live run views.
 - External effects — nodes call your code; Docket never talks to the network.
 
-On `0.1.0-dev`, the host also owns persistence when using the legacy supervised
-driver. The developing PostgreSQL backend owns its tables and tenant scoping,
-but it is not operational until its bundle and vehicle are assembled.
+The configured backend exclusively owns graph/run persistence, scheduling,
+recovery, signals, and production supervision.
 
 ## Installation
 
@@ -304,8 +286,8 @@ end
 ## Learn more
 
 - [examples/parent-app-integration.md](examples/parent-app-integration.md) —
-  the target durable integration boundary, marked where PostgreSQL assembly is
-  still pending.
+  the durable parent-application integration boundary.
+- [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).
 - [examples/llm-node.md](examples/llm-node.md) — a generic, configurable LLM
   node implementation.
 - [docs/architecture/](docs/architecture/) — design rationale: the graph

@@ -16,7 +16,6 @@ defmodule Docket.Runtime.FailureRetryTest do
       assert run.failure.details["errors"]["failing_node"] =~ "always_fails"
 
       run_failed = List.last(checkpoints)
-      assert run_failed.delivery == :sync
 
       failed_nodes =
         for event <- run_failed.events,
@@ -140,7 +139,6 @@ defmodule Docket.Runtime.FailureRetryTest do
       # attempt and the accumulated failures.
       for {park, index} <-
             checkpoints |> Enum.filter(&(&1.type == :retry_scheduled)) |> Enum.with_index(1) do
-        assert park.delivery == :sync
         assert park.run.status == :running
         assert park.run.step == 0
 

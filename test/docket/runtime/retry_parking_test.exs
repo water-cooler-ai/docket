@@ -2,7 +2,6 @@ defmodule Docket.Runtime.RetryParkingTest do
   use Docket.Test.Case, async: true
 
   alias Docket.Run.{PendingWrite, TaskState, TimerState}
-  alias Docket.Test.Checkpoint.FailOn
 
   # start fans out to flaky and steady in one superstep; flaky fails
   # retryably while steady commits its result at the first retry park.
@@ -144,35 +143,6 @@ defmodule Docket.Runtime.RetryParkingTest do
       refute_received {:executed, "steady", _}
     end
 
-    test "a park rejected by its sync checkpoint repeats the same attempt identity" do
-      graph = parallel_retry_graph()
-
-      assert {:error, error, checkpoints} =
-               Docket.Test.run_inline(graph, %{},
-                 checkpoint: FailOn,
-                 context: %{notify: self(), fail_on: [:retry_scheduled]}
-               )
-
-      assert error.type == :checkpoint_failed
-      assert_received {:attempted, "flaky", 1, key1, _state}
-      assert_received {:executed, "steady", 1}
-
-      # The initialized run stays the durable truth: nothing of the failed
-      # superstep was committed.
-      committed = List.last(checkpoints).run
-      assert committed.active_tasks == %{}
-      assert committed.pending_writes == []
-
-      # Re-execution repeats attempt 1 - and the uncommitted sibling - with
-      # byte-identical identity.
-      assert {:ok, resumed, _} =
-               Docket.Test.resume_inline(graph, committed, context: %{notify: self()})
-
-      assert resumed.status == :done
-      assert_received {:attempted, "flaky", 1, ^key1, _state}
-      assert_received {:executed, "steady", 1}
-    end
-
     test "permanent failure after a park discards parked sibling results" do
       graph = parallel_retry_graph(failures: 5.0, max_attempts: 2)
 
@@ -298,7 +268,9 @@ defmodule Docket.Runtime.RetryParkingTest do
       assert_received {:slept, 50}
       refute_received {:slept, _}
 
-      assert collect_attempts([]) == [{"fast", 1}, {"slow", 1}, {"fast", 2}, {"slow", 2}]
+      attempts = collect_attempts([])
+      assert Enum.sort(Enum.take(attempts, 2)) == [{"fast", 1}, {"slow", 1}]
+      assert Enum.drop(attempts, 2) == [{"fast", 2}, {"slow", 2}]
 
       assert [park1, park2] = Enum.filter(checkpoints, &(&1.type == :retry_scheduled))
 

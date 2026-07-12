@@ -308,9 +308,8 @@ LISTEN connection for poll-only deployments. Dispatcher and vehicle policies
 may be supplied through `dispatcher:` and `vehicle:` keyword lists; the store
 capabilities themselves are fixed and cannot be mixed independently.
 
-The old host-owned supervised `run`/`resume`/`get_run` path still exists while
-that replacement is incomplete. It is migration compatibility, not the target
-PostgreSQL lifecycle.
+The old host-owned supervised `run`/`resume`/`get_run` path is absent in
+v0.1.0. A configured backend is the only supervised production lifecycle.
 
 ## Design boundaries
 

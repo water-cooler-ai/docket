@@ -110,7 +110,7 @@ defmodule Docket.LifecycleTest do
     assert {:ok, %Docket.RunInfo{run: ^started, wake_at: %DateTime{}}} =
              Host.inspect_run(started.id)
 
-    assert_receive {:observed, %Docket.Checkpoint{type: :run_initialized, delivery: :observer}}
+    assert_receive {:observed, %Docket.Checkpoint{type: :run_initialized}}
     assert_receive :failing_observer_called
 
     assert {:ok, cancelled} = Host.cancel_run(started.id, context: %{notify: self()})
@@ -298,8 +298,7 @@ defmodule Docket.LifecycleTest do
     forged = %{first | graph_hash: String.duplicate("0", 64)}
     assert {:error, :not_found} = Host.start_run(forged, %{"value" => "x"})
 
-    assert {:error, %Docket.Error{type: :invalid_operation}} =
-             Host.run(graph, %{"value" => "x"})
+    refute function_exported?(Host, :run, 2)
   end
 
   test "a blocking observer cannot delay a committed API result" do
@@ -382,7 +381,7 @@ defmodule Docket.LifecycleTest do
   end
 
   defp backend_ref(host) do
-    {:ok, defaults} = Docket.Runtime.Registry.defaults(host)
+    {:ok, defaults} = Docket.Runtime.Instance.defaults(host)
     {Keyword.fetch!(defaults, :backend), Keyword.fetch!(defaults, :backend_context)}
   end
 

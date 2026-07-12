@@ -75,7 +75,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end
       end
 
-      test "latest_checkpoint_type values mirror Docket.Checkpoint.types/0" do
+      test "latest_checkpoint_type values mirror runtime checkpoint types" do
         assert Ecto.Enum.values(Run, :latest_checkpoint_type) == Docket.Checkpoint.types()
       end
 

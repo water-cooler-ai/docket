@@ -2,9 +2,15 @@
 
 Date: 2026-07-11
 
-This audit compares the `v0.1.0` branch with the architecture previously
-described by the operational transition spec. It records repository state,
-not ticket intent. The code and module documentation remain authoritative.
+Status: historical pre-cutover snapshot. DCKT-37 superseded its lifecycle and
+testing-gap findings after the assembled backend and deterministic modes
+landed. See the module docs, PostgreSQL guide, and migration guide for the
+current v0.1.0 production boundary.
+
+This audit compared the pre-DCKT-37 `v0.1.0` branch with the architecture
+previously described by the operational transition spec. Its tables record
+repository state on 2026-07-11 and are intentionally not current. The code and
+module documentation remain authoritative.
 
 ## Verdict
 

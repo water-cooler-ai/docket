@@ -1,30 +1,14 @@
 defmodule Docket.Runtime.MomentTest do
   use Docket.Test.Case, async: true
 
-  alias Docket.Checkpoint
   alias Docket.Runtime.{Loop, Moment}
   alias Docket.Test.MemoryBackend
-
-  defmodule NeverCalled do
-    @behaviour Docket.Checkpoint
-
-    def handle(_checkpoint, _context) do
-      raise "checkpoint handler invoked during moment calculation"
-    end
-  end
-
-  defmodule RaisingObserver do
-    @behaviour Docket.Checkpoint
-
-    def handle(_checkpoint, _context), do: raise("observer exploded")
-  end
 
   @now DateTime.from_naive!(~N[2026-07-10 12:00:00], "Etc/UTC")
 
   defp opts(overrides \\ []) do
     Keyword.merge(
       [
-        checkpoint: NeverCalled,
         clock: fn -> @now end,
         id_generator: fn kind -> "#{kind}_fixed" end,
         run_id: "run_fixed"
@@ -123,10 +107,10 @@ defmodule Docket.Runtime.MomentTest do
       rtg = compile!(Graphs.minimal_linear())
       moment = propose_init!(rtg, %{"value" => "hello"}, opts())
 
-      accepted_opts = opts(checkpoint: Docket.Test.Checkpoint.Accept)
+      accepted_opts = opts()
       run = Loop.build_initial_run(rtg, %{"value" => "hello"}, accepted_opts)
 
-      {:ok, committed, [{:checkpoint, checkpoint, _context, :accepted}]} =
+      {:ok, committed, [{:checkpoint, checkpoint}]} =
         Loop.init(rtg, run, accepted_opts)
 
       assert moment.run == committed
@@ -236,7 +220,7 @@ defmodule Docket.Runtime.MomentTest do
       rtg = compile!(graph)
 
       {:ok, inline_run, inline_checkpoints} =
-        Docket.Test.run_inline(rtg, %{}, opts(checkpoint: Docket.Test.Checkpoint.Accept))
+        Docket.Test.run_inline(rtg, %{}, opts())
 
       init_moment = propose_init!(rtg, %{}, opts())
       moments = [init_moment | drain(rtg, init_moment.run, opts())]
@@ -520,7 +504,7 @@ defmodule Docket.Runtime.MomentTest do
 
           # Only after transaction success does a committed checkpoint exist.
           checkpoint =
-            Moment.checkpoint(moment, Checkpoint.delivery(moment.checkpoint_type))
+            Moment.checkpoint(moment)
 
           assert checkpoint.run == committed
           assert checkpoint.seq == committed.checkpoint_seq
@@ -603,27 +587,6 @@ defmodule Docket.Runtime.MomentTest do
       # The run commit inside the failed transaction never became durable.
       assert {:ok, run} = MemoryBackend.fetch_run(backend, :tenantless, "run_fixed")
       assert run == init_moment.run
-    end
-
-    test "post-commit observer failure cannot change durable state" do
-      rtg = compile!(Graphs.minimal_linear())
-      opts = opts()
-      backend = start_backend()
-
-      init_moment = propose_init!(rtg, %{"value" => "hello"}, opts)
-      insert!(backend, init_moment)
-      token = claim!(backend)
-
-      {:ok, moment} = Loop.propose_advance(rtg, init_moment.run, opts)
-      {:ok, committed} = commit_moment(backend, moment, init_moment.run.checkpoint_seq, token)
-
-      checkpoint = Moment.checkpoint(moment, Checkpoint.delivery(moment.checkpoint_type))
-      context = Moment.context(moment, %{})
-
-      assert {:error, {:raised, _exception}} =
-               Loop.deliver_checkpoint(RaisingObserver, checkpoint, context)
-
-      assert {:ok, ^committed} = MemoryBackend.fetch_run(backend, :tenantless, "run_fixed")
     end
   end
 end

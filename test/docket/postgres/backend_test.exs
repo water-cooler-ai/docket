@@ -53,13 +53,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    defmodule LegacyCheckpoint do
-      @behaviour Docket.Checkpoint
-
-      @impl true
-      def handle(_checkpoint, _context), do: raise("durable path called legacy checkpoint")
-    end
-
     defmodule PollHost do
       @pruner [
         interval_ms: :timer.hours(1),
@@ -73,7 +66,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         repo: TestRepo,
         notifier: :none,
         dispatcher: [concurrency: 2, poll_interval_ms: 10],
-        checkpoint: LegacyCheckpoint,
         checkpoint_observers: [FailingObserver],
         pruner: @pruner
     end
@@ -363,7 +355,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                PollHost.await_run(started.id, timeout: 5_000)
 
       assert {:ok, ^done} = PollHost.fetch_run(started.id)
-      assert {:error, %Docket.Error{type: :not_found}} = PollHost.get_run(started.id)
 
       assert_receive {:observer_called, :run_initialized}
       assert_receive {:observer_called, :run_completed}

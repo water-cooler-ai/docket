@@ -4,9 +4,7 @@ This example connects durable Docket runs to app-owned users, accounts, and
 workflow rows without making the parent application a second persistence
 driver.
 
-> **Status:** this is the target integration API. The backend-neutral facade
-> exists, but `Docket.Postgres` and its claimed-run vehicle are not implemented
-> on `0.1.0-dev`, so this example is not runnable with PostgreSQL yet.
+> **Status:** this is the v0.1.0 production integration API.
 
 ## Configure one backend
 
@@ -20,7 +18,7 @@ defmodule MyApp.Docket do
 end
 ```
 
-Once assembled, `Docket.Postgres` will own graph/run persistence, claiming,
+`Docket.Postgres` owns graph/run persistence, claiming,
 scheduling, and cold recovery. The private ETF state stored by the existing
 PostgreSQL stores is not an application wire format.
 
@@ -98,7 +96,7 @@ defmodule MyApp.DocketProjection do
   @behaviour Docket.Checkpoint.Observer
 
   @impl true
-  def handle(%Docket.Checkpoint{run: run}, _context) do
+  def observe(%Docket.Checkpoint{run: run}, _context) do
     MyApp.Workflows.project_status(run.id, run.status, run.updated_at)
     :ok
   end

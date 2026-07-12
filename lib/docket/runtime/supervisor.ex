@@ -8,28 +8,24 @@ defmodule Docket.Runtime.Supervisor do
       children = [
         {Docket.Runtime.Supervisor,
          name: MyApp.DocketRuntime,
-         checkpoint: MyApp.DocketCheckpoint}
+         backend: Docket.Postgres,
+         repo: MyApp.Repo}
       ]
 
   `:name` is required and becomes the runtime identity passed to
-  `Docket.run/4` and friends. All other options are stored as the instance's
+  durable facade functions. All other options are stored as the instance's
   default run options and merged under per-call options. A configured
   `backend: BackendModule` contributes its own supervised child and is the
   only public durable backend substitution point; individual stores cannot be mixed.
 
-  The tree owns a unique registry (one active `Docket.Runtime` per run ID),
-  a `Task.Supervisor` for node tasks and async checkpoint delivery, and a
-  `DynamicSupervisor` for the per-run Runtime processes.
+  A production instance always owns one backend bundle. The tree also owns a
+  small instance-configuration process and a `Task.Supervisor` used by backend
+  vehicles for node execution and observer delivery.
   """
 
   use Supervisor
 
-  alias Docket.Runtime.Registry, as: RuntimeRegistry
-
-  @doc "DynamicSupervisor name for the per-run Runtime processes."
-  def run_supervisor(runtime) when is_atom(runtime), do: Module.concat(runtime, RunSupervisor)
-
-  @doc "Task.Supervisor name for node tasks and async checkpoint delivery."
+  @doc "Task.Supervisor name for node tasks and after-commit observer delivery."
   def task_supervisor(runtime) when is_atom(runtime), do: Module.concat(runtime, TaskSupervisor)
 
   def start_link(opts) do
@@ -46,18 +42,14 @@ defmodule Docket.Runtime.Supervisor do
   def init({name, defaults}) do
     {backend_children, defaults} = backend_children(name, defaults)
 
+    # Shared configuration and execution supervision must exist before the
+    # backend can claim already-due persisted work during its own startup.
     children =
-      [RuntimeRegistry.child_spec(name)] ++
-        backend_children ++
-        [
-          defaults_child(name, defaults),
-          {Task.Supervisor, name: task_supervisor(name)},
-          {DynamicSupervisor, name: run_supervisor(name), strategy: :one_for_one}
-        ]
+      [
+        {Docket.Runtime.Instance, {name, defaults}},
+        {Task.Supervisor, name: task_supervisor(name)}
+      ] ++ backend_children
 
-    # If the registry dies, running Runtime processes are unreachable
-    # orphans; restart the whole tree and let hosts resume runs from their
-    # latest checkpoints.
     Supervisor.init(children, strategy: :one_for_all)
   end
 
@@ -66,7 +58,8 @@ defmodule Docket.Runtime.Supervisor do
 
     case Keyword.get(defaults, :backend) do
       nil ->
-        {[], defaults}
+        raise ArgumentError,
+              "Docket.Runtime.Supervisor requires one :backend implementing Docket.Backend"
 
       backend when is_atom(backend) ->
         validate_backend!(backend)
@@ -80,6 +73,12 @@ defmodule Docket.Runtime.Supervisor do
   end
 
   defp reject_component_configuration!(defaults) do
+    if Keyword.has_key?(defaults, :checkpoint) do
+      raise ArgumentError,
+            "production :checkpoint configuration was removed; use :checkpoint_observers " <>
+              "or Docket.Test processless helpers"
+    end
+
     forbidden =
       [:storage, :transaction, :graph_store, :run_store, :event_store, :coordinator]
       |> Enum.filter(&Keyword.has_key?(defaults, &1))
@@ -105,22 +104,5 @@ defmodule Docket.Runtime.Supervisor do
             ":backend module #{inspect(backend)} does not implement Docket.Backend; " <>
               "missing #{Enum.join(missing, ", ")}"
     end
-  end
-
-  # Stores the instance defaults as registry metadata synchronously during
-  # tree startup, so Docket.run/4 can never observe a started tree without
-  # defaults. `:ignore` keeps it processless.
-  defp defaults_child(name, defaults) do
-    %{
-      id: :defaults,
-      start: {__MODULE__, :put_defaults, [name, defaults]},
-      restart: :transient
-    }
-  end
-
-  @doc false
-  def put_defaults(name, defaults) do
-    :ok = RuntimeRegistry.put_defaults(name, defaults)
-    :ignore
   end
 end

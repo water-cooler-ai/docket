@@ -3,7 +3,7 @@ defmodule Docket.Run do
   Durable execution state for one graph run.
 
   A run is created by Docket when a run starts, advanced through committed
-  checkpoints, and stored by the configured backend. Applications may inspect
+  read-only checkpoint notifications, and stored by the configured backend.
   the top-level fields (`id`,
   `graph_id`, `graph_hash`, `status`, `step`, `input`, `output`, and the
   timestamps) but should not interpret, pattern match, mutate, or rebuild
@@ -25,7 +25,7 @@ defmodule Docket.Run do
 
   `:created` is a private initialization sentinel: a built-but-never
   initialized run consumed by the runtime's init barrier. It never appears
-  in a checkpoint, is not cancellable, and is rejected by durable storage.
+  , in an uncommitted transition, is not cancellable, and is rejected by durable storage.
 
   Status describes graph execution state, not Runtime process liveness and
   not operational health - see `Docket.RunInfo` for the latter.

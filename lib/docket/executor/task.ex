@@ -10,9 +10,9 @@ defmodule Docket.Executor.Task do
   ## Options
 
   - `:task_supervisor` - a `Task.Supervisor` name or pid to run node code
-    under. The supervised Runtime injects its own task supervisor
-    automatically; without one the node runs in an unsupervised monitored
-    process.
+    under. A supervised Docket instance injects its shared task supervisor
+    automatically for backend vehicles; without one the node runs in an
+    unsupervised monitored process.
   - `:timeout_ms` - injected by the dispatcher from the node's resolved
     `"timeout_ms"` policy; `nil` waits indefinitely.
 

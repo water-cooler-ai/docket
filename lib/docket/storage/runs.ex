@@ -360,7 +360,7 @@ defmodule Docket.Storage.Runs do
   attempt and abandon counts reset, and an immediate wake recorded at `now`.
   Calling this for an
   already-unpoisoned non-terminal run is idempotent success and changes
-  nothing. The command consumes neither checkpoint nor event sequence.
+  nothing. The command consumes neither commit nor event sequence.
 
   An unknown run or scope mismatch returns `{:error, :not_found}`.
   """

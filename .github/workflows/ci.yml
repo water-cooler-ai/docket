@@ -47,3 +47,43 @@ jobs:
       - run: mix compile --warnings-as-errors
 
       - run: mix test
+
+  postgres:
+    name: live Postgres release leg
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: runner
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U runner"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      MIX_ENV: test
+      PGUSER: runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-postgres-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-postgres-
+
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix test --include postgres

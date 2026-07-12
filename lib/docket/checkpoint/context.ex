@@ -1,6 +1,7 @@
 defmodule Docket.Checkpoint.Context do
   @moduledoc """
-  Context passed to `c:Docket.Checkpoint.handle/2` alongside each checkpoint.
+  Context passed to observers and processless test sinks alongside each
+  checkpoint.
 
   `checkpoint_seq` is the committed run fence and `graph_step` is the
   proposed run's committed graph position. `active_superstep`, when present,

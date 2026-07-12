@@ -2,33 +2,30 @@ defmodule Docket.Runtime.Loop do
   @moduledoc false
 
   # Processless transition functions over `Docket.Runtime.Graph` and
-  # `Docket.Run`, shared by the supervised Runtime and `Docket.Test`.
+  # `Docket.Run`, shared by backend vehicles and `Docket.Test`.
   #
   # Every transition calculates exactly one pre-commit
   # `Docket.Runtime.Moment`: the proposed run, its assigned events, the
   # checkpoint type, and an explicit disposition. Calculation delivers no
   # checkpoint and emits no telemetry. `propose_init/3` and
   # `propose_advance/3` expose the raw moments to drivers that commit
-  # externally; the legacy entrypoints (`init/3`, `plan/3`,
+  # externally; the processless entrypoints (`init/3`, `plan/3`,
   # `apply_results/5`, `resolve_interrupt/5`) adapt the same moments through
-  # the host-owned sync committer and return a new committed run plus
-  # checkpoint effects - or a typed error with the previous run untouched.
+  # the processless driver and return a new run plus checkpoint values - or a
+  # typed error with the previous run untouched.
   # Deterministic execution logic lives in `Docket.Runtime.Algorithm`.
   #
-  # Checkpoint effects are `{:checkpoint, checkpoint, context, :accepted}`
-  # for sync checkpoints already delivered inside the transition, and
-  # `{:checkpoint, checkpoint, context, :pending}` for async checkpoints the
-  # shell must deliver. A processless module cannot own async execution, so
-  # async delivery belongs to the shell (inline: drained synchronously;
-  # supervised Runtime: background task).
+  # Processless test effects are `{:checkpoint, checkpoint}` values.
+  # Production observers are a separate after-commit path owned by
+  # `Docket.Lifecycle`.
 
-  alias Docket.{Checkpoint, Error, Run, Schema, Wire}
+  alias Docket.{Error, Run, Schema, Wire}
   alias Docket.Run.{ChannelState, Failure, InterruptState, PendingWrite, TaskState, TimerState}
   alias Docket.Runtime.{Algorithm, Config, Dispatcher, Moment, RunMutation, TaskResult}
 
   @doc false
   # Builds the fresh `:created` run document consumed by `init/3`. Shared by
-  # `Docket.run/4` and `Docket.Test.run_inline/3` so both entry points create
+  # backend lifecycle starts and `Docket.Test.run_inline/3` so both entry points create
   # byte-identical initial runs.
   def build_initial_run(rtg, input, opts) do
     config = Config.resolve_moment(opts)
@@ -72,8 +69,8 @@ defmodule Docket.Runtime.Loop do
   Calculates the initialization moment without delivering anything.
 
   Same run-status inference as `init/3`, but the transition is returned as
-  one pre-commit `Docket.Runtime.Moment`: no checkpoint handler is invoked
-  and no telemetry is emitted. Returns `{:ok, moment}`, `{:terminal, run}`
+  one pre-commit `Docket.Runtime.Moment`: no observer is invoked and no
+  telemetry is emitted. Returns `{:ok, moment}`, `{:terminal, run}`
   for an already-terminal run (nothing to commit), or `{:error, error}`.
   """
   def propose_init(rtg, %Run{} = run, opts) do
@@ -254,8 +251,8 @@ defmodule Docket.Runtime.Loop do
   - `{:wait, run, interrupt_ids}` - blocked on open interrupts
   - `{:terminal, run, effects}` - the run just completed or failed (the
     terminal checkpoint has been emitted), or was already terminal
-  - `{:error, error}` - sync checkpoint failure or uninitialized run; the
-    caller keeps the previous run
+  - `{:error, error}` - invalid or uninitialized run; the caller keeps the
+    previous run
 
   Shells that have already served a park's wait pass the served instant -
   the park's `resume_at`, or a durable claim's `claimed_at`, which is never
@@ -271,10 +268,8 @@ defmodule Docket.Runtime.Loop do
 
     case do_propose_plan(rtg, run, opts, config) do
       {:moment, %Moment{} = moment} ->
-        case accept(moment, config) do
-          {:ok, run, effects} -> {:terminal, run, effects}
-          {:error, error} -> {:error, error}
-        end
+        {:ok, run, effects} = accept(moment, config)
+        {:terminal, run, effects}
 
       {:already_terminal, run} ->
         {:terminal, run, []}
@@ -518,10 +513,8 @@ defmodule Docket.Runtime.Loop do
         accept(moment, config)
 
       {:moment, %Moment{} = moment, park} ->
-        case accept(moment, config) do
-          {:ok, run, effects} -> {:park, run, park, effects}
-          {:error, error} -> {:error, error}
-        end
+        {:ok, run, effects} = accept(moment, config)
+        {:park, run, park, effects}
     end
   end
 
@@ -1029,47 +1022,12 @@ defmodule Docket.Runtime.Loop do
     Moment.propose(run, type, entries, disposition, config.clock.(), identity_opts)
   end
 
-  # Adapts one moment through the host-owned committer: a sync checkpoint
-  # must be accepted before the proposed run becomes the shell's truth; an
-  # async checkpoint is returned as a pending effect alongside the already
-  # accepted run. Only this function turns moments into committed
-  # checkpoints and telemetry.
+  # Adapts one moment for processless tests. Production backends do not call
+  # this path and persist moments directly before delivering observers.
   defp accept(%Moment{} = moment, config) do
-    delivery = Checkpoint.delivery(moment.checkpoint_type, config.checkpoint_overrides)
-    checkpoint = Moment.checkpoint(moment, delivery)
-    context = Moment.context(moment, config.context)
-
-    case delivery do
-      :sync ->
-        case deliver_checkpoint(config.checkpoint, checkpoint, context) do
-          :ok ->
-            Docket.Telemetry.emit_events(moment.run, moment.events)
-            {:ok, moment.run, [{:checkpoint, checkpoint, context, :accepted}]}
-
-          {:error, reason} ->
-            {:error,
-             Error.new(
-               :checkpoint_failed,
-               "sync #{moment.checkpoint_type} checkpoint was not accepted",
-               phase: moment.checkpoint_type,
-               reason: reason
-             )}
-        end
-
-      :async ->
-        Docket.Telemetry.emit_events(moment.run, moment.events)
-        {:ok, moment.run, [{:checkpoint, checkpoint, context, :pending}]}
-    end
-  end
-
-  @doc false
-  def deliver_checkpoint(module, checkpoint, context) do
-    case module.handle(checkpoint, context) do
-      :ok -> :ok
-      {:error, reason} -> {:error, reason}
-      other -> {:error, {:invalid_checkpoint_return, other}}
-    end
-  rescue
-    exception -> {:error, {:raised, exception}}
+    checkpoint = Moment.checkpoint(moment)
+    _ = config
+    Docket.Telemetry.emit_events(moment.run, moment.events)
+    {:ok, moment.run, [{:checkpoint, checkpoint}]}
   end
 end

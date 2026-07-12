@@ -135,7 +135,7 @@ defmodule Docket.Lifecycle do
 
   @spec after_commit(Moment.t(), keyword()) :: :ok
   def after_commit(%Moment{} = moment, opts) do
-    checkpoint = Moment.checkpoint(moment, :observer)
+    checkpoint = Moment.checkpoint(moment)
     context = Moment.context(moment, Keyword.get(opts, :context, %{}))
 
     :telemetry.execute(

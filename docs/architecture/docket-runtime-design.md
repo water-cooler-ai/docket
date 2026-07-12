@@ -3,11 +3,9 @@
 Status: design rationale and background, not a current spec
 Date: 2026-06-25
 
-Release note: resident per-run process and host-checkpoint sections describe
-the `0.0.1` driver. `0.1.0-dev` retains that driver alongside the
-backend-neutral durable facade; the PostgreSQL production owner is not yet
-assembled. The PostgreSQL backend guide and implementation audit describe the
-current boundary.
+Release note: resident per-run process and host-checkpoint sections are
+`0.0.1` history, superseded for v0.1.0 production. The PostgreSQL backend guide
+and module docs describe the current backend-owned lifecycle.
 
 Implementation note: this document records the research basis, mental
 model, goals, and alternatives considered for the runtime. Concrete

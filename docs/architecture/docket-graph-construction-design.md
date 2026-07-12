@@ -6,8 +6,8 @@ Date: 2026-06-25
 Release note: this document records the `0.0.1` host-owned graph persistence
 boundary. The `0.1.0-dev` durable facade publishes effective graph versions
 through a configured backend and `start_run` accepts their `Docket.GraphRef`.
-The first-party PostgreSQL bundle is not yet assembled; see the PostgreSQL
-backend guide and current implementation audit.
+Its 0.0.1 lifecycle examples are superseded for v0.1.0 production; see the
+PostgreSQL backend guide and module docs.
 
 Related documents:
 

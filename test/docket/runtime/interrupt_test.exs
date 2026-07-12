@@ -28,7 +28,6 @@ defmodule Docket.Runtime.InterruptTest do
 
       interrupt_checkpoint = List.last(checkpoints)
       assert interrupt_checkpoint.type == :interrupt_requested
-      assert interrupt_checkpoint.delivery == :sync
       assert interrupt_checkpoint.run.status == :waiting
       assert Enum.any?(interrupt_checkpoint.events, &(&1.type == :interrupt_requested))
     end

@@ -9,26 +9,27 @@ when you want to understand *why* the contracts are shaped the way they are.
 
 ## Reading Order
 
-1. `docket-operational-transition-spec.md`
+1. `migration-0.0.1-to-0.1.0.md`
+   - Drain-and-cut-over instructions for existing 0.0.1 adopters.
+2. `docket-operational-transition-spec.md`
    - A public-facing guide to the implemented PostgreSQL data model, queue
-     semantics, claim fencing, tenancy, migrations, and current assembly gaps.
-2. `docket-v0.1.0-spec-lock-audit.md`
-   - A current implementation audit: what from the proposed v0.1.0 design has
-     landed and what still blocks an operational release.
-3. `docket-graph-construction-design.md`
+     semantics, claim fencing, tenancy, migrations, and backend operations.
+3. `docket-v0.1.0-spec-lock-audit.md`
+   - A historical pre-cutover audit retained to explain the final sequencing.
+4. `docket-graph-construction-design.md`
    - The public `Docket.Graph` editing API, ID rules, publication boundary,
      and private effective-graph identity contract.
-4. `docket-compiler-design.md`
+5. `docket-compiler-design.md`
    - Compiler verification, diagnostics, and lowering from the public graph
      to the internal runtime graph.
-5. `docket-graph-execution-contract-design.md`
+6. `docket-graph-execution-contract-design.md`
    - The execution contract: runtime loop, public run APIs, checkpoints,
      executors, guards, failures, and interrupts.
-6. `docket-reducers-design.md`
+7. `docket-reducers-design.md`
    - Why the v1.1 reducer contract folds the prior committed value, and the
      rationale behind list-write concatenation, natural zeros, and
      reducer-aware write validation.
-7. `docket-runtime-design.md`
+8. `docket-runtime-design.md`
    - Long-form research and background: goals, alternatives considered
      (Pregel, LangGraph, Temporal), and future design space.
 
@@ -38,17 +39,13 @@ The graph programming model is continuous across the release lines: node
 modules, graphs, schemas, reducers, interrupts, executors, run serialization,
 and `Docket.Test` helpers carry forward. The lifecycle owner changes:
 
-- `0.0.1`: the host checkpoint callback persists runs and the host explicitly
-  resumes resident per-run processes.
-- `0.1.0-dev`: the backend contract, durable facade, PostgreSQL stores,
-  dispatcher, and claimed-run vehicle exist. The public `Docket.Postgres`
-  bundle does not, so the old supervised `run` / `resume` / `get_run` path is
-  still present.
+- `0.0.1`: the host checkpoint callback persisted runs and the host explicitly
+  resumed resident per-run processes.
+- `0.1.0`: one required backend owns persistence, scheduling, recovery, and
+  signals. The old supervised `run` / `resume` / `get_run` path is absent.
 
 The older graph-construction and execution-contract documents below record the
-`0.0.1` host-owned boundary. The PostgreSQL guide describes the developing
-durable boundary; the implementation audit calls out places where it is not
-complete.
+`0.0.1` host-owned boundary and are superseded for v0.1.0 production guidance.
 
 ## Current Core Shape
 
