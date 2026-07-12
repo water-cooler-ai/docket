@@ -7,7 +7,7 @@ defmodule Docket.Benchmark do
   remain explicit, manual work rather than ordinary test-suite work.
   """
 
-  @scenarios ~w(empty_one_step smoke)
+  @scenarios ~w(claim_only empty_one_step smoke)
   @all_scenarios ~w(claim_only empty_one_step cyclic_drain blocked_vehicles mixed_fairness graph_cache freshness_split_brain multinode notify_poll amplification soak smoke)
 
   @defaults %{
@@ -18,6 +18,12 @@ defmodule Docket.Benchmark do
     nodes: 1,
     event_policy: "all",
     output: "results/docket-bench.json",
+    format: "json",
+    concurrency_matrix: nil,
+    pool_size_matrix: nil,
+    batch_size: nil,
+    ready_ratio: nil,
+    orphan_ttl_ms: 60_000,
     seed: 1,
     repetitions: 1,
     warmup: 0,
@@ -31,10 +37,16 @@ defmodule Docket.Benchmark do
     runs: :integer,
     concurrency: :integer,
     pool_size: :integer,
+    concurrency_matrix: :string,
+    pool_size_matrix: :string,
+    batch_size: :integer,
+    ready_ratio: :string,
+    orphan_ttl_ms: :integer,
     nodes: :integer,
     duration: :string,
     event_policy: :string,
     output: :string,
+    format: :string,
     seed: :integer,
     repetitions: :integer,
     warmup: :integer,
@@ -47,8 +59,15 @@ defmodule Docket.Benchmark do
   @doc false
   def parse(argv) do
     case OptionParser.parse(argv, strict: @switches) do
-      {opts, [], []} -> validate(Map.merge(@defaults, Map.new(opts)))
-      {_opts, args, invalid} -> {:error, "unexpected arguments: #{inspect(args ++ invalid)}"}
+      {opts, [], []} ->
+        with :ok <- reject_matrix_conflicts(opts),
+             {:ok, config} <- @defaults |> Map.merge(Map.new(opts)) |> normalize_matrix(),
+             {:ok, config} <- normalize_scenario(config) do
+          validate(config)
+        end
+
+      {_opts, args, invalid} ->
+        {:error, "unexpected arguments: #{inspect(args ++ invalid)}"}
     end
   end
 
@@ -59,15 +78,21 @@ defmodule Docket.Benchmark do
          :ok <- positive(config.runs, "runs"),
          :ok <- positive(config.concurrency, "concurrency"),
          :ok <- positive(config.pool_size, "pool-size"),
+         :ok <- positive_list(config.concurrencies, "concurrency-matrix"),
+         :ok <- positive_list(config.pool_sizes, "pool-size-matrix"),
          :ok <- positive(config.nodes, "nodes"),
+         :ok <- non_negative(config.seed, "seed"),
          :ok <- positive(config.repetitions, "repetitions"),
          :ok <- non_negative(config.warmup, "warmup"),
+         :ok <- scenario_options(config),
          :ok <- current_run_shape(config),
          :ok <- positive(config.poll_interval_ms, "poll-interval-ms"),
+         :ok <- positive(config.orphan_ttl_ms, "orphan-ttl-ms"),
          :ok <- positive(config.timeout_ms, "timeout-ms"),
          :ok <- event_policy(config.event_policy),
          :ok <- one_node(config.nodes),
          :ok <- output(config.output),
+         :ok <- member(config.format, ~w(json ndjson), "format"),
          :ok <- authority(config) do
       {:ok, config}
     end
@@ -79,6 +104,22 @@ defmodule Docket.Benchmark do
       apply(Docket.Benchmark.Postgres, :run, [config])
     else
       {:error, "Postgres benchmarks require the optional ecto_sql and postgrex dependencies"}
+    end
+  end
+
+  @doc false
+  def plan(config) do
+    cells =
+      for concurrency <- config.concurrencies,
+          pool_size <- config.pool_sizes,
+          do: {concurrency, pool_size}
+
+    for repetition <- 1..config.repetitions,
+        {concurrency, pool_size} <- rotate(cells, config.seed + repetition - 1) do
+      config
+      |> Map.put(:concurrency, concurrency)
+      |> Map.put(:pool_size, pool_size)
+      |> Map.put(:repetition, repetition)
     end
   end
 
@@ -107,18 +148,26 @@ defmodule Docket.Benchmark do
 
   defp authority(_), do: :ok
 
-  defp current_run_shape(%{warmup: warmup}) when warmup != 0,
-    do: {:error, "warmup is not implemented with a separate supervised interval; use 0"}
-
-  defp current_run_shape(%{repetitions: repetitions}) when repetitions != 1,
-    do: {:error, "repetitions are not implemented as separate artifacts; use 1"}
-
   defp current_run_shape(%{duration: duration}),
     do:
       {:error,
        "duration=#{inspect(duration)} is only valid for steady-state scenarios that are not implemented"}
 
   defp current_run_shape(_), do: :ok
+
+  defp scenario_options(%{scenario: "claim_only"} = config) do
+    with :ok <- positive(config.batch_size, "batch-size") do
+      if config.warmup == 0,
+        do: :ok,
+        else: {:error, "claim_only does not support warmup runs; use repetitions"}
+    end
+  end
+
+  defp scenario_options(%{batch_size: nil, ready_ratio: nil}), do: :ok
+
+  defp scenario_options(_config),
+    do: {:error, "batch-size and ready-ratio are only valid for claim_only"}
+
   defp positive(value, _name) when is_integer(value) and value > 0, do: :ok
 
   defp positive(value, name),
@@ -128,6 +177,14 @@ defmodule Docket.Benchmark do
 
   defp non_negative(value, name),
     do: {:error, "#{name} must be a non-negative integer, got: #{inspect(value)}"}
+
+  defp positive_list(values, name) when is_list(values) do
+    if values != [] and Enum.all?(values, &(is_integer(&1) and &1 > 0)) do
+      :ok
+    else
+      {:error, "#{name} must contain positive integers"}
+    end
+  end
 
   defp member(value, values, name) do
     if value in values do
@@ -139,4 +196,98 @@ defmodule Docket.Benchmark do
 
   defp output(value) when is_binary(value) and byte_size(value) > 0, do: :ok
   defp output(value), do: {:error, "output must be a non-empty path, got: #{inspect(value)}"}
+
+  defp normalize_matrix(config) do
+    with {:ok, concurrencies} <- matrix_values(config.concurrency_matrix, config.concurrency),
+         {:ok, pool_sizes} <- matrix_values(config.pool_size_matrix, config.pool_size) do
+      {:ok, Map.merge(config, %{concurrencies: concurrencies, pool_sizes: pool_sizes})}
+    end
+  end
+
+  defp matrix_values(nil, fallback), do: {:ok, [fallback]}
+
+  defp matrix_values(value, _fallback) when is_binary(value) do
+    values =
+      value
+      |> String.split(",", trim: false)
+      |> Enum.map(&String.trim/1)
+
+    parsed = Enum.map(values, &Integer.parse/1)
+
+    cond do
+      parsed == [] or Enum.any?(values, &(&1 == "")) ->
+        {:error, "matrix values must not be empty"}
+
+      Enum.all?(parsed, fn
+        {number, ""} when number > 0 -> true
+        _ -> false
+      end) ->
+        numbers = Enum.map(parsed, &elem(&1, 0))
+
+        if Enum.uniq(numbers) == numbers do
+          {:ok, numbers}
+        else
+          {:error, "matrix values must not contain duplicates, got: #{inspect(value)}"}
+        end
+
+      true ->
+        {:error,
+         "matrix values must be comma-separated positive integers, got: #{inspect(value)}"}
+    end
+  end
+
+  defp reject_matrix_conflicts(opts) do
+    conflicts =
+      [
+        {:concurrency, :concurrency_matrix},
+        {:pool_size, :pool_size_matrix}
+      ]
+      |> Enum.filter(fn {scalar, matrix} ->
+        Keyword.has_key?(opts, scalar) and Keyword.has_key?(opts, matrix)
+      end)
+
+    case conflicts do
+      [] ->
+        :ok
+
+      [{scalar, matrix} | _] ->
+        {:error, "--#{dash(scalar)} and --#{dash(matrix)} are mutually exclusive"}
+    end
+  end
+
+  defp dash(value), do: value |> Atom.to_string() |> String.replace("_", "-")
+
+  defp normalize_scenario(%{scenario: "claim_only"} = config) do
+    with {:ok, ratio} <- parse_ratio(config.ready_ratio || "1:1") do
+      {:ok, %{config | batch_size: config.batch_size || 50, ready_ratio: ratio}}
+    end
+  end
+
+  defp normalize_scenario(config), do: {:ok, config}
+
+  defp parse_ratio(value) when is_binary(value) do
+    case String.split(value, ":", parts: 2) do
+      [ready, expired] ->
+        with {ready, ""} <- Integer.parse(ready),
+             {expired, ""} <- Integer.parse(expired),
+             true <- ready >= 0 and expired >= 0 and ready + expired > 0 do
+          {:ok, %{ready_weight: ready, expired_weight: expired}}
+        else
+          _ ->
+            {:error,
+             "ready-ratio must be READY:EXPIRED non-negative weights, got: #{inspect(value)}"}
+        end
+
+      _ ->
+        {:error, "ready-ratio must be READY:EXPIRED non-negative weights, got: #{inspect(value)}"}
+    end
+  end
+
+  defp rotate([], _seed), do: []
+
+  defp rotate(values, seed) do
+    offset = Integer.mod(seed, length(values))
+    {left, right} = Enum.split(values, offset)
+    right ++ left
+  end
 end

@@ -9,8 +9,11 @@ defmodule Mix.Tasks.Docket.Bench do
       mix docket.bench --scenario smoke --runs 10 --concurrency 2 \\
         --pool-size 5 --output results/smoke.json
 
-  Current scenarios are `smoke` and `empty_one_step`. Results are exploratory;
-  unsupported scenarios and production-incompatible options are rejected.
+  Current scenarios are `smoke`, `empty_one_step`, and `claim_only`. Matrix
+  execution uses `--concurrency-matrix`, `--pool-size-matrix`, `--warmup`, and
+  `--repetitions`; `--format ndjson` writes raw trials plus a suite summary.
+  Results are exploratory; unsupported scenarios and production-incompatible
+  options are rejected.
   """
 
   @impl Mix.Task
