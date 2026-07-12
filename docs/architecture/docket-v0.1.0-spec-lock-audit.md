@@ -1,4 +1,4 @@
-# Docket v0.1.0 Implementation Audit
+# Historical Docket v0.1.0 Pre-Cutover Audit
 
 Date: 2026-07-11
 
@@ -25,7 +25,11 @@ backend boundary.
 
 ## State by area
 
-| Area | Current state | Evidence |
+> **Historical snapshot:** every state in this table is the state observed
+> before DCKT-24 and DCKT-37 landed. “Missing” and “Not done” below are not
+> claims about the released v0.1.0 code.
+
+| Area | State in pre-cutover snapshot | Evidence |
 | --- | --- | --- |
 | Backend contract | Implemented | `Docket.Backend` bundles storage, graph, run, event, context, and supervision capabilities. |
 | Public PostgreSQL bundle | Implemented | `Docket.Postgres` fixes the storage capabilities and owns their operational supervision. |
@@ -38,9 +42,9 @@ backend boundary.
 | Dispatcher | Implemented | Demand-bounded, jittered polling and lease launch/release behavior exist. |
 | Execution vehicle | Implemented | `Docket.Postgres.Vehicle` fetches and compiles the graph for a lease (with an optional generation-checked cache), drains fenced moments, and abandons, releases, or parks the run. Claim freshness during long supersteps is configurable: strict timeout alignment by default, opt-in token-guarded heartbeat with stale-result rejection. |
 | Backend supervision assembly | Implemented | A one-for-all execution subtree couples dispatcher accounting to its vehicle supervisor; notifier and pruner are isolated siblings. |
-| Deterministic backend test mode | Missing | There is no public PostgreSQL drain/manual testing API. |
+| Deterministic backend test mode | Missing at snapshot; implemented by DCKT-24 | The snapshot had no public PostgreSQL drain/manual testing API. |
 | Pruning/retention | Implemented | `Docket.Postgres.Pruner` performs locked, bounded cleanup under the bundle's required explicit policy. |
-| Legacy production API removal | Not done | `run`, `resume`, `get_run`, and `checkpoint:` remain in the public supervised runtime. |
+| Legacy production API removal | Not done at snapshot; completed by DCKT-37 | The snapshot still exposed `run`, `resume`, `get_run`, and `checkpoint:`. |
 
 ## Decisions verified in code
 
@@ -111,18 +115,22 @@ The dispatcher launches `Docket.Postgres.Vehicle` under a dedicated task
 supervisor. Each uncached claim fetches and compiles its effective graph on the
 executing node, then reuses that runtime graph for its moment drain.
 
-### The legacy lifecycle remains active
+### Historical finding: the legacy lifecycle was still active
 
-The branch still supports the `0.0.1` host checkpoint committer and resident
-per-run processes. Durable APIs coexist with `run`, `resume`, and `get_run`.
-Documentation must call this transitional compatibility, not a completed
-single-lifecycle release.
+At the time of this snapshot, the branch still supported the `0.0.1` host
+checkpoint committer and resident per-run processes. Durable APIs coexisted
+with `run`, `resume`, and `get_run`; documentation therefore had to call this
+transitional compatibility, not a completed single-lifecycle release.
 
-### Some operational promises remain design work
+This finding was resolved by DCKT-37. The released v0.1.0 boundary has no
+legacy production lifecycle.
 
-Notification-assisted wakes, pruning, bounded drains, and production assembly
-have landed. Deterministic manual/drain test modes and a retained-event export
-API remain separate product work.
+### Historical finding: some operational promises remained design work
+
+At the time of this snapshot, notification-assisted wakes, pruning, bounded
+drains, and production assembly had landed, while deterministic manual/drain
+test modes remained separate product work. DCKT-24 subsequently implemented
+the deterministic backend test modes.
 
 ## Release gate
 
@@ -132,7 +140,8 @@ and the deliberate DCKT-37 removal of the transitional legacy facade.
 
 ## Verification performed
 
-- `mix test --include postgres` passes: 615 tests, 0 failures.
+- At the snapshot commit, `mix test --include postgres` passed: 615 tests, 0
+  failures. This count is historical, not the v0.1.0 release-gate total.
 - The suite includes live bundle assembly, facade, migration, lifecycle,
   notification, vehicle, retention, tenant-isolation, and poison-recovery
   coverage against PostgreSQL.

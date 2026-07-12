@@ -23,15 +23,16 @@ when you want to understand *why* the contracts are shaped the way they are.
    - Compiler verification, diagnostics, and lowering from the public graph
      to the internal runtime graph.
 6. `docket-graph-execution-contract-design.md`
-   - The execution contract: runtime loop, public run APIs, checkpoints,
-     executors, guards, failures, and interrupts.
+   - Historical 0.0.1 execution contract: the removed resident runtime and
+     host-checkpoint APIs, plus still-relevant executor, guard, failure, and
+     interrupt rationale.
 7. `docket-reducers-design.md`
    - Why the v1.1 reducer contract folds the prior committed value, and the
      rationale behind list-write concatenation, natural zeros, and
      reducer-aware write validation.
 8. `docket-runtime-design.md`
-   - Long-form research and background: goals, alternatives considered
-     (Pregel, LangGraph, Temporal), and future design space.
+   - Historical 0.0.1 runtime research and background: goals, alternatives
+     considered (Pregel, LangGraph, Temporal), and future design space.
 
 ## Release-Line Boundary
 

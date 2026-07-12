@@ -222,6 +222,11 @@ entries below reflect what has landed so far.
 
 ### Changed
 
+- Release documentation now consistently describes the backend-owned v0.1.0
+  lifecycle, processless waiting, required tenant scope, deterministic testing
+  modes, and current production vehicles. The Hex package includes its linked
+  examples, telemetry guide, architecture guides, and changelog, and the
+  historical pre-cutover audit is labeled at each obsolete finding (DCKT-26).
 - Runtime dispatch now executes every node selected for a superstep
   concurrently against the same committed snapshot, then collects results in
   deterministic activation order before crossing the existing update barrier.

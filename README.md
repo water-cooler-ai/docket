@@ -24,7 +24,9 @@ checkpoint at every durable transition boundary.
   boundaries and the backend commits them with a token-and-sequence fence.
 - **Deterministic semantics.** Superstep planning, write conflict resolution,
   and guard evaluation are pure and ordered; replanning after a crash produces
-  byte-identical task identities, so external effects can be deduplicated.
+  byte-identical task identities. Integrations can persist and check those
+  identities to deduplicate external effects; Docket does not automatically
+  make arbitrary external calls exactly-once.
 - **Explicit durable boundaries.** Docket owns execution semantics and the
   private backend storage codec. Applications own graph versioning,
   authorization and UI; the PostgreSQL stores encode opaque state as
@@ -43,12 +45,12 @@ checkpoint at every durable transition boundary.
   programming model: a graph of nodes over shared state channels with
   reducers, checkpointing as the durability primitive, and first-class
   human-in-the-loop interrupts.
-- **OTP** — where Python-based graph runtimes have to bolt on persistence,
-  queues, and schedulers, the BEAM already is the scheduler. Each run is one
-  supervised, addressable process; nodes selected in the same superstep execute
-  concurrently against one committed snapshot, and node code can execute in an
-  additional isolated task process with real timeouts; a million concurrent
-  waiting sessions is a normal Tuesday for the runtime.
+- **OTP** — where Python-based graph runtimes have to bolt on execution
+  supervision, the BEAM already provides it. Dispatchers launch ephemeral,
+  supervised vehicles only while claimed runs are advancing; waiting runs live
+  durably in PostgreSQL without retaining a per-run process. Nodes selected in
+  the same superstep execute concurrently against one committed snapshot, and
+  node code runs in isolated supervised tasks with real timeouts.
 
 ## Quick start
 
@@ -126,7 +128,7 @@ end
 {:ok, graph_ref} = MyApp.DurableDocket.save_graph(graph)
 
 {:ok, run} =
-  MyApp.DurableDocket.start_run(graph_ref, input,
+  MyApp.DurableDocket.start_run(graph_ref, %{"message" => "hello world"},
     tenant_id: account.id,
     metadata: %{"workflow_id" => workflow.id}
   )
@@ -141,7 +143,7 @@ content-addressed document. `start_run` accepts only the returned stable
 reference, fetches the saved document, and compiles it on the executing node;
 later schema defaults are never injected into that retained graph version, and
 starting a run never republishes the graph. Compiled runtime graphs are
-node-local and ephemeral. The planned production vehicle compiles once per
+node-local and ephemeral. The production vehicle compiles once per
 claim and reuses that value while draining supersteps. Applications must keep node code and
 retained checkpoints compatible across deploys, drain old vehicles, or use
 versioned node modules when behavior must remain fixed. Cyclic graphs may run
@@ -172,7 +174,8 @@ Durable integration tests use the production lifecycle and PostgreSQL stores.
 Configure `testing: :inline` to commit `start_run` and named signals in the
 caller and synchronously drain due work to its next park, without starting a
 dispatcher, notifier, vehicle task, or pruner. Configure `testing: :manual` to
-disable automatic advancement and call `MyApp.Docket.drain_runs(max_runs: 100)`
+disable automatic advancement and call
+`MyApp.DurableDocket.drain_runs(max_runs: 100)`
 after starts, signals, or manual clock changes. The bound prevents cyclic
 graphs that remain immediately due from hanging a test. Both modes keep one
 production `Docket.Lifecycle`/storage transaction per logical moment; neither
@@ -213,7 +216,10 @@ The run commits as `:waiting` without retaining a per-run process. When the
 human answers:
 
 ```elixir
-{:ok, run} = MyApp.Docket.resolve_interrupt(run_id, interrupt_id, "approved")
+{:ok, run} =
+  MyApp.DurableDocket.resolve_interrupt(run_id, interrupt_id, "approved",
+    tenant_id: account.id
+  )
 ```
 
 The value is validated against the interrupt's schema (if any), written to
@@ -249,7 +255,7 @@ strict collection key/value shapes and fails closed on malformed stored terms.
 Each instance supervises one backend bundle and shared execution resources:
 
 ```text
-MyApp.Docket (Supervisor, :one_for_all)
+MyApp.DurableDocket (Supervisor, :one_for_all)
 ├── Docket.Postgres     — stores, dispatcher, vehicles, notifier, pruner
 ├── Runtime.Instance    — immutable facade configuration
 └── Task.Supervisor     — isolated node execution and observer delivery
@@ -273,15 +279,21 @@ recovery, signals, and production supervision.
 
 ## Installation
 
-Docket is not yet published to Hex. Add it as a git dependency:
+Docket 0.1.0 is not yet published to Hex. During release development, pin the
+release branch as a git dependency:
 
 ```elixir
 def deps do
   [
-    {:docket, github: "water-cooler-ai/docket"}
+    {:docket, github: "water-cooler-ai/docket", branch: "v0.1.0"}
   ]
 end
 ```
+
+After publication, prefer the Hex requirement documented on the package page.
+Production hosts using `Docket.Postgres` must also provide `ecto_sql`,
+`postgrex`, and a configured Ecto Repo; Docket keeps those dependencies
+optional so PostgreSQL-free `Docket.Test` consumers do not pull them in.
 
 ## Learn more
 
