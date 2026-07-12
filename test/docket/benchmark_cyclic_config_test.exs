@@ -7,12 +7,15 @@ defmodule Docket.BenchmarkCyclicConfigTest do
 
     assert config.cycle_moments == 12
     assert config.drain_max_moments == 4
-    assert config.drain_max_elapsed_ms == nil
+    assert config.drain_max_elapsed_ms == 3_000
     assert config.cycle_moments > config.drain_max_moments
 
     if Code.ensure_loaded?(Docket.Benchmark.Postgres) do
       opts = apply(Docket.Benchmark.Postgres, :runtime_opts, [config])
-      assert get_in(opts, [:vehicle, :drain_budget]) == [max_moments: 4]
+      assert get_in(opts, [:vehicle, :max_attempt_elapsed_ms]) == 2_000
+
+      assert get_in(opts, [:vehicle, :drain_budget]) ==
+               [max_moments: 4, max_elapsed_ms: 3_000]
     end
   end
 
@@ -29,8 +32,10 @@ defmodule Docket.BenchmarkCyclicConfigTest do
     if Code.ensure_loaded?(Docket.Benchmark.Postgres) do
       opts = apply(Docket.Benchmark.Postgres, :runtime_opts, [config])
 
+      assert get_in(opts, [:vehicle, :max_attempt_elapsed_ms]) == 250
+
       assert get_in(opts, [:vehicle, :drain_budget]) ==
-               [max_elapsed_ms: 250, max_moments: 5]
+               [max_moments: 5, max_elapsed_ms: 250]
     end
 
     assert {:error, message} =

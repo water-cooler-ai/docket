@@ -185,7 +185,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    max_moments: 100,
                    max_elapsed_ms: attempt_budget[:drain_budget][:max_elapsed_ms]
                  },
-                 heartbeat: "disabled",
                  node_executor: "Docket.Executor.Task",
                  staged_activation_target_lead_ms: 1_000,
                  minimum_runtime_ready_lead_ms: @minimum_runtime_ready_lead_ms,

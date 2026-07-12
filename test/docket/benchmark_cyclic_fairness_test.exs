@@ -23,8 +23,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert artifact.runtime_configuration.drain_budget == %{
                max_moments: 2,
-               max_elapsed_ms: "infinity"
+               max_elapsed_ms: 3_000
              }
+
+      assert artifact.runtime_configuration.max_attempt_elapsed_ms == 2_000
 
       assert artifact.workload.graph_shape.requested_cycle_iterations == 6
       assert artifact.workload.graph_shape.compatibility_option == "--cycle-moments"

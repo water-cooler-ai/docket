@@ -522,7 +522,8 @@ defmodule Docket.Benchmark do
      %{
        config
        | cycle_moments: config.cycle_moments || 12,
-         drain_max_moments: config.drain_max_moments || 4
+         drain_max_moments: config.drain_max_moments || 4,
+         drain_max_elapsed_ms: config.drain_max_elapsed_ms || 3_000
      }}
   end
 

@@ -863,9 +863,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           config.concurrency
         ),
         invariant(
-          "vehicle supervisor contains one vehicle and node task per slot",
+          "vehicle supervisor contains one resident vehicle per slot",
           plateau.topology.supervised_dynamic_children,
-          config.concurrency * 2
+          config.concurrency
         ),
         invariant(
           "Repo has no busy-or-unavailable capacity at the stable blocked snapshot",
@@ -1053,7 +1053,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       opts =
         if config.scenario == "cyclic_vs_one_step" do
-          Keyword.put(opts, :vehicle, drain_budget: cyclic_drain_budget(config))
+          Keyword.put(opts, :vehicle, cyclic_vehicle_budget(config))
         else
           opts
         end
@@ -1063,12 +1063,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @doc false
     def cyclic_drain_budget(config) do
-      [max_moments: config.drain_max_moments]
-      |> then(fn budget ->
-        if config.drain_max_elapsed_ms,
-          do: Keyword.put(budget, :max_elapsed_ms, config.drain_max_elapsed_ms),
-          else: budget
-      end)
+      [max_moments: config.drain_max_moments, max_elapsed_ms: config.drain_max_elapsed_ms]
+    end
+
+    @doc false
+    def cyclic_vehicle_budget(config) do
+      [
+        max_attempt_elapsed_ms: min(2_000, config.drain_max_elapsed_ms),
+        drain_budget: cyclic_drain_budget(config)
+      ]
     end
 
     @doc false

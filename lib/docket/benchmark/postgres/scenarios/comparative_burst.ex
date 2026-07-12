@@ -160,8 +160,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              poll_interval_ms: config.poll_interval_ms,
              orphan_ttl_ms: config.orphan_ttl_ms,
              max_claim_attempts: 5,
+             max_attempt_elapsed_ms:
+               if(kind == :cyclic_vs_one_step,
+                 do: min(2_000, config.drain_max_elapsed_ms),
+                 else: comparative_attempt_budget(config)[:max_attempt_elapsed_ms]
+               ),
              drain_budget: runtime_drain_budget(config, kind),
-             heartbeat: "disabled",
              node_executor: "Docket.Executor.Task",
              staged_activation_target_lead_ms: 500,
              minimum_runtime_ready_lead_ms: @minimum_runtime_ready_lead_ms,
@@ -466,11 +470,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       config
       |> cyclic_drain_budget()
       |> Map.new()
-      |> Map.put_new(:max_elapsed_ms, "infinity")
     end
 
     defp runtime_drain_budget(_config, _kind),
-      do: %{max_moments: 100, max_elapsed_ms: 1_000}
+      do: %{max_moments: 100, max_elapsed_ms: 2_000}
 
     defp interleave(a, a_count, b, b_count) do
       pairs = min(a_count, b_count)
