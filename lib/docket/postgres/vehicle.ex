@@ -554,22 +554,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       now = state.clock.()
       retry_at = DateTime.add(now, state.abandon_backoff_ms, :millisecond)
 
-      {:ok, :rescheduled} =
-        state.runs.abandon_claim(
-          state.context,
-          :system,
-          state.lease.run_id,
-          state.lease.claim_token,
-          %{
-            expected_checkpoint_seq: state.lease.checkpoint_seq,
-            now: now,
-            retry_at: retry_at,
-            max_claim_abandons: state.max_claim_abandons,
-            non_poisoning: true
-          }
-        )
-
-      {:ok, {:host_incompatible, error}}
+      case state.runs.abandon_claim(
+             state.context,
+             :system,
+             state.lease.run_id,
+             state.lease.claim_token,
+             %{
+               expected_checkpoint_seq: state.lease.checkpoint_seq,
+               now: now,
+               retry_at: retry_at,
+               max_claim_abandons: state.max_claim_abandons,
+               non_poisoning: true
+             }
+           ) do
+        {:ok, :rescheduled} -> {:ok, {:host_incompatible, error}}
+        {:ok, :stale} -> {:ok, :fence_lost}
+      end
     end
 
     defp defer(state, park) do
