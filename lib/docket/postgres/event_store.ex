@@ -4,7 +4,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     import Ecto.Query
 
-    alias Docket.Postgres.Storage
+    alias Docket.Postgres.{RunCodec, Storage}
     alias Docket.Postgres.Schemas.{Event, Run}
 
     @behaviour Docket.Storage.Events
@@ -45,6 +45,215 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def append_events(_ctx, scope, _run_id, _events) do
       validate_scope!(scope)
       {:error, :invalid_events}
+    end
+
+    @impl true
+    def list_events(ctx, scope, run_id, %{after_seq: after_seq, limit: limit})
+        when is_integer(after_seq) and after_seq >= 0 and is_integer(limit) and limit > 0 do
+      started = System.monotonic_time()
+      {repo, prefix} = Storage.context!(ctx)
+      {scope_sql, scope_params} = scope_filter(scope)
+      params = [run_id, after_seq, limit] ++ scope_params
+
+      result =
+        case Ecto.Adapters.SQL.query(repo, list_statement(prefix, scope_sql), params) do
+          {:ok, %{rows: []}} -> {:error, :not_found}
+          {:ok, %{rows: rows}} -> decode_page(rows, after_seq)
+          {:error, reason} -> {:error, reason}
+        end
+
+      emit_list_telemetry(result, started)
+      result
+    end
+
+    defp list_statement(prefix, scope_sql) do
+      runs = qualified_table(prefix, "docket_runs")
+      events = qualified_table(prefix, "docket_events")
+
+      """
+      SELECT
+        runs.run_id,
+        runs.graph_id,
+        runs.graph_hash,
+        runs.status,
+        runs.step,
+        runs.checkpoint_seq,
+        runs.started_at,
+        runs.updated_at,
+        runs.finished_at,
+        runs.state,
+        bounds.oldest,
+        bounds.latest,
+        page.seq,
+        page.type,
+        page.step,
+        page.node_id,
+        page.channel_id,
+        page.task_id,
+        page.payload,
+        page.metadata,
+        page.occurred_at
+      FROM #{runs} AS runs
+      LEFT JOIN LATERAL (
+        SELECT MIN(e.seq) AS oldest, MAX(e.seq) AS latest
+        FROM #{events} AS e
+        WHERE e.run_id = runs.run_id
+      ) AS bounds ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT e.seq, e.type, e.step, e.node_id, e.channel_id, e.task_id,
+               e.payload, e.metadata, e.occurred_at
+        FROM #{events} AS e
+        WHERE e.run_id = runs.run_id AND e.seq > $2
+        ORDER BY e.seq
+        LIMIT $3
+      ) AS page ON TRUE
+      WHERE runs.run_id = $1#{scope_sql}
+      ORDER BY page.seq
+      """
+    end
+
+    defp decode_page([first | _] = rows, after_seq) do
+      latest_seq = run_event_seq!(first)
+      oldest = Enum.at(first, 10)
+      latest = Enum.at(first, 11)
+
+      with {:ok, events} <- decode_events(rows) do
+        next_after_seq =
+          case events do
+            [] -> after_seq
+            _ -> List.last(events).seq
+          end
+
+        {:ok,
+         %Docket.EventPage{
+           events: events,
+           next_after_seq: next_after_seq,
+           has_more?: latest != nil and latest > next_after_seq,
+           oldest_available_seq: oldest,
+           latest_available_seq: latest,
+           latest_seq: latest_seq
+         }}
+      end
+    end
+
+    defp run_event_seq!(row) do
+      attrs = %{
+        run_id: Enum.at(row, 0),
+        graph_id: Enum.at(row, 1),
+        graph_hash: Enum.at(row, 2),
+        status: load_status(Enum.at(row, 3)),
+        step: Enum.at(row, 4),
+        checkpoint_seq: Enum.at(row, 5),
+        started_at: Enum.at(row, 6),
+        updated_at: Enum.at(row, 7),
+        finished_at: Enum.at(row, 8),
+        state: Enum.at(row, 9)
+      }
+
+      RunCodec.load!(attrs).event_seq
+    end
+
+    defp decode_events(rows) do
+      rows
+      |> Enum.reject(fn row -> is_nil(Enum.at(row, 12)) end)
+      |> Enum.reduce_while({:ok, []}, fn row, {:ok, acc} ->
+        case decode_event_row(row) do
+          {:ok, event} -> {:cont, {:ok, [event | acc]}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, events} -> {:ok, Enum.reverse(events)}
+        error -> error
+      end
+    end
+
+    defp decode_event_row(row) do
+      seq = Enum.at(row, 12)
+
+      try do
+        event = %Docket.Event{
+          run_id: Enum.at(row, 0),
+          seq: seq,
+          type: load_event_type!(Enum.at(row, 13)),
+          step: Enum.at(row, 14),
+          node_id: Enum.at(row, 15),
+          channel_id: Enum.at(row, 16),
+          task_id: Enum.at(row, 17),
+          timestamp: Enum.at(row, 20),
+          payload: Docket.DurableCodec.decode!(Enum.at(row, 18), :event),
+          metadata: Docket.DurableCodec.decode!(Enum.at(row, 19), :event)
+        }
+
+        {:ok, event}
+      rescue
+        error in Docket.Error -> {:error, event_corruption(seq, error)}
+      end
+    end
+
+    defp load_status(text) when is_binary(text) do
+      Enum.find(Docket.Run.durable_statuses(), fn status -> Atom.to_string(status) == text end)
+    end
+
+    defp load_status(other), do: other
+
+    defp load_event_type!(text) when is_binary(text) do
+      Enum.find(Docket.Event.types(), fn type -> Atom.to_string(type) == text end) ||
+        raise Docket.Error, type: :invalid_durable_state, message: "unknown event type #{text}"
+    end
+
+    defp load_event_type!(other) do
+      raise Docket.Error,
+        type: :invalid_durable_state,
+        message: "event type must be text, got: #{inspect(other)}"
+    end
+
+    defp event_corruption(seq, %Docket.Error{} = reason) do
+      Docket.Error.new(:corrupt_event_row, "Postgres event row is corrupt",
+        details: %{seq: seq},
+        reason: reason
+      )
+    end
+
+    defp scope_filter(:system), do: {"", []}
+    defp scope_filter(:tenantless), do: {" AND runs.tenant_id IS NULL", []}
+
+    defp scope_filter({:tenant, tenant}) when is_binary(tenant),
+      do: {" AND runs.tenant_id = $4", [tenant]}
+
+    defp scope_filter(scope),
+      do: raise(ArgumentError, "invalid storage scope: #{inspect(scope)}")
+
+    defp emit_list_telemetry(result, started) do
+      {rows, bytes} =
+        case result do
+          {:ok, page} ->
+            {length(page.events),
+             Enum.reduce(page.events, 0, fn event, acc -> acc + event_bytes(event) end)}
+
+          _other ->
+            {0, 0}
+        end
+
+      :telemetry.execute(
+        [:docket, :postgres, :store],
+        %{
+          duration: System.monotonic_time() - started,
+          selected_rows: rows,
+          encoded_bytes: bytes
+        },
+        Map.merge(Docket.Telemetry.correlation_metadata(), %{
+          operation: :event_list,
+          result: Docket.Telemetry.result_kind(result)
+        })
+      )
+    end
+
+    defp qualified_table(nil, name), do: ~s("#{name}")
+
+    defp qualified_table(prefix, name) do
+      quoted_prefix = String.replace(prefix, ~s("), ~s(""))
+      ~s("#{quoted_prefix}"."#{name}")
     end
 
     defp transactional_append(repo, prefix, scope, run_id, attrs) do

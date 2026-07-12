@@ -543,8 +543,8 @@ defmodule Docket.MemoryBackendTest do
     middle = event("r1", 10)
     assert :ok = MemoryBackend.append_events(b, :tenantless, "r1", [middle, earlier])
 
-    assert {:ok, [^middle, ^checkpoint_fact]} =
-             MemoryBackend.list_events(b, :tenantless, "r1", 3, 2)
+    assert {:ok, %Docket.EventPage{events: [^middle, ^checkpoint_fact]}} =
+             MemoryBackend.list_events(b, :tenantless, "r1", %{after_seq: 3, limit: 2})
 
     assert [^earlier, ^middle, ^checkpoint_fact] =
              MemoryBackend.events(b, :tenantless, "r1")
@@ -1165,5 +1165,147 @@ defmodule Docket.MemoryBackendTest do
 
     assert {:error, :inactive_run} =
              MemoryBackend.retry_poisoned_run(b, :tenantless, "terminal", retry_at)
+  end
+
+  describe "list_events pages retained events with retention-aware bounds" do
+    defp prune_events(backend, run_id, seqs) do
+      Agent.update(backend, fn state ->
+        update_in(state.runs[run_id].events, &Map.drop(&1, seqs))
+      end)
+    end
+
+    test "enforces run ownership through scope", %{backend: b} do
+      owned = %{run("owned") | event_seq: 2}
+
+      assert {:ok, _} =
+               initialize(b, owned,
+                 scope: {:tenant, "a"},
+                 events: [event("owned", 1), event("owned", 2)]
+               )
+
+      opts = %{after_seq: 0, limit: 10}
+
+      assert {:ok, %Docket.EventPage{}} =
+               MemoryBackend.list_events(b, {:tenant, "a"}, "owned", opts)
+
+      assert {:error, :not_found} =
+               MemoryBackend.list_events(b, {:tenant, "b"}, "owned", opts)
+
+      assert {:error, :not_found} =
+               MemoryBackend.list_events(b, :tenantless, "owned", opts)
+
+      assert {:error, :not_found} = MemoryBackend.list_events(b, :system, "missing", opts)
+    end
+
+    test "an empty page beyond the latest echoes the cursor and reports no more", %{backend: b} do
+      run = %{run("r1") | event_seq: 2}
+      assert {:ok, _} = initialize(b, run, events: [event("r1", 1), event("r1", 2)])
+
+      assert {:ok, page} =
+               MemoryBackend.list_events(b, :tenantless, "r1", %{after_seq: 2, limit: 10})
+
+      assert page.events == []
+      assert page.next_after_seq == 2
+      refute page.has_more?
+      assert page.oldest_available_seq == 1
+      assert page.latest_available_seq == 2
+      assert page.latest_seq == 2
+    end
+
+    test "honors the default and boundary limits", %{backend: b} do
+      run = %{run("r1") | event_seq: 3}
+      events = [event("r1", 1), event("r1", 2), event("r1", 3)]
+      assert {:ok, _} = initialize(b, run, events: events)
+
+      assert {:ok, %Docket.EventPage{events: ^events, has_more?: false}} =
+               MemoryBackend.list_events(b, :tenantless, "r1", %{after_seq: 0, limit: 250})
+
+      assert {:ok, page} =
+               MemoryBackend.list_events(b, :tenantless, "r1", %{after_seq: 0, limit: 1})
+
+      assert page.events == [event("r1", 1)]
+      assert page.next_after_seq == 1
+      assert page.has_more?
+    end
+
+    test "paginates a run across pages using next_after_seq", %{backend: b} do
+      run = %{run("r1") | event_seq: 5}
+      all = for seq <- 1..5, do: event("r1", seq)
+      assert {:ok, _} = initialize(b, run, events: all)
+
+      assert {:ok, first} =
+               MemoryBackend.list_events(b, :tenantless, "r1", %{after_seq: 0, limit: 2})
+
+      assert first.events == [event("r1", 1), event("r1", 2)]
+      assert first.next_after_seq == 2
+      assert first.has_more?
+
+      assert {:ok, second} =
+               MemoryBackend.list_events(b, :tenantless, "r1", %{
+                 after_seq: first.next_after_seq,
+                 limit: 2
+               })
+
+      assert second.events == [event("r1", 3), event("r1", 4)]
+      assert second.next_after_seq == 4
+      assert second.has_more?
+
+      assert {:ok, third} =
+               MemoryBackend.list_events(b, :tenantless, "r1", %{
+                 after_seq: second.next_after_seq,
+                 limit: 2
+               })
+
+      assert third.events == [event("r1", 5)]
+      assert third.next_after_seq == 5
+      refute third.has_more?
+    end
+
+    test "tolerates ordinary sequence gaps", %{backend: b} do
+      run = %{run("r1") | event_seq: 5}
+      events = [event("r1", 1), event("r1", 2), event("r1", 5)]
+      assert {:ok, _} = initialize(b, run, events: events)
+
+      assert {:ok, page} =
+               MemoryBackend.list_events(b, :tenantless, "r1", %{after_seq: 0, limit: 10})
+
+      assert page.events == events
+      assert page.oldest_available_seq == 1
+      assert page.latest_available_seq == 5
+      assert page.next_after_seq == 5
+      refute page.has_more?
+    end
+
+    test "reflects retention gaps in the oldest available sequence", %{backend: b} do
+      run = %{run("r1") | event_seq: 4}
+      assert {:ok, _} = initialize(b, run, events: for(seq <- 1..4, do: event("r1", seq)))
+
+      prune_events(b, "r1", [1, 2])
+
+      assert {:ok, page} =
+               MemoryBackend.list_events(b, :tenantless, "r1", %{after_seq: 0, limit: 10})
+
+      assert page.events == [event("r1", 3), event("r1", 4)]
+      assert page.oldest_available_seq == 3
+      assert page.latest_available_seq == 4
+      assert page.latest_seq == 4
+    end
+
+    test "keeps latest_seq after a fully pruned history", %{backend: b} do
+      run = %{run("r1") | event_seq: 4}
+      assert {:ok, _} = initialize(b, run, events: for(seq <- 1..4, do: event("r1", seq)))
+
+      prune_events(b, "r1", [1, 2, 3, 4])
+
+      assert {:ok, page} =
+               MemoryBackend.list_events(b, :tenantless, "r1", %{after_seq: 0, limit: 10})
+
+      assert page.events == []
+      assert page.oldest_available_seq == nil
+      assert page.latest_available_seq == nil
+      assert page.next_after_seq == 0
+      refute page.has_more?
+      assert page.latest_seq == 4
+    end
   end
 end

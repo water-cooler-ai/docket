@@ -141,6 +141,189 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert :ok = EventStore.append_events(TestRepo, {:tenant, "t2"}, "missing", [])
     end
 
+    describe "list_events pages retained events with retention-aware bounds" do
+      test "enforces tenant ownership through the owning run", %{run: run} do
+        append(run, [2, 3])
+        opts = %{after_seq: 0, limit: 10}
+
+        assert {:ok, %Docket.EventPage{}} =
+                 EventStore.list_events(TestRepo, {:tenant, "t1"}, run.id, opts)
+
+        assert {:ok, %Docket.EventPage{}} =
+                 EventStore.list_events(TestRepo, :system, run.id, opts)
+
+        assert {:error, :not_found} =
+                 EventStore.list_events(TestRepo, {:tenant, "t2"}, run.id, opts)
+
+        assert {:error, :not_found} =
+                 EventStore.list_events(TestRepo, :tenantless, run.id, opts)
+
+        assert {:error, :not_found} =
+                 EventStore.list_events(TestRepo, :system, "missing", opts)
+      end
+
+      test "returns an empty page beyond the latest sequence", %{run: run} do
+        run = reinsert(run, event_seq: 3)
+        append(run, [2, 3])
+
+        assert {:ok, page} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{after_seq: 3, limit: 10})
+
+        assert page.events == []
+        assert page.next_after_seq == 3
+        refute page.has_more?
+        assert page.oldest_available_seq == 2
+        assert page.latest_available_seq == 3
+        assert page.latest_seq == 3
+      end
+
+      test "honors default and boundary limits", %{run: run} do
+        append(run, [2, 3, 4])
+
+        assert {:ok, full} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{after_seq: 0, limit: 250})
+
+        assert Enum.map(full.events, & &1.seq) == [2, 3, 4]
+        refute full.has_more?
+
+        assert {:ok, one} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{after_seq: 0, limit: 1})
+
+        assert Enum.map(one.events, & &1.seq) == [2]
+        assert one.next_after_seq == 2
+        assert one.has_more?
+      end
+
+      test "paginates across pages using next_after_seq", %{run: run} do
+        append(run, [1, 2, 3, 4, 5])
+
+        assert {:ok, first} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{after_seq: 0, limit: 2})
+
+        assert Enum.map(first.events, & &1.seq) == [1, 2]
+        assert first.next_after_seq == 2
+        assert first.has_more?
+
+        assert {:ok, second} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{
+                   after_seq: first.next_after_seq,
+                   limit: 2
+                 })
+
+        assert Enum.map(second.events, & &1.seq) == [3, 4]
+        assert second.has_more?
+
+        assert {:ok, third} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{
+                   after_seq: second.next_after_seq,
+                   limit: 2
+                 })
+
+        assert Enum.map(third.events, & &1.seq) == [5]
+        refute third.has_more?
+      end
+
+      test "tolerates ordinary sequence gaps", %{run: run} do
+        run = reinsert(run, event_seq: 5)
+        append(run, [1, 2, 5])
+
+        assert {:ok, page} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{after_seq: 0, limit: 10})
+
+        assert Enum.map(page.events, & &1.seq) == [1, 2, 5]
+        assert page.oldest_available_seq == 1
+        assert page.latest_available_seq == 5
+        assert page.next_after_seq == 5
+        refute page.has_more?
+      end
+
+      test "reflects retention pruning of low sequences", %{run: run} do
+        run = reinsert(run, event_seq: 4)
+        append(run, [1, 2, 3, 4])
+
+        TestRepo.delete_all(from(e in Event, where: e.seq < 3))
+
+        assert {:ok, page} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{after_seq: 0, limit: 10})
+
+        assert Enum.map(page.events, & &1.seq) == [3, 4]
+        assert page.oldest_available_seq == 3
+        assert page.latest_available_seq == 4
+        assert page.latest_seq == 4
+      end
+
+      test "keeps latest_seq after a fully pruned history", %{run: run} do
+        run = reinsert(run, event_seq: 4)
+        append(run, [1, 2, 3, 4])
+
+        TestRepo.delete_all(Event)
+
+        assert {:ok, page} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{after_seq: 0, limit: 10})
+
+        assert page.events == []
+        assert page.oldest_available_seq == nil
+        assert page.latest_available_seq == nil
+        assert page.next_after_seq == 0
+        refute page.has_more?
+        assert page.latest_seq == 4
+      end
+
+      test "reports a typed error for an undecodable row", %{run: run} do
+        append(run, [2, 3])
+        TestRepo.update_all(from(e in Event, where: e.seq == 3), set: [payload: <<0, 1, 2>>])
+
+        assert {:error, %Docket.Error{type: :corrupt_event_row, details: %{seq: 3}}} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{after_seq: 0, limit: 10})
+      end
+
+      test "keeps per-call bounds coherent as appends interleave pagination", %{run: run} do
+        run = reinsert(run, event_seq: 5)
+        append(run, [1, 2, 3])
+
+        assert {:ok, first} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{after_seq: 0, limit: 2})
+
+        assert Enum.map(first.events, & &1.seq) == [1, 2]
+        assert first.latest_available_seq == 3
+        assert first.has_more?
+
+        append(run, [4, 5])
+
+        assert {:ok, second} =
+                 EventStore.list_events(TestRepo, :system, run.id, %{
+                   after_seq: first.next_after_seq,
+                   limit: 2
+                 })
+
+        assert Enum.map(second.events, & &1.seq) == [3, 4]
+        assert second.latest_available_seq == 5
+        assert second.has_more?
+      end
+    end
+
+    defp append(run, seqs) do
+      events = Enum.map(seqs, &event(run, &1))
+      assert :ok = EventStore.append_events(TestRepo, :system, run.id, events)
+    end
+
+    defp reinsert(run, opts) do
+      TestRepo.delete_all(Event)
+      TestRepo.delete_all(Run)
+      updated = %{run | event_seq: Keyword.fetch!(opts, :event_seq)}
+
+      assert {:ok, ^updated} =
+               RunStore.insert_run(
+                 TestRepo,
+                 {:tenant, "t1"},
+                 updated,
+                 :run_initialized,
+                 db_time(@now)
+               )
+
+      updated
+    end
+
     defp event(run, seq),
       do: %Docket.Event{
         run_id: run.id,
