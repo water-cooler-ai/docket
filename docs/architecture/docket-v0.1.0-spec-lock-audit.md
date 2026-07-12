@@ -35,12 +35,12 @@ backend boundary.
 | Public PostgreSQL bundle | Implemented | `Docket.Postgres` fixes the storage capabilities and owns their operational supervision. |
 | Versioned migration | Implemented | `Docket.Postgres.Migration` and schema version 1 create three tables with constraints and indexes. |
 | Graph store | Implemented | Immutable effective graph save/fetch with content-address conflict checks. |
-| Run aggregate store | Implemented | Scoped reads, insert, mutation, bounded claims, fencing, release, heartbeat, and poison retry. |
+| Run aggregate store | Implemented | Scoped reads, insert, mutation, bounded claims, fencing, release, claim refresh, and poison retry. |
 | Event store | Implemented | Assigned event append in the lifecycle transaction. |
 | Lifecycle composer | Implemented | `Docket.Lifecycle` owns start, moment commit, and signal transaction recipes. |
 | Durable facade | Implemented against a backend | Publication, start, reads, signals, poison retry, and bounded await are exercised with the conformance backend. |
 | Dispatcher | Implemented | Demand-bounded, jittered polling and lease launch/release behavior exist. |
-| Execution vehicle | Implemented | `Docket.Postgres.Vehicle` fetches and compiles the graph for a lease (with an optional generation-checked cache), drains fenced moments, and abandons, releases, or parks the run. Claim freshness during long supersteps is configurable: strict timeout alignment by default, opt-in token-guarded heartbeat with stale-result rejection. |
+| Execution vehicle | Implemented | `Docket.Postgres.Vehicle` fetches and compiles the graph for a lease (with an optional generation-checked cache), validates it against the host attempt maximum, and drains fenced moments. Runtime-owned finite deadlines bound executor callbacks; orphan TTL and fencing recover crashed or stolen claims. |
 | Backend supervision assembly | Implemented | A one-for-all execution subtree couples dispatcher accounting to its vehicle supervisor; notifier and pruner are isolated siblings. |
 | Deterministic backend test mode | Missing at snapshot; implemented by DCKT-24 | The snapshot had no public PostgreSQL drain/manual testing API. |
 | Pruning/retention | Implemented | `Docket.Postgres.Pruner` performs locked, bounded cleanup under the bundle's required explicit policy. |

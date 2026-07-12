@@ -50,7 +50,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def refresh_claim(ctx, scope, run_id, token, now) do
         result = Docket.Postgres.RunStore.refresh_claim(ctx, scope, run_id, token, now)
 
-        case Process.whereis(:storage_heartbeat_relay) do
+        case Process.whereis(:storage_claim_refresh_relay) do
           nil -> :ok
           pid -> send(pid, {:refreshed, result})
         end
@@ -143,42 +143,37 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert done.status == :done
     end
 
-    test "heartbeat refreshes the claim from a companion process while node work blocks", %{
+    test "attempt timeout commits durable retry state and releases the claim", %{
       context: context,
       backend: backend
     } do
-      rtg = publish!(context, Graphs.blocking())
-      run = start_run!(backend, rtg, %{})
-      lease = claim!(context, DateTime.utc_now())
-      supervisor = start_supervised!({Task.Supervisor, name: __MODULE__.HeartbeatSup})
-      Process.register(self(), :storage_heartbeat_relay)
-
-      opts =
-        [backend: {RelayBackend, context}, graph_cache: false]
-        |> Keyword.merge(
-          context: %{coordinator: self()},
-          task_supervisor: supervisor,
-          heartbeat: [interval_ms: 50]
+      rtg =
+        publish!(
+          context,
+          Graphs.blocking(%{"retry" => %{"max_attempts" => 2, "backoff_ms" => 60_000}})
         )
 
-      assert {:ok, vehicle} = Vehicle.launch(lease, opts)
-      monitor = Process.monitor(vehicle)
+      run = start_run!(backend, rtg, %{})
+      lease = claim!(context, DateTime.utc_now())
+      supervisor = start_supervised!({Task.Supervisor, name: __MODULE__.TimeoutSup})
 
-      assert_receive {:blocked, node_pid, "blocker", 1}, 5_000
+      opts =
+        vehicle_opts(context,
+          context: %{coordinator: self()},
+          task_supervisor: supervisor,
+          max_attempt_elapsed_ms: 200
+        )
 
-      # Pool size is 1 and node work holds no connection, so the companion
-      # heartbeat's refresh gets the pool to itself while the node blocks.
-      assert_receive {:refreshed, :ok}, 5_000
-      assert_receive {:refreshed, :ok}, 5_000
+      assert {:ok, {:parked, {:at, %DateTime{}}}} = Vehicle.drain(lease, opts)
+      assert_received {:blocked, _node_pid, "blocker", 1}
 
-      assert {:ok, info} = RunStore.inspect_run(context, :system, run.id)
-      assert DateTime.compare(info.claimed_at, lease.claimed_at) == :gt
+      assert {:ok, %RunInfo{} = info} = RunStore.inspect_run(context, :system, run.id)
+      assert info.claimed_at == nil
+      assert DateTime.compare(info.wake_at, DateTime.utc_now()) == :gt
 
-      send(node_pid, :release)
-      assert_receive {:DOWN, ^monitor, :process, ^vehicle, :normal}, 5_000
-
-      assert {:ok, done} = RunStore.fetch_run(context, :system, run.id)
-      assert done.status == :done
+      assert {:ok, current} = RunStore.fetch_run(context, :system, run.id)
+      assert current.status == :running
+      assert current.checkpoint_seq > lease.checkpoint_seq
     end
 
     test "killed vehicle leaves the claim; recovery resumes from the last committed moment", %{
@@ -330,7 +325,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, %RunInfo{claimed_at: claimed_at}} =
                RunStore.inspect_run(context, :system, run.id)
 
-      # Heartbeat refreshes use the database clock. Advance from the durable
+      # Claim refreshes use the database clock. Advance from the durable
       # claim timestamp so the steal remains deterministic on every host.
       stolen_at = DateTime.add(claimed_at, 61, :second)
 

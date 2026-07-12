@@ -10,7 +10,7 @@ defmodule Docket.Node do
   - returning `{:error, reason}`,
   - raising an exception,
   - exiting or throwing, or
-  - exceeding its resolved `timeout_ms` (with `Docket.Executor.Task`).
+  - exceeding its finite runtime-owned effective attempt timeout.
 
   Each is a node *attempt* failure. The dispatcher retries the attempt per the
   node's resolved retry policy (`max_attempts`/`backoff_ms`); when retries are

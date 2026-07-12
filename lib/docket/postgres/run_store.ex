@@ -36,7 +36,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     Committed `Docket.Run` fields and backend-owned operational fields share a
     row but have separate clocks. In particular, `updated_at` belongs to the
-    last committed run document; claims, heartbeats, releases, and poison
+    last committed run document; claims, refreshes, releases, and poison
     transitions never rewrite it.
 
     Claim tokens are redacted from schema inspection, and token-bearing
@@ -246,7 +246,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       result = if count == 1, do: :ok, else: {:error, :claim_lost}
-      emit_claim_operation(:heartbeat, started, result)
+      emit_claim_operation(:refresh, started, result)
       result
     end
 
@@ -310,6 +310,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     the abandon count reached the policy maximum — poisons the run with
     reason `"max_claim_abandons_exceeded"`. A stale token or an advanced
     checkpoint sequence matches nothing and reports `{:ok, :stale}`.
+
+    A `:non_poisoning` policy never poisons; with `:backoff` the recorded
+    wake grows exponentially with the durable abandon count up to the cap.
     """
     @spec abandon_claim(
             ctx(),
@@ -320,10 +323,68 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           ) :: Docket.Storage.Runs.abandon_result()
     def abandon_claim(ctx, :system, run_id, claim_token, policy) do
       started = System.monotonic_time()
-      {repo, prefix} = Storage.context!(ctx)
 
       %{expected_checkpoint_seq: seq, now: now, retry_at: retry_at, max_claim_abandons: max} =
-        validate_abandon_policy!(policy)
+        policy = validate_abandon_policy!(policy)
+
+      if Map.get(policy, :non_poisoning, false) do
+        non_poisoning_abandon(ctx, run_id, claim_token, seq, retry_at, policy, started)
+      else
+        poisoning_abandon(ctx, run_id, claim_token, seq, now, retry_at, max, started)
+      end
+    end
+
+    def abandon_claim(_ctx, scope, _run_id, _claim_token, _policy) do
+      raise ArgumentError, "abandon_claim scope must be :system, got: #{inspect(scope)}"
+    end
+
+    defp non_poisoning_abandon(ctx, run_id, claim_token, seq, retry_at, policy, started) do
+      {repo, prefix} = Storage.context!(ctx)
+
+      {matched, _} =
+        run_id
+        |> current_claim(claim_token)
+        |> where([run], run.checkpoint_seq == ^seq)
+        |> claim_query(prefix)
+        |> repo.update_all(
+          [
+            set: [
+              claim_token: nil,
+              claimed_at: nil,
+              claim_attempts: dynamic([run], fragment("GREATEST(? - 1, 0)", run.claim_attempts)),
+              claim_abandons: dynamic([run], run.claim_abandons + 1),
+              wake_at: non_poisoning_wake(policy, retry_at)
+            ]
+          ],
+          log: false
+        )
+
+      result = if matched == 1, do: {:ok, :rescheduled}, else: {:ok, :stale}
+      emit_claim_operation(:abandon, started, result, %{reason: :host_incompatible})
+      result
+    end
+
+    # The exponent is the durable abandon count, so consecutive handbacks
+    # push the wake back geometrically until the cap; committed progress
+    # resets the count. The exponent is clamped so the double-precision
+    # product stays exact well past any practical cap.
+    defp non_poisoning_wake(%{backoff: %{base_ms: base, cap_ms: cap}, now: now}, _retry_at) do
+      dynamic(
+        [run],
+        fragment(
+          "? + (LEAST(? * POWER(2, LEAST(?, 30)), ?) * interval '1 millisecond')",
+          type(^now, :utc_datetime_usec),
+          ^base,
+          run.claim_abandons,
+          ^cap
+        )
+      )
+    end
+
+    defp non_poisoning_wake(_policy, retry_at), do: retry_at
+
+    defp poisoning_abandon(ctx, run_id, claim_token, seq, now, retry_at, max, started) do
+      {repo, prefix} = Storage.context!(ctx)
 
       predicate =
         dynamic(
@@ -402,10 +463,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       result
-    end
-
-    def abandon_claim(_ctx, scope, _run_id, _claim_token, _policy) do
-      raise ArgumentError, "abandon_claim scope must be :system, got: #{inspect(scope)}"
     end
 
     @doc "Commits an exact-next run document under the current claim fence."
@@ -1138,6 +1195,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               "abandon policy retry_at must not precede now, got: #{inspect(policy)}"
       end
 
+      validate_abandon_backoff!(policy)
+
       %{
         policy
         | now: normalize_database_datetime(now),
@@ -1149,6 +1208,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       raise ArgumentError,
             "abandon policy requires non-negative expected_checkpoint_seq, DateTime now " <>
               "and retry_at, and positive max_claim_abandons, got: #{inspect(policy)}"
+    end
+
+    defp validate_abandon_backoff!(policy) do
+      case Map.get(policy, :backoff) do
+        nil ->
+          :ok
+
+        %{base_ms: base, cap_ms: cap}
+        when is_integer(base) and base > 0 and is_integer(cap) and cap >= base ->
+          :ok
+
+        other ->
+          raise ArgumentError,
+                "abandon policy backoff requires positive base_ms and cap_ms >= base_ms, " <>
+                  "got: #{inspect(other)}"
+      end
     end
 
     defp notify_wake(repo, prefix, {:release_claim, :immediate}), do: notify_wake(repo, prefix)

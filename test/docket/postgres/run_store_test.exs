@@ -852,10 +852,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:error, :claim_lost} =
                RunStore.refresh_claim(TestRepo, :system, "run", "wrong", @now)
 
-      assert_receive {[:docket, :postgres, :claim, :operation], %{duration: heartbeat_duration},
-                      %{operation: :heartbeat, result: :claim_lost}}
+      assert_receive {[:docket, :postgres, :claim, :operation], %{duration: refresh_duration},
+                      %{operation: :refresh, result: :claim_lost}}
 
-      assert is_integer(heartbeat_duration) and heartbeat_duration >= 0
+      assert is_integer(refresh_duration) and refresh_duration >= 0
 
       assert :ok = RunStore.release_claim(TestRepo, :system, "run", "wrong", @now)
 

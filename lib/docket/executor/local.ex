@@ -4,9 +4,8 @@ defmodule Docket.Executor.Local do
   activation's dispatcher task.
 
   The dispatcher gives concurrent activations separate tasks, but `Local`
-  does not add a child process around an individual node call and therefore
-  cannot enforce `timeout_ms`. Per-node timeouts become real with
-  `Docket.Executor.Task`.
+  does not add a nested node task. The runtime dispatcher owns the activation
+  process and enforces its effective attempt timeout.
   """
 
   @behaviour Docket.Executor
