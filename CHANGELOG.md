@@ -16,6 +16,11 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- An operator-facing PostgreSQL correctness guide covering durable status
+  rationale, derived queue views, scope, claims and poison, failure recovery,
+  configuration defaults, checkpoint/event delivery boundaries, and the
+  0.0.1 cutover. Its revision-8 introspection SQL is executed by the live
+  PostgreSQL suite to prevent documentation/schema drift (DCKT-27).
 - `Docket.Postgres`: the fixed Postgres backend bundle supplying Storage,
   GraphStore, RunStore, and EventStore while supervising a one-for-all
   dispatcher/vehicle execution subtree, optional LISTEN/NOTIFY fast path, and

@@ -1,0 +1,355 @@
+# Docket.Postgres Operations and Correctness Guide
+
+This guide is the operator-facing reference for the v0.1.0 revision-8,
+three-table runtime. Start with the [README quickstart](../README.md), then use
+this page for production configuration, inspection, and failure recovery.
+
+## Fresh application setup
+
+Add Docket plus the optional PostgreSQL dependencies to the host, configure
+`MyApp.Repo`, then install the tables through a host-owned migration:
+
+```elixir
+def deps do
+  [
+    {:docket, "~> 0.1.0"},
+    {:ecto_sql, "~> 3.10"},
+    {:postgrex, "~> 0.17"}
+  ]
+end
+```
+
+```sh
+mix deps.get
+mix docket.gen.migration -r MyApp.Repo
+mix ecto.migrate -r MyApp.Repo
+```
+
+Define one complete facade. Production retention has no implicit defaults:
+
+```elixir
+defmodule MyApp.Docket do
+  use Docket,
+    repo: MyApp.Repo,
+    backend: Docket.Postgres,
+    tenant_mode: :none,
+    notifier: :none,
+    pruner: [
+      interval_ms: :timer.hours(1),
+      event_retention_ms: :timer.hours(24 * 30),
+      run_retention_ms: :timer.hours(24 * 90),
+      batch_size: 1_000
+    ]
+end
+```
+
+Start it after the Repo in `MyApp.Application`:
+
+```elixir
+children = [MyApp.Repo, MyApp.Docket]
+Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
+```
+
+This setup uses polling and tenantless storage. Removing `notifier: :none`
+enables LISTEN/NOTIFY; changing to `tenant_mode: :required` requires the same
+authorized non-empty binary tenant ID on every run, read, and signal call.
+
+## Persistence and transaction ownership
+
+`Docket.Postgres` is one fixed `Docket.Backend` bundle. It supplies compatible
+transaction, graph, run, event, and supervision capabilities. The focused
+store modules are capability and backend-test boundaries, not public
+mix-and-match configuration.
+
+`Docket.Runtime.Moment` is a pre-commit proposal containing the next run,
+assigned events, checkpoint metadata, and scheduling disposition.
+`Docket.Lifecycle` is the single transaction composer: it persists the run,
+schedule, and events atomically, then invokes best-effort observers only after
+commit. A failed event append or lost claim fence commits none of the moment.
+
+## Durable statuses and derived operational views
+
+The durable status enum is deliberately flat:
+
+- `running`: graph work may be ready, future-scheduled, claimed, or poisoned.
+- `waiting`: the graph requires an external signal, such as interrupt input.
+- `done`: successful terminal outcome.
+- `failed`: terminal graph failure; `%Docket.Run{failure: %Docket.Run.Failure{}}`
+  retains the structured cause.
+- `cancelled`: explicit operator or application cancellation.
+
+Outcome timestamps do not replace status: time and outcome are different
+facts. Folding cancellation into `failed` plus a cause would make an intentional
+control action indistinguishable from graph failure. A status/outcome pair
+would add combinations the database must reject without adding information.
+`finished_at` already carries the terminal-phase bit that a separate
+`finished` status would duplicate.
+
+`waiting` is necessary because revision 8 enforces the useful invariant that
+every healthy `running` row has exactly one of a wake or a claim. An externally
+parked run has neither, so calling it `running` would weaken the SQL-enforceable
+queue shape.
+
+Ready, scheduled, claimed, recoverable, and poisoned are derived operational
+views, not durable graph statuses:
+
+- ready: unclaimed healthy `running`, with `wake_at <= now`;
+- scheduled: unclaimed healthy `running`, with `wake_at > now`;
+- claimed: healthy `running`, with paired token and claim timestamp;
+- recoverable: claimed with `claimed_at` older than the orphan TTL;
+- poisoned: `running` with paired poison facts and neither wake nor claim;
+- invalid: any row violating these tuples (normally impossible because CHECK
+  constraints reject it).
+
+`fetch_run` returns the exact committed `%Docket.Run{}` execution document.
+`inspect_run` returns `Docket.RunInfo`, adding token-free wake, claim timestamp,
+attempt/abandon counters, and poison facts. Claim operations never rewrite the
+run document's `updated_at`.
+
+## Scope is mandatory
+
+Storage operations accept exactly `:system`, `:tenantless`, or
+`{:tenant, non_empty_binary_id}`. `:system` is reserved for trusted dispatcher
+and recovery code. Tenantless access matches only `tenant_id IS NULL`; it is
+not an unscoped or system read. A required-tenant facade rejects omission
+before storage, and cross-tenant reads return not found.
+
+Applications remain responsible for authorization before deriving the stable
+tenant ID passed to the facade. See the
+[parent-application example](../examples/parent-app-integration.md).
+The public outcomes fail closed:
+
+```elixir
+{:error, %Docket.Error{type: :invalid_tenant}} =
+  MyApp.RequiredDocket.fetch_run(run_id)
+
+{:error, :not_found} =
+  MyApp.RequiredDocket.fetch_run(run_id, tenant_id: "different-tenant")
+
+{:error, :not_found} =
+  MyApp.TenantlessDocket.fetch_run(tenant_owned_run_id)
+```
+
+The facade never accepts `:system` from these options; that scope exists only
+inside the backend dispatcher and recovery paths.
+
+## Claims, fences, and poison
+
+The run row is the queue, and `RunStore` owns the whole aggregate transition:
+claim, heartbeat, release, fenced commit, serialized mutation, and poison
+recovery. A claim token remains authoritative after TTL expiry until another
+claimant actually steals it. A steal changes the token, invalidating stale
+commit and heartbeat; stale release is an idempotent no-op.
+
+`claim_attempts` counts consecutive launched claims without committed graph
+progress. With maximum `N`, exactly `N` launches are allowed; the next recovery
+need poisons instead of launching. A successful commit resets the counter.
+Pre-execution deployment incompatibility uses the separate `claim_abandons`
+counter and poison reason.
+
+Claims and checkpoint fences guarantee one durable winner. They do not
+guarantee one executor, cancel arbitrary in-flight effects, or make external
+calls exactly-once. Persist and check the stable task/idempotency identity in
+an external integration when duplicate effects are unacceptable.
+
+## Failure, poison, and signals
+
+A fresh supervised application can exercise the complete interrupt lifecycle
+with an ordinary node and graph:
+
+```elixir
+defmodule MyApp.Nodes.Review do
+  @behaviour Docket.Node
+
+  @impl true
+  def config_schema do
+    Docket.Schema.object(%{
+      "resume_field" => Docket.Schema.string(required: true),
+      "result_field" => Docket.Schema.string(required: true)
+    })
+  end
+
+  @impl true
+  def call(state, config, _context) do
+    case Map.fetch(state, config["resume_field"]) do
+      :error ->
+        {:interrupt,
+         %Docket.Interrupt{
+           prompt: "Approve?",
+           schema: Docket.Schema.string(),
+           resume_channel: config["resume_field"]
+         }}
+
+      {:ok, decision} ->
+        {:ok, %{config["result_field"] => decision}}
+    end
+  end
+end
+
+graph =
+  Docket.Graph.new!(id: "review")
+  |> Docket.Graph.put_field!("decision", schema: Docket.Schema.string())
+  |> Docket.Graph.put_field!("result", schema: Docket.Schema.string())
+  |> Docket.Graph.put_node!("review",
+    implementation: MyApp.Nodes.Review,
+    config: %{resume_field: "decision", result_field: "result"}
+  )
+  |> Docket.Graph.put_edge!("start-review", from: "$start", to: "review")
+  |> Docket.Graph.put_edge!("review-finish", from: "review", to: "$finish")
+  |> Docket.Graph.put_output!("result", [])
+
+{:ok, graph_ref} = MyApp.Docket.save_graph(graph)
+{:ok, started} = MyApp.Docket.start_run(graph_ref, %{})
+{:ok, waiting} = MyApp.Docket.await_run(started.id, timeout: 5_000)
+[{interrupt_id, %{status: :open}}] = Map.to_list(waiting.interrupts)
+
+{:ok, _scheduled} =
+  MyApp.Docket.resolve_interrupt(waiting.id, interrupt_id, "approved")
+
+{:ok, done} = MyApp.Docket.await_run(waiting.id, timeout: 5_000)
+:done = done.status
+%{"result" => "approved"} = done.output
+```
+
+With `tenant_mode: :required`, add the same authorized non-empty binary
+`tenant_id` to `start_run`, both `await_run` calls, and `resolve_interrupt`.
+Cancellation follows the same serialized signal path:
+
+```elixir
+{:ok, %Docket.Run{status: :cancelled}} =
+  MyApp.Docket.cancel_run(run_id, tenant_id: tenant_id)
+```
+
+```elixir
+{:ok, %Docket.Run{status: :failed, failure: failure}} =
+  MyApp.Docket.fetch_run(run_id, tenant_id: tenant_id)
+
+failure.code
+failure.message
+failure.details
+```
+
+PostgreSQL v0.1.0 always persists assigned runtime events; there is no public
+`events: :none` production option. Structured terminal failure is stored in
+the run aggregate and does not depend on reconstructing it from event history.
+This is the recorded deviation from the ticket's proposed “events disabled”
+example.
+
+Poison is operational, not a graph status. Inspection and bounded waiting
+surface it explicitly:
+
+```elixir
+{:ok, %Docket.RunInfo{poisoned_at: poisoned_at, poison_reason: reason}} =
+  MyApp.Docket.inspect_run(run_id, tenant_id: tenant_id)
+
+{:error, {:poisoned, %Docket.RunInfo{}}} =
+  MyApp.Docket.await_run(run_id, tenant_id: tenant_id, timeout: 5_000)
+
+{:ok, %Docket.Run{status: :running}} =
+  MyApp.Docket.retry_poisoned_run(run_id, tenant_id: tenant_id)
+```
+
+`resolve_interrupt` and `cancel_run` are serialized lifecycle mutations.
+Repeated calls return explicit inactive/not-found outcomes; they do not replay
+the prior success. There is no public `resume_run` or graph-semantic
+`retry_failed` operation in v0.1.0.
+
+## Configuration reference
+
+| Option | Default | Guidance |
+| --- | --- | --- |
+| `repo:` | required | A started Ecto PostgreSQL Repo owned by the host. |
+| `backend:` | required | Use the complete `Docket.Postgres` bundle. |
+| `prefix:` | `public` | Must match both directions of the generated migration. |
+| `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
+| `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
+| `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
+| `dispatcher.orphan_ttl_ms` | `60_000` | Must exceed the longest unrefreshed execution stretch. |
+| `dispatcher.max_claim_attempts` | `5` | Launches allowed before the next recovery need poisons. |
+| `dispatcher.drain_timeout_ms` | `30_000` | Shutdown wait for tracked vehicles. |
+| `vehicle.drain_budget` | 100 moments / 1 second | Bounds one claim drain before a committed immediate yield. |
+| `vehicle.heartbeat` | disabled | Enable with an interval strictly inside the orphan TTL for long supersteps. |
+| `vehicle.abandon_backoff_ms` | `30_000` | Delay before retrying a pre-execution graph incompatibility. |
+| `vehicle.max_claim_abandons` | `5` | Abandons allowed before incompatibility poison. |
+| `vehicle.executor` | `Docket.Executor.Local` | Runtime dispatch still fans out activations; configure `Docket.Executor.Task` when per-node task isolation and timeout enforcement are required. |
+| `vehicle.executor_opts` | `[]` | Passed to the configured executor. |
+| `max_supersteps` | unbounded | Optional host safety ceiling; publish a graph policy when it is graph identity. |
+| dispatcher/vehicle `clock`, `jitter` | system clock/random jitter | Injection points for deterministic tests; production overrides must stay monotonic and distribute polling/backoff. |
+| `dispatcher.on_poisoned` | no-op | Best-effort operational callback for newly poisoned claims; inspect durable rows for truth. |
+| `notifier:` | enabled | Use `:none` for poll-only. LISTEN needs a direct/session-pooled endpoint. |
+| `notifier.connection` | derived from Repo | Override only to use a direct/session-pooled LISTEN endpoint. |
+| `pruner:` | required, no defaults | Supply interval, event/run retention, and batch size. Event retention must not exceed run retention. |
+| `checkpoint_observers:` | `[]` | Best-effort after commit; delivery may be lost or duplicated. |
+| `testing:` | production | `:inline` drains synchronously; `:manual` advances only through bounded `drain_runs`. |
+
+Node retry policy belongs to the published graph. A retryable failure commits
+`:retry_scheduled` while graph status remains `running`; durable attempt state,
+sibling results, and the future wake survive process recovery. The dispatcher
+does not sleep on behalf of retrying work.
+Without a retry policy, a node gets one attempt and no backoff. A configured
+retry policy defaults `max_attempts` to `1` and `backoff_ms` to `0`; raise the
+attempt count and choose a positive backoff to enable durable retry parking.
+Testing modes start no dispatcher, notifier, vehicle supervisor, or pruner;
+their caller-owned drain still uses the production lifecycle transactions.
+
+## Checkpoints, events, and notifications
+
+The stored `checkpoint_seq` is the current committed fence. A proposed moment
+must carry exactly that value plus one. Event `seq` is an independent monotonic
+history identity because one moment may emit multiple
+runtime events plus one metadata-only `:checkpoint_committed` event.
+
+`checkpoint_observers` run after commit and may be lost or duplicated around
+a crash. They are suitable for cache/UI hints, not an outbox. Retained events
+are the durable integration source; v0.1.0 does not expose a high-level export
+API, so an authorized application exporter must read the retained rows or add
+a backend-specific capability that applies tenant predicates and uses supported
+decoding. Raw payload and metadata columns are private binary formats. The
+removed 0.0.1 host-owned `checkpoint:`
+committer belongs only in migration documentation.
+
+Immediate wakes call `pg_notify` inside the recording transaction. PostgreSQL
+delivers only after commit and drops notifications on rollback. Listener loss
+only adds latency because polling remains correctness. Fence loss discards the
+proposal and recovery replans from the last committed run, so its cost is
+re-execution, not a partial durable moment.
+
+## Tested introspection SQL
+
+[`postgres-introspection.sql`](postgres-introspection.sql) contains the exact
+revision-8 queries for ready backlog, expired and fresh claims, poison, oldest
+wake, invalid tuples, graph references, retained terminal failures, and event
+and run retention candidates. The live-PostgreSQL test suite installs the
+revision-8 migration and prepares every named query, preventing documentation
+drift from the shipped schema.
+
+The file uses unqualified table names. For a prefixed install, set a trusted
+session or transaction search path before running it, for example:
+
+```sql
+BEGIN;
+SET LOCAL search_path TO automation, public;
+-- run the selected introspection query
+COMMIT;
+```
+
+Never interpolate an untrusted schema name. Retention counts are advisory
+capacity estimates; the pruner still applies its batch limits, locks, and
+concurrent `SKIP LOCKED` selection.
+
+Treat these as operator queries. Application reads should use the scoped
+facade so tenantless or tenant access can never become system access.
+
+## Migration from 0.0.1
+
+Nodes, graphs, schemas, reducers, interrupts, executors, and processless inline
+semantic tests carry forward. Durable run serialization does not: host-defined
+0.0.1 persistence has no universal shape, so Docket cannot supply an automatic
+row conversion.
+
+Drain or terminate old runs, stop old writers, remove the host checkpoint
+handler and persistence, install the Docket migration, configure `repo:` and
+`backend: Docket.Postgres`, publish each graph to a `Docket.GraphRef`, replace
+`run`/`get_run` with `start_run` and `fetch_run`/`inspect_run`, and remove host
+`resume` orchestration. The detailed sequence is in the
+[migration guide](architecture/migration-0.0.1-to-0.1.0.md).
