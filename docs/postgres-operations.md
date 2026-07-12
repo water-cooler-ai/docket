@@ -1,7 +1,7 @@
 # Docket.Postgres Operations and Correctness Guide
 
-This guide is the operator-facing reference for the v0.1.0 revision-8,
-three-table runtime. Start with the [README quickstart](../README.md), then use
+This guide is the operator-facing reference for the v0.1.0 PostgreSQL runtime.
+Start with the [README quickstart](../README.md), then use
 this page for production configuration, inspection, and failure recovery.
 
 ## Fresh application setup
@@ -85,7 +85,7 @@ would add combinations the database must reject without adding information.
 `finished_at` already carries the terminal-phase bit that a separate
 `finished` status would duplicate.
 
-`waiting` is necessary because revision 8 enforces the useful invariant that
+`waiting` is necessary because the database enforces the useful invariant that
 every healthy `running` row has exactly one of a wake or a claim. An externally
 parked run has neither, so calling it `running` would weaken the SQL-enforceable
 queue shape.
@@ -232,8 +232,6 @@ failure.details
 PostgreSQL v0.1.0 always persists assigned runtime events; there is no public
 `events: :none` production option. Structured terminal failure is stored in
 the run aggregate and does not depend on reconstructing it from event history.
-This is the recorded deviation from the ticket's proposed “events disabled”
-example.
 
 Poison is operational, not a graph status. Inspection and bounded waiting
 surface it explicitly:
@@ -314,31 +312,19 @@ only adds latency because polling remains correctness. Fence loss discards the
 proposal and recovery replans from the last committed run, so its cost is
 re-execution, not a partial durable moment.
 
-## Tested introspection SQL
+## Operational inspection
 
-[`postgres-introspection.sql`](postgres-introspection.sql) contains the exact
-revision-8 queries for ready backlog, expired and fresh claims, poison, oldest
-wake, invalid tuples, graph references, retained terminal failures, and event
-and run retention candidates. The live-PostgreSQL test suite installs the
-revision-8 migration and prepares every named query, preventing documentation
-drift from the shipped schema.
+Use `inspect_run` for per-run scheduling, claim age, attempt counts, and poison
+health. Use telemetry for dispatcher backlog/claim activity, vehicle outcomes,
+observer failures, notifier health, and pruning passes. Database tables and
+opaque binary columns are backend implementation details rather than an
+application query API.
 
-The file uses unqualified table names. For a prefixed install, set a trusted
-session or transaction search path before running it, for example:
-
-```sql
-BEGIN;
-SET LOCAL search_path TO automation, public;
--- run the selected introspection query
-COMMIT;
-```
-
-Never interpolate an untrusted schema name. Retention counts are advisory
-capacity estimates; the pruner still applies its batch limits, locks, and
-concurrent `SKIP LOCKED` selection.
-
-Treat these as operator queries. Application reads should use the scoped
-facade so tenantless or tenant access can never become system access.
+If an operator must inspect tables directly during an incident, use a trusted
+database role, honor the configured schema prefix, and avoid decoding the
+private `state`, `payload`, or `metadata` columns. Application-facing tools
+should remain on the scoped facade so tenantless or tenant access can never
+become system access.
 
 ## Migration from 0.0.1
 

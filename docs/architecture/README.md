@@ -2,7 +2,7 @@
 
 Operational instrumentation and correctness boundaries are documented in the
 [telemetry guide](../telemetry.md).
-Production status, configuration, failure recovery, and tested SQL are in the
+Production status, configuration, failure recovery, and inspection are in the
 [PostgreSQL operations guide](../postgres-operations.md).
 
 These documents record the design rationale behind Docket. The code and its

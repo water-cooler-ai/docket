@@ -315,7 +315,7 @@ the package page.
   the durable parent-application integration boundary.
 - [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).
 - [PostgreSQL operations and correctness guide](docs/postgres-operations.md) —
-  statuses, claims, poison recovery, configuration, and tested introspection.
+  statuses, claims, poison recovery, configuration, and inspection.
 - [examples/llm-node.md](examples/llm-node.md) — a generic, configurable LLM
   node implementation.
 - [docs/architecture/](docs/architecture/) — design rationale: the graph

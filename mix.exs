@@ -60,7 +60,7 @@ defmodule Docket.MixProject do
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => @source_url},
       files:
-        ~w(lib mix.exs README.md CHANGELOG.md LICENSE docs/architecture docs/telemetry.md docs/postgres-operations.md docs/postgres-introspection.sql examples)
+        ~w(lib mix.exs README.md CHANGELOG.md LICENSE docs/architecture docs/telemetry.md docs/postgres-operations.md examples)
     ]
   end
 end
