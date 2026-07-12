@@ -7,8 +7,15 @@ defmodule Docket.Benchmark do
   remain explicit, manual work rather than ordinary test-suite work.
   """
 
-  @scenarios ~w(blocked_vehicles claim_only cyclic_vs_one_step empty_one_step mixed_service_times parked_wait_vs_blocking_wait smoke)
-  @all_scenarios ~w(claim_only empty_one_step cyclic_drain cyclic_vs_one_step blocked_vehicles mixed_fairness mixed_service_times parked_wait_vs_blocking_wait graph_cache freshness_split_brain multinode notify_poll amplification soak smoke)
+  @scenarios ~w(blocked_vehicles claim_only cyclic_vs_one_step empty_one_step mixed_service_times parked_wait_vs_blocking_wait smoke steady_arrival)
+  @all_scenarios ~w(claim_only empty_one_step cyclic_drain cyclic_vs_one_step blocked_vehicles mixed_fairness mixed_service_times parked_wait_vs_blocking_wait graph_cache freshness_split_brain multinode notify_poll amplification soak smoke steady_arrival)
+  @maximum_steady_arrival_runs 1_000_000
+  @observer_abba_sequence [
+    {"bounded_instrumented", 1, 1},
+    {"counters_only_control", 2, 1},
+    {"counters_only_control", 3, 2},
+    {"bounded_instrumented", 4, 2}
+  ]
 
   @defaults %{
     scenario: "smoke",
@@ -24,16 +31,23 @@ defmodule Docket.Benchmark do
     batch_size: nil,
     ready_ratio: nil,
     hold_ms: nil,
+    slow_percent: nil,
+    cycle_moments: nil,
+    drain_max_moments: nil,
+    drain_max_elapsed_ms: nil,
     sample_interval_ms: nil,
     max_samples: nil,
     probe_count: nil,
+    duration: nil,
+    arrival_rate: nil,
     orphan_ttl_ms: 60_000,
     seed: 1,
     repetitions: 1,
     warmup: 0,
     poll_interval_ms: 10,
     timeout_ms: 30_000,
-    database_url: "postgres://localhost:5432/docket_bench"
+    database_url: "postgres://localhost:5432/docket_bench",
+    observer_abba: false
   }
 
   @switches [
@@ -46,12 +60,17 @@ defmodule Docket.Benchmark do
     batch_size: :integer,
     ready_ratio: :string,
     hold_ms: :integer,
+    slow_percent: :integer,
+    cycle_moments: :integer,
+    drain_max_moments: :integer,
+    drain_max_elapsed_ms: :integer,
     sample_interval_ms: :integer,
     max_samples: :integer,
     probe_count: :integer,
     orphan_ttl_ms: :integer,
     nodes: :integer,
     duration: :string,
+    arrival_rate: :string,
     event_policy: :string,
     output: :string,
     format: :string,
@@ -61,7 +80,8 @@ defmodule Docket.Benchmark do
     poll_interval_ms: :integer,
     timeout_ms: :integer,
     database_url: :string,
-    authoritative: :boolean
+    authoritative: :boolean,
+    observer_abba: :boolean
   ]
 
   @doc false
@@ -83,6 +103,7 @@ defmodule Docket.Benchmark do
   def validate(config) do
     with :ok <- member(config.scenario, @all_scenarios, "scenario"),
          :ok <- supported(config.scenario),
+         :ok <- observer_abba_scenario(config),
          :ok <- positive(config.runs, "runs"),
          :ok <- positive(config.concurrency, "concurrency"),
          :ok <- positive(config.pool_size, "pool-size"),
@@ -92,6 +113,8 @@ defmodule Docket.Benchmark do
          :ok <- non_negative(config.seed, "seed"),
          :ok <- positive(config.repetitions, "repetitions"),
          :ok <- non_negative(config.warmup, "warmup"),
+         :ok <- cyclic_controls_scope(config),
+         :ok <- mixed_service_controls_scope(config),
          :ok <- scenario_options(config),
          :ok <- current_run_shape(config),
          :ok <- positive(config.poll_interval_ms, "poll-interval-ms"),
@@ -131,12 +154,19 @@ defmodule Docket.Benchmark do
           pool_size <- config.pool_sizes,
           do: {concurrency, pool_size}
 
-    for repetition <- 1..config.repetitions,
-        {concurrency, pool_size} <- rotate(cells, config.seed + repetition - 1) do
-      config
-      |> Map.put(:concurrency, concurrency)
-      |> Map.put(:pool_size, pool_size)
-      |> Map.put(:repetition, repetition)
+    base =
+      for repetition <- 1..config.repetitions,
+          {concurrency, pool_size} <- rotate(cells, config.seed + repetition - 1) do
+        config
+        |> Map.put(:concurrency, concurrency)
+        |> Map.put(:pool_size, pool_size)
+        |> Map.put(:repetition, repetition)
+      end
+
+    if config.observer_abba do
+      Enum.flat_map(base, &observer_abba_points/1)
+    else
+      base
     end
   end
 
@@ -146,6 +176,35 @@ defmodule Docket.Benchmark do
     do:
       {:error,
        "scenario #{inspect(scenario)} is not implemented; refusing to substitute a different workload"}
+
+  defp observer_abba_scenario(%{observer_abba: true, scenario: scenario})
+       when scenario in ["smoke", "empty_one_step"],
+       do: :ok
+
+  defp observer_abba_scenario(%{observer_abba: true, scenario: scenario}),
+    do:
+      {:error,
+       "observer-abba is implemented only for smoke/empty_one_step, got: #{inspect(scenario)}"}
+
+  defp observer_abba_scenario(_config), do: :ok
+
+  defp cyclic_controls_scope(%{scenario: "cyclic_vs_one_step"}), do: :ok
+
+  defp cyclic_controls_scope(%{
+         cycle_moments: nil,
+         drain_max_moments: nil,
+         drain_max_elapsed_ms: nil
+       }),
+       do: :ok
+
+  defp cyclic_controls_scope(_config),
+    do: {:error, "cycle/drain controls are only valid for cyclic_vs_one_step"}
+
+  defp mixed_service_controls_scope(%{scenario: "mixed_service_times"}), do: :ok
+  defp mixed_service_controls_scope(%{slow_percent: nil}), do: :ok
+
+  defp mixed_service_controls_scope(_config),
+    do: {:error, "slow-percent is only valid for mixed_service_times"}
 
   defp event_policy("all"), do: :ok
 
@@ -165,7 +224,9 @@ defmodule Docket.Benchmark do
 
   defp authority(_), do: :ok
 
-  defp current_run_shape(%{duration: duration}),
+  defp current_run_shape(%{scenario: "steady_arrival"}), do: :ok
+
+  defp current_run_shape(%{duration: duration}) when not is_nil(duration),
     do:
       {:error,
        "duration=#{inspect(duration)} is only valid for steady-state scenarios that are not implemented"}
@@ -193,18 +254,43 @@ defmodule Docket.Benchmark do
     end
   end
 
-  defp scenario_options(%{scenario: scenario} = config)
-       when scenario in ["mixed_service_times", "parked_wait_vs_blocking_wait"] do
+  defp scenario_options(%{scenario: "steady_arrival"} = config) do
+    with :ok <- at_least(config.duration_ms, 10, "duration"),
+         :ok <- at_least(config.sample_interval_ms, 5, "sample-interval-ms"),
+         :ok <- positive(config.max_samples, "max-samples"),
+         :ok <- steady_arrival_options(config) do
+      if config.warmup == 0,
+        do: :ok,
+        else: {:error, "steady_arrival does not support warmup runs; use repetitions"}
+    end
+  end
+
+  defp scenario_options(%{scenario: "mixed_service_times"} = config) do
+    with :ok <- positive(config.hold_ms, "hold-ms"),
+         :ok <- at_least(config.runs, 2, "runs"),
+         :ok <- percentage(config.slow_percent, "slow-percent") do
+      if config.warmup == 0,
+        do: :ok,
+        else: {:error, "mixed_service_times does not support warmup runs; use repetitions"}
+    end
+  end
+
+  defp scenario_options(%{scenario: "parked_wait_vs_blocking_wait"} = config) do
     with :ok <- positive(config.hold_ms, "hold-ms"),
          :ok <- at_least(config.runs, 2, "runs") do
       if config.warmup == 0,
         do: :ok,
-        else: {:error, "#{scenario} does not support warmup runs; use repetitions"}
+        else:
+          {:error, "parked_wait_vs_blocking_wait does not support warmup runs; use repetitions"}
     end
   end
 
   defp scenario_options(%{scenario: "cyclic_vs_one_step"} = config) do
-    with :ok <- at_least(config.runs, 2, "runs") do
+    with :ok <- at_least(config.runs, 2, "runs"),
+         :ok <- positive(config.cycle_moments, "cycle-moments"),
+         :ok <- positive(config.drain_max_moments, "drain-max-moments"),
+         :ok <- optional_positive(config.drain_max_elapsed_ms, "drain-max-elapsed-ms"),
+         :ok <- cycle_exceeds_drain_budget(config) do
       if config.warmup == 0,
         do: :ok,
         else: {:error, "cyclic_vs_one_step does not support warmup runs; use repetitions"}
@@ -215,6 +301,11 @@ defmodule Docket.Benchmark do
          batch_size: nil,
          ready_ratio: nil,
          hold_ms: nil,
+         slow_percent: nil,
+         cycle_moments: nil,
+         drain_max_moments: nil,
+         drain_max_elapsed_ms: nil,
+         arrival_rate: nil,
          sample_interval_ms: nil,
          max_samples: nil,
          probe_count: nil
@@ -224,7 +315,35 @@ defmodule Docket.Benchmark do
   defp scenario_options(_config),
     do:
       {:error,
-       "batch-size/ready-ratio are only valid for claim_only; hold-ms is valid for blocked_vehicles and wait-comparison scenarios; sample/probe options are only valid for blocked_vehicles"}
+       "batch-size/ready-ratio are only valid for claim_only; hold-ms is valid for blocked_vehicles and wait-comparison scenarios; slow-percent is only valid for mixed_service_times; cycle/drain controls are only valid for cyclic_vs_one_step; duration/arrival-rate are only valid for steady_arrival; sample/max options are valid for blocked_vehicles and steady_arrival; probe-count is only valid for blocked_vehicles"}
+
+  defp steady_arrival_options(config) do
+    unsupported =
+      [
+        batch_size: config.batch_size,
+        ready_ratio: config.ready_ratio,
+        hold_ms: config.hold_ms,
+        slow_percent: config.slow_percent,
+        cycle_moments: config.cycle_moments,
+        drain_max_moments: config.drain_max_moments,
+        drain_max_elapsed_ms: config.drain_max_elapsed_ms,
+        probe_count: config.probe_count
+      ]
+      |> Enum.filter(fn {_name, value} -> not is_nil(value) end)
+
+    if unsupported == [],
+      do: :ok,
+      else: {:error, "unsupported steady_arrival options: #{inspect(Keyword.keys(unsupported))}"}
+  end
+
+  defp cycle_exceeds_drain_budget(config) do
+    if config.cycle_moments > config.drain_max_moments do
+      :ok
+    else
+      {:error,
+       "cycle-moments must be greater than drain-max-moments so the benchmark exercises a bounded drain yield"}
+    end
+  end
 
   defp blocked_backlog(config) do
     maximum_concurrency = Enum.max(config.concurrencies)
@@ -249,6 +368,14 @@ defmodule Docket.Benchmark do
 
   defp positive(value, name),
     do: {:error, "#{name} must be a positive integer, got: #{inspect(value)}"}
+
+  defp optional_positive(nil, _name), do: :ok
+  defp optional_positive(value, name), do: positive(value, name)
+
+  defp percentage(value, _name) when is_integer(value) and value in 1..99, do: :ok
+
+  defp percentage(value, name),
+    do: {:error, "#{name} must be an integer from 1 through 99, got: #{inspect(value)}"}
 
   defp at_least(value, minimum, _name) when is_integer(value) and value >= minimum, do: :ok
 
@@ -356,9 +483,37 @@ defmodule Docket.Benchmark do
      }}
   end
 
-  defp normalize_scenario(%{scenario: scenario} = config)
-       when scenario in ["mixed_service_times", "parked_wait_vs_blocking_wait"] do
+  defp normalize_scenario(%{scenario: "steady_arrival"} = config) do
+    with {:ok, duration_ms} <- parse_duration(config.duration),
+         {:ok, arrival_rate} <- parse_arrival_rate(config.arrival_rate),
+         {:ok, runs} <- steady_arrival_runs(config.runs, duration_ms, arrival_rate) do
+      {:ok,
+       %{
+         config
+         | runs: runs,
+           arrival_rate: arrival_rate,
+           sample_interval_ms: config.sample_interval_ms || 20,
+           max_samples: config.max_samples || 256
+       }
+       |> Map.put(:duration_ms, duration_ms)}
+    end
+  end
+
+  defp normalize_scenario(%{scenario: "mixed_service_times"} = config) do
+    {:ok, %{config | hold_ms: config.hold_ms || 250, slow_percent: config.slow_percent || 10}}
+  end
+
+  defp normalize_scenario(%{scenario: "parked_wait_vs_blocking_wait"} = config) do
     {:ok, %{config | hold_ms: config.hold_ms || 250}}
+  end
+
+  defp normalize_scenario(%{scenario: "cyclic_vs_one_step"} = config) do
+    {:ok,
+     %{
+       config
+       | cycle_moments: config.cycle_moments || 12,
+         drain_max_moments: config.drain_max_moments || 4
+     }}
   end
 
   defp normalize_scenario(config), do: {:ok, config}
@@ -381,11 +536,59 @@ defmodule Docket.Benchmark do
     end
   end
 
+  defp parse_duration(nil),
+    do: {:error, "steady_arrival requires --duration with an ms, s, or m suffix"}
+
+  defp parse_duration(value) when is_binary(value) do
+    case Regex.run(~r/\A([1-9][0-9]*)(ms|s|m)\z/, value) do
+      [_, count, "ms"] -> {:ok, String.to_integer(count)}
+      [_, count, "s"] -> {:ok, String.to_integer(count) * 1_000}
+      [_, count, "m"] -> {:ok, String.to_integer(count) * 60_000}
+      _ -> {:error, "duration must be a positive integer with an ms, s, or m suffix"}
+    end
+  end
+
+  defp parse_arrival_rate(nil), do: {:ok, nil}
+
+  defp parse_arrival_rate(value) when is_binary(value) do
+    case Float.parse(value) do
+      {rate, ""} when rate > 0 -> {:ok, rate}
+      _ -> {:error, "arrival-rate must be a positive number of runs per second"}
+    end
+  end
+
+  defp steady_arrival_runs(runs, _duration_ms, nil), do: {:ok, runs}
+
+  defp steady_arrival_runs(_runs, duration_ms, arrival_rate) do
+    derived = ceil(arrival_rate * duration_ms / 1_000)
+
+    cond do
+      derived < 1 ->
+        {:error, "arrival-rate and duration must schedule at least one run"}
+
+      derived > @maximum_steady_arrival_runs ->
+        {:error,
+         "arrival-rate and duration exceed the #{@maximum_steady_arrival_runs} run safety limit"}
+
+      true ->
+        {:ok, derived}
+    end
+  end
+
   defp rotate([], _seed), do: []
 
   defp rotate(values, seed) do
     offset = Integer.mod(seed, length(values))
     {left, right} = Enum.split(values, offset)
     right ++ left
+  end
+
+  defp observer_abba_points(config) do
+    Enum.map(@observer_abba_sequence, fn {mode, position, pair} ->
+      config
+      |> Map.put(:observer_mode, mode)
+      |> Map.put(:observer_position, position)
+      |> Map.put(:observer_pair, pair)
+    end)
   end
 end

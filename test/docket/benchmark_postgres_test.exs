@@ -24,7 +24,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert artifact.success
       assert artifact.workload.ready_count == 7
       assert artifact.workload.expired_count == 5
-      assert artifact.measurements.collection.complete_sample_set
+      assert artifact.measurements.collection.telemetry_checks_pass
       assert artifact.measurements.counts.ready_claims == 7
       assert artifact.measurements.counts.expired_claims == 5
       assert artifact.headline.ready_claims == 7
@@ -33,14 +33,48 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Enum.all?(artifact.invariants, & &1.pass)
       assert artifact.cleanup.isolated_database_removed
 
+      environment = artifact.environment
+      assert environment.postgres_settings["checkpoint_timeout"] != nil
+      assert environment.postgres_settings["autovacuum"] != nil
+      assert environment.postgres_settings["work_mem"] != nil
+      assert environment.postgres_settings["shared_preload_libraries"] != nil
+      assert environment.postgres_setting_details["checkpoint_timeout"].status == "available"
+      assert is_list(environment.unavailable_postgres_settings)
+      assert environment.pg_stat_statements.status in ["available", "unavailable"]
+      refute environment.pg_stat_statements.query_statistics_captured
+      assert environment.postgres_connection.transport in ["tcp", "unix_socket"]
+      assert is_binary(environment.host.os.family)
+      assert is_binary(environment.runtime.architecture)
+      assert is_boolean(environment.container.detected)
+      assert is_binary(environment.storage.class)
+      assert is_binary(environment.storage.filesystem)
+      assert is_binary(environment.storage.postgres_data_directory)
+
+      amplification = artifact.measurements.amplification
+      counters = amplification.postgres_database_counters_delta
+      assert is_number(counters.xact_commit)
+      assert Map.has_key?(counters, :deadlocks)
+      assert Map.has_key?(counters, :temp_bytes)
+      assert Map.has_key?(counters, :blk_read_time)
+      assert Map.has_key?(counters, :active_time)
+
+      contention = amplification.postgres_contention
+      assert is_number(contention.before.activity.other_backends)
+      assert is_number(contention.after.activity.active_waiting_backends)
+      assert is_number(contention.before.locks.ungranted_lock_rows)
+      assert is_number(contention.after.locks.backends_with_ungranted_locks)
+      assert is_number(contention.gauge_delta.activity.active_backends)
+      assert is_number(contention.gauge_delta.locks.lock_rows)
+      assert contention.caveat =~ "miss transient"
+
       encoded = File.read!(output)
       decoded = JSON.decode!(encoded)
       assert is_map(decoded)
       assert decoded["kind"] == "benchmark_suite"
-      assert decoded["schema_version"] == 4
+      assert decoded["schema_version"] == 5
       assert decoded["scenario"] == "claim_only"
       assert [point] = decoded["points"]
-      assert point["schema_version"] == 4
+      assert point["schema_version"] == 5
       assert point["headline"]["ready_claims"] == 7
       refute encoded =~ config.database_url
       refute encoded =~ output
@@ -68,16 +102,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert artifact.success
       assert artifact.workload.ready_count == 1000
       assert artifact.workload.expired_count == 0
-      assert artifact.measurements.batches.nonempty_scans >= 1
-      assert artifact.measurements.batches.nonempty_scans <= config.concurrency
-      assert artifact.measurements.batches.empty_scans <= config.concurrency
-      assert artifact.measurements.batches.total_scans <= config.concurrency * 2
+      batches = artifact.measurements.batches.exact_global_counts
+      assert batches.nonempty_scan_events >= 1
+      assert batches.nonempty_scan_events <= config.concurrency
+      assert batches.empty_scan_events <= config.concurrency
+      assert batches.total_scan_events <= config.concurrency * 2
 
       assert artifact.measurements.counts.claim_query_samples ==
-               artifact.measurements.batches.total_scans
+               batches.total_scan_events
 
-      assert artifact.measurements.collection.observed_claim_samples == config.runs
-      assert artifact.measurements.collection.complete_sample_set
+      exact = artifact.measurements.collection.exact_global_counts
+      assert exact.claim_attempt_events == config.runs
+      assert exact.claimed_rows_from_scan_events == config.runs
+      assert artifact.measurements.collection.telemetry_checks_pass
     end
 
     test "claim-only supports an entirely expired backlog" do
@@ -113,12 +150,116 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                12
 
       assert artifact.measurements.latency.expired_overdue_after_ttl_ms.sample_count == 12
-      assert artifact.measurements.collection.expected_ready_samples == 0
-      assert artifact.measurements.collection.observed_ready_samples == 0
-      assert artifact.measurements.collection.expected_expired_samples == 12
-      assert artifact.measurements.collection.observed_expired_samples == 12
-      assert artifact.measurements.collection.complete_sample_set
+      exact = artifact.measurements.collection.exact_global_counts
+      assert exact.expected_ready_claim_attempt_events == 0
+      assert exact.ready_claim_attempt_events == 0
+      assert exact.expected_expired_claim_attempt_events == 12
+      assert exact.expired_claim_attempt_events == 12
+      assert artifact.measurements.collection.telemetry_checks_pass
       assert Enum.all?(artifact.invariants, & &1.pass)
+    end
+
+    test "steady arrivals preserve the open-loop schedule and drain exact backlog" do
+      output =
+        Path.join(
+          System.tmp_dir!(),
+          "docket-steady-arrival-#{System.unique_integer([:positive])}.json"
+        )
+
+      on_exit(fn -> File.rm(output) end)
+
+      assert {:ok, config} =
+               Docket.Benchmark.parse(
+                 ~w(--scenario steady_arrival --duration 80ms --arrival-rate 50 --concurrency 2 --pool-size 2 --sample-interval-ms 5 --max-samples 8 --timeout-ms 10000 --output #{output})
+               )
+
+      assert config.runs == 4
+      assert {:ok, %{artifact: suite, artifacts: [artifact]}} = Docket.Benchmark.run(config)
+      assert artifact.success
+      assert artifact.scenario == "steady_arrival"
+      assert artifact.measurements.collection.telemetry_checks_pass
+
+      steady = artifact.measurements.steady_arrival
+      assert steady.offered_rate_per_second == 50.0
+      assert is_number(steady.achieved_arrival_window_rate_per_second)
+      assert is_number(steady.achieved_terminal_drain_rate_per_second)
+      assert steady.retained_completion_lag_us.sample_count == 4
+
+      exact = steady.exact_terminal_telemetry
+      assert exact.boundary_accounting_exact
+      assert exact.completed_in_arrival_window == steady.completed_by_arrival_window_end
+
+      assert exact.completed_in_arrival_window + exact.due_outstanding_at_arrival_window_end ==
+               4
+
+      assert steady.due_outstanding_at_arrival_window_end ==
+               4 - exact.completed_in_arrival_window
+
+      assert steady.achieved_arrival_window_rate_per_second ==
+               Float.round(exact.completed_in_arrival_window / 0.08, 3)
+
+      window_sample = steady.boundary_samples.arrival_window_end
+      assert window_sample.requested_boundary_offset_us == 80_000
+      assert window_sample.observed_sample_start_offset_us == window_sample.offset_us
+      assert window_sample.observed_sample_completion_offset_us >= window_sample.offset_us
+      assert window_sample.sample_start_delay_us >= 0
+      assert window_sample.sample_callback_duration_us >= 0
+
+      assert window_sample.requested_to_sample_completion_us >=
+               window_sample.sample_start_delay_us
+
+      refute window_sample.exact_boundary_state
+      assert window_sample.snapshot_scope =~ "later within the callback interval"
+      assert steady.oldest_due_lag_growth_sample_span_us > 0
+      assert steady.oldest_due_lag_growth_scope =~ "observed SQL sample starts"
+      assert steady.backlog_growth_scope =~ "not instantaneous growth"
+      assert steady.terminal_drain_duration_us == exact.last_terminal_checkpoint_offset_us
+      assert steady.completion_poll_detection_delay_us >= 0
+
+      assert abs(
+               steady.completion_poll_detected_offset_us - steady.terminal_drain_duration_us -
+                 steady.completion_poll_detection_delay_us
+             ) <= 1
+
+      assert steady.achieved_terminal_drain_rate_per_second ==
+               Float.round(4 * 1_000_000 / steady.terminal_drain_duration_us, 3)
+
+      post_detection = steady.boundary_samples.post_completion_detection
+      assert post_detection.phase == "post_completion_detection"
+      assert post_detection.metrics.completed_runs == 4
+      assert post_detection.metrics.due_outstanding_runs == 0
+      assert steady.timeline.retained_bucket_count <= 8
+      assert steady.timeline.represented_sample_count == steady.timeline.raw_sample_count
+      assert steady.timeline.forced_phase_sample_count == 3
+
+      assert steady.backlog_state_at_window_end in [
+               "drained_by_window_end",
+               "outstanding_at_window_end"
+             ]
+
+      assert artifact.headline.offered_rate_per_second == 50.0
+      assert artifact.headline.terminal_drain_duration_us == steady.terminal_drain_duration_us
+
+      assert artifact.headline.completion_poll_detection_delay_us ==
+               steady.completion_poll_detection_delay_us
+
+      assert is_number(artifact.headline.retained_completion_lag_p95_us)
+      assert Enum.all?(artifact.invariants, & &1.pass)
+      assert artifact.cleanup.isolated_database_removed
+
+      assert suite.concurrency_knee.data_status == "exploratory"
+      assert suite.concurrency_knee.method.generic_safe_capacity_recommendation == "disabled"
+      assert [pool] = suite.concurrency_knee.pools
+      assert pool.status == "exploratory_only"
+      assert pool.recommended_safe_concurrency == nil
+
+      assert suite.summary
+             |> hd()
+             |> get_in([
+               :latency_across_repetitions,
+               :retained_completion_lag_p95_us,
+               :sample_count
+             ]) == 1
     end
 
     test "blocked vehicles expose a bounded saturated plateau without holding the Repo" do
@@ -142,7 +283,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert is_number(artifact.headline.short_query_p50_us)
       assert artifact.headline.orphan_ttl_ms == config.orphan_ttl_ms
       assert artifact.cleanup.isolated_database_removed
-      assert artifact.measurements.blocked_vehicles.collection.complete_sample_set
+      assert artifact.measurements.blocked_vehicles.collection.telemetry_checks_pass
       assert artifact.measurements.blocked_vehicles.plateau.active_claims == 2
       assert artifact.measurements.blocked_vehicles.plateau.ready_unclaimed_runs == 2
       assert artifact.measurements.blocked_vehicles.plateau.repo_pool.capacity == 1
@@ -227,7 +368,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       scenarios = [
         {"mixed_service_times", ["--hold-ms", "10"], [:slow, :fast], 4},
         {"parked_wait_vs_blocking_wait", ["--hold-ms", "10"], [:blocking, :parked], 6},
-        {"cyclic_vs_one_step", [], [:cyclic, :one_step], 4}
+        {"cyclic_vs_one_step", [], [:cyclic, :one_step], :from_budget_yields}
       ]
 
       for {scenario, extra, cohorts, expected_claims} <- scenarios do
@@ -247,9 +388,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert {:ok, %{artifacts: [artifact]}} = Docket.Benchmark.run(config)
         assert artifact.success
         assert artifact.scenario == scenario
-        assert artifact.measurements.collection.complete_sample_set
+        assert artifact.measurements.collection.telemetry_checks_pass
 
-        assert artifact.measurements.collection.expected_ready_claim_samples ==
+        expected_claims =
+          if expected_claims == :from_budget_yields do
+            config.runs + artifact.measurements.drain_fairness.budget_yields.total
+          else
+            expected_claims
+          end
+
+        assert artifact.measurements.collection.exact_global_counts.expected_ready_claim_attempt_events ==
                  expected_claims
 
         assert Map.keys(artifact.measurements.cohorts) |> Enum.sort() == Enum.sort(cohorts)
@@ -259,13 +407,87 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    cohort.activation_to_terminal_commit_offset_us.sample_count == cohort.runs and
                    cohort.activation_to_first_claim_offset_us.sample_count == cohort.runs and
                    cohort.first_claim_to_terminal_commit_us.sample_count == cohort.runs and
+                   cohort.normalized_slowdown.sample_count == cohort.runs and
+                   cohort.terminal_rank_in_retained_sample.sample_count == cohort.runs and
+                   cohort.terminal_rank_minus_staged_ordinal.sample_count == cohort.runs and
+                   cohort.claims.claims_per_run.sample_count == cohort.runs and
+                   cohort.sampling.complete_population and
+                   is_number(cohort.activation_to_first_claim_offset_us.p95) and
+                   is_number(cohort.activation_to_first_claim_offset_us.p99) and
+                   is_number(cohort.activation_to_first_claim_offset_us.max) and
                    is_number(cohort.queue_share_of_median_percent)
                end)
 
         for label <- cohorts do
           assert is_number(artifact.headline[:"cohort_#{label}_activation_to_terminal_p50_us"])
+          assert is_number(artifact.headline[:"cohort_#{label}_activation_to_first_claim_p95_us"])
+          assert is_number(artifact.headline[:"cohort_#{label}_activation_to_first_claim_p99_us"])
+          assert is_number(artifact.headline[:"cohort_#{label}_activation_to_first_claim_max_us"])
           assert is_number(artifact.headline[:"cohort_#{label}_first_claim_to_terminal_p50_us"])
+          assert is_number(artifact.headline[:"cohort_#{label}_normalized_slowdown_p50_ratio"])
+
+          assert is_number(
+                   artifact.headline[:"cohort_#{label}_terminal_rank_in_retained_sample_p50"]
+                 )
+
           assert is_number(artifact.headline[:"cohort_#{label}_queue_share_of_median_percent"])
+        end
+
+        total_terminal_rank_samples =
+          artifact.measurements.cohorts
+          |> Enum.reduce(0, fn {_label, cohort}, total ->
+            total + cohort.terminal_rank_in_retained_sample.sample_count
+          end)
+
+        assert total_terminal_rank_samples == config.runs
+        assert artifact.measurements.fairness.sampling.complete_population
+        assert artifact.measurements.fairness.sampling.retained_correlation_samples == config.runs
+
+        cond do
+          scenario == "parked_wait_vs_blocking_wait" ->
+            assert artifact.measurements.cohorts.parked.claims.retained_observations == 4
+
+            assert artifact.measurements.cohorts.parked.claims.retained_subsequent_observations ==
+                     2
+
+            assert artifact.measurements.cohorts.parked.claims.retained_runs_with_subsequent_claims ==
+                     2
+
+            assert artifact.measurements.cohorts.parked.claims.activation_to_subsequent_claim_offset_us.sample_count ==
+                     2
+
+            assert artifact.measurements.cohorts.parked.claims.subsequent_ready_age_at_scan_start_ms.sample_count ==
+                     2
+
+            assert artifact.headline.cohort_parked_retained_subsequent_claims == 2
+            assert is_number(artifact.headline.cohort_parked_subsequent_ready_age_p95_ms)
+
+            assert artifact.measurements.cohorts.blocking.claims.retained_subsequent_observations ==
+                     0
+
+          scenario == "cyclic_vs_one_step" ->
+            assert artifact.measurements.cohorts.cyclic.claims.retained_subsequent_observations >
+                     0
+
+            assert artifact.measurements.cohorts.one_step.claims.retained_subsequent_observations ==
+                     0
+
+          true ->
+            assert Enum.all?(artifact.measurements.cohorts, fn {_label, cohort} ->
+                     cohort.claims.retained_subsequent_observations == 0
+                   end)
+        end
+
+        if scenario == "mixed_service_times" do
+          assert is_number(
+                   artifact.measurements.fairness.fast_to_slow_normalized_slowdown_p50_ratio
+                 )
+
+          assert is_number(
+                   artifact.measurements.fairness.fast_to_slow_normalized_slowdown_p95_ratio
+                 )
+
+          assert is_number(artifact.headline.fast_to_slow_normalized_slowdown_p50_ratio)
         end
 
         assert Enum.all?(artifact.invariants, & &1.pass)
@@ -334,14 +556,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         span = latency.first_commit_to_terminal_us
         terminal = latency.burst_activation_to_terminal_commit_offset_us
 
-        assert collection.observed_first_commit_samples == 3
-        assert collection.observed_first_to_terminal_pairs == 3
-        assert collection.observed_terminal_commit_samples == 3
-        assert collection.observed_completion_event_samples == 3
-        assert collection.invalid_checkpoint_shapes == 0
-        assert collection.invalid_terminal_shapes == 0
-        assert collection.unknown_correlation_events == 0
-        assert collection.pre_activation_work_events == 0
+        exact = collection.exact_global_counts
+        retained = collection.retained_per_run_shape_evidence
+        assert exact.terminal_checkpoint_events == 3
+        assert exact.completion_events == 3
+        assert exact.pre_activation_work_events == 0
+        assert retained.runs_with_first_checkpoint == 3
+        assert retained.first_to_terminal_pairs == 3
+        assert retained.runs_with_terminal_checkpoint == 3
+        assert retained.runs_with_completion_event == 3
+        assert retained.invalid_checkpoint_shapes == 0
+        assert retained.invalid_terminal_checkpoint_shapes == 0
+        assert retained.invalid_completion_event_shapes == 0
+        assert retained.unindexed_or_unknown_correlation_events == 0
+        assert collection.full_population_uniqueness.status == "available"
+        assert collection.full_population_uniqueness.unique_run_count == 3
         assert first.sample_count == 3
         assert span.sample_count == 3
         assert terminal.sample_count == 3
@@ -351,9 +580,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert first.max <= terminal.max
         assert span.max <= terminal.max
         assert trial.duration_us == terminal.max
-        assert trial.schema_version == 4
+        assert trial.schema_version == 5
         assert trial.scenario == "empty_one_step"
         assert is_number(trial.headline.throughput_per_second)
+        assert trial.headline.completion_event_count == 3
         assert trial.headline.activation_to_terminal_p95_us == terminal.p95
         assert trial.measurements.amplification.durable_run_rows == 3
         assert trial.measurements.latency.vehicle_claim_held_ms.sample_count == 3

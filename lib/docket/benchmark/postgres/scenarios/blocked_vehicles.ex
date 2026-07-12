@@ -36,7 +36,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           target: config.concurrency
         )
 
-      collector = Docket.Benchmark.Collector.start(run_ids)
+      collector = Docket.Benchmark.Collector.start(run_ids, activation_at: t0)
 
       try do
         sampler =
@@ -137,8 +137,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
             passed =
               Enum.all?(invariants, & &1.pass) and
-                measurements.collection.complete_sample_set and
-                blocked.collection.complete_sample_set
+                measurements.collection.telemetry_checks_pass and
+                blocked.collection.telemetry_checks_pass
 
             {:ok,
              %{

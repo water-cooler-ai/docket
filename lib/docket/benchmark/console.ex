@@ -9,22 +9,45 @@ defmodule Docket.Benchmark.Console do
 
   def lines(points) when is_list(points) do
     points =
-      Enum.sort_by(points, &{&1.point.concurrency, &1.point.pool_size, &1.point.repetition})
+      Enum.sort_by(points, fn point ->
+        {
+          point.point.concurrency,
+          point.point.pool_size,
+          point.point.repetition,
+          Map.get(point.point, :observer_position, 0)
+        }
+      end)
 
     scenario = hd(points).scenario
     valid = Enum.count(points, & &1.success)
+    observer? = observer_abba?(points)
 
-    cells = Enum.group_by(points, &{&1.point.concurrency, &1.point.pool_size})
+    reported_points =
+      if observer?,
+        do: Enum.filter(points, &(observer_mode(&1) == "bounded_instrumented")),
+        else: points
+
+    cells = Enum.group_by(reported_points, &{&1.point.concurrency, &1.point.pool_size})
+
+    summary_note =
+      if observer? do
+        "Ordinary medians use bounded-instrumented A trials only; distribution columns use p95 only when every reported trial has n>=20, otherwise max."
+      else
+        "Medians across repetitions; distribution columns use p95 only when every trial has n>=20, otherwise max."
+      end
+
+    trial_label =
+      if observer?, do: "observer trials", else: plural(length(points), "trial", "trials")
 
     [
-      "#{status(valid == length(points))} exploratory · #{scenario} · #{map_size(cells)} #{plural(map_size(cells), "cell", "cells")} · #{valid}/#{length(points)} #{plural(length(points), "trial", "trials")} valid",
-      "Medians across repetitions; distribution columns use p95 only when every trial has n>=20, otherwise max."
+      "#{status(valid == length(points))} exploratory · #{scenario} · #{map_size(cells)} #{plural(map_size(cells), "cell", "cells")} · #{valid}/#{length(points)} #{trial_label} valid",
+      summary_note
     ] ++
       (cells
        |> Enum.sort_by(fn {{concurrency, pool_size}, _points} -> {concurrency, pool_size} end)
        |> Enum.flat_map(fn {{concurrency, pool_size}, cell_points} ->
          cell_lines(scenario, concurrency, pool_size, cell_points)
-       end)) ++ cohort_note(scenario)
+       end)) ++ observer_lines(points, scenario, observer?) ++ cohort_note(scenario)
   end
 
   defp point_lines(point) do
@@ -42,7 +65,13 @@ defmodule Docket.Benchmark.Console do
   end
 
   defp point_rate_line(point) do
-    label = if point.scenario == "claim_only", do: "Claim drain", else: "Burst"
+    label =
+      case point.scenario do
+        "claim_only" -> "Claim drain"
+        "steady_arrival" -> "Arrival + drain"
+        _other -> "Burst"
+      end
+
     throughput = get_in(point, [:measurements, :throughput_per_second])
 
     "#{label} #{format_duration(point.duration_us)} · #{format_rate(throughput, point.scenario)}"
@@ -126,6 +155,21 @@ defmodule Docket.Benchmark.Console do
     ]
   end
 
+  defp scenario_lines("steady_arrival", point) do
+    steady = get_in(point, [:measurements, :steady_arrival]) || %{}
+
+    [
+      "",
+      "Open-loop arrival window",
+      "  offered #{format_rate(steady[:offered_rate_per_second], "steady_arrival")} · achieved in window #{format_rate(steady[:achieved_arrival_window_rate_per_second], "steady_arrival")} · exact terminal-drain #{format_rate(steady[:achieved_terminal_drain_rate_per_second], "steady_arrival")}",
+      distribution_line("completion lag", steady[:retained_completion_lag_us]),
+      "Backlog at window end",
+      "  state #{safe_label(steady[:backlog_state_at_window_end] || @missing)} · outstanding #{format_count(steady[:due_outstanding_at_arrival_window_end])} · finite-window net accumulation #{format_decimal_or_missing(steady[:backlog_growth_runs_per_second], 1)} runs/s",
+      "  oldest-due growth #{format_decimal_or_missing(steady[:oldest_due_lag_growth_ms_per_second], 1)} ms/s · terminal drain after window #{format_duration(steady[:terminal_drain_after_arrival_window_us])}",
+      "  terminal drain duration #{format_duration(steady[:terminal_drain_duration_us])} · polling detection delay #{format_duration(steady[:completion_poll_detection_delay_us])}"
+    ]
+  end
+
   defp scenario_lines(scenario, point) when scenario in @comparative_scenarios do
     cohorts = sorted_cohorts(point)
 
@@ -140,12 +184,29 @@ defmodule Docket.Benchmark.Console do
           )
         end)
 
+      first_claim_lines =
+        Enum.map(cohorts, fn {label, cohort} ->
+          distribution_line(
+            "#{label} first claim",
+            cohort[:activation_to_first_claim_offset_us]
+          )
+        end)
+
       service_lines =
         Enum.map(cohorts, fn {label, cohort} ->
           distribution_line(
             "#{label} claim -> terminal",
             cohort[:first_claim_to_terminal_commit_us]
           )
+        end)
+
+      fairness_lines =
+        Enum.map(cohorts, fn {label, cohort} ->
+          normalized = get_in(cohort, [:normalized_slowdown, :p50])
+          terminal_rank = get_in(cohort, [:terminal_rank_in_retained_sample, :p50])
+          subsequent = get_in(cohort, [:claims, :retained_subsequent_observations])
+
+          "  #{String.pad_trailing("#{label} fairness", 25)} normalized slowdown p50 #{format_decimal_or_missing(normalized, 2)}x · retained terminal rank p50 #{format_count(terminal_rank)} · retained subsequent claims #{format_count(subsequent)}"
         end)
 
       queue_shares =
@@ -155,8 +216,12 @@ defmodule Docket.Benchmark.Console do
 
       ["", "Cohort offsets from common activation (queue-inclusive)"] ++
         terminal_lines ++
+        ["Wait before first claim"] ++
+        first_claim_lines ++
         ["Per-run service after first claim"] ++
         service_lines ++
+        ["Normalized wait and completion order"] ++
+        fairness_lines ++
         ["  #{String.pad_trailing("queue share of p50", 25)} #{queue_shares}"]
     end
   end
@@ -257,6 +322,27 @@ defmodule Docket.Benchmark.Console do
     "    plateau fill #{format_duration(fill)} · release -> terminal #{release.statistic} #{format_duration(release.median)} · short query #{query.statistic} #{format_duration(query.median)}"
   end
 
+  defp cell_metric_line("steady_arrival", points) do
+    achieved =
+      median_at(points, [
+        :measurements,
+        :steady_arrival,
+        :achieved_arrival_window_rate_per_second
+      ])
+
+    lag =
+      cell_distribution(points, [
+        :measurements,
+        :steady_arrival,
+        :retained_completion_lag_us
+      ])
+
+    growth =
+      median_at(points, [:measurements, :steady_arrival, :backlog_growth_runs_per_second])
+
+    "    window achieved #{format_rate(achieved, "steady_arrival")} · completion lag #{lag.statistic} #{format_duration(lag.median)} · backlog growth #{format_decimal_or_missing(growth, 1)} runs/s"
+  end
+
   defp cell_metric_line(scenario, points) when scenario in @comparative_scenarios do
     labels =
       points
@@ -289,6 +375,84 @@ defmodule Docket.Benchmark.Console do
        do: ["* Cohort offsets include backlog waiting."]
 
   defp cohort_note(_scenario), do: []
+
+  defp observer_abba?(points) do
+    Enum.any?(points, fn point ->
+      get_in(point, [:observer_control, :enabled]) == true
+    end)
+  end
+
+  defp observer_mode(point) do
+    get_in(point, [:observer_control, :mode]) || get_in(point, [:point, :observer_mode])
+  end
+
+  defp observer_lines(_points, _scenario, false), do: []
+
+  defp observer_lines(points, scenario, true) do
+    cells =
+      points
+      |> Enum.group_by(&{&1.point.concurrency, &1.point.pool_size})
+      |> Enum.sort_by(fn {{concurrency, pool_size}, _trials} -> {concurrency, pool_size} end)
+      |> Enum.map(fn {{concurrency, pool_size}, trials} ->
+        pairs =
+          trials
+          |> Enum.group_by(fn trial ->
+            {trial.point.repetition, Map.get(trial.point, :observer_pair)}
+          end)
+          |> Enum.map(fn {_pair, pair_trials} -> observer_pair_delta(pair_trials) end)
+
+        valid = Enum.filter(pairs, & &1.valid)
+
+        throughput = observer_median(valid, :throughput)
+        throughput_percent = observer_median(valid, :throughput_percent)
+        duration = observer_median(valid, :duration)
+        duration_percent = observer_median(valid, :duration_percent)
+
+        "  c=#{concurrency} pool=#{pool_size} · #{length(valid)}/#{length(pairs)} pairs valid · throughput delta median #{format_rate(throughput, scenario)} (#{format_percent(throughput_percent)}) · duration delta median #{format_duration(duration)} (#{format_percent(duration_percent)})"
+      end)
+
+    [
+      "",
+      "Observer ABBA raw deltas (bounded instrumented - counters-only control)",
+      "Diagnostic sensitivity only; these deltas are not a causal latency correction."
+    ] ++ cells
+  end
+
+  defp observer_pair_delta(trials) do
+    instrumented = Enum.find(trials, &(observer_mode(&1) == "bounded_instrumented"))
+    control = Enum.find(trials, &(observer_mode(&1) == "counters_only_control"))
+
+    valid =
+      instrumented != nil and control != nil and instrumented.success and control.success and
+        is_number(instrumented.duration_us) and is_number(control.duration_us) and
+        is_number(get_in(instrumented, [:measurements, :throughput_per_second])) and
+        is_number(get_in(control, [:measurements, :throughput_per_second]))
+
+    if valid do
+      instrumented_throughput = get_in(instrumented, [:measurements, :throughput_per_second])
+      control_throughput = get_in(control, [:measurements, :throughput_per_second])
+
+      %{
+        valid: true,
+        throughput: instrumented_throughput - control_throughput,
+        throughput_percent: percent_delta(instrumented_throughput, control_throughput),
+        duration: instrumented.duration_us - control.duration_us,
+        duration_percent: percent_delta(instrumented.duration_us, control.duration_us)
+      }
+    else
+      %{valid: false}
+    end
+  end
+
+  defp percent_delta(_observed, 0), do: nil
+  defp percent_delta(observed, baseline), do: (observed - baseline) * 100 / baseline
+
+  defp observer_median(values, key) do
+    values
+    |> Enum.flat_map(fn value -> if is_number(value[key]), do: [value[key]], else: [] end)
+    |> Enum.sort()
+    |> median()
+  end
 
   defp repetition(points, path) do
     values = numeric_values(points, path)

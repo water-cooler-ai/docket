@@ -44,7 +44,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       if config.warmup == 0, do: Docket.Postgres.GraphCache.clear()
       {activation_at, t0, physical_before} = prepare_measured_activation()
-      collector = Docket.Benchmark.Collector.start(measured_run_ids)
+
+      collector =
+        Docket.Benchmark.Collector.start(measured_run_ids,
+          activation_at: t0,
+          mode: observer_collector_mode(config)
+        )
+
       runtime = start_runtime!(runtime_opts(config), collector)
       started_at = activation_at
 
@@ -74,7 +80,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           )
 
         passed =
-          Enum.all?(invariants, & &1.pass) and measurements.collection.complete_sample_set
+          Enum.all?(invariants, & &1.pass) and measurements.collection.telemetry_checks_pass
 
         duration_us = measurements.burst_duration_us
 
@@ -83,11 +89,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           classification: "exploratory",
           success: passed,
           scenario: canonical_scenario(config.scenario),
-          point: %{
-            concurrency: config.concurrency,
-            pool_size: config.pool_size,
-            repetition: config.repetition
-          },
+          point: artifact_point(config),
           parameters: artifact_parameters(config),
           started_at: DateTime.to_iso8601(started_at),
           finished_at: DateTime.to_iso8601(finished_at),
@@ -117,6 +119,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           duration_us: duration_us,
           measurements: measurements,
           environment: environment(config),
+          observer_control: observer_trial_metadata(config, collector_stats),
           invariants: invariants,
           warnings: warnings(config)
         }

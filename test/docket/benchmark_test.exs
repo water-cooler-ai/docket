@@ -12,6 +12,9 @@ defmodule Docket.BenchmarkTest do
       assert Docket.Benchmark.Postgres.Scenario.fetch!("blocked_vehicles") ==
                Docket.Benchmark.Postgres.Scenarios.BlockedVehicles
 
+      assert Docket.Benchmark.Postgres.Scenario.fetch!("steady_arrival") ==
+               Docket.Benchmark.Postgres.Scenarios.SteadyArrival
+
       assert Docket.Benchmark.Postgres.Scenario.fetch!("mixed_service_times") ==
                Docket.Benchmark.Postgres.Scenarios.MixedServiceTimes
 
@@ -22,6 +25,155 @@ defmodule Docket.BenchmarkTest do
                Docket.Benchmark.Postgres.Scenarios.CyclicVsOneStep
 
       assert Docket.Benchmark.Postgres.Scenario.canonical_name("smoke") == "empty_one_step"
+    end
+
+    test "steady-arrival schedules uniform offsets inside the configured window" do
+      assert Docket.Benchmark.Postgres.Scenarios.SteadyArrival.schedule_offsets(4, 100) ==
+               [0, 25_000, 50_000, 75_000]
+    end
+
+    test "Postgres physical deltas preserve explicit unavailable values" do
+      assert Docket.Benchmark.Postgres.map_delta(
+               %{commits: 12, newer_counter: "unavailable"},
+               %{commits: 5, newer_counter: "unavailable"}
+             ) == %{commits: 7, newer_counter: "unavailable"}
+
+      before = %{
+        activity: %{active_backends: 1, active_waiting_backends: 0},
+        locks: %{lock_rows: 2, ungranted_lock_rows: 0}
+      }
+
+      after_snapshot = %{
+        activity: %{active_backends: 3, active_waiting_backends: 1},
+        locks: %{lock_rows: 5, ungranted_lock_rows: 1}
+      }
+
+      change = Docket.Benchmark.Postgres.contention_change(before, after_snapshot)
+      assert change.before == before
+      assert change.after == after_snapshot
+      assert change.gauge_delta.activity.active_backends == 2
+      assert change.gauge_delta.activity.active_waiting_backends == 1
+      assert change.gauge_delta.locks.lock_rows == 3
+      assert change.gauge_delta.locks.ungranted_lock_rows == 1
+      assert change.caveat =~ "miss transient"
+    end
+
+    test "host and runtime fingerprints always expose stable fields" do
+      host = Docket.Benchmark.Postgres.host_fingerprint()
+      runtime = Docket.Benchmark.Postgres.runtime_fingerprint()
+      container = Docket.Benchmark.Postgres.container_fingerprint()
+
+      assert is_binary(host.os.family)
+      assert is_binary(host.os.version)
+      assert is_binary(host.os.kernel_release)
+      assert is_binary(host.cpu.model)
+      assert Map.has_key?(host.memory, :host_total_bytes)
+      assert is_binary(runtime.architecture)
+      assert runtime.schedulers_online == System.schedulers_online()
+      assert Map.has_key?(runtime, :logical_processors_available)
+      assert is_boolean(container.detected)
+      assert is_binary(container.runtime)
+      assert Map.has_key?(container, :cpu_quota_cores)
+      assert Map.has_key?(container, :memory_limit_bytes)
+    end
+
+    test "comparative measurements expose claim tails, retry visibility, and terminal rank" do
+      native_ms = System.convert_time_unit(1, :millisecond, :native)
+      t0 = 10 * native_ms
+
+      claim = fn id, offset_ms, eligible_age_ms ->
+        {
+          [:docket, :postgres, :claim, :attempt],
+          %{eligible_age_ms: eligible_age_ms},
+          %{correlation_id: id, class: :ready, result: :acquired},
+          t0 + offset_ms * native_ms
+        }
+      end
+
+      terminal = fn id, offset_ms ->
+        {
+          [:docket, :checkpoint, :committed],
+          %{},
+          %{correlation_id: id, checkpoint_type: "run_completed"},
+          t0 + offset_ms * native_ms
+        }
+      end
+
+      events = [
+        claim.(1, 1, 1),
+        claim.(2, 2, 2),
+        claim.(3, 3, 3),
+        claim.(4, 4, 4),
+        claim.(2, 6, 7),
+        terminal.(4, 7),
+        terminal.(2, 8),
+        terminal.(1, 11),
+        terminal.(3, 12)
+      ]
+
+      result =
+        Docket.Benchmark.Postgres.Scenarios.ComparativeBurst.comparative_measurements(
+          events,
+          t0,
+          [:slow, :fast, :slow, :fast],
+          :mixed_service_times
+        )
+
+      fast = result.cohorts.fast
+      slow = result.cohorts.slow
+
+      assert fast.activation_to_first_claim_offset_us.p95 == 4_000
+      assert fast.activation_to_first_claim_offset_us.p99 == 4_000
+      assert fast.activation_to_first_claim_offset_us.max == 4_000
+
+      assert fast.terminal_rank_in_retained_sample == %{
+               unit: "rank",
+               sample_count: 2,
+               min: 1,
+               p50: 1,
+               p95: 2,
+               p99: 2,
+               max: 2,
+               mean: 1.5
+             }
+
+      assert fast.terminal_rank_minus_staged_ordinal.min == -3
+      assert fast.terminal_order.finished_ahead_of_staged_ordinal == 1
+      assert fast.terminal_order.finished_at_staged_ordinal == 1
+      assert slow.terminal_order.finished_behind_staged_ordinal == 2
+
+      assert fast.claims.retained_observations == 3
+      assert fast.claims.retained_subsequent_observations == 1
+      assert fast.claims.retained_runs_with_subsequent_claims == 1
+      assert fast.claims.activation_to_subsequent_claim_offset_us.p50 == 6_000
+      assert fast.claims.first_to_subsequent_claim_us.p50 == 4_000
+      assert fast.claims.subsequent_ready_age_at_scan_start_ms.p50 == 7
+      assert slow.claims.retained_subsequent_observations == 0
+
+      assert result.fairness.fast_to_slow_normalized_slowdown_p50_ratio == 1.212
+      assert result.fairness.fast_to_slow_normalized_slowdown_p95_ratio == 1.75
+
+      sampled_events =
+        Enum.filter(events, fn {_event, _measurements, metadata, _at} ->
+          metadata.correlation_id in [2, 3]
+        end)
+
+      sampled =
+        Docket.Benchmark.Postgres.Scenarios.ComparativeBurst.comparative_measurements(
+          sampled_events,
+          t0,
+          [:slow, :fast, :slow, :fast, :slow, :fast],
+          :mixed_service_times
+        )
+
+      refute sampled.fairness.sampling.complete_population
+      assert sampled.fairness.sampling.population_runs == 6
+      assert sampled.fairness.sampling.retained_correlation_samples == 2
+      assert sampled.cohorts.fast.sampling.population_runs == 3
+      assert sampled.cohorts.fast.sampling.retained_correlation_samples == 1
+      assert sampled.cohorts.fast.terminal_rank_in_retained_sample.p50 == 1
+      refute Map.has_key?(sampled.cohorts.fast, :terminal_rank_minus_staged_ordinal)
+      refute Map.has_key?(sampled.cohorts.fast, :terminal_order)
     end
   end
 
@@ -50,6 +202,38 @@ defmodule Docket.BenchmarkTest do
              )
 
     assert warmup =~ "does not support warmup"
+  end
+
+  test "normalizes bounded steady-arrival options" do
+    assert {:ok, derived} =
+             Docket.Benchmark.parse(
+               ~w(--scenario steady_arrival --duration 200ms --arrival-rate 20 --sample-interval-ms 5 --max-samples 16)
+             )
+
+    assert derived.duration_ms == 200
+    assert derived.arrival_rate == 20.0
+    assert derived.runs == 4
+    assert derived.sample_interval_ms == 5
+    assert derived.max_samples == 16
+
+    assert {:ok, by_runs} =
+             Docket.Benchmark.parse(~w(--scenario steady_arrival --duration 1s --runs 12))
+
+    assert by_runs.runs == 12
+    assert by_runs.arrival_rate == nil
+
+    assert {:error, missing} = Docket.Benchmark.parse(~w(--scenario steady_arrival))
+    assert missing =~ "requires --duration"
+
+    assert {:error, warmup} =
+             Docket.Benchmark.parse(~w(--scenario steady_arrival --duration 100ms --warmup 1))
+
+    assert warmup =~ "does not support warmup"
+
+    assert {:error, unsupported} =
+             Docket.Benchmark.parse(~w(--scenario steady_arrival --duration 100ms --hold-ms 10))
+
+    assert unsupported =~ "unsupported steady_arrival options"
   end
 
   test "parses the bounded smoke contract" do
@@ -557,13 +741,15 @@ defmodule Docket.BenchmarkTest do
            ) == 2
 
     assert %{
-             capture_mode: "full_event_capture",
+             capture_mode: "bounded_streaming_reservoir",
              captured_events: 3,
-             observer_effect: "not_quantified"
-           } =
-             Docket.Benchmark.Collector.stats(collector)
+             retained_event_samples: 3,
+             exact_counters: true,
+             max_samples_per_event: 4_096
+           } = Docket.Benchmark.Collector.stats(collector)
 
-    events = Docket.Benchmark.Collector.stop(collector)
+    snapshot = Docket.Benchmark.Collector.stop(collector)
+    events = Docket.Benchmark.Collector.sampled_events(snapshot)
 
     assert {[:docket, :postgres, :claim, :attempt], _, attempt_metadata, _} =
              Enum.find(events, fn {event, _, _, _} ->
@@ -590,7 +776,16 @@ defmodule Docket.BenchmarkTest do
       :telemetry.list_handlers([:docket, :run, :completed])
       |> Enum.find(&(&1.id == collector.handler_id))
 
-    assert Map.keys(handler.config) |> Enum.sort() == [:correlate?, :counters, :table]
+    assert Map.keys(handler.config) |> Enum.sort() == [
+             :activation_at,
+             :correlate?,
+             :counters,
+             :max_samples,
+             :measurement_end_at,
+             :mode,
+             :table
+           ]
+
     refute inspect(handler.config) =~ "run-secret"
 
     event = %Docket.Event{
@@ -610,7 +805,8 @@ defmodule Docket.BenchmarkTest do
       %{class: :ready, result: :acquired, run_id: "run-secret"}
     )
 
-    events = Docket.Benchmark.Collector.stop(collector)
+    snapshot = Docket.Benchmark.Collector.stop(collector)
+    events = Docket.Benchmark.Collector.sampled_events(snapshot)
 
     assert {[:docket, :checkpoint, :committed], _,
             %{correlation_id: 1, checkpoint_type: "step_committed"},
@@ -629,7 +825,7 @@ defmodule Docket.BenchmarkTest do
     refute inspect(events) =~ "run-secret"
   end
 
-  test "collector wait counters count unique correlated terminal runs" do
+  test "collector wait counters stay raw while full correlation checks detect duplicates" do
     collector = Docket.Benchmark.Collector.start(["run-a", "run-b"])
     now = DateTime.utc_now()
 
@@ -654,16 +850,226 @@ defmodule Docket.BenchmarkTest do
     Docket.Telemetry.emit_events(run, [checkpoint, completed])
     Docket.Telemetry.emit_events(run, [checkpoint, completed])
 
-    assert Docket.Benchmark.Collector.count(collector, [:docket, :run, :completed]) == 1
+    assert Docket.Benchmark.Collector.count(collector, [:docket, :run, :completed]) == 2
 
     assert Docket.Benchmark.Collector.count(
              collector,
              [:docket, :checkpoint, :committed],
              %{checkpoint_type: "run_completed"}
-           ) == 1
+           ) == 2
 
     assert Docket.Benchmark.Collector.stats(collector).captured_events == 4
-    Docket.Benchmark.Collector.stop(collector)
+    snapshot = Docket.Benchmark.Collector.stop(collector)
+
+    assert Docket.Benchmark.Collector.unique_count(snapshot, [:docket, :run, :completed]) == 1
+
+    assert Docket.Benchmark.Collector.full_population_unique_count(
+             snapshot,
+             [:docket, :run, :completed]
+           ) == {:ok, 1}
+
+    assert Docket.Benchmark.Collector.unique_count(
+             snapshot,
+             [:docket, :postgres, :claim, :attempt]
+           ) == :unsupported
+
+    assert Docket.Benchmark.Collector.correlation_summary(snapshot).completion_count_frequencies ==
+             %{0 => 1, 2 => 1}
+
+    terminal_max =
+      Docket.Benchmark.Collector.observed_at_max(
+        snapshot,
+        [:docket, :checkpoint, :committed],
+        %{checkpoint_type: "run_completed"}
+      )
+
+    assert is_integer(terminal_max)
+
+    assert terminal_max ==
+             Docket.Benchmark.Collector.phase_observed_at_max(
+               snapshot,
+               :measured,
+               [:docket, :checkpoint, :committed],
+               %{checkpoint_type: "run_completed"}
+             )
+  end
+
+  test "collector bounds retained observations while preserving exact aggregates" do
+    collector = Docket.Benchmark.Collector.start([], max_samples_per_event: 8)
+
+    Enum.each(1..1_000, fn leases ->
+      :telemetry.execute(
+        [:docket, :postgres, :run_store, :claim],
+        %{duration: leases, leases: leases, steals: 1, poisoned: 0},
+        %{}
+      )
+    end)
+
+    stats = Docket.Benchmark.Collector.stats(collector)
+    assert stats.observed_events == 1_000
+    assert stats.retained_event_samples == 8
+    assert stats.aggregated_events == 992
+
+    snapshot = Docket.Benchmark.Collector.stop(collector)
+
+    assert Docket.Benchmark.Collector.observation_count(
+             snapshot,
+             [:docket, :postgres, :run_store, :claim]
+           ) == 1_000
+
+    assert Docket.Benchmark.Collector.numeric_sum(
+             snapshot,
+             [:docket, :postgres, :run_store, :claim],
+             :leases
+           ) == 500_500
+
+    assert Docket.Benchmark.Collector.numeric_max(
+             snapshot,
+             [:docket, :postgres, :run_store, :claim],
+             :leases
+           ) == 1_000
+
+    assert length(Docket.Benchmark.Collector.sampled_events(snapshot)) == 8
+
+    assert Docket.Benchmark.Collector.uniqueness_scope(snapshot) ==
+             :correlation_population_not_configured
+
+    assert snapshot
+           |> Docket.Benchmark.Collector.histogram(
+             [:docket, :postgres, :run_store, :claim],
+             :leases
+           )
+           |> Map.values()
+           |> Enum.sum() == 8
+  end
+
+  test "collector bounds lease-value distributions with ten thousand distinct values" do
+    event = [:docket, :postgres, :run_store, :claim]
+    collector = Docket.Benchmark.Collector.start([], max_samples_per_event: 32)
+
+    Enum.each(0..9_999, &emit_claim_measurement/1)
+
+    stats = Docket.Benchmark.Collector.stats(collector)
+    assert stats.histogram_scope == "retained_bounded_event_sample"
+    assert stats.retained_event_samples == 32
+    refute stats.full_population_shape_coverage
+    assert stats.uniqueness_scope == "correlation_population_not_configured"
+    assert :ets.info(collector.counters, :size) < 50
+
+    snapshot = Docket.Benchmark.Collector.stop(collector)
+    histogram = Docket.Benchmark.Collector.histogram(snapshot, event, :leases)
+
+    assert histogram |> Map.values() |> Enum.sum() == 32
+    assert map_size(histogram) <= 32
+    assert Docket.Benchmark.Collector.observation_count(snapshot, event) == 10_000
+    assert Docket.Benchmark.Collector.numeric_sum(snapshot, event, :leases) == 49_995_000
+    assert Docket.Benchmark.Collector.numeric_max(snapshot, event, :leases) == 9_999
+    assert Docket.Benchmark.Collector.predicate_count(snapshot, event, :leases_zero) == 1
+  end
+
+  test "collector exact aggregates exclude pre-activation and expose window phases" do
+    activation_at =
+      System.monotonic_time() + System.convert_time_unit(50, :millisecond, :native)
+
+    measurement_end_at =
+      activation_at + System.convert_time_unit(250, :millisecond, :native)
+
+    collector =
+      Docket.Benchmark.Collector.start([],
+        activation_at: activation_at,
+        measurement_end_at: measurement_end_at,
+        max_samples_per_event: 8
+      )
+
+    emit_claim_measurement(1)
+    sleep_until_monotonic(activation_at)
+    emit_claim_measurement(2)
+    sleep_until_monotonic(measurement_end_at)
+    emit_claim_measurement(4)
+
+    assert Docket.Benchmark.Collector.count(
+             collector,
+             [:docket, :postgres, :run_store, :claim]
+           ) == 2
+
+    snapshot = Docket.Benchmark.Collector.stop(collector)
+    event = [:docket, :postgres, :run_store, :claim]
+
+    assert Docket.Benchmark.Collector.phase_observation_count(
+             snapshot,
+             :pre_activation,
+             event
+           ) == 1
+
+    assert Docket.Benchmark.Collector.phase_observation_count(snapshot, :measured, event) == 1
+
+    assert Docket.Benchmark.Collector.phase_observation_count(snapshot, :post_measurement, event) ==
+             1
+
+    assert Docket.Benchmark.Collector.observation_count(snapshot, event) == 2
+
+    assert Docket.Benchmark.Collector.phase_numeric_sum(snapshot, :pre_activation, event, :leases) ==
+             1
+
+    assert Docket.Benchmark.Collector.phase_numeric_sum(snapshot, :measured, event, :leases) == 2
+
+    assert Docket.Benchmark.Collector.phase_numeric_sum(
+             snapshot,
+             :post_measurement,
+             event,
+             :leases
+           ) == 4
+
+    assert Docket.Benchmark.Collector.numeric_sum(snapshot, event, :leases) == 6
+    assert Docket.Benchmark.Collector.numeric_max(snapshot, event, :leases) == 4
+
+    assert Docket.Benchmark.Collector.phase_histogram(snapshot, :pre_activation, event, :leases) ==
+             %{1 => 1}
+
+    assert Docket.Benchmark.Collector.phase_histogram(snapshot, :measured, event, :leases) == %{
+             2 => 1
+           }
+
+    assert Docket.Benchmark.Collector.phase_histogram(snapshot, :post_measurement, event, :leases) ==
+             %{4 => 1}
+
+    assert Docket.Benchmark.Collector.histogram(snapshot, event, :leases) == %{2 => 1, 4 => 1}
+  end
+
+  test "collector correlation state remains hard-bounded for large populations" do
+    run_ids = Enum.map(1..50_000, &"run-#{&1}")
+    collector = Docket.Benchmark.Collector.start(run_ids, max_samples_per_event: 32)
+
+    Enum.each(run_ids, fn run_id ->
+      :telemetry.execute([:docket, :run, :completed], %{duration: 1}, %{run_id: run_id})
+    end)
+
+    stats = Docket.Benchmark.Collector.stats(collector)
+    assert stats.correlation_population == 50_000
+    assert stats.indexed_correlations == 32
+    assert stats.peak_correlation_cardinality == 32
+
+    assert stats.correlation_correctness_scope ==
+             "exact_global_counts_with_bounded_per_run_sample"
+
+    assert :ets.info(collector.counters, :size) < 300
+    assert Docket.Benchmark.Collector.count(collector, [:docket, :run, :completed]) == 50_000
+
+    snapshot = Docket.Benchmark.Collector.stop(collector)
+    summary = Docket.Benchmark.Collector.correlation_summary(snapshot)
+
+    assert summary.population_expected == 50_000
+    assert summary.sampled_expected == 32
+    assert summary.completion_count_frequencies == %{1 => 32}
+    refute summary.full_population_shape_coverage
+
+    assert Docket.Benchmark.Collector.unique_count(snapshot, [:docket, :run, :completed]) ==
+             :unavailable
+
+    assert Docket.Benchmark.Collector.full_population_unique_count(
+             snapshot,
+             [:docket, :run, :completed]
+           ) == {:unavailable, :bounded_correlation_sample}
   end
 
   test "console summary labels smoke cohort and post-first-commit metrics" do
@@ -770,8 +1176,15 @@ defmodule Docket.BenchmarkTest do
     assert text =~ "fast terminal"
     assert text =~ "slow terminal"
     assert text =~ "p50 5.69 s · p95 6.10 s"
+    assert text =~ "Wait before first claim"
+    assert text =~ "fast first claim"
     assert text =~ "Per-run service after first claim"
     assert text =~ "fast claim -> terminal"
+    assert text =~ "Normalized wait and completion order"
+
+    assert text =~
+             "normalized slowdown p50 120.00x · retained terminal rank p50 550 · retained subsequent claims 0"
+
     assert text =~ "queue share of p50"
     assert text =~ "fast 99.9% · slow 90.7%"
   end
@@ -808,7 +1221,14 @@ defmodule Docket.BenchmarkTest do
       |> Docket.Benchmark.Headline.build()
 
     assert headline.cohort_fast_activation_to_terminal_p50_us == 5_685_113
+    assert headline.cohort_fast_activation_to_first_claim_p95_us == 6_090_000
+    assert headline.cohort_fast_activation_to_first_claim_p99_us == 6_120_000
+    assert headline.cohort_fast_activation_to_first_claim_max_us == 6_120_000
     assert headline.cohort_fast_first_claim_to_terminal_p50_us == 1_200
+    assert headline.cohort_fast_normalized_slowdown_p50_ratio == 120.0
+    assert headline.cohort_fast_terminal_rank_in_retained_sample_p95 == 950
+    assert headline.cohort_fast_retained_subsequent_claims == 0
+    assert headline.fast_to_slow_normalized_slowdown_p50_ratio == 12.4
     assert headline.cohort_slow_queue_share_of_median_percent == 90.7
     refute Map.has_key?(headline, :activation_to_terminal_p50_us)
 
@@ -847,7 +1267,7 @@ defmodule Docket.BenchmarkTest do
 
   defp console_point(scenario) do
     distribution = fn p50, p95, max, unit, count ->
-      %{p50: p50, p95: p95, max: max, unit: unit, sample_count: count}
+      %{p50: p50, p95: p95, p99: max, max: max, unit: unit, sample_count: count}
     end
 
     base = %{
@@ -899,18 +1319,38 @@ defmodule Docket.BenchmarkTest do
         put_in(base, [:measurements], %{
           throughput_per_second: 162.906,
           latency: %{},
+          fairness: %{
+            fast_to_slow_normalized_slowdown_p50_ratio: 12.4,
+            fast_to_slow_normalized_slowdown_p95_ratio: 19.2
+          },
           cohorts: %{
             fast: %{
               activation_to_terminal_commit_offset_us:
                 distribution.(5_685_113, 6_100_585, 6_138_508, "us", 900),
+              activation_to_first_claim_offset_us:
+                distribution.(5_680_000, 6_090_000, 6_120_000, "us", 900),
               first_claim_to_terminal_commit_us: distribution.(1_200, 3_400, 9_000, "us", 900),
+              normalized_slowdown: distribution.(120.0, 300.0, 500.0, "ratio", 900),
+              terminal_rank_in_retained_sample: distribution.(550, 950, 1_000, "rank", 900),
+              claims: %{
+                retained_subsequent_observations: 0,
+                subsequent_ready_age_at_scan_start_ms: %{unit: "ms", sample_count: 0}
+              },
               queue_share_of_median_percent: 99.9
             },
             slow: %{
               activation_to_terminal_commit_offset_us:
                 distribution.(2_711_165, 5_136_728, 5_410_657, "us", 100),
+              activation_to_first_claim_offset_us:
+                distribution.(2_460_000, 4_880_000, 5_120_000, "us", 100),
               first_claim_to_terminal_commit_us:
                 distribution.(251_000, 260_000, 270_000, "us", 100),
+              normalized_slowdown: distribution.(9.7, 15.6, 18.0, "ratio", 100),
+              terminal_rank_in_retained_sample: distribution.(100, 700, 900, "rank", 100),
+              claims: %{
+                retained_subsequent_observations: 0,
+                subsequent_ready_age_at_scan_start_ms: %{unit: "ms", sample_count: 0}
+              },
               queue_share_of_median_percent: 90.7
             }
           }
@@ -936,6 +1376,24 @@ defmodule Docket.BenchmarkTest do
 
       _other ->
         base
+    end
+  end
+
+  defp emit_claim_measurement(leases) do
+    :telemetry.execute(
+      [:docket, :postgres, :run_store, :claim],
+      %{duration: leases, leases: leases, steals: 0, poisoned: 0},
+      %{}
+    )
+  end
+
+  defp sleep_until_monotonic(target) do
+    remaining = target - System.monotonic_time()
+
+    if remaining > 0 do
+      milliseconds = max(System.convert_time_unit(remaining, :native, :millisecond), 1)
+      Process.sleep(milliseconds)
+      sleep_until_monotonic(target)
     end
   end
 

@@ -14,6 +14,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       "empty_one_step" => Docket.Benchmark.Postgres.Scenarios.EmptyOneStep,
       "claim_only" => Docket.Benchmark.Postgres.Scenarios.ClaimOnly,
       "blocked_vehicles" => Docket.Benchmark.Postgres.Scenarios.BlockedVehicles,
+      "steady_arrival" => Docket.Benchmark.Postgres.Scenarios.SteadyArrival,
       "mixed_service_times" => Docket.Benchmark.Postgres.Scenarios.MixedServiceTimes,
       "parked_wait_vs_blocking_wait" =>
         Docket.Benchmark.Postgres.Scenarios.ParkedWaitVsBlockingWait,

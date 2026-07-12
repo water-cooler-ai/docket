@@ -36,10 +36,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         scalar("SELECT coalesce(sum(checkpoint_seq), 0)::bigint FROM docket_runs")
 
       physical_before = physical_snapshot()
-      collector = Docket.Benchmark.Collector.start()
+      t0 = System.monotonic_time()
+      collector = Docket.Benchmark.Collector.start([], activation_at: t0)
       leases = :ets.new(__MODULE__.ClaimLeases, [:set, :public, write_concurrency: true])
       counters = :atomics.new(3, signed: false)
-      t0 = System.monotonic_time()
       started_at = DateTime.utc_now()
 
       try do
@@ -76,7 +76,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           )
 
         passed =
-          Enum.all?(invariants, & &1.pass) and measurements.collection.complete_sample_set
+          Enum.all?(invariants, & &1.pass) and measurements.collection.telemetry_checks_pass
 
         {:ok,
          %{
