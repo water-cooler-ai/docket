@@ -62,6 +62,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :max_attempt_elapsed_ms,
       :jitter,
       :abandon_backoff_ms,
+      :abandon_backoff_cap_ms,
       :max_claim_abandons,
       :executor,
       :executor_opts,
@@ -422,6 +423,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             :max_supersteps,
             :max_attempt_elapsed_ms,
             :abandon_backoff_ms,
+            :abandon_backoff_cap_ms,
             :max_claim_abandons
           ],
           value = Keyword.get(effective, key),
@@ -470,6 +472,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         raise ArgumentError,
               ":vehicle drain_budget max_elapsed_ms must leave headroom below dispatcher orphan_ttl_ms"
       end
+
+      _abandon_backoff = Docket.Postgres.Vehicle.abandon_backoff!(vehicle)
     end
 
     defp effective_vehicle(host_opts, nested) do

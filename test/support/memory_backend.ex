@@ -461,7 +461,8 @@ defmodule Docket.Test.MemoryBackend do
           | claim_token: nil,
             claimed_at: nil,
             claim_attempts: max(record.claim_attempts - 1, 0),
-            wake_at: policy.retry_at
+            claim_abandons: record.claim_abandons + 1,
+            wake_at: non_poisoning_wake(policy, record.claim_abandons)
         }
 
         {{:ok, :rescheduled}, put_in(state.runs[run_id], record)}
@@ -492,6 +493,12 @@ defmodule Docket.Test.MemoryBackend do
         {{:ok, :poisoned}, put_in(state.runs[run_id], record)}
     end
   end
+
+  defp non_poisoning_wake(%{backoff: %{base_ms: base, cap_ms: cap}, now: now}, abandons) do
+    DateTime.add(now, min(base * Integer.pow(2, min(abandons, 30)), cap), :millisecond)
+  end
+
+  defp non_poisoning_wake(policy, _abandons), do: policy.retry_at
 
   defp validate_abandon_policy!(%{
          expected_checkpoint_seq: seq,

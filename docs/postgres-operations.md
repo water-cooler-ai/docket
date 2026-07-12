@@ -147,6 +147,15 @@ need poisons instead of launching. A successful commit resets the counter.
 Pre-execution deployment incompatibility uses the separate `claim_abandons`
 counter and poison reason.
 
+A graph whose explicit node timeout exceeds this host's attempt maximum is
+handed back without poisoning: the run stays valid, the handback counts one
+claim abandon, and its wake backs off exponentially with the consecutive
+abandon count up to `abandon_backoff_cap_ms`. A fleet with no compatible host
+therefore parks the run at the cap instead of spinning or failing it; watch
+the `[:docket, :postgres, :claim, :operation]` abandon telemetry with reason
+`:host_incompatible` and audit stored graphs before tightening host limits.
+Any committed progress resets the abandon count.
+
 Claims and checkpoint fences guarantee one durable winner. They do not
 guarantee one executor, cancel arbitrary in-flight effects, or make external
 calls exactly-once. Persist and check the stable task/idempotency identity in
@@ -267,8 +276,9 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `dispatcher.drain_timeout_ms` | `30_000` | Shutdown wait for tracked vehicles. |
 | `vehicle.max_attempt_elapsed_ms` | `2_000` | Finite host maximum inherited by nodes without `timeout_ms`; larger explicit graph timeouts are rejected before execution. |
 | `vehicle.drain_budget` | 100 moments / 3 seconds | Cooperative moment-boundary yield; `max_elapsed_ms` must be finite, at least the attempt maximum, and below orphan TTL. |
-| `vehicle.abandon_backoff_ms` | `30_000` | Delay before retrying a pre-execution graph incompatibility. |
-| `vehicle.max_claim_abandons` | `5` | Abandons allowed before incompatibility poison. |
+| `vehicle.abandon_backoff_ms` | `30_000` | Base delay before retrying a pre-execution incompatibility; host-limit handbacks double it per consecutive abandon. |
+| `vehicle.abandon_backoff_cap_ms` | `3_600_000` | Ceiling on the exponential host-incompatibility backoff. |
+| `vehicle.max_claim_abandons` | `5` | Abandons allowed before incompatibility poison; host-limit handbacks share the counter but never poison. |
 | `vehicle.executor` | `Docket.Executor.Local` | All executors run inside runtime-owned per-activation processes with the same hard deadline. |
 | `vehicle.executor_opts` | `[]` | Passed to the configured executor. |
 | `max_supersteps` | unbounded | Optional host safety ceiling; publish a graph policy when it is graph identity. |

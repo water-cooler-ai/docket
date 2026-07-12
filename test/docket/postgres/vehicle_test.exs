@@ -759,7 +759,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    test "host timeout incompatibility releases without abandon or poison state", %{
+    test "host timeout incompatibility reschedules with exponential pushback and no poison", %{
       backend_ref: backend_ref
     } do
       graph = Graphs.minimal_linear()
@@ -770,28 +770,37 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         | nodes: Map.put(graph.nodes, "copy", %{node | policies: %{"timeout_ms" => 101}})
       }
 
+      now = DateTime.utc_now()
+
+      opts =
+        vehicle_opts(backend_ref,
+          max_attempt_elapsed_ms: 100,
+          abandon_backoff_ms: 100,
+          abandon_backoff_cap_ms: 300,
+          clock: fn -> now end
+        )
+
       {run, lease} = start_claimed!(backend_ref, graph, %{"value" => "x"})
 
       assert {:ok, {:host_incompatible, %Docket.Error{type: :incompatible_execution_policy}}} =
-               Vehicle.drain(lease, vehicle_opts(backend_ref, max_attempt_elapsed_ms: 100))
+               Vehicle.drain(lease, opts)
 
-      assert {:ok, info} = Host.inspect_run(run.id)
-      assert info.claimed_at == nil
-      assert info.claim_abandons == 0
-      assert info.claim_attempts == 0
-      assert %DateTime{} = info.wake_at
+      expected = [{100, 1}, {200, 2}, {300, 3}, {300, 4}]
 
-      for _ <- 1..3 do
-        assert {:ok, current} = Host.inspect_run(run.id)
-        [lease] = claim!(backend_ref, current.wake_at)
+      for {{backoff_ms, abandons}, index} <- Enum.with_index(expected) do
+        assert {:ok, info} = Host.inspect_run(run.id)
+        assert info.claimed_at == nil
+        assert info.claim_attempts == 0
+        assert info.claim_abandons == abandons
+        refute info.poisoned_at
+        assert info.wake_at == DateTime.add(now, backoff_ms, :millisecond)
 
-        assert {:ok, {:host_incompatible, %Docket.Error{}}} =
-                 Vehicle.drain(lease, vehicle_opts(backend_ref, max_attempt_elapsed_ms: 100))
+        if index < length(expected) - 1 do
+          [next_lease] = claim!(backend_ref, info.wake_at)
 
-        assert {:ok, next} = Host.inspect_run(run.id)
-        assert next.claim_abandons == 0
-        assert next.claim_attempts == 0
-        refute next.poisoned_at
+          assert {:ok, {:host_incompatible, %Docket.Error{}}} =
+                   Vehicle.drain(next_lease, opts)
+        end
       end
 
       assert {:ok, latest} = Host.inspect_run(run.id)
@@ -799,6 +808,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, {:parked, :terminal}} =
                Vehicle.drain(compatible, vehicle_opts(backend_ref, max_attempt_elapsed_ms: 101))
+
+      assert {:ok, done} = Host.inspect_run(run.id)
+      assert done.claim_abandons == 0
     end
 
     def telemetry_relay(event, _measurements, _metadata, %{pid: pid}) do

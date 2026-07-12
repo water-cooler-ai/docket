@@ -33,7 +33,10 @@ defmodule Docket.Runtime.ExecutionPolicy do
     end)
   end
 
+  # Entry points reject oversized explicit timeouts via validate_graph/2
+  # before execution; clamping keeps the runtime deadline a hard bound even
+  # for callers that reach dispatch without that validation.
   @spec effective_timeout(pos_integer() | nil, pos_integer()) :: pos_integer()
   def effective_timeout(nil, maximum), do: maximum
-  def effective_timeout(timeout, _maximum), do: timeout
+  def effective_timeout(timeout, maximum), do: min(timeout, maximum)
 end

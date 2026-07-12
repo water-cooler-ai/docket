@@ -6,8 +6,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Each vehicle loads and compiles the run's exact graph, validates every
     explicit node timeout against the host's finite attempt maximum, and
     commits one fenced runtime moment at a time. Host-policy incompatibility
-    reschedules the claim with a non-poisoning backoff, reversing the claim
-    attempt increment and leaving graph-incompatibility counters unchanged.
+    reschedules the claim without poisoning: the claim-attempt increment is
+    reversed, the run stays valid, and the handback counts one claim abandon.
+    The retry wake backs off exponentially with the consecutive abandon
+    count — `min(abandon_backoff_ms * 2^abandons, abandon_backoff_cap_ms)` —
+    so a fleet with no compatible host pushes the run back instead of
+    spinning, and any committed progress resets the count. Stored-graph
+    incompatibility shares the same abandon counter, so a persistently
+    incompatible deployment still poisons through that path's budget.
     Deployments should still use homogeneous limits and audit stored graphs
     before rollout so compatible work is not needlessly delayed.
 
@@ -26,6 +32,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Runtime.Loop
 
     @default_abandon_backoff_ms 30_000
+    @default_abandon_backoff_cap_ms 3_600_000
     @default_max_claim_abandons 5
 
     @moment_option_keys [
@@ -53,6 +60,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             | {:max_attempt_elapsed_ms, pos_integer()}
             | {:jitter, (pos_integer() -> non_neg_integer())}
             | {:abandon_backoff_ms, pos_integer()}
+            | {:abandon_backoff_cap_ms, pos_integer()}
             | {:max_claim_abandons, pos_integer()}
             | {:graph_cache, module() | false}
             | {:graph_cache_opts, keyword()}
@@ -99,6 +107,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       _drain_budget = drain_budget!(opts)
       _monotonic_clock = monotonic_clock!(opts)
       _max_attempt_elapsed_ms = max_attempt_elapsed_ms!(opts)
+      _abandon_backoff = abandon_backoff!(opts)
       _task_supervisor = Keyword.fetch!(opts, :task_supervisor)
       {_backend, _context} = Keyword.fetch!(opts, :backend)
 
@@ -197,7 +206,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         drain_budget: drain_budget!(opts),
         max_attempt_elapsed_ms: max_attempt_elapsed_ms!(opts),
         jitter: Keyword.get(opts, :jitter, &:rand.uniform/1),
-        abandon_backoff_ms: Keyword.get(opts, :abandon_backoff_ms, @default_abandon_backoff_ms),
+        abandon_backoff: abandon_backoff!(opts),
         max_claim_abandons: Keyword.get(opts, :max_claim_abandons, @default_max_claim_abandons),
         graph_cache: Keyword.get(opts, :graph_cache, GraphCache),
         graph_cache_opts: Keyword.get(opts, :graph_cache_opts, []),
@@ -536,13 +545,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    @doc false
+    @spec abandon_backoff!([option()]) :: %{base_ms: pos_integer(), cap_ms: pos_integer()}
+    def abandon_backoff!(opts) do
+      base = Keyword.get(opts, :abandon_backoff_ms, @default_abandon_backoff_ms)
+      cap = Keyword.get(opts, :abandon_backoff_cap_ms, @default_abandon_backoff_cap_ms)
+
+      unless is_integer(base) and base > 0 do
+        raise ArgumentError, ":abandon_backoff_ms must be a positive integer"
+      end
+
+      unless is_integer(cap) and cap >= base do
+        raise ArgumentError,
+              ":abandon_backoff_cap_ms must be an integer at least :abandon_backoff_ms"
+      end
+
+      %{base_ms: base, cap_ms: cap}
+    end
+
     # ---------------------------------------------------------------------
     # Claim hand-back and release
     # ---------------------------------------------------------------------
 
     defp abandon(state, reason) do
       now = state.clock.()
-      backoff_ms = state.abandon_backoff_ms + state.jitter.(state.abandon_backoff_ms)
+      base_ms = state.abandon_backoff.base_ms
+      backoff_ms = base_ms + state.jitter.(base_ms)
 
       {:ok,
        {:abandoned, hand_back(state, now, DateTime.add(now, backoff_ms, :millisecond)), reason}}
@@ -550,7 +578,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp host_incompatible(state, error) do
       now = state.clock.()
-      retry_at = DateTime.add(now, state.abandon_backoff_ms, :millisecond)
+      retry_at = DateTime.add(now, state.abandon_backoff.base_ms, :millisecond)
 
       case state.runs.abandon_claim(
              state.context,
@@ -562,7 +590,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                now: now,
                retry_at: retry_at,
                max_claim_abandons: state.max_claim_abandons,
-               non_poisoning: true
+               non_poisoning: true,
+               backoff: state.abandon_backoff
              }
            ) do
         {:ok, :rescheduled} -> {:ok, {:host_incompatible, error}}

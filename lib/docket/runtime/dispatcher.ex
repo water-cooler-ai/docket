@@ -7,10 +7,7 @@ defmodule Docket.Runtime.Dispatcher do
   def dispatch([], _rtg, _run, _config), do: []
 
   def dispatch(activations, rtg, run, config) do
-    case ExecutionPolicy.validate_graph(rtg, config.max_attempt_elapsed_ms) do
-      :ok -> collect(start_workers(activations, rtg, run, config), %{})
-      {:error, error} -> raise error
-    end
+    collect(start_workers(activations, rtg, run, config), %{})
   end
 
   defp start_workers(activations, rtg, run, config) do
@@ -49,14 +46,19 @@ defmodule Docket.Runtime.Dispatcher do
          }}
       end)
 
-    %{ref: dispatch_ref, workers: workers, count: length(activations)}
+    monitors = Map.new(workers, fn {worker_ref, worker} -> {worker.monitor, worker_ref} end)
+
+    %{ref: dispatch_ref, workers: workers, monitors: monitors, count: length(activations)}
   end
 
   defp collect(%{workers: workers, count: count}, results) when map_size(workers) == 0 do
     for index <- 0..(count - 1), do: Map.fetch!(results, index)
   end
 
-  defp collect(%{ref: ref, workers: workers} = state, results) do
+  # Dispatch runs in the embedding caller's process, so every clause is
+  # guarded to this dispatch's own refs and monitors; a message that is not
+  # ours must stay in the mailbox untouched.
+  defp collect(%{ref: ref, workers: workers, monitors: monitors} = state, results) do
     receive do
       {^ref, worker_ref, result} when is_map_key(workers, worker_ref) ->
         worker = Map.fetch!(workers, worker_ref)
@@ -78,24 +80,28 @@ defmodule Docket.Runtime.Dispatcher do
           timeout_result(worker.activation, worker.started)
         )
 
-      {:DOWN, monitor, :process, pid, reason} ->
-        case Enum.find(workers, fn {_ref, worker} ->
-               worker.monitor == monitor and worker.pid == pid
-             end) do
-          {worker_ref, worker} ->
-            cancel_timer(worker.timer, ref, worker_ref)
-            result = failure_result(worker.activation, {:exited, reason}, worker.started)
-            finish_worker(state, results, worker_ref, worker, result)
-
-          nil ->
-            collect(state, results)
-        end
+      {:DOWN, monitor, :process, _pid, reason} when is_map_key(monitors, monitor) ->
+        worker_ref = Map.fetch!(monitors, monitor)
+        worker = Map.fetch!(workers, worker_ref)
+        cancel_timer(worker.timer, ref, worker_ref)
+        result = failure_result(worker.activation, {:exited, reason}, worker.started)
+        finish_worker(state, results, worker_ref, worker, result)
     end
   end
 
-  defp finish_worker(%{workers: workers} = state, results, worker_ref, worker, result) do
+  defp finish_worker(
+         %{workers: workers, monitors: monitors} = state,
+         results,
+         worker_ref,
+         worker,
+         result
+       ) do
     collect(
-      %{state | workers: Map.delete(workers, worker_ref)},
+      %{
+        state
+        | workers: Map.delete(workers, worker_ref),
+          monitors: Map.delete(monitors, worker.monitor)
+      },
       Map.put(results, worker.index, result)
     )
   end

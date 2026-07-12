@@ -92,13 +92,20 @@ defmodule Docket.Storage.Runs do
   caller's clock reading, `retry_at` is the future wake the abandoned run
   receives, and `max_claim_abandons` bounds consecutive abandons before the
   run is poisoned instead of rescheduled.
+
+  A `:non_poisoning` abandon reverses the claim-attempt increment, counts
+  one claim abandon, and never poisons regardless of the count. When
+  `:backoff` is present the store ignores `retry_at` and computes the wake
+  from its durable abandon count as
+  `now + min(base_ms * 2^claim_abandons, cap_ms)`.
   """
   @type abandon_policy :: %{
           required(:expected_checkpoint_seq) => non_neg_integer(),
           required(:now) => DateTime.t(),
           required(:retry_at) => DateTime.t(),
           required(:max_claim_abandons) => pos_integer(),
-          optional(:non_poisoning) => boolean()
+          optional(:non_poisoning) => boolean(),
+          optional(:backoff) => %{base_ms: pos_integer(), cap_ms: pos_integer()}
         }
 
   @typedoc "Disposition applied by one pre-execution claim abandon."

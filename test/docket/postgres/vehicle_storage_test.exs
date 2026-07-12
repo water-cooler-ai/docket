@@ -143,6 +143,39 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert done.status == :done
     end
 
+    test "attempt timeout commits durable retry state and releases the claim", %{
+      context: context,
+      backend: backend
+    } do
+      rtg =
+        publish!(
+          context,
+          Graphs.blocking(%{"retry" => %{"max_attempts" => 2, "backoff_ms" => 60_000}})
+        )
+
+      run = start_run!(backend, rtg, %{})
+      lease = claim!(context, DateTime.utc_now())
+      supervisor = start_supervised!({Task.Supervisor, name: __MODULE__.TimeoutSup})
+
+      opts =
+        vehicle_opts(context,
+          context: %{coordinator: self()},
+          task_supervisor: supervisor,
+          max_attempt_elapsed_ms: 200
+        )
+
+      assert {:ok, {:parked, {:at, %DateTime{}}}} = Vehicle.drain(lease, opts)
+      assert_received {:blocked, _node_pid, "blocker", 1}
+
+      assert {:ok, %RunInfo{} = info} = RunStore.inspect_run(context, :system, run.id)
+      assert info.claimed_at == nil
+      assert DateTime.compare(info.wake_at, DateTime.utc_now()) == :gt
+
+      assert {:ok, current} = RunStore.fetch_run(context, :system, run.id)
+      assert current.status == :running
+      assert current.checkpoint_seq > lease.checkpoint_seq
+    end
+
     test "killed vehicle leaves the claim; recovery resumes from the last committed moment", %{
       context: context,
       backend: backend

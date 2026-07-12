@@ -310,6 +310,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     the abandon count reached the policy maximum — poisons the run with
     reason `"max_claim_abandons_exceeded"`. A stale token or an advanced
     checkpoint sequence matches nothing and reports `{:ok, :stale}`.
+
+    A `:non_poisoning` policy never poisons; with `:backoff` the recorded
+    wake grows exponentially with the durable abandon count up to the cap.
     """
     @spec abandon_claim(
             ctx(),
@@ -322,10 +325,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       started = System.monotonic_time()
 
       %{expected_checkpoint_seq: seq, now: now, retry_at: retry_at, max_claim_abandons: max} =
-        validate_abandon_policy!(policy)
+        policy = validate_abandon_policy!(policy)
 
       if Map.get(policy, :non_poisoning, false) do
-        non_poisoning_abandon(ctx, run_id, claim_token, seq, retry_at, started)
+        non_poisoning_abandon(ctx, run_id, claim_token, seq, retry_at, policy, started)
       else
         poisoning_abandon(ctx, run_id, claim_token, seq, now, retry_at, max, started)
       end
@@ -335,7 +338,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       raise ArgumentError, "abandon_claim scope must be :system, got: #{inspect(scope)}"
     end
 
-    defp non_poisoning_abandon(ctx, run_id, claim_token, seq, retry_at, started) do
+    defp non_poisoning_abandon(ctx, run_id, claim_token, seq, retry_at, policy, started) do
       {repo, prefix} = Storage.context!(ctx)
 
       {matched, _} =
@@ -349,7 +352,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               claim_token: nil,
               claimed_at: nil,
               claim_attempts: dynamic([run], fragment("GREATEST(? - 1, 0)", run.claim_attempts)),
-              wake_at: retry_at
+              claim_abandons: dynamic([run], run.claim_abandons + 1),
+              wake_at: non_poisoning_wake(policy, retry_at)
             ]
           ],
           log: false
@@ -359,6 +363,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       emit_claim_operation(:abandon, started, result, %{reason: :host_incompatible})
       result
     end
+
+    # The exponent is the durable abandon count, so consecutive handbacks
+    # push the wake back geometrically until the cap; committed progress
+    # resets the count. The exponent is clamped so the double-precision
+    # product stays exact well past any practical cap.
+    defp non_poisoning_wake(%{backoff: %{base_ms: base, cap_ms: cap}, now: now}, _retry_at) do
+      dynamic(
+        [run],
+        fragment(
+          "? + (LEAST(? * POWER(2, LEAST(?, 30)), ?) * interval '1 millisecond')",
+          type(^now, :utc_datetime_usec),
+          ^base,
+          run.claim_abandons,
+          ^cap
+        )
+      )
+    end
+
+    defp non_poisoning_wake(_policy, retry_at), do: retry_at
 
     defp poisoning_abandon(ctx, run_id, claim_token, seq, now, retry_at, max, started) do
       {repo, prefix} = Storage.context!(ctx)
@@ -1172,6 +1195,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               "abandon policy retry_at must not precede now, got: #{inspect(policy)}"
       end
 
+      validate_abandon_backoff!(policy)
+
       %{
         policy
         | now: normalize_database_datetime(now),
@@ -1183,6 +1208,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       raise ArgumentError,
             "abandon policy requires non-negative expected_checkpoint_seq, DateTime now " <>
               "and retry_at, and positive max_claim_abandons, got: #{inspect(policy)}"
+    end
+
+    defp validate_abandon_backoff!(policy) do
+      case Map.get(policy, :backoff) do
+        nil ->
+          :ok
+
+        %{base_ms: base, cap_ms: cap}
+        when is_integer(base) and base > 0 and is_integer(cap) and cap >= base ->
+          :ok
+
+        other ->
+          raise ArgumentError,
+                "abandon policy backoff requires positive base_ms and cap_ms >= base_ms, " <>
+                  "got: #{inspect(other)}"
+      end
     end
 
     defp notify_wake(repo, prefix, {:release_claim, :immediate}), do: notify_wake(repo, prefix)

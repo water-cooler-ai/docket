@@ -18,8 +18,9 @@ entries below reflect what has landed so far.
 
 - Finite runtime-owned node attempt deadlines across Local, Task, and custom
   executors. Missing node timeouts inherit the host maximum; larger explicit
-  graph limits are rejected before execution and rescheduled without poison.
-  Vehicles no longer refresh claims during node execution (DCKT-41).
+  graph limits are rejected before execution and rescheduled without poison,
+  backing off exponentially up to a configurable cap. Vehicles no longer
+  refresh claims during node execution.
 
 - An operator-facing PostgreSQL correctness guide covering durable status
   rationale, derived queue views, scope, claims and poison, failure recovery,

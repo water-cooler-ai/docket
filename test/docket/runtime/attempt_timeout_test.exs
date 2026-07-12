@@ -121,6 +121,43 @@ defmodule Docket.Runtime.AttemptTimeoutTest do
     refute_received {:DOWN, _, :process, _, _}
   end
 
+  test "dispatch leaves foreign DOWN messages in the caller's mailbox" do
+    {dead, dead_ref} = spawn_monitor(fn -> :ok end)
+    assert_receive {:DOWN, ^dead_ref, :process, ^dead, :normal}
+
+    # Monitoring a dead process queues a :noproc DOWN that sits in the
+    # mailbox while the whole run dispatches inline in this process.
+    foreign_ref = Process.monitor(dead)
+
+    graph =
+      Docket.Graph.new!(id: "foreign-down")
+      |> Docket.Graph.put_node!("ok", implementation: OkNode)
+      |> Docket.Graph.put_edge!("start", from: "$start", to: "ok")
+      |> Docket.Graph.put_edge!("finish", from: "ok", to: "$finish")
+
+    assert {:ok, %{status: :done}, _} = Docket.Test.run_inline(graph, %{})
+
+    assert_received {:DOWN, ^foreign_ref, :process, ^dead, :noproc}
+  end
+
+  test "a dying dispatch caller kills its in-flight node work" do
+    test_pid = self()
+
+    runner =
+      spawn(fn ->
+        Docket.Test.run_inline(blocking_graph(), %{},
+          max_attempt_elapsed_ms: 60_000,
+          context: %{coordinator: test_pid}
+        )
+      end)
+
+    assert_receive {:blocked, worker, "slow", 1}, 1_000
+    worker_ref = Process.monitor(worker)
+
+    Process.exit(runner, :kill)
+    assert_receive {:DOWN, ^worker_ref, :process, ^worker, :killed}, 1_000
+  end
+
   defp blocking_graph(timeout \\ nil) do
     policies = if timeout, do: %{"timeout_ms" => timeout}, else: %{}
 
