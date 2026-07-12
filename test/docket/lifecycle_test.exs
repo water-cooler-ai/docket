@@ -110,7 +110,7 @@ defmodule Docket.LifecycleTest do
     assert {:ok, %Docket.RunInfo{run: ^started, wake_at: %DateTime{}}} =
              Host.inspect_run(started.id)
 
-    assert_receive {:observed, %Docket.Checkpoint{type: :run_initialized, delivery: :observer}}
+    assert_receive {:observed, %Docket.Checkpoint{type: :run_initialized}}
     assert_receive :failing_observer_called
 
     assert {:ok, cancelled} = Host.cancel_run(started.id, context: %{notify: self()})

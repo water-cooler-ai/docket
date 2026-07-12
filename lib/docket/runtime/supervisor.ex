@@ -25,7 +25,7 @@ defmodule Docket.Runtime.Supervisor do
 
   use Supervisor
 
-  @doc "Task.Supervisor name for node tasks and async checkpoint delivery."
+  @doc "Task.Supervisor name for node tasks and after-commit observer delivery."
   def task_supervisor(runtime) when is_atom(runtime), do: Module.concat(runtime, TaskSupervisor)
 
   def start_link(opts) do

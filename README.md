@@ -155,7 +155,8 @@ only tenantless rows; `tenant_mode: :required` requires a non-empty
 commit, are best-effort, and cannot veto state. Durable consumers that cannot
 tolerate lost or duplicate delivery should consume retained events instead of
 observer callbacks. Production `checkpoint:` configuration is rejected;
-`Docket.Test` still accepts checkpoint sinks for processless semantic tests.
+`Docket.Test` returns read-only checkpoint values for processless semantic
+assertions; those values cannot affect execution.
 
 ### Migration from 0.0.1
 

@@ -33,7 +33,7 @@ defmodule Docket.Runtime.SupervisorConfigTest do
   test "the host-owned checkpoint committer is rejected" do
     assert_raise ArgumentError, ~r/production :checkpoint configuration was removed/, fn ->
       Docket.Runtime.Supervisor.init(
-        {@runtime, backend: MemoryBackend, checkpoint: Docket.Test.Checkpoint.Accept}
+        {@runtime, backend: MemoryBackend, checkpoint: __MODULE__.RemovedCheckpointHandler}
       )
     end
   end

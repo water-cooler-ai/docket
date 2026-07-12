@@ -13,7 +13,7 @@ when you want to understand *why* the contracts are shaped the way they are.
    - Drain-and-cut-over instructions for existing 0.0.1 adopters.
 2. `docket-operational-transition-spec.md`
    - A public-facing guide to the implemented PostgreSQL data model, queue
-     semantics, claim fencing, tenancy, migrations, and current assembly gaps.
+     semantics, claim fencing, tenancy, migrations, and backend operations.
 3. `docket-v0.1.0-spec-lock-audit.md`
    - A historical pre-cutover audit retained to explain the final sequencing.
 4. `docket-graph-construction-design.md`

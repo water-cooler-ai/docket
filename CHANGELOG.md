@@ -168,12 +168,12 @@ entries below reflect what has landed so far.
   events, checkpoint type/metadata, and an explicit core-owned disposition
   (`:continue` or `{:park, :immediate | :external | {:at, timestamp} |
   :terminal, reason}`). Calculation performs no storage write, checkpoint
-  delivery, or telemetry; `Moment.checkpoint/2`/`context/2` build the
+  delivery, or telemetry; `Moment.checkpoint/1`/`context/2` build the
   committed checkpoint value only after the driver's commit succeeds
   (DCKT-10).
 - Processless moment entrypoints on the shared runtime loop:
   initialization calculates exactly one `:run_initialized` moment without
-  invoking a checkpoint handler, and advancement plans, dispatches, and
+  invoking observers, and advancement plans, dispatches, and
   applies exactly one superstep per call — one commit-boundary moment
   (barrier, retry park, or terminal), never a speculative multi-step
   drain. Retry moments ride DCKT-30's durable control state: graph status
@@ -279,12 +279,10 @@ entries below reflect what has landed so far.
   expired-claim `(claimed_at, id)`, and poison-introspection partial
   indexes behind positive dispatch eligibility (`status = 'running' AND
   poisoned_at IS NULL`) (DCKT-29, #19).
-- The runtime loop's checkpoint emission is split into pure moment
-  production plus a host-owned sync-committer adapter: the supervised and
-  inline shells adapt the same `Docket.Runtime.Moment` a durable driver
-  will commit transactionally, with unchanged public behavior — sync veto,
-  async pending effects, checkpoint/telemetry ordering, and park/wake
-  mechanics are byte-identical (DCKT-10).
+- The runtime loop separates pure moment production from commitment. Durable
+  backends commit moments transactionally before best-effort observation;
+  processless helpers return read-only checkpoint values for assertions.
+  Checkpoints never participate in lifecycle decisions (DCKT-10, DCKT-37).
 
 ### Removed
 

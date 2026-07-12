@@ -2,7 +2,6 @@ defmodule Docket.Runtime.RetryParkingTest do
   use Docket.Test.Case, async: true
 
   alias Docket.Run.{PendingWrite, TaskState, TimerState}
-  alias Docket.Test.Checkpoint.FailOn
 
   # start fans out to flaky and steady in one superstep; flaky fails
   # retryably while steady commits its result at the first retry park.
@@ -142,35 +141,6 @@ defmodule Docket.Runtime.RetryParkingTest do
       assert key2 == "#{task_id}:2"
       refute_received {:attempted, "flaky", _, _, _}
       refute_received {:executed, "steady", _}
-    end
-
-    test "a park rejected by its sync checkpoint repeats the same attempt identity" do
-      graph = parallel_retry_graph()
-
-      assert {:error, error, checkpoints} =
-               Docket.Test.run_inline(graph, %{},
-                 checkpoint: FailOn,
-                 context: %{notify: self(), fail_on: [:retry_scheduled]}
-               )
-
-      assert error.type == :checkpoint_failed
-      assert_received {:attempted, "flaky", 1, key1, _state}
-      assert_received {:executed, "steady", 1}
-
-      # The initialized run stays the durable truth: nothing of the failed
-      # superstep was committed.
-      committed = List.last(checkpoints).run
-      assert committed.active_tasks == %{}
-      assert committed.pending_writes == []
-
-      # Re-execution repeats attempt 1 - and the uncommitted sibling - with
-      # byte-identical identity.
-      assert {:ok, resumed, _} =
-               Docket.Test.resume_inline(graph, committed, context: %{notify: self()})
-
-      assert resumed.status == :done
-      assert_received {:attempted, "flaky", 1, ^key1, _state}
-      assert_received {:executed, "steady", 1}
     end
 
     test "permanent failure after a park discards parked sibling results" do

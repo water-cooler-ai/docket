@@ -1,8 +1,6 @@
 defmodule Docket.Test.InlineRuntimeTest do
   use Docket.Test.Case, async: true
 
-  alias Docket.Test.Checkpoint.MemorySink
-
   describe "run_inline/3" do
     test "runs minimal_linear to completion in the calling process" do
       assert {:ok, run, checkpoints} =
@@ -22,18 +20,6 @@ defmodule Docket.Test.InlineRuntimeTest do
 
       assert run.status == :done
       assert run.output == %{"result" => "hi"}
-    end
-
-    test "the checkpoint sink receives the same checkpoints the helper returns" do
-      {:ok, sink} = MemorySink.start_link()
-
-      assert {:ok, _run, checkpoints} =
-               Docket.Test.run_inline(Graphs.minimal_linear(), %{"value" => "x"},
-                 checkpoint: MemorySink,
-                 context: %{memory_sink: sink}
-               )
-
-      assert MemorySink.checkpoints(sink) == checkpoints
     end
 
     test "every checkpoint carries a restorable run and monotonic seqs" do
@@ -85,16 +71,10 @@ defmodule Docket.Test.InlineRuntimeTest do
     end
 
     test "missing required input fails before any checkpoint" do
-      {:ok, sink} = MemorySink.start_link()
-
       assert {:error, %Docket.Error{type: :invalid_input} = error, []} =
-               Docket.Test.run_inline(Graphs.minimal_linear(), %{},
-                 checkpoint: MemorySink,
-                 context: %{memory_sink: sink}
-               )
+               Docket.Test.run_inline(Graphs.minimal_linear(), %{})
 
       assert error.details.reasons == ["required input \"value\" is missing"]
-      assert MemorySink.checkpoints(sink) == []
     end
 
     test "unknown and non-durable inputs fail with typed errors" do

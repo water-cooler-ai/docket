@@ -212,9 +212,8 @@ defmodule Docket.Runtime.RunMutationTest do
     end
   end
 
-  test "the new cancellation fact is registered as sync checkpoint vocabulary" do
+  test "the new cancellation fact is registered as checkpoint vocabulary" do
     assert :run_cancelled in Docket.Event.types()
     assert :run_cancelled in Docket.Checkpoint.types()
-    assert Docket.Checkpoint.delivery(:run_cancelled) == :sync
   end
 end

@@ -2,23 +2,20 @@ defmodule Docket.Test do
   @moduledoc """
   Inline test runtime: executes graph transitions in the calling process
   using the same loop, algorithm, validation, reducer, and
-  checkpoint-building code as the supervised Runtime.
+  checkpoint-building code as backend execution vehicles.
 
-  The inline runtime is not a second interpreter - only the shell differs.
+  The inline runtime is not a second interpreter - only the driver differs.
   Use it for graph semantics, checkpoint ordering, reducers, guards,
-  interrupts, and failure policy. Supervised tests are reserved for process
-  lifecycle, crash recovery, and task-executor behavior.
+  interrupts, and failure policy. Backend tests cover durable lifecycle,
+  crash recovery, claims, scheduling, and supervised task execution.
 
   ## Options
 
   All helpers accept:
 
-  - `:checkpoint` - `Docket.Checkpoint` module (default
-    `Docket.Test.Checkpoint.Accept`)
-  - `:checkpoint_overrides` - map forcing checkpoint types to `:sync`
   - `:executor` - `Docket.Executor` module (default `Docket.Executor.Local`)
   - `:executor_opts` - keyword list passed through to the executor
-  - `:context` - application context passed to nodes and checkpoint handlers
+  - `:context` - application context passed to nodes and test sinks
   - `:clock`, `:id_generator`, `:sleeper` - determinism injection points;
     the sleeper serves each committed retry park's wait, and the helpers
     then treat the parked deadline as reached without re-reading the clock
@@ -27,11 +24,8 @@ defmodule Docket.Test do
   - `:run_id` - explicit run ID for the fresh run document
   - `:metadata` - application metadata map for the fresh run document
 
-  Async checkpoints are drained synchronously in order before each helper
-  returns, so ordinary semantic tests can assert a complete checkpoint
-  sequence without `Process.sleep/1`. A failed async delivery is skipped
-  from the returned list without blocking execution, matching production
-  semantics where async failure never rolls back the active run.
+  Checkpoints are returned in order so ordinary semantic tests can
+  assert a complete transition sequence without `Process.sleep/1`.
 
   Return shape for all helpers:
 
@@ -198,9 +192,6 @@ defmodule Docket.Test do
           {:park, run, park, effects} ->
             config.sleeper.(park.wait_ms)
             {:continue_at, run, park.resume_at, deliver(effects, opts)}
-
-          {:error, error} ->
-            {:error, error, []}
         end
 
       # An uncommitted retry wait: nothing durable changed, the sleeper just
@@ -223,20 +214,11 @@ defmodule Docket.Test do
   defp put_resume_floor(opts, nil), do: Keyword.delete(opts, :resume_floor)
   defp put_resume_floor(opts, %DateTime{} = floor), do: Keyword.put(opts, :resume_floor, floor)
 
-  # Sync checkpoints in effects were already accepted inside the loop; async
-  # ones are drained here, in order, in the calling process.
-  defp deliver(effects, opts) do
-    config = Config.resolve(opts)
-
+  # Processless checkpoint values are accumulated in transition order.
+  defp deliver(effects, _opts) do
     Enum.flat_map(effects, fn
-      {:checkpoint, checkpoint, _context, :accepted} ->
+      {:checkpoint, checkpoint} ->
         [checkpoint]
-
-      {:checkpoint, checkpoint, context, :pending} ->
-        case Loop.deliver_checkpoint(config.checkpoint, checkpoint, context) do
-          :ok -> [checkpoint]
-          {:error, _reason} -> []
-        end
     end)
   end
 
@@ -245,7 +227,7 @@ defmodule Docket.Test do
   # ---------------------------------------------------------------------------
 
   defp normalize_opts(opts) do
-    Keyword.put_new(opts, :checkpoint, Docket.Test.Checkpoint.Accept)
+    opts
   end
 
   defp ensure_compiled(graph_or_runtime_graph, opts) do

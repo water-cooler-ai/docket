@@ -4,10 +4,10 @@ defmodule Docket.Telemetry do
 
   Every committed transition emits one telemetry event per `Docket.Event`
   it produced, so live UIs and instrumentation can observe runs without
-  parsing checkpoint payloads. Emission is observability-only: it happens
-  after the transition's sync checkpoint is accepted (or alongside the
-  pending async checkpoint), handlers run via `:telemetry.execute/3` with
-  its usual failing-handler detachment, and delivery never affects the run.
+  parsing checkpoint payloads. Emission is observability-only: production
+  emits after the backend commit, handlers run via `:telemetry.execute/3`
+  with its usual failing-handler detachment, and delivery never affects the
+  run.
 
   ## Event catalog
 

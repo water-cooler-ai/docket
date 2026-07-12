@@ -14,14 +14,14 @@ defmodule Docket.Runtime.Moment do
 
   - A durable driver persists the proposed run and assigned events inside
     its outer storage transaction and, only after transaction success,
-    builds the committed checkpoint with `checkpoint/2`/`context/2` and
+    builds the committed checkpoint with `checkpoint/1`/`context/2` and
     delivers observers and telemetry. A lost fence or failed event append
     discards the moment; no committed checkpoint value ever exists for a
     discarded moment, and observer failure after commit cannot change
     durable state.
-  - The processless `Docket.Test` shell may present the moment to a configured
-    sync checkpoint sink, which may veto the transition before it becomes the
-    returned run value. Production supervision has no host-owned committer.
+  - The processless `Docket.Test` shell applies the moment directly and
+    returns its checkpoint as a read-only assertion value. Nothing in the
+    checkpoint path can veto the transition.
 
   Dispositions:
 
@@ -208,15 +208,13 @@ defmodule Docket.Runtime.Moment do
   @doc """
   Builds the committed `Docket.Checkpoint` value for a moment.
 
-  Call only after the moment has durably committed (or, for host-owned
-  drivers, as the value presented to the sync committer). `delivery` is the
-  resolved delivery mode for the checkpoint type.
+  Production callers build this value only after the moment has durably
+  committed. `Docket.Test` may build it while driving processless semantics.
   """
-  @spec checkpoint(t(), Checkpoint.delivery()) :: Checkpoint.t()
-  def checkpoint(%__MODULE__{} = moment, delivery) do
+  @spec checkpoint(t()) :: Checkpoint.t()
+  def checkpoint(%__MODULE__{} = moment) do
     %Checkpoint{
       type: moment.checkpoint_type,
-      delivery: delivery,
       seq: moment.run.checkpoint_seq,
       run: moment.run,
       events: moment.events,
