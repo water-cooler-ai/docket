@@ -74,6 +74,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :batch_size,
       :clock
     ]
+    @testing_modes [:inline, :manual]
 
     @impl Docket.Backend
     def storage, do: Storage
@@ -116,20 +117,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def init(opts) do
       name = Keyword.fetch!(opts, :name)
       validate_tenant_mode!(opts)
+      validate_testing!(opts)
       validate_observers!(opts)
       validate_nested!(Keyword.get(opts, :dispatcher, []), :dispatcher)
       validate_nested!(Keyword.get(opts, :vehicle, []), :vehicle)
       validate_dispatcher!(Keyword.merge(@default_dispatcher, Keyword.get(opts, :dispatcher, [])))
       validate_vehicle!(opts, Keyword.get(opts, :vehicle, []))
 
-      context = context(opts)
-      runner = runner_name(name)
-      dispatcher = dispatcher_name(name)
+      children = children(opts, name)
 
-      children =
+      Supervisor.init(children, strategy: :one_for_one)
+    end
+
+    defp children(opts, name) do
+      if Keyword.get(opts, :testing) in @testing_modes do
+        []
+      else
+        context = context(opts)
+        dispatcher = dispatcher_name(name)
+
         [
           {Docket.Postgres.Runner,
-           name: runner,
+           name: runner_name(name),
            dispatcher: dispatcher,
            vehicle_supervisor: vehicle_supervisor_name(name),
            context: context,
@@ -137,8 +146,98 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ] ++
           notifier_children(opts, name, context, dispatcher) ++
           [pruner_child(opts, name, context)]
+      end
+    end
 
-      Supervisor.init(children, strategy: :one_for_one)
+    @doc false
+    def testing_mode(opts), do: Keyword.get(opts, :testing)
+
+    @doc "Synchronously claims and drains due runs in the calling process."
+    def drain_runs(opts) when is_list(opts) do
+      validate_testing!(opts)
+
+      max_runs = Keyword.get(opts, :max_runs, 100)
+
+      cond do
+        opts[:testing] not in @testing_modes ->
+          {:error, :testing_mode_required}
+
+        not (is_integer(max_runs) and max_runs > 0) ->
+          {:error, :invalid_max_runs}
+
+        true ->
+          context = context(opts)
+
+          dispatcher =
+            @default_dispatcher
+            |> Keyword.merge(Keyword.get(opts, :dispatcher, []))
+            |> Keyword.put(:clock, Keyword.get(opts, :clock, &DateTime.utc_now/0))
+
+          vehicle = testing_vehicle_opts(opts, context)
+
+          drain_due(context, dispatcher, vehicle, max_runs, %{
+            drained: 0,
+            poisoned: [],
+            outcomes: [],
+            limit_reached: false
+          })
+      end
+    end
+
+    defp drain_due(_context, _dispatcher, _vehicle, 0, summary),
+      do: {:ok, %{summary | limit_reached: true}}
+
+    defp drain_due(context, dispatcher, vehicle, remaining, summary) do
+      now = Keyword.get(dispatcher, :clock, &DateTime.utc_now/0).()
+
+      policy = %{
+        now: now,
+        limit: 1,
+        orphan_ttl_ms: Keyword.fetch!(dispatcher, :orphan_ttl_ms),
+        max_claim_attempts: Keyword.fetch!(dispatcher, :max_claim_attempts),
+        preference: :ready
+      }
+
+      case RunStore.claim_due(context, :system, policy) do
+        {:ok, %{leases: [], poisoned: []}} ->
+          {:ok, summary}
+
+        {:ok, %{leases: [lease], poisoned: poisoned}} ->
+          outcome = Docket.Postgres.Vehicle.drain(lease, vehicle)
+
+          next = %{
+            summary
+            | drained: summary.drained + 1,
+              poisoned: summary.poisoned ++ poisoned,
+              outcomes: summary.outcomes ++ [outcome]
+          }
+
+          case outcome do
+            {:ok, {:parked, _kind}} ->
+              drain_due(context, dispatcher, vehicle, remaining - 1, next)
+
+            {:ok, reason} ->
+              {:error, {:drain_stopped, reason, next}}
+          end
+
+        {:ok, %{leases: [], poisoned: poisoned}} ->
+          {:ok, %{summary | poisoned: summary.poisoned ++ poisoned}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+
+    defp testing_vehicle_opts(opts, context) do
+      vehicle = Keyword.merge(@default_vehicle, Keyword.get(opts, :vehicle, []))
+
+      opts
+      |> Keyword.take(@vehicle_keys)
+      |> Keyword.merge(vehicle)
+      |> Keyword.delete(:heartbeat)
+      |> Keyword.put(:graph_cache, false)
+      |> Keyword.put(:task_supervisor, Keyword.fetch!(opts, :task_supervisor))
+      |> Keyword.put(:backend, {__MODULE__, context})
     end
 
     @doc false
@@ -258,6 +357,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         mode ->
           raise ArgumentError, ":tenant_mode must be :none or :required, got: #{inspect(mode)}"
+      end
+    end
+
+    defp validate_testing!(opts) do
+      case Keyword.get(opts, :testing) do
+        nil -> :ok
+        mode when mode in @testing_modes -> :ok
+        mode -> raise ArgumentError, ":testing must be :inline or :manual, got: #{inspect(mode)}"
       end
     end
 

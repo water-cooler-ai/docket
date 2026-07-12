@@ -41,6 +41,29 @@ generated_database_repos =
     []
   end
 
+generated_database_repos =
+  if Code.ensure_loaded?(Ecto.Adapters.SQL.Sandbox) and
+       Code.ensure_loaded?(Docket.Postgres.BackendSandboxTestRepo) do
+    repo = Docket.Postgres.BackendSandboxTestRepo
+
+    {url, generated?} =
+      case System.fetch_env("DOCKET_BACKEND_SANDBOX_TEST_DATABASE_URL") do
+        {:ok, url} -> {url, false}
+        :error -> {"postgres://localhost:5432/docket_backend_sandbox_test_#{System.pid()}", true}
+      end
+
+    Application.put_env(:docket, repo,
+      url: url,
+      pool: Ecto.Adapters.SQL.Sandbox,
+      pool_size: 2,
+      log: false
+    )
+
+    if generated?, do: [repo | generated_database_repos], else: generated_database_repos
+  else
+    generated_database_repos
+  end
+
 # Postgres migration and RunStore tests need a live Postgres. Opt in with:
 #
 #     mix test --include postgres

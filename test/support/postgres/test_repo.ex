@@ -53,4 +53,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduledoc false
     use Ecto.Repo, otp_app: :docket, adapter: Ecto.Adapters.Postgres
   end
+
+  defmodule Docket.Postgres.BackendSandboxTestRepo do
+    @moduledoc false
+    use Ecto.Repo, otp_app: :docket, adapter: Ecto.Adapters.Postgres
+  end
 end
