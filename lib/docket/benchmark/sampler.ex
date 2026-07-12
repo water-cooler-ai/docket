@@ -1,8 +1,12 @@
 defmodule Docket.Benchmark.Timeline do
   @moduledoc false
 
+  # Buckets are stored newest-first so each sample prepends in constant time
+  # instead of copying the list; chronological order is restored during
+  # compaction and in artifact/1.
   defstruct max_buckets: 256,
             buckets: [],
+            bucket_count: 0,
             raw_sample_count: 0,
             compactions: 0
 
@@ -11,39 +15,47 @@ defmodule Docket.Benchmark.Timeline do
 
   def add(%__MODULE__{} = timeline, offset_us, metrics)
       when is_integer(offset_us) and offset_us >= 0 and is_map(metrics) do
-    bucket = raw_bucket(offset_us, metrics)
-    buckets = timeline.buckets ++ [bucket]
+    buckets = [raw_bucket(offset_us, metrics) | timeline.buckets]
+    bucket_count = timeline.bucket_count + 1
 
-    if length(buckets) > timeline.max_buckets do
+    if bucket_count > timeline.max_buckets do
       %{
         timeline
         | buckets: compact_once(buckets),
+          bucket_count: bucket_count - 1,
           raw_sample_count: timeline.raw_sample_count + 1,
           compactions: timeline.compactions + 1
       }
     else
-      %{timeline | buckets: buckets, raw_sample_count: timeline.raw_sample_count + 1}
+      %{
+        timeline
+        | buckets: buckets,
+          bucket_count: bucket_count,
+          raw_sample_count: timeline.raw_sample_count + 1
+      }
     end
   end
 
   def artifact(%__MODULE__{} = timeline) do
+    buckets = Enum.reverse(timeline.buckets)
+
     summary =
-      case timeline.buckets do
+      case buckets do
         [] -> %{}
         [first | rest] -> rest |> Enum.reduce(first, &merge_bucket(&2, &1)) |> metric_artifact()
       end
 
     %{
       raw_sample_count: timeline.raw_sample_count,
-      retained_bucket_count: length(timeline.buckets),
+      retained_bucket_count: timeline.bucket_count,
       max_retained_buckets: timeline.max_buckets,
       compactions: timeline.compactions,
       compaction_strategy: "merge_adjacent_lowest_weight_pair",
-      represented_sample_count: Enum.reduce(timeline.buckets, 0, &(&1.sample_count + &2)),
+      represented_sample_count: Enum.reduce(buckets, 0, &(&1.sample_count + &2)),
       maximum_samples_represented_by_one_bucket:
-        timeline.buckets |> Enum.map(& &1.sample_count) |> Enum.max(fn -> 0 end),
+        buckets |> Enum.map(& &1.sample_count) |> Enum.max(fn -> 0 end),
       summary: summary,
-      buckets: Enum.map(timeline.buckets, &bucket_artifact/1)
+      buckets: Enum.map(buckets, &bucket_artifact/1)
     }
   end
 
@@ -78,7 +90,14 @@ defmodule Docket.Benchmark.Timeline do
     }
   end
 
-  defp compact_once(buckets) do
+  defp compact_once(newest_first) do
+    newest_first
+    |> Enum.reverse()
+    |> compact_chronological_once()
+    |> Enum.reverse()
+  end
+
+  defp compact_chronological_once(buckets) do
     {_weight, index} =
       buckets
       |> Enum.chunk_every(2, 1, :discard)

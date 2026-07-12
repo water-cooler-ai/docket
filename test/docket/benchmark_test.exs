@@ -294,6 +294,26 @@ defmodule Docket.BenchmarkTest do
     assert one_bucket.represented_sample_count == 10
   end
 
+  test "timeline buckets stay chronological with and without compaction" do
+    for {samples, max_buckets} <- [{5, 8}, {300, 16}, {1_000, 7}] do
+      artifact =
+        Enum.reduce(1..samples, Docket.Benchmark.Timeline.new(max_buckets), fn value, timeline ->
+          Docket.Benchmark.Timeline.add(timeline, value, %{value: value})
+        end)
+        |> Docket.Benchmark.Timeline.artifact()
+
+      starts = Enum.map(artifact.buckets, & &1.start_offset_us)
+      ends = Enum.map(artifact.buckets, & &1.end_offset_us)
+
+      assert starts == Enum.sort(starts)
+      assert ends == Enum.sort(ends)
+      assert hd(starts) == 1
+      assert List.last(ends) == samples
+      assert Enum.all?(artifact.buckets, &(&1.start_offset_us <= &1.end_offset_us))
+      assert Enum.all?(artifact.buckets, &(&1.metrics.value.first <= &1.metrics.value.last))
+    end
+  end
+
   test "sampler validates before attaching and reports unavailable metrics" do
     before_handlers =
       :telemetry.list_handlers([:docket, :postgres, :dispatcher, :state]) |> length()
@@ -528,6 +548,29 @@ defmodule Docket.BenchmarkTest do
              Enum.count(events, fn {event, _, _, _} ->
                event == [:docket, :benchmark, :repo, :query]
              end)
+  end
+
+  test "collector reports its own ETS memory so samplers can subtract the observer" do
+    collector = Docket.Benchmark.Collector.start()
+
+    baseline = Docket.Benchmark.Collector.observer_memory_bytes(collector)
+    assert baseline > 0
+
+    for step <- 1..500 do
+      :telemetry.execute(
+        [:docket, :postgres, :dispatcher, :poll],
+        %{duration: step, leases: 1, poisoned: 0},
+        %{result: :ok, source: :interval}
+      )
+    end
+
+    grown = Docket.Benchmark.Collector.observer_memory_bytes(collector)
+    assert grown > baseline
+
+    events = Docket.Benchmark.Collector.stop(collector)
+    assert length(events) == 500
+
+    assert Docket.Benchmark.Collector.observer_memory_bytes(collector) == 0
   end
 
   test "collector retains run identity only as an internal correlation key" do

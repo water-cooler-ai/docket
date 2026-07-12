@@ -375,7 +375,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             start_at: t0,
             interval_ms: config.sample_interval_ms,
             max_buckets: config.max_samples,
-            sample: fn gauges -> blocked_system_sample(config, gate, gauges, t0) end
+            sample: fn gauges -> blocked_system_sample(config, gate, collector, gauges, t0) end
           )
 
         try do
@@ -832,10 +832,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end)
     end
 
-    defp blocked_system_sample(config, gate, event_gauges, activation_at) do
+    defp blocked_system_sample(config, gate, collector, event_gauges, activation_at) do
       gate_gauges = Docket.Benchmark.BlockingGate.gauges(gate)
       pool = repo_pool_snapshot(config)
       memory = :erlang.memory()
+
+      # The collector's full-event capture tables grow with the workload, so
+      # raw BEAM memory readings would partly measure the observer itself.
+      collector_ets_bytes = Docket.Benchmark.Collector.observer_memory_bytes(collector)
       scheduler_queues = :erlang.statistics(:run_queue_lengths)
       unclaimed = max(config.runs - event_gauges.cumulative_claim_leases, 0)
 
@@ -861,10 +865,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           |> Enum.take(System.schedulers_online())
           |> Enum.max(fn -> 0 end),
         beam_process_count: :erlang.system_info(:process_count),
-        beam_memory_total_bytes: memory[:total],
+        beam_memory_total_bytes: memory[:total] - collector_ets_bytes,
         beam_memory_processes_bytes: memory[:processes],
         beam_memory_binary_bytes: memory[:binary],
-        beam_memory_ets_bytes: memory[:ets],
+        beam_memory_ets_bytes: memory[:ets] - collector_ets_bytes,
+        observer_collector_ets_bytes: collector_ets_bytes,
         runtime_mailbox_length: mailbox_length(@runtime),
         dispatcher_mailbox_length: mailbox_length(dispatcher_name()),
         vehicle_supervisor_mailbox_length: mailbox_length(vehicle_supervisor_name()),
@@ -1013,7 +1018,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               :derived_unclaimed_common_due_backlog,
               :derived_oldest_unclaimed_wake_at_age_ms
             ],
-            derived_common_due_source: "common_due_activation_boundary_and_cumulative_leases"
+            derived_common_due_source: "common_due_activation_boundary_and_cumulative_leases",
+            observer_adjusted_memory_metrics: [
+              :beam_memory_total_bytes,
+              :beam_memory_ets_bytes
+            ],
+            observer_memory_adjustment:
+              "benchmark collector ETS table memory is subtracted and reported separately as observer_collector_ets_bytes"
           }),
         collection: %{
           expected_blocked_arrivals: config.concurrency,

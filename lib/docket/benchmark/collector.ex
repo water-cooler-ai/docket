@@ -121,6 +121,17 @@ defmodule Docket.Benchmark.Collector do
     }
   end
 
+  def observer_memory_bytes(%{table: table, counters: counters}) do
+    word_size = :erlang.system_info(:wordsize)
+
+    Enum.reduce([table, counters], 0, fn tid, bytes ->
+      case :ets.info(tid, :memory) do
+        words when is_integer(words) -> bytes + words * word_size
+        _undefined -> bytes
+      end
+    end)
+  end
+
   defp safe_metadata(event, metadata, counters)
        when event in [[:docket, :checkpoint, :committed], [:docket, :run, :completed]] do
     %{
