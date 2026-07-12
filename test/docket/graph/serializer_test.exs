@@ -371,6 +371,37 @@ defmodule Docket.Graph.SerializerTest do
       assert Graph.from_map!(map) == graph
     end
 
+    test "rejects a passthrough map that reuses the reserved module tag" do
+      for extra <- [%{"handler" => "x"}, %{"implementation" => "foo"}] do
+        impl = Map.merge(%{"type" => "module"}, extra)
+
+        graph =
+          Graph.new!(id: "reserved")
+          |> Graph.put_node!("n", implementation: impl)
+
+        error = assert_raise Graph.Error, fn -> Graph.to_map(graph) end
+        assert error.code == :invalid_implementation
+      end
+    end
+
+    test "agrees with Graph normalization across module implementation shapes" do
+      shapes = [Writer, {Writer, :call}, %{type: :module, module: Writer}]
+
+      for impl <- shapes do
+        graph =
+          Graph.new!(id: "agree")
+          |> Graph.put_node!("n", implementation: impl)
+
+        reg = %{"writer" => impl}
+        map = Graph.to_map(graph, implementations: reg)
+
+        assert map["nodes"]["n"]["implementation"] ==
+                 %{"type" => "module", "implementation" => "writer"}
+
+        assert Graph.from_map!(map, implementations: reg) == graph
+      end
+    end
+
     test "nil implementation stays nil" do
       graph = Graph.new!(id: "empty") |> Graph.put_node!("n", label: "N")
       map = Graph.to_map(graph)
@@ -461,6 +492,53 @@ defmodule Docket.Graph.SerializerTest do
 
       assert {:error, %Graph.Error{code: :invalid_public_id}} = Graph.from_map(doc)
       assert_raise Graph.Error, fn -> Graph.from_map!(doc) end
+    end
+  end
+
+  describe "load rejects $-prefixed names dump cannot re-serialize" do
+    test "object-schema field named \"$x\" is rejected" do
+      doc = %{
+        "schema_version" => 1,
+        "id" => "g",
+        "fields" => %{
+          "f" => %{
+            "schema" => %{"type" => "object", "fields" => %{"$x" => %{"type" => "string"}}}
+          }
+        }
+      }
+
+      assert {:error, %Graph.Error{code: :invalid_document}} = Graph.from_map(doc)
+    end
+
+    test "branch group named \"$b\" is rejected" do
+      doc = %{
+        "schema_version" => 1,
+        "id" => "g",
+        "nodes" => %{"n" => %{"branches" => %{"$b" => ["e1"]}}}
+      }
+
+      assert {:error, %Graph.Error{code: :invalid_document}} = Graph.from_map(doc)
+    end
+  end
+
+  describe "improper lists" do
+    test "to_map raises on an improper list in node config" do
+      graph =
+        Graph.new!(id: "improper")
+        |> Graph.put_node!("n", config: %{"vals" => [1 | 2]})
+
+      error = assert_raise Graph.Error, fn -> Graph.to_map(graph) end
+      assert error.code == :non_durable_value
+    end
+
+    test "from_map rejects a hand-built document with an improper list" do
+      doc = %{
+        "schema_version" => 1,
+        "id" => "g",
+        "nodes" => %{"n" => %{"config" => %{"vals" => [1 | 2]}}}
+      }
+
+      assert {:error, %Graph.Error{code: :non_durable_value}} = Graph.from_map(doc)
     end
   end
 end

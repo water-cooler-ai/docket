@@ -22,8 +22,7 @@ defmodule Docket.Graph.Serializer do
   # `%{type: :module, module: M, function: F}` implementation in the reverse
   # registry and emits only the identifier; `load!/2` maps an identifier back to
   # the registered implementation. No module, function, or type name is ever
-  # converted to an atom on load, so loading an untrusted document cannot create
-  # or reach arbitrary code.
+  # converted to an atom on load.
   #
   # dump/2 canonicalizes open content with Jason-style coercion: atoms become
   # strings (both map keys and values), silently. Terms with no JSON
@@ -48,7 +47,7 @@ defmodule Docket.Graph.Serializer do
   @id_pattern ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
 
   @field_kinds %{"input" => :input, "state" => :state}
-  @field_kinds_out %{input: "input", state: "state"}
+  @field_kinds_out Map.new(@field_kinds, fn {k, v} -> {v, k} end)
 
   @schema_types %{
     "string" => :string,
@@ -60,16 +59,7 @@ defmodule Docket.Graph.Serializer do
     "object" => :object,
     "enum" => :enum
   }
-  @schema_types_out %{
-    string: "string",
-    float: "float",
-    integer: "integer",
-    boolean: "boolean",
-    map: "map",
-    list: "list",
-    object: "object",
-    enum: "enum"
-  }
+  @schema_types_out Map.new(@schema_types, fn {k, v} -> {v, k} end)
 
   @reducer_types %{
     "append" => :append,
@@ -79,14 +69,7 @@ defmodule Docket.Graph.Serializer do
     "sum" => :sum,
     "union" => :union
   }
-  @reducer_types_out %{
-    append: "append",
-    first_value: "first_value",
-    last_value: "last_value",
-    merge: "merge",
-    sum: "sum",
-    union: "union"
-  }
+  @reducer_types_out Map.new(@reducer_types, fn {k, v} -> {v, k} end)
 
   @guard_ops %{
     "all" => :all,
@@ -98,16 +81,7 @@ defmodule Docket.Graph.Serializer do
     "path" => :path,
     "version_at_least" => :version_at_least
   }
-  @guard_ops_out %{
-    all: "all",
-    any: "any",
-    changed: "changed",
-    equals: "equals",
-    exists: "exists",
-    not: "not",
-    path: "path",
-    version_at_least: "version_at_least"
-  }
+  @guard_ops_out Map.new(@guard_ops, fn {k, v} -> {v, k} end)
   @guard_recursive_ops [:all, :any, :not]
 
   @graph_keys ~w(schema_version id name description inputs fields outputs nodes edges policies metadata)
@@ -397,9 +371,8 @@ defmodule Docket.Graph.Serializer do
 
   # Plain argument positions (changed/equals/exists/path/version_at_least) may
   # reference nested guard expressions, e.g. equals(path(...), value). Nested
-  # guards are wrapped in a reserved "$guard" tag so loading can distinguish
-  # them from plain map values; "$"-prefixed keys are rejected in durable
-  # values, which keeps the tag unambiguous.
+  # guards are wrapped in a reserved "$guard" tag; "$"-prefixed keys are
+  # rejected in durable values.
   defp dump_guard_args(_op, args) do
     Enum.map(args, fn
       %Guard{} = arg -> %{"$guard" => dump_guard(arg)}
@@ -440,6 +413,14 @@ defmodule Docket.Graph.Serializer do
           %{module: inspect(module), function: function}
         )
     end
+  end
+
+  defp dump_implementation(%{"type" => "module"} = impl, _registry) when not is_struct(impl) do
+    invalid!(
+      :invalid_implementation,
+      "passthrough implementation #{inspect(impl)} uses the reserved \"type\" => \"module\" " <>
+        "tag; the module tag is reserved for registered module implementations"
+    )
   end
 
   defp dump_implementation(%{} = impl, _registry) when not is_struct(impl), do: durable!(impl)
@@ -601,7 +582,11 @@ defmodule Docket.Graph.Serializer do
 
   defp load_schema_fields!(fields, location) when is_map(fields) and not is_struct(fields) do
     assert_string_keys!(fields, "schema fields in #{location}")
-    Map.new(fields, fn {name, schema} -> {name, load_schema!(schema, "#{location}.#{name}")} end)
+
+    Map.new(fields, fn {name, schema} ->
+      key = load_durable_key!(name, "schema fields in #{location}")
+      {key, load_schema!(schema, "#{location}.#{name}")}
+    end)
   end
 
   defp load_schema_fields!(other, location) do
@@ -727,7 +712,8 @@ defmodule Docket.Graph.Serializer do
     assert_string_keys!(branches, "node #{inspect(id)} branches")
 
     Map.new(branches, fn {name, group} ->
-      {name, load_branch_group!(group, id, name)}
+      key = load_durable_key!(name, "node #{inspect(id)} branches")
+      {key, load_branch_group!(group, id, name)}
     end)
   end
 
@@ -886,7 +872,7 @@ defmodule Docket.Graph.Serializer do
        do: value
 
   defp load_durable_value!(list, location) when is_list(list) do
-    Enum.map(list, &load_durable_value!(&1, location))
+    load_durable_list!(list, location)
   end
 
   defp load_durable_value!(map, location) when is_map(map) and not is_struct(map) do
@@ -900,6 +886,20 @@ defmodule Docket.Graph.Serializer do
       :invalid_document,
       "#{location} contains a non-durable value #{inspect(other)}",
       %{location: location, value: inspect(other)}
+    )
+  end
+
+  defp load_durable_list!([], _location), do: []
+
+  defp load_durable_list!([head | tail], location) when is_list(tail) do
+    [load_durable_value!(head, location) | load_durable_list!(tail, location)]
+  end
+
+  defp load_durable_list!([_head | tail], location) do
+    invalid!(
+      :non_durable_value,
+      "#{location} contains an improper list with non-list tail #{inspect(tail)}",
+      %{location: location, value: inspect(tail)}
     )
   end
 
@@ -999,10 +999,8 @@ defmodule Docket.Graph.Serializer do
   end
 
   defp assert_known_keys!(map, allowed, location) do
-    allowed_set = MapSet.new(allowed)
-
     Enum.each(Map.keys(map), fn key ->
-      unless MapSet.member?(allowed_set, key) do
+      unless key in allowed do
         invalid!(:invalid_document, "unknown #{location} key #{inspect(key)}", %{
           location: location,
           key: key
@@ -1053,7 +1051,7 @@ defmodule Docket.Graph.Serializer do
 
   defp durable!(atom) when is_atom(atom), do: Atom.to_string(atom)
 
-  defp durable!(list) when is_list(list), do: Enum.map(list, &durable!/1)
+  defp durable!(list) when is_list(list), do: durable_list!(list)
 
   defp durable!(%_struct{} = struct) do
     non_durable!(struct, "structs are not durable values")
@@ -1065,6 +1063,16 @@ defmodule Docket.Graph.Serializer do
 
   defp durable!(value) do
     non_durable!(value, durable_hint(value))
+  end
+
+  defp durable_list!([]), do: []
+
+  defp durable_list!([head | tail]) when is_list(tail) do
+    [durable!(head) | durable_list!(tail)]
+  end
+
+  defp durable_list!([_head | tail]) do
+    non_durable!(tail, "improper lists are not durable")
   end
 
   defp durable_key!(key) when is_binary(key) do
