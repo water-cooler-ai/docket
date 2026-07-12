@@ -5,13 +5,13 @@ built for long-running, interruptible work like agentic LLM sessions, where a
 run may pause for a human decision, survive a deploy, and resume exactly where
 it left off.
 
-This branch is `0.1.0-dev`. The graph runtime is usable inline and through the
-legacy supervised checkpoint driver. The PostgreSQL foundation—migrations,
-stores, transaction recipes, claim fencing, and a dispatcher—is implemented,
-but the public `Docket.Postgres` backend bundle and claimed-run vehicle have
-not landed. PostgreSQL is therefore not yet a runnable production backend.
-See the [PostgreSQL backend guide](docs/architecture/docket-operational-transition-spec.md)
-for the implemented model and remaining release boundary.
+This branch is `0.1.0-dev`. The graph runtime is usable inline, through the
+transitional supervised checkpoint driver, and through the assembled
+`Docket.Postgres` durable backend. The PostgreSQL bundle owns its stores,
+transaction recipes, claim fencing, dispatcher, claimed-run vehicles,
+notification fast path, and retention pruner. See the
+[PostgreSQL backend guide](docs/architecture/docket-operational-transition-spec.md)
+for configuration and operational boundaries.
 
 You describe a workflow as a graph document: nodes that do work, shared state
 fields they read and write, and edges (optionally guarded) that decide what
@@ -103,12 +103,12 @@ Enum.map(checkpoints, & &1.type)
 #=> [:run_initialized, :step_committed, :run_completed]
 ```
 
-### PostgreSQL facade (target API)
+### PostgreSQL facade
 
-The durable facade is implemented against the backend contract, but the
-`Docket.Postgres` bundle shown below is not implemented yet. This example
-documents the intended public assembly, not a working `0.1.0-dev`
-configuration:
+`Docket.Postgres` assembles the durable stores, dispatcher, vehicles,
+LISTEN/NOTIFY fast path, and retention pruner behind one backend boundary.
+The application owns and supervises its Ecto Repo. Retention is explicit so
+the library never silently chooses when durable records are deleted:
 
 ```elixir
 defmodule MyApp.DurableDocket do
@@ -116,7 +116,13 @@ defmodule MyApp.DurableDocket do
     repo: MyApp.Repo,
     backend: Docket.Postgres,
     tenant_mode: :required,
-    checkpoint_observers: [MyApp.DocketObserver]
+    checkpoint_observers: [MyApp.DocketObserver],
+    pruner: [
+      interval_ms: :timer.hours(1),
+      event_retention_ms: :timer.hours(24 * 30),
+      run_retention_ms: :timer.hours(24 * 90),
+      batch_size: 1_000
+    ]
 end
 
 {:ok, graph_ref} = MyApp.DurableDocket.save_graph(graph)
@@ -163,7 +169,7 @@ the PostgreSQL-free graph-semantics testing surface. Run persistence is
 backend-private. The v0.0.1 host Run map codec is not part
 of v0.1.0 and there is no compatibility decoder or dual-write path.
 
-Once the PostgreSQL bundle and vehicle land, the intended cutover is:
+The intended cutover is:
 
 1. Drain or terminate active `0.0.1` runs and stop old writers.
 2. Delete the host checkpoint committer and Docket-specific host tables.

@@ -6,12 +6,10 @@ Docket's PostgreSQL backend stores published graphs, durable run state, and an
 optional event history. It also provides the queue primitives needed to claim
 and recover runs without a separate jobs table.
 
-This guide describes the code that exists today. The backend is still being
-assembled: the migration, stores, claim dispatcher, the LISTEN/NOTIFY wake
-notifier, and the vehicle that executes a claimed run are implemented, but
-`Docket.Postgres` (the public backend bundle) has not landed. Consequently the low-level pieces can be
-tested, but the PostgreSQL backend is not yet a runnable production
-configuration.
+This guide describes the code that exists today. `Docket.Postgres` assembles
+the migration-backed stores, claim dispatcher, LISTEN/NOTIFY wake notifier,
+claimed-run vehicles, and retention pruner into one runnable backend bundle.
+The host application owns and supervises its Ecto Repo.
 
 ## The model
 
@@ -107,9 +105,8 @@ modules installed locally. It never republishes the graph or adds defaults
 introduced after publication. The initial run and its events commit in one
 transaction through `Docket.Lifecycle`.
 
-These facade functions work with a conforming backend bundle. They are covered
-by the in-memory backend in the test suite, but cannot yet be configured with
-`backend: Docket.Postgres` because that bundle module is not implemented.
+These facade functions work with any conforming bundle and are exercised
+end-to-end with `backend: Docket.Postgres` against the revision-8 schema.
 
 ## Claiming and recovery
 
@@ -156,10 +153,10 @@ committed run under the lease fence, compiles the stored effective graph
 node-locally exactly once (optionally through `Docket.Postgres.GraphCache`,
 which validates every read against the local module generation), and then
 commits one runtime moment at a time through `Docket.Lifecycle`, exiting at
-the first park. Wiring `launch: &Docket.Postgres.Vehicle.launch(&1, opts)`
-plus a `Task.Supervisor` into the dispatcher is what remains for the backend
-bundle; the supervisor should start before the dispatcher and give vehicles
-a shutdown of at least the dispatcher's drain timeout.
+the first park. The bundle wires `Docket.Postgres.Vehicle.launcher/1` through
+a dedicated `Task.Supervisor`. The execution subtree uses `:one_for_all`, so a
+dispatcher restart also terminates vehicles it can no longer account for.
+Notifier and pruner failures remain isolated from that execution subtree.
 
 ### Pre-execution abandon
 
@@ -299,20 +296,17 @@ tokens are deliberately excluded. A sustained abandon count is the durable
 signal that the current deployment cannot yet execute a run. `await_run/2` polls this projection until the run waits, terminates,
 becomes poisoned, or reaches its required timeout.
 
-These facade examples require an assembled backend. Until `Docket.Postgres`
-lands, use the store modules only in backend development and integration tests.
+Use the facade for application operations. The store modules remain internal
+capabilities and focused backend-development test surfaces.
 
-## What remains before production use
+## Backend configuration
 
-The PostgreSQL foundation is substantial, but `0.1.0-dev` is not an operational
-release yet. The remaining public boundary includes:
-
-- the `Docket.Postgres` implementation of `Docket.Backend`;
-- supervision wiring from dispatcher leases to vehicle launches, including
-  placement of the `Docket.Postgres.Notifier` child (`notifier: :none` omits
-  it for poll-only operation);
-- deterministic backend testing controls; and
-- retention/pruning policy and production integration coverage.
+The bundle requires `repo:` and an explicit `pruner:` policy containing
+`interval_ms`, `event_retention_ms`, `run_retention_ms`, and `batch_size`.
+Event retention cannot exceed run retention. `notifier: :none` omits the
+LISTEN connection for poll-only deployments. Dispatcher and vehicle policies
+may be supplied through `dispatcher:` and `vehicle:` keyword lists; the store
+capabilities themselves are fixed and cannot be mixed independently.
 
 The old host-owned supervised `run`/`resume`/`get_run` path still exists while
 that replacement is incomplete. It is migration compatibility, not the target

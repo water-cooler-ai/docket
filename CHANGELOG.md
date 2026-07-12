@@ -9,13 +9,22 @@ Each v0.1.0 ticket updates the Unreleased section in its own PR.
 ## 0.1.0 — Unreleased
 
 The developing operational release line. The backend contract, PostgreSQL
-stores, migration, lifecycle transactions, dispatcher, and claimed-run vehicle
-have landed. The public `Docket.Postgres` bundle has not, so this branch
-is not yet a runnable PostgreSQL production backend. The implementation guide
-and current-state audit live in `docs/architecture/`; entries below reflect
-what has landed so far.
+stores, migration, lifecycle transactions, dispatcher, claimed-run vehicle,
+notifier, pruner, and public `Docket.Postgres` bundle have landed. The
+implementation guide and current-state audit live in `docs/architecture/`;
+entries below reflect what has landed so far.
 
 ### Added
+
+- `Docket.Postgres`: the fixed Postgres backend bundle supplying Storage,
+  GraphStore, RunStore, and EventStore while supervising a one-for-all
+  dispatcher/vehicle execution subtree, optional LISTEN/NOTIFY fast path, and
+  explicit-policy pruner. The host owns its Repo; schema prefixes and all
+  operational children derive from one backend context. Dispatcher failure
+  terminates untracked vehicles before restart, while notifier/pruner failures
+  remain isolated. `notifier: :none` provides poll-only mode, retention has no
+  silent deletion defaults, and individual stores cannot be mixed through the
+  public configuration (DCKT-25).
 
 - `Docket.Postgres.Pruner`: explicit, periodically supervised retention with
   bounded event and terminal-run batches, transaction-scoped per-schema
