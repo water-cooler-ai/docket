@@ -21,3 +21,4 @@ docket-*.tar
 
 # Local Claude workspace state and worktrees.
 /.claude/
+results/
