@@ -48,10 +48,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           )
 
         try do
+          attempt_budget = blocked_attempt_budget(config)
+
           runtime_opts =
             runtime_opts(config,
               context: %{blocking_benchmark: %{gate: gate.pid, token: gate.token}},
-              executor: Docket.Executor.Task
+              executor: Docket.Executor.Task,
+              vehicle: attempt_budget
             )
 
           runtime = start_runtime!(runtime_opts, collector)
@@ -177,7 +180,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  poll_interval_ms: config.poll_interval_ms,
                  orphan_ttl_ms: config.orphan_ttl_ms,
                  max_claim_attempts: 5,
-                 drain_budget: %{max_moments: 100, max_elapsed_ms: 1_000},
+                 max_attempt_elapsed_ms: attempt_budget[:max_attempt_elapsed_ms],
+                 drain_budget: %{
+                   max_moments: 100,
+                   max_elapsed_ms: attempt_budget[:drain_budget][:max_elapsed_ms]
+                 },
                  heartbeat: "disabled",
                  node_executor: "Docket.Executor.Task",
                  staged_activation_target_lead_ms: 1_000,

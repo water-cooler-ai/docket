@@ -268,7 +268,8 @@ defmodule Docket.Benchmark do
   defp scenario_options(%{scenario: "mixed_service_times"} = config) do
     with :ok <- positive(config.hold_ms, "hold-ms"),
          :ok <- at_least(config.runs, 2, "runs"),
-         :ok <- percentage(config.slow_percent, "slow-percent") do
+         :ok <- percentage(config.slow_percent, "slow-percent"),
+         :ok <- blocking_hold_below_ttl(config) do
       if config.warmup == 0,
         do: :ok,
         else: {:error, "mixed_service_times does not support warmup runs; use repetitions"}
@@ -277,7 +278,8 @@ defmodule Docket.Benchmark do
 
   defp scenario_options(%{scenario: "parked_wait_vs_blocking_wait"} = config) do
     with :ok <- positive(config.hold_ms, "hold-ms"),
-         :ok <- at_least(config.runs, 2, "runs") do
+         :ok <- at_least(config.runs, 2, "runs"),
+         :ok <- blocking_hold_below_ttl(config) do
       if config.warmup == 0,
         do: :ok,
         else:
@@ -361,6 +363,14 @@ defmodule Docket.Benchmark do
       :ok
     else
       {:error, "blocked_vehicles hold-ms must be at most half of orphan-ttl-ms"}
+    end
+  end
+
+  defp blocking_hold_below_ttl(config) do
+    if config.hold_ms < config.orphan_ttl_ms - 1 do
+      :ok
+    else
+      {:error, "blocking hold-ms must leave deadline headroom below orphan-ttl-ms"}
     end
   end
 

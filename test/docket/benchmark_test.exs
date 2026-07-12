@@ -184,6 +184,12 @@ defmodule Docket.BenchmarkTest do
 
       assert config.hold_ms == 75
       assert config.warmup == 0
+
+      if Code.ensure_loaded?(Docket.Benchmark.Postgres) do
+        budget = apply(Docket.Benchmark.Postgres, :comparative_attempt_budget, [config])
+        assert budget[:max_attempt_elapsed_ms] == 2_000
+        assert budget[:drain_budget][:max_elapsed_ms] == 2_000
+      end
     end
 
     assert {:ok, config} =
@@ -202,6 +208,13 @@ defmodule Docket.BenchmarkTest do
              )
 
     assert warmup =~ "does not support warmup"
+
+    assert {:error, deadline} =
+             Docket.Benchmark.parse(
+               ~w(--scenario mixed_service_times --runs 10 --hold-ms 1000 --orphan-ttl-ms 1001)
+             )
+
+    assert deadline =~ "deadline headroom"
   end
 
   test "normalizes bounded steady-arrival options" do

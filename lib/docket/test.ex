@@ -231,7 +231,11 @@ defmodule Docket.Test do
   end
 
   defp ensure_compiled(graph_or_runtime_graph, opts) do
-    Docket.ensure_compiled(graph_or_runtime_graph, opts)
+    with {:ok, rtg} <- Docket.ensure_compiled(graph_or_runtime_graph, opts),
+         config = Config.resolve(opts),
+         :ok <- Docket.Runtime.ExecutionPolicy.validate_graph(rtg, config.max_attempt_elapsed_ms) do
+      {:ok, rtg}
+    end
   end
 
   defp graph_from_opts(opts) do

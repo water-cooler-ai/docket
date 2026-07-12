@@ -79,7 +79,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         |> Map.put(:expected_ready_claim_samples, expected_claims)
         |> Map.put(:flexible_checkpoint_shapes, kind != :mixed_service_times)
 
-      runtime = start_runtime!(runtime_opts(config, executor: Docket.Executor.Task), collector)
+      extra = [executor: Docket.Executor.Task]
+
+      extra =
+        if kind in [:mixed_service_times, :parked_wait_vs_blocking_wait],
+          do: Keyword.put(extra, :vehicle, comparative_attempt_budget(config)),
+          else: extra
+
+      runtime = start_runtime!(runtime_opts(config, extra), collector)
 
       try do
         runtime_ready_lead_us = ensure_activation_lead!(t0, @minimum_runtime_ready_lead_ms)

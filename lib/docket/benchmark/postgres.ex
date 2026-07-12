@@ -1072,6 +1072,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @doc false
+    def blocked_attempt_budget(config) do
+      maximum =
+        min(
+          config.orphan_ttl_ms - 1,
+          max(2_000, config.hold_ms + config.timeout_ms)
+        )
+
+      [
+        max_attempt_elapsed_ms: maximum,
+        drain_budget: [max_moments: 100, max_elapsed_ms: maximum]
+      ]
+    end
+
+    @doc false
+    def comparative_attempt_budget(config) do
+      maximum = min(config.orphan_ttl_ms - 1, max(2_000, config.hold_ms + 1_000))
+
+      [
+        max_attempt_elapsed_ms: maximum,
+        drain_budget: [max_moments: 100, max_elapsed_ms: maximum]
+      ]
+    end
+
+    @doc false
     def seed_runs(ref, count) do
       Enum.map(1..count, fn _ ->
         {:ok, run} = Docket.start_run(@runtime, ref, %{})

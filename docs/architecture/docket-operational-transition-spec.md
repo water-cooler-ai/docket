@@ -130,20 +130,13 @@ execution guarantee. If a worker pauses long enough for its claim to expire,
 another worker may execute the same graph work. Only the transaction holding
 the current token and expected checkpoint sequence can win the durable commit.
 
-Claim freshness during execution has two sanctioned strategies. By default
-the commits themselves are the heartbeat: every `:retain_claim` commit
-refreshes the claimed time, so the deployment must keep each between-commit
-stretch of node execution shorter than the orphan TTL (strict timeout
-alignment). Deployments whose nodes legitimately block longer than that
-opt into a token-guarded heartbeat per vehicle: a companion process
-refreshes the claim under the exact current token on a fixed interval while
-node work runs, and a heartbeat that finds its token stale tells the
-vehicle to stop accepting the superstep's result at the next commit
-boundary. The heartbeat narrows the steal window for slow-but-alive
-holders; it never substitutes for the commit fence, and refreshes never
-move the claimed time backward. A heartbeat interval that cannot fit the
-lease's TTL is a deployment misconfiguration and takes the pre-execution
-abandon disposition below. Work that an external system owns end-to-end
+Every `:retain_claim` commit refreshes claimed time. Between commits, finite
+runtime-owned node attempt deadlines bound executor callback residency and
+the cooperative drain budget stops new moments at its boundary. The drain
+limit must leave operational headroom below orphan TTL for termination,
+moment construction, database checkout, commit, and release. Vehicles never
+refresh claims while node work runs; the token/sequence fence remains the
+sole commit authority after crash recovery or steal. Work that an external system owns end-to-end
 should not hold a claim at all — it parks as an external wait and resumes
 through the signal path.
 
