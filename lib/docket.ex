@@ -181,6 +181,31 @@ defmodule Docket do
   end
 
   @doc """
+  Reads a page of retained durable events for a run.
+
+  Events come back in ascending sequence order, restricted to sequences
+  greater than `:after_seq` (default `0`) and limited by `:limit` (default
+  `250`, an integer in `1..1000`). Sequence gaps from persistence filtering
+  and retention pruning are normal, so pages are not promised contiguous. The
+  returned `Docket.EventPage` carries the retention bounds and the run's latest
+  committed event sequence observed from the same snapshot.
+
+  Invalid options return `{:error, %Docket.Error{type: :invalid_options}}`
+  without reaching storage. A wrong tenant and an unknown run both return
+  `{:error, :not_found}`.
+
+      {:ok, page} = MyApp.Docket.list_events("run-123", after_seq: 10, limit: 50)
+      page.events
+  """
+  def list_events(runtime, run_id, opts \\ []) do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, page_opts} <- list_events_options(opts),
+         {:ok, {backend, context}, scope} <- durable_access(opts) do
+      backend.events().list_events(context, scope, run_id, page_opts)
+    end
+  end
+
+  @doc """
   Polls durable operational state until waiting, terminal, poisoned, or timeout.
 
   `:timeout` is required and expressed in milliseconds. `:poll_interval`
@@ -242,6 +267,7 @@ defmodule Docket do
 
       def fetch_run(run_id, opts \\ []), do: Docket.fetch_run(__MODULE__, run_id, opts)
       def inspect_run(run_id, opts \\ []), do: Docket.inspect_run(__MODULE__, run_id, opts)
+      def list_events(run_id, opts \\ []), do: Docket.list_events(__MODULE__, run_id, opts)
       def await_run(run_id, opts \\ []), do: Docket.await_run(__MODULE__, run_id, opts)
       def drain_runs(opts \\ []), do: Docket.drain_runs(__MODULE__, opts)
     end
@@ -379,6 +405,23 @@ defmodule Docket do
   end
 
   defp invalid_tenant(message), do: {:error, Error.new(:invalid_tenant, message)}
+
+  defp list_events_options(opts) do
+    after_seq = Keyword.get(opts, :after_seq, 0)
+    limit = Keyword.get(opts, :limit, 250)
+
+    cond do
+      not (is_integer(after_seq) and after_seq >= 0) ->
+        {:error,
+         Error.new(:invalid_options, "list_events :after_seq must be a non-negative integer")}
+
+      not (is_integer(limit) and limit in 1..1000) ->
+        {:error, Error.new(:invalid_options, "list_events :limit must be an integer in 1..1000")}
+
+      true ->
+        {:ok, %{after_seq: after_seq, limit: limit}}
+    end
+  end
 
   defp durable_resolve_interrupt(opts, run_id, interrupt_id, value) do
     with {:ok, {backend, context} = backend_ref, scope} <- durable_access(opts),

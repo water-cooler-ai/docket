@@ -607,7 +607,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc false
     @spec claim_statement(String.t() | nil) :: String.t()
     def claim_statement(prefix \\ nil) do
-      table = qualified_table(prefix)
+      table = Storage.qualified_table(prefix, "docket_runs")
 
       """
       WITH ready_candidates AS MATERIALIZED (
@@ -1261,13 +1261,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       datetime
       |> DateTime.to_unix(:microsecond)
       |> DateTime.from_unix!(:microsecond)
-    end
-
-    defp qualified_table(nil), do: ~s("docket_runs")
-
-    defp qualified_table(prefix) do
-      quoted_prefix = String.replace(prefix, ~s("), ~s(""))
-      ~s("#{quoted_prefix}"."docket_runs")
     end
   end
 end

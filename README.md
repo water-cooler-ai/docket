@@ -121,6 +121,31 @@ graph =
   |> Docket.Graph.put_output!("result", [])
 ```
 
+An authored graph is a plain document, so it round-trips through any JSON codec
+for storage in an editor or transmission over the wire. Executable node
+implementations map through an explicit host registry of stable string
+identifiers, so decoding never creates atoms from the document:
+
+```elixir
+registry = %{"myapp.shout" => MyApp.Nodes.Shout}
+
+json =
+  graph
+  |> Docket.Graph.to_map(implementations: registry)
+  |> Jason.encode!()
+
+{:ok, graph} =
+  json
+  |> Jason.decode!()
+  |> Docket.Graph.from_map(implementations: registry)
+```
+
+This is the editable *authored* graph; it carries no `GraphRef` hash. Only
+`save_graph` materializes node defaults and hashes the *effective* graph into a
+content-addressed reference, so re-saving after a node's defaults change may
+produce a different effective reference even when the authored document is
+unchanged. Docket takes no JSON dependency — the host owns encode/decode.
+
 Before publishing, the same graph can run processlessly in a unit test:
 
 ```elixir
@@ -157,6 +182,26 @@ finished.output #=> %{"result" => "HELLO WORLD"}
 advancement is asynchronous. `await_run` is a bounded convenience for callers
 that need to wait until a run pauses or terminates. Use `fetch_run` for the last
 committed graph state and `inspect_run` for scheduling and poison health.
+
+To read a run's history, page its retained events in ascending sequence order:
+
+```elixir
+{:ok, page} = MyApp.DurableDocket.list_events(run.id, after_seq: 0, limit: 250)
+
+page.events            # this page, ascending by sequence
+page.next_after_seq    # cursor for the next page
+page.has_more?         # whether more retained events follow
+```
+
+Pass `tenant_id:` under `tenant_mode: :required`; a wrong tenant and an unknown
+run both return `{:error, :not_found}`. This is the delivery-safe way to repair
+observer gaps: `checkpoint_observers:` run best-effort after commit and may drop
+or duplicate, but the reader replays exactly what durably committed. Sequence
+gaps are normal — persistence filtering and retention pruning both leave holes,
+so pages are never contiguous. `oldest_available_seq`/`latest_available_seq`
+report the retained window, while `latest_seq` is the run's latest committed
+event sequence regardless of retention, so a fully pruned history is detectable
+as `latest_seq > 0` with `latest_available_seq == nil`.
 
 For multi-tenant applications, configure `tenant_mode: :required` and pass a
 non-empty `tenant_id` to every run, read, and signal call. See the

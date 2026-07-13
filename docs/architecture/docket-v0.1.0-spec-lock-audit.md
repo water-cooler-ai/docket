@@ -147,3 +147,60 @@ and the deliberate DCKT-37 removal of the transitional legacy facade.
   coverage against PostgreSQL.
 - Repository inspection confirms that every PostgreSQL module is conditionally
   compiled behind optional `ecto_sql` and `postgrex` dependencies.
+
+## DCKT-43 lock reopening (2026-07-12)
+
+The DCKT-1 spec lock reopens narrowly to add two public read/interchange
+surfaces. Nothing in the durable data model, transaction boundaries, claim
+fencing, or persistence codecs changes; ETF persistence is unchanged.
+
+### Retained-event reader contract
+
+`Docket.list_events/3` (and the generated `list_events/2` host wrapper) reads a
+tenant-scoped, keyset page of retained durable events for a run, backed by the
+new `Docket.Storage.Events.list_events/4` backend callback with memory and
+Postgres implementations. The final contract:
+
+- Events return in ascending sequence order, restricted to sequences greater
+  than `:after_seq` (default `0`) and bounded by `:limit` (default `250`, an
+  integer in `1..1000`). Invalid options are rejected before storage; a wrong
+  tenant and an unknown run both report `{:error, :not_found}`.
+- Sequence gaps are legal. Persistence filtering and retention pruning both
+  leave holes, so pages and retention bounds are never promised contiguous.
+- An undecodable stored row is a typed `%Docket.Error{type: :corrupt_event_row}`
+  and is never silently skipped.
+- The result is a `Docket.EventPage`: `events`, `next_after_seq`, `has_more?`,
+  `oldest_available_seq`, `latest_available_seq`, and `latest_seq` — the owning
+  run's latest committed event sequence, present even when history is fully
+  pruned, so a fully pruned history is detectable as `latest_seq > 0` with
+  `latest_available_seq == nil`. The Postgres reader gathers the page rows,
+  MIN/MAX retention bounds, and run state in one SQL statement so every field
+  reflects one consistent snapshot.
+
+This is the delivery-safe path for observers: `checkpoint_observers:` are
+best-effort and may drop or duplicate, while the reader replays exactly what
+durably committed.
+
+### Authored graph interchange contract
+
+`Docket.Graph.to_map/2`, `from_map/2`, and `from_map!/2` (through the strict
+`Docket.Graph.Serializer`) return, and validate, a JSON-safe, string-keyed map
+with an explicit `schema_version: 1`. The final contract:
+
+- Strict validation rejects unknown structural keys, unknown enum values,
+  malformed tagged expressions, unsupported versions, and non-portable values;
+  `$`-prefixed keys are reserved for tagged expressions.
+- Executable node implementations resolve only through an explicit host
+  `implementations:` registry of stable string identifiers, validated eagerly
+  for unambiguous reverse mapping. Loading never creates or reaches
+  implementation atoms. Failures are typed `Docket.Graph.Error` codes
+  `:invalid_registry`, `:unregistered_implementation`, and
+  `:unknown_implementation`.
+- This is the editable AUTHORED graph document. It carries no `Docket.GraphRef`
+  hash; `save_graph` still materializes node defaults and privately encodes and
+  hashes the effective graph, so re-saving after defaults change may yield a
+  different effective reference.
+
+Non-goals held firm: no public `Docket.Run` map codec, no public
+`Docket.Graph.hash`, no Jason dependency (hosts own JSON encode/decode), and no
+change to the private ETF persistence codec.

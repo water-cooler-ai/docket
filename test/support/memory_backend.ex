@@ -344,7 +344,8 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  def list_events(backend, scope, run_id, after_seq, limit) do
+  @impl Docket.Storage.Events
+  def list_events(backend, scope, run_id, %{after_seq: after_seq, limit: limit}) do
     validate_scope!(scope)
 
     unless is_integer(after_seq) and after_seq >= 0 and is_integer(limit) and limit > 0 do
@@ -353,16 +354,28 @@ defmodule Docket.Test.MemoryBackend do
 
     state_get(backend, fn state ->
       with {:ok, record} <- fetch_scoped_record(state, scope, run_id) do
-        events =
-          record.events
-          |> Enum.filter(fn {seq, _event} -> seq > after_seq end)
-          |> Enum.sort_by(&elem(&1, 0))
-          |> Enum.take(limit)
-          |> Enum.map(&elem(&1, 1))
-
-        {:ok, events}
+        {:ok, build_event_page(record, after_seq, limit)}
       end
     end)
+  end
+
+  defp build_event_page(record, after_seq, limit) do
+    seqs = Map.keys(record.events)
+
+    {oldest, latest} =
+      case seqs do
+        [] -> {nil, nil}
+        _ -> {Enum.min(seqs), Enum.max(seqs)}
+      end
+
+    events =
+      record.events
+      |> Enum.filter(fn {seq, _event} -> seq > after_seq end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.take(limit)
+      |> Enum.map(&elem(&1, 1))
+
+    Docket.EventPage.new(events, after_seq, oldest, latest, record.run.event_seq)
   end
 
   # Conformance-test inspection helpers. These deliberately bypass public
@@ -376,8 +389,8 @@ defmodule Docket.Test.MemoryBackend do
   end
 
   def events(backend, scope, run_id) do
-    case list_events(backend, scope, run_id, 0, 1_000_000) do
-      {:ok, events} -> events
+    case list_events(backend, scope, run_id, %{after_seq: 0, limit: 1_000_000}) do
+      {:ok, %Docket.EventPage{events: events}} -> events
       {:error, :not_found} -> nil
     end
   end

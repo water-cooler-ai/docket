@@ -20,7 +20,8 @@ when you want to understand *why* the contracts are shaped the way they are.
    - A historical pre-cutover audit retained to explain the final sequencing.
 4. `docket-graph-construction-design.md`
    - The public `Docket.Graph` editing API, ID rules, publication boundary,
-     and private effective-graph identity contract.
+     private effective-graph identity contract, and the rationale for the
+     authored map interchange (`to_map`/`from_map`).
 5. `docket-compiler-design.md`
    - Compiler verification, diagnostics, and lowering from the public graph
      to the internal runtime graph.
@@ -61,6 +62,12 @@ Durable public documents:
   groups live on source nodes.
 - `Docket.Run`: the durable execution state document encoded by the backend's
   run store and returned through committed reads.
+
+Public read projection:
+
+- `Docket.EventPage`: a keyset page of a run's retained events, returned by the
+  tenant-scoped `Docket.list_events/3` reader alongside the retention bounds and
+  the run's latest committed event sequence from one snapshot.
 
 Derived internal runtime values:
 
