@@ -410,15 +410,47 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       start_supervised!(TenantHost)
 
       assert {:ok, reference} = PollHost.save_graph(Graphs.minimal_linear())
+      assert {:ok, %Docket.Graph{}} = PollHost.fetch_graph(reference)
+
+      assert {:error, %Docket.Error{type: :invalid_tenant}} = TenantHost.fetch_graph(reference)
+      assert {:error, :not_found} = TenantHost.fetch_graph(reference, tenant_id: "a")
+
       assert {:ok, tenantless} = PollHost.start_run(reference, %{"value" => "none"})
 
       assert {:error, :not_found} = TenantHost.fetch_run(tenantless.id, tenant_id: "a")
+
+      assert {:error, :not_found} =
+               TenantHost.start_run(reference, %{"value" => "a"}, tenant_id: "a")
+
+      assert {:ok, ^reference} =
+               TenantHost.save_graph(Graphs.minimal_linear(), tenant_id: "a")
 
       assert {:ok, tenant_a} =
                TenantHost.start_run(reference, %{"value" => "a"}, tenant_id: "a")
 
       assert {:error, :not_found} = TenantHost.fetch_run(tenant_a.id, tenant_id: "b")
       assert {:error, :not_found} = PollHost.fetch_run(tenant_a.id)
+
+      assert {:ok, tenantless_page} = PollHost.list_runs()
+      assert Enum.any?(tenantless_page.runs, &(&1.id == tenantless.id))
+      refute Enum.any?(tenantless_page.runs, &(&1.id == tenant_a.id))
+
+      assert {:ok, tenant_page} = TenantHost.list_runs(tenant_id: "a")
+      assert Enum.map(tenant_page.runs, & &1.id) == [tenant_a.id]
+
+      assert {:ok, %Docket.RunSummary{id: tenant_a_id}} =
+               TenantHost.fetch_latest_run(tenant_id: "a")
+
+      assert tenant_a_id == tenant_a.id
+      assert {:ok, %Docket.RunPage{runs: []}} = TenantHost.list_runs(tenant_id: "b")
+
+      assert {:ok, %Docket.Event{seq: 1}} = TenantHost.fetch_event(tenant_a.id, 1, tenant_id: "a")
+
+      assert {:ok, %Docket.Event{}} =
+               TenantHost.fetch_latest_event(tenant_a.id, tenant_id: "a")
+
+      assert {:error, :not_found} =
+               TenantHost.fetch_latest_event(tenant_a.id, tenant_id: "b")
 
       assert {:error, %Docket.Error{type: :invalid_tenant}} =
                TenantHost.fetch_run(tenant_a.id,
@@ -491,7 +523,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    test "revision-8 storage remains exactly the version-one three-table schema" do
+    test "storage remains exactly the current three-table schema" do
       tables =
         TestRepo.query!(
           "SELECT table_name FROM information_schema.tables " <>

@@ -22,7 +22,7 @@ defmodule Docket.Storage do
   @typedoc "Authorization and tenancy scope for a run or its events."
   @type scope :: :system | :tenantless | {:tenant, String.t()}
 
-  @typedoc "Scope that also determines the tenant stored on a newly inserted run."
+  @typedoc "Scope that determines graph/run ownership; tenant identifiers are non-empty."
   @type owner_scope :: :tenantless | {:tenant, String.t()}
 
   @type transaction_result :: {:ok, term()} | {:error, term()}

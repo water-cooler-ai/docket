@@ -23,6 +23,24 @@ defmodule Docket.Storage.Runs do
   @type claim_token :: nonempty_binary()
   @type checkpoint_type :: atom()
 
+  @typedoc "Stable newest-first run-list cursor: `{started_at, run_id}`."
+  @type list_cursor :: Docket.RunPage.cursor()
+
+  @typedoc """
+  Trusted, normalized filters for one run collection read.
+
+  Public callers are normalized into this shape before reaching storage.
+  `before` is exclusive, and `statuses` is either `nil` or a non-empty list
+  containing only durable run statuses.
+  """
+  @type list_query :: %{
+          required(:limit) => pos_integer(),
+          required(:before) => list_cursor() | nil,
+          required(:graph_id) => String.t() | nil,
+          required(:graph_hash) => String.t() | nil,
+          required(:statuses) => [Docket.Run.durable_status()] | nil
+        }
+
   @typedoc """
   Storage effect applied with a committed run transition.
 
@@ -63,6 +81,7 @@ defmodule Docket.Storage.Runs do
   """
   @type claim_lease :: %{
           required(:run_id) => String.t(),
+          required(:owner_scope) => owner_scope(),
           required(:graph_id) => String.t(),
           required(:graph_hash) => String.t(),
           required(:checkpoint_seq) => non_neg_integer(),
@@ -162,6 +181,23 @@ defmodule Docket.Storage.Runs do
   """
   @callback fetch_run(ctx(), scope(), run_id :: String.t()) ::
               {:ok, Docket.Run.t()} | {:error, :not_found}
+
+  @doc """
+  Lists lightweight run summaries under an explicit scope.
+
+  Results are ordered newest first by immutable `(started_at, run_id)` and
+  use an exclusive keyset cursor. Scope and every requested filter must be
+  enforced by the backing query; implementations must not load out-of-scope
+  rows and filter them in application memory. The full durable run state is
+  deliberately absent from `Docket.RunSummary` and must not be decoded for a
+  collection read.
+
+  No matching rows is successful and returns an empty `Docket.RunPage` whose
+  `next_before` preserves the supplied cursor and whose `has_more?` is false.
+  Page construction trusts implementations to uphold ordering and cursor
+  exclusivity rather than scanning backend output again.
+  """
+  @callback list_runs(ctx(), scope(), list_query()) :: {:ok, Docket.RunPage.t()}
 
   @doc """
   Reads the committed run with substrate-neutral operational information.

@@ -65,6 +65,12 @@ Durable public documents:
 
 Public read projection:
 
+- `Docket.GraphVersion` and `Docket.GraphVersionPage`: lightweight,
+  tenant-scoped metadata for retained graph versions and their stable
+  newest-first keyset page. Exact documents are read separately with a
+  `Docket.GraphRef`.
+- `Docket.RunSummary` and `Docket.RunPage`: lightweight, tenant-scoped run
+  collection rows and their stable newest-first keyset page.
 - `Docket.EventPage`: a keyset page of a run's retained events, returned by the
   tenant-scoped `Docket.list_events/3` reader alongside the retention bounds and
   the run's latest committed event sequence from one snapshot.

@@ -69,6 +69,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert GraphCache.fetch("minimal-linear", "hash-1") == {:incompatible, :schema_mismatch}
     end
 
+    test "owner-scoped negative entries cannot poison another tenant" do
+      graph = Graphs.minimal_linear()
+      tenant_a = [cache_scope: {TestRepo, nil, {:tenant, "a"}}]
+      tenant_b = [cache_scope: {TestRepo, nil, {:tenant, "b"}}]
+
+      assert :ok =
+               GraphCache.put_incompatible(
+                 "minimal-linear",
+                 "hash-1",
+                 graph,
+                 :corrupt_graph,
+                 tenant_a
+               )
+
+      assert GraphCache.fetch("minimal-linear", "hash-1", tenant_a) ==
+               {:incompatible, :corrupt_graph}
+
+      assert GraphCache.fetch("minimal-linear", "hash-1", tenant_b) == :miss
+    end
+
     test "an undecodable entry expires after its TTL" do
       assert :ok =
                GraphCache.put_incompatible("garbled", "hash-1", :undecodable, :corrupt_graph,

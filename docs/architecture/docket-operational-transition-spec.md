@@ -38,13 +38,15 @@ coordination layer and the run itself is the scheduled unit.
 
 ## Tables
 
-Schema version 1 installs three tables.
+Schema version 1 installs three tables with graph versions and their run
+references scoped to an explicit tenant owner.
 
 ### `docket_graph_versions`
 
-Published graphs are immutable and content addressed by `{graph_id,
-graph_hash}`. Publication materializes node configuration defaults before
-hashing and stores the effective graph as deterministic, versioned ETF.
+Published graphs are immutable and content addressed within an owner scope by
+`{scope_key, graph_id, graph_hash}`. Publication materializes node
+configuration defaults before hashing and stores the effective graph as
+deterministic, versioned ETF.
 
 A run always references the exact graph version it started from. The composite
 foreign key uses `ON DELETE RESTRICT`, so a retained run cannot lose its graph.
@@ -82,9 +84,9 @@ run-retention period.
 
 The same bounded pass deletes only terminal runs older than the configured run
 retention. It then removes unreferenced graph versions older than the newest ten
-publications for each graph ID. Graph publication order is `inserted_at`, with
-the immutable row ID breaking ties. Any referencing run protects its exact
-graph version regardless of age.
+publications for each owner scope and graph ID. Graph publication order is the
+database-authored `inserted_at`, with graph hash breaking ties. Any referencing
+run protects its exact scoped graph version regardless of age.
 
 ## Publication and start
 
@@ -97,7 +99,7 @@ Graph publication and run creation are separate boundaries:
 
 This example uses the default `tenant_mode: :none`. With
 `tenant_mode: :required`, pass the same non-empty binary `tenant_id` to
-`start_run` and every subsequent read or signal.
+`save_graph`, `start_run`, and every graph/run/event read or signal.
 
 `save_graph/2` validates the graph, snapshots schema defaults, computes its
 private hash, and stores the immutable effective document. Concurrent saves of

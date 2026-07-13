@@ -222,7 +222,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     # ---------------------------------------------------------------------
 
     defp claimed_run(%{lease: lease} = state) do
-      case state.runs.fetch_run(state.context, :system, lease.run_id) do
+      case state.runs.fetch_run(state.context, lease.owner_scope, lease.run_id) do
         {:ok, %Run{checkpoint_seq: seq}} when seq != lease.checkpoint_seq ->
           emit_fence_loss(:pre_fetch, :stale_fence)
           :fence_lost
@@ -260,7 +260,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp fetch_and_compile(%{lease: lease} = state) do
       result =
         Docket.Telemetry.span([:docket, :postgres, :graph, :fetch], %{}, fn ->
-          result = state.graphs.fetch_graph(state.context, lease.graph_id, lease.graph_hash)
+          result =
+            state.graphs.fetch_graph(
+              state.context,
+              lease.owner_scope,
+              lease.graph_id,
+              lease.graph_hash
+            )
+
           {result, %{result: Docket.Telemetry.result_kind(result)}}
         end)
 
@@ -355,7 +362,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       case Lifecycle.commit_moment(
              state.backend_ref,
-             :system,
+             state.lease.owner_scope,
              moment,
              run.checkpoint_seq,
              state.lease.claim_token
@@ -640,7 +647,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp cache_fetch(%{graph_cache: false}), do: :miss
 
     defp cache_fetch(%{lease: lease} = state),
-      do: state.graph_cache.fetch(lease.graph_id, lease.graph_hash, state.graph_cache_opts)
+      do: state.graph_cache.fetch(lease.graph_id, lease.graph_hash, scoped_cache_opts(state))
 
     defp cache_put_compiled(%{graph_cache: false}, _rtg), do: :ok
 
@@ -650,7 +657,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           lease.graph_id,
           lease.graph_hash,
           rtg,
-          state.graph_cache_opts
+          scoped_cache_opts(state)
         )
     end
 
@@ -663,8 +670,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           lease.graph_hash,
           source,
           reason,
-          state.graph_cache_opts
+          scoped_cache_opts(state)
         )
+    end
+
+    defp scoped_cache_opts(%{lease: lease} = state) do
+      {repo, prefix} = Docket.Postgres.Storage.context!(state.context)
+
+      Keyword.put(
+        state.graph_cache_opts,
+        :cache_scope,
+        {repo, prefix, lease.owner_scope}
+      )
     end
   end
 end

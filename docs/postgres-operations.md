@@ -221,8 +221,9 @@ graph =
 ```
 
 With `tenant_mode: :required`, add the same authorized non-empty binary
-`tenant_id` to `start_run`, both `await_run` calls, and `resolve_interrupt`.
-Cancellation follows the same serialized signal path:
+`tenant_id` to `save_graph`, `fetch_graph`, graph-version listing/latest reads,
+`start_run`, both `await_run` calls, and `resolve_interrupt`. Cancellation
+follows the same serialized signal path:
 
 ```elixir
 {:ok, %Docket.Run{status: :cancelled}} =
@@ -335,6 +336,14 @@ health. Use telemetry for dispatcher backlog/claim activity, vehicle outcomes,
 observer failures, notifier health, and pruning passes. Database tables and
 opaque binary columns are backend implementation details rather than an
 application query API.
+
+For application-facing discovery, use `list_runs` with the same tenant scope
+as every other run read. It returns indexed summary columns rather than opaque
+run state, ordered newest first by `(started_at, run_id)`, and supports status
+and graph filters. Use `fetch_run` or `inspect_run` only after selecting a run
+that needs its full committed or operational state. `fetch_event` and
+`fetch_latest_event` provide scoped retained-event point reads; latest may be
+`nil` after complete event pruning.
 
 If an operator must inspect tables directly during an incident, use a trusted
 database role, honor the configured schema prefix, and avoid decoding the

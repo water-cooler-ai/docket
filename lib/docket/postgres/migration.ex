@@ -39,7 +39,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     ## Tables
 
     Version 1 installs `docket_graph_versions`, `docket_runs`, and
-    `docket_events`.
+    `docket_events`, including tenant-scoped graph identity.
 
     The migrated version is recorded as a `COMMENT` on the `docket_runs`
     table, so `up/1` and `down/1` are idempotent and only apply the steps

@@ -35,7 +35,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @tables ~w(docket_events docket_graph_versions docket_runs)
 
     @run_columns ~w(
-      id run_id tenant_id graph_id graph_hash status step state
+      id run_id tenant_id scope_key graph_id graph_hash status step state
       checkpoint_seq latest_checkpoint_type claim_token
       claimed_at wake_at claim_attempts claim_abandons poisoned_at poison_reason
       inserted_at started_at updated_at finished_at
@@ -49,7 +49,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :ok
     end
 
-    test "migrates up, down, and back up cleanly on a fresh Postgres" do
+    test "V01 installs, removes, and reinstalls the final schema on a fresh Postgres" do
       install!()
 
       assert tables("public") == @tables
@@ -57,6 +57,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert columns("docket_runs") == Enum.sort(@run_columns)
 
       assert column_type("docket_graph_versions", "graph") == "bytea"
+      assert column_default("docket_graph_versions", "inserted_at") =~ "clock_timestamp()"
 
       assert column_type("docket_runs", "state") == "bytea"
 
@@ -65,11 +66,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert column_type("docket_events", "metadata") == "bytea"
 
       assert nullable?("docket_runs", "tenant_id")
+      refute nullable?("docket_runs", "scope_key")
+      assert nullable?("docket_graph_versions", "tenant_id")
+      refute nullable?("docket_graph_versions", "scope_key")
       refute nullable?("docket_runs", "started_at")
 
       indexes = indexes("docket_runs")
 
       assert indexes["docket_runs_run_id_index"] =~ "CREATE UNIQUE INDEX"
+
+      assert indexes["docket_runs_list_order_index"] =~
+               "(started_at DESC, run_id DESC)"
+
+      assert indexes["docket_runs_tenant_list_order_index"] =~
+               "(tenant_id, started_at DESC, run_id DESC)"
 
       assert indexes["docket_runs_tenant_id_status_index"] =~
                "WHERE (tenant_id IS NOT NULL)"
@@ -102,13 +112,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert indexes["docket_runs_graph_id_graph_hash_index"] =~ "(graph_id, graph_hash)"
 
-      assert indexes("docket_graph_versions")["docket_graph_versions_graph_id_graph_hash_index"] =~
+      graph_indexes = indexes("docket_graph_versions")
+
+      assert graph_indexes["docket_graph_versions_scope_graph_index"] =~
                "CREATE UNIQUE INDEX"
 
       revision_order =
-        indexes("docket_graph_versions")["docket_graph_versions_revision_order_index"]
+        graph_indexes["docket_graph_versions_scope_revision_order_index"]
 
-      assert revision_order =~ "(graph_id, inserted_at DESC, id DESC)"
+      assert revision_order =~ "(scope_key, graph_id, inserted_at DESC, graph_hash DESC)"
+      refute Map.has_key?(graph_indexes, "docket_graph_versions_graph_id_graph_hash_index")
+      refute Map.has_key?(graph_indexes, "docket_graph_versions_revision_order_index")
 
       assert indexes("docket_events")["docket_events_run_id_seq_index"] =~
                "CREATE UNIQUE INDEX"
@@ -284,7 +298,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:error, %Postgrex.Error{postgres: %{code: :foreign_key_violation} = pg}} =
                insert_run(graph_hash: "unpublished")
 
-      assert pg.constraint == "docket_runs_graph_hash_fkey"
+      assert pg.constraint == "docket_runs_graph_scope_fkey"
 
       assert {:ok, _} = insert_run([])
 
@@ -323,6 +337,46 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                TestRepo.query!("SELECT count(*) FROM docket_events WHERE run_id = $1", [run_id])
     end
 
+    test "scoped graph identity binds tenantless and tenant-owned runs without NULL holes" do
+      install!()
+
+      assert {:ok, %{rows: [[tenantless_run]]}} = insert_run([])
+      assert {:ok, %{rows: [[tenant_run]]}} = insert_run(tenant_id: "acme")
+
+      assert %{rows: [["", nil]]} =
+               TestRepo.query!(
+                 "SELECT scope_key, tenant_id FROM docket_runs WHERE run_id = $1",
+                 [tenantless_run]
+               )
+
+      assert %{rows: [["acme", "acme"]]} =
+               TestRepo.query!(
+                 "SELECT scope_key, tenant_id FROM docket_runs WHERE run_id = $1",
+                 [tenant_run]
+               )
+
+      assert {:error, %Postgrex.Error{postgres: %{code: :foreign_key_violation} = pg}} =
+               TestRepo.query(
+                 "UPDATE docket_runs SET tenant_id = 'other' WHERE run_id = $1",
+                 [tenant_run]
+               )
+
+      assert pg.constraint == "docket_runs_graph_scope_fkey"
+
+      for table <- ["docket_graph_versions", "docket_runs"] do
+        assert {:error, %Postgrex.Error{postgres: %{code: :check_violation} = pg}} =
+                 TestRepo.query(
+                   "UPDATE #{table} SET tenant_id = '' WHERE tenant_id IS NULL",
+                   []
+                 )
+
+        assert pg.constraint in [
+                 "docket_graph_versions_tenant_id_check",
+                 "docket_runs_tenant_id_check"
+               ]
+      end
+    end
+
     test "dispatch and poison-introspection scans use their partial indexes" do
       install!()
 
@@ -351,6 +405,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert explain(ready_scan) =~ "docket_runs_wake_at_id_index"
       assert explain(expired_scan) =~ "docket_runs_claimed_at_id_index"
       assert explain(poison_scan) =~ "docket_runs_poisoned_at_index"
+    end
+
+    test "newest-first run collection scans use stable listing indexes" do
+      install!()
+
+      system_scan = """
+      SELECT run_id, started_at FROM docket_runs
+      ORDER BY started_at DESC, run_id DESC
+      LIMIT 10
+      """
+
+      tenant_scan = """
+      SELECT run_id, started_at FROM docket_runs
+      WHERE tenant_id = 'tenant-1'
+      ORDER BY started_at DESC, run_id DESC
+      LIMIT 10
+      """
+
+      assert explain(system_scan) =~ "docket_runs_list_order_index"
+      assert explain(tenant_scan) =~ "docket_runs_tenant_list_order_index"
     end
 
     defp install! do
@@ -384,6 +458,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert run.poisoned_at == nil
       assert run.poison_reason == nil
       assert run.tenant_id == nil
+      assert run.scope_key == ""
 
       assert {:error, changeset} =
                %{
@@ -419,7 +494,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     # success.
     defp insert_run(overrides, prefix \\ "public") do
       now = DateTime.utc_now()
-      ensure_graph_version(prefix)
 
       base = %{
         run_id: "run_#{System.unique_integer([:positive])}",
@@ -445,6 +519,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       }
 
       row = Map.merge(base, Map.new(overrides))
+      ensure_graph_version(prefix, row.tenant_id)
       columns = Map.keys(base)
       placeholders = Enum.map_join(1..length(columns), ", ", &"$#{&1}")
 
@@ -471,18 +546,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
     end
 
-    defp ensure_graph_version(prefix) do
-      insert_graph_version!("g1", "abc123", prefix)
+    defp ensure_graph_version(prefix, tenant_id) do
+      insert_graph_version!("g1", "abc123", prefix, tenant_id)
     end
 
-    defp insert_graph_version!(graph_id, graph_hash, prefix \\ "public") do
+    defp insert_graph_version!(
+           graph_id,
+           graph_hash,
+           prefix \\ "public",
+           tenant_id \\ nil
+         ) do
       TestRepo.query!(
         """
-        INSERT INTO #{prefix}.docket_graph_versions (graph_id, graph_hash, graph, inserted_at)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO #{prefix}.docket_graph_versions
+          (tenant_id, graph_id, graph_hash, graph, inserted_at)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT DO NOTHING
         """,
-        [graph_id, graph_hash, <<131, 106>>, DateTime.utc_now()]
+        [tenant_id, graph_id, graph_hash, <<131, 106>>, DateTime.utc_now()]
       )
     end
 
@@ -554,6 +635,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       data_type
+    end
+
+    defp column_default(table, column) do
+      %{rows: [[default]]} =
+        TestRepo.query!(
+          """
+          SELECT column_default FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+          """,
+          [table, column]
+        )
+
+      default
     end
 
     defp indexes(table) do

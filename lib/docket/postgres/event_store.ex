@@ -47,12 +47,55 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {:error, :invalid_events}
     end
 
+    @impl Docket.Storage.Events
+    def fetch_event(ctx, scope, run_id, seq) when is_integer(seq) and seq > 0 do
+      started = System.monotonic_time()
+      {repo, prefix} = Storage.context!(ctx)
+      {scope_sql, scope_params} = scope_filter(scope, 3)
+      params = [run_id, seq] ++ scope_params
+
+      result =
+        case Ecto.Adapters.SQL.query(repo, fetch_statement(prefix, scope_sql), params) do
+          {:ok, %{rows: []}} -> {:error, :not_found}
+          {:ok, %{rows: [[nil | _rest]]}} -> {:error, :not_found}
+          {:ok, %{rows: [row]}} -> decode_event_row(row, run_id, 0)
+          {:error, reason} -> {:error, reason}
+        end
+
+      emit_read_telemetry(:event_fetch, result, started)
+      result
+    end
+
+    def fetch_event(_ctx, scope, _run_id, _seq) do
+      validate_scope!(scope)
+      raise ArgumentError, "event sequence must be a positive integer"
+    end
+
+    @impl Docket.Storage.Events
+    def fetch_latest_event(ctx, scope, run_id) do
+      started = System.monotonic_time()
+      {repo, prefix} = Storage.context!(ctx)
+      {scope_sql, scope_params} = scope_filter(scope, 2)
+      params = [run_id] ++ scope_params
+
+      result =
+        case Ecto.Adapters.SQL.query(repo, latest_statement(prefix, scope_sql), params) do
+          {:ok, %{rows: []}} -> {:error, :not_found}
+          {:ok, %{rows: [[nil | _rest]]}} -> {:ok, nil}
+          {:ok, %{rows: [row]}} -> decode_event_row(row, run_id, 0)
+          {:error, reason} -> {:error, reason}
+        end
+
+      emit_read_telemetry(:event_fetch_latest, result, started)
+      result
+    end
+
     @impl true
     def list_events(ctx, scope, run_id, %{after_seq: after_seq, limit: limit})
         when is_integer(after_seq) and after_seq >= 0 and is_integer(limit) and limit > 0 do
       started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)
-      {scope_sql, scope_params} = scope_filter(scope)
+      {scope_sql, scope_params} = scope_filter(scope, 4)
       params = [run_id, after_seq, limit] ++ scope_params
 
       result =
@@ -64,6 +107,64 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       emit_list_telemetry(result, started)
       result
+    end
+
+    defp fetch_statement(prefix, scope_sql) do
+      runs = Storage.qualified_table(prefix, "docket_runs")
+      events = Storage.qualified_table(prefix, "docket_events")
+
+      """
+      SELECT
+        event.seq,
+        event.type,
+        event.step,
+        event.node_id,
+        event.channel_id,
+        event.task_id,
+        event.payload,
+        event.metadata,
+        event.occurred_at
+      FROM #{runs} AS runs
+      LEFT JOIN #{events} AS event
+        ON event.run_id = runs.run_id AND event.seq = $2
+      WHERE runs.run_id = $1#{scope_sql}
+      """
+    end
+
+    defp latest_statement(prefix, scope_sql) do
+      runs = Storage.qualified_table(prefix, "docket_runs")
+      events = Storage.qualified_table(prefix, "docket_events")
+
+      """
+      SELECT
+        latest.seq,
+        latest.type,
+        latest.step,
+        latest.node_id,
+        latest.channel_id,
+        latest.task_id,
+        latest.payload,
+        latest.metadata,
+        latest.occurred_at
+      FROM #{runs} AS runs
+      LEFT JOIN LATERAL (
+        SELECT
+          event.seq,
+          event.type,
+          event.step,
+          event.node_id,
+          event.channel_id,
+          event.task_id,
+          event.payload,
+          event.metadata,
+          event.occurred_at
+        FROM #{events} AS event
+        WHERE event.run_id = runs.run_id
+        ORDER BY event.seq DESC
+        LIMIT 1
+      ) AS latest ON TRUE
+      WHERE runs.run_id = $1#{scope_sql}
+      """
     end
 
     defp list_statement(prefix, scope_sql) do
@@ -180,28 +281,62 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    defp decode_event_row(row, run_id) do
-      seq = Enum.at(row, 13)
+    defp decode_event_row(row, run_id, offset \\ 13) do
+      seq = Enum.at(row, offset)
 
       try do
         event = %Docket.Event{
           run_id: run_id,
           seq: seq,
-          type: load_event_type!(Enum.at(row, 14)),
-          step: Enum.at(row, 15),
-          node_id: Enum.at(row, 16),
-          channel_id: Enum.at(row, 17),
-          task_id: Enum.at(row, 18),
-          timestamp: Enum.at(row, 21),
-          payload: Docket.DurableCodec.decode!(Enum.at(row, 19), :event),
-          metadata: Docket.DurableCodec.decode!(Enum.at(row, 20), :event)
+          type: load_event_type!(Enum.at(row, offset + 1)),
+          step: Enum.at(row, offset + 2),
+          node_id: Enum.at(row, offset + 3),
+          channel_id: Enum.at(row, offset + 4),
+          task_id: Enum.at(row, offset + 5),
+          timestamp: Enum.at(row, offset + 8),
+          payload: Docket.DurableCodec.decode!(Enum.at(row, offset + 6), :event),
+          metadata: Docket.DurableCodec.decode!(Enum.at(row, offset + 7), :event)
         }
 
-        {:ok, event}
+        {:ok, validate_decoded_event!(event)}
       rescue
         error in Docket.Error -> {:error, event_corruption(seq, error)}
       end
     end
+
+    defp validate_decoded_event!(%Docket.Event{} = event) do
+      valid? =
+        is_binary(event.run_id) and is_integer(event.seq) and event.seq > 0 and
+          event.type in Docket.Event.types() and is_integer(event.step) and event.step >= 0 and
+          optional_binary?(event.node_id) and optional_binary?(event.channel_id) and
+          optional_binary?(event.task_id) and database_timestamp?(event.timestamp) and
+          is_map(event.payload) and not is_struct(event.payload) and is_map(event.metadata) and
+          not is_struct(event.metadata)
+
+      unless valid? do
+        raise Docket.Error,
+          type: :invalid_durable_state,
+          message: "event row fields do not form a valid Docket.Event"
+      end
+
+      event
+    end
+
+    defp optional_binary?(value), do: is_nil(value) or is_binary(value)
+
+    defp database_timestamp?(
+           %DateTime{
+             calendar: Calendar.ISO,
+             time_zone: "Etc/UTC",
+             zone_abbr: "UTC",
+             utc_offset: 0,
+             std_offset: 0,
+             microsecond: {_value, 6}
+           } = datetime
+         ),
+         do: Docket.DurableCodec.valid_datetime?(datetime)
+
+    defp database_timestamp?(_other), do: false
 
     defp load_status(text) when is_binary(text) do
       Enum.find(Docket.Run.durable_statuses(), fn status -> Atom.to_string(status) == text end)
@@ -227,14 +362,35 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
     end
 
-    defp scope_filter(:system), do: {"", []}
-    defp scope_filter(:tenantless), do: {" AND runs.tenant_id IS NULL", []}
+    defp scope_filter(:system, _parameter), do: {"", []}
+    defp scope_filter(:tenantless, _parameter), do: {" AND runs.tenant_id IS NULL", []}
 
-    defp scope_filter({:tenant, tenant}) when is_binary(tenant),
-      do: {" AND runs.tenant_id = $4", [tenant]}
+    defp scope_filter({:tenant, tenant}, parameter) when is_binary(tenant),
+      do: {" AND runs.tenant_id = $#{parameter}", [tenant]}
 
-    defp scope_filter(scope),
+    defp scope_filter(scope, _parameter),
       do: raise(ArgumentError, "invalid storage scope: #{inspect(scope)}")
+
+    defp emit_read_telemetry(operation, result, started) do
+      {rows, bytes} =
+        case result do
+          {:ok, %Docket.Event{} = event} -> {1, event_bytes(event)}
+          _other -> {0, 0}
+        end
+
+      :telemetry.execute(
+        [:docket, :postgres, :store],
+        %{
+          duration: System.monotonic_time() - started,
+          selected_rows: rows,
+          encoded_bytes: bytes
+        },
+        Map.merge(Docket.Telemetry.correlation_metadata(), %{
+          operation: operation,
+          result: Docket.Telemetry.result_kind(result)
+        })
+      )
+    end
 
     defp emit_list_telemetry(result, started) do
       {rows, bytes} =

@@ -449,9 +449,22 @@ defmodule Docket.Runtime.MomentTest do
     end
 
     defp insert!(backend, moment) do
+      {:ok, effective, publication_rtg} =
+        Compiler.compile_for_publication(Graphs.minimal_linear())
+
+      assert publication_rtg.graph_hash == moment.run.graph_hash
+
       {:ok, _run} =
         MemoryBackend.transaction(backend, fn tx ->
-          with {:ok, run} <-
+          with :ok <-
+                 MemoryBackend.save_graph(
+                   tx,
+                   :tenantless,
+                   moment.run.graph_id,
+                   moment.run.graph_hash,
+                   effective
+                 ),
+               {:ok, run} <-
                  MemoryBackend.insert_run(tx, :tenantless, moment.run, :run_initialized, @now) do
             case MemoryBackend.append_events(tx, :tenantless, run.id, moment.events) do
               :ok -> {:ok, run}
@@ -488,8 +501,13 @@ defmodule Docket.Runtime.MomentTest do
       end)
     end
 
+    defp published_runtime! do
+      {:ok, _effective, rtg} = Compiler.compile_for_publication(Graphs.minimal_linear())
+      rtg
+    end
+
     test "a vehicle drives propose -> commit -> continue until the terminal park" do
-      rtg = compile!(Graphs.minimal_linear())
+      rtg = published_runtime!()
       opts = opts()
       backend = start_backend()
 
@@ -526,7 +544,7 @@ defmodule Docket.Runtime.MomentTest do
     end
 
     test "a lost fence discards the moment and exposes no committed checkpoint" do
-      rtg = compile!(Graphs.minimal_linear())
+      rtg = published_runtime!()
       opts = opts()
       backend = start_backend()
 
@@ -549,7 +567,7 @@ defmodule Docket.Runtime.MomentTest do
     end
 
     test "an event append failure discards the whole moment" do
-      rtg = compile!(Graphs.minimal_linear())
+      rtg = published_runtime!()
       opts = opts()
       backend = start_backend()
 

@@ -4,7 +4,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Optional node-local cache of compiled runtime graphs and known-incompatible
     graph versions.
 
-    Entries are keyed by the store-provided `{graph_id, graph_hash}` and
+    Entries are keyed by the store namespace, graph owner scope, and
+    store-provided `{graph_id, graph_hash}` and
     validated on every read against the local generation: a fingerprint of the
     `:docket` application's loaded modules plus the beam MD5 of each node
     implementation module recorded when the entry was written. An entry whose
@@ -27,6 +28,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       * `:generation` - zero-arity function replacing the built-in `:docket`
         module fingerprint, for hosts that prefer an explicit release identity
+      * `:cache_scope` - opaque storage namespace and graph owner identity;
+        vehicles always provide this so tenant-specific corruption cannot
+        poison another tenant's cache entry
       * `:undecodable_ttl_ms` - lifetime of entries recorded without a module
         list (default `#{30_000}`)
     """
@@ -62,7 +66,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @impl Contract
     def fetch(graph_id, graph_hash, opts \\ []) do
       started = System.monotonic_time()
-      key = key(graph_id, graph_hash)
+      key = key(graph_id, graph_hash, opts)
 
       {result, cache_result} =
         case :persistent_term.get(key, :miss) do
@@ -93,7 +97,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def put_compiled(graph_id, graph_hash, rtg, opts \\ []) do
       modules = rtg.nodes |> Map.values() |> Enum.map(& &1.module)
       entry = {:compiled, rtg, generation(modules, nil, opts)}
-      :persistent_term.put(key(graph_id, graph_hash), entry)
+      :persistent_term.put(key(graph_id, graph_hash, opts), entry)
     end
 
     @impl Contract
@@ -109,20 +113,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end
 
       entry = {:incompatible, reason, generation}
-      :persistent_term.put(key(graph_id, graph_hash), entry)
+      :persistent_term.put(key(graph_id, graph_hash, opts), entry)
     end
 
     @doc "Erases every cache entry."
     @spec clear() :: :ok
     def clear do
-      for {{__MODULE__, _graph_id, _graph_hash} = key, _entry} <- :persistent_term.get() do
+      for {key, _entry} <- :persistent_term.get(),
+          is_tuple(key),
+          tuple_size(key) == 4,
+          elem(key, 0) == __MODULE__ do
         :persistent_term.erase(key)
       end
 
       :ok
     end
 
-    defp key(graph_id, graph_hash), do: {__MODULE__, graph_id, graph_hash}
+    defp key(graph_id, graph_hash, opts) do
+      {__MODULE__, Keyword.get(opts, :cache_scope, :global), graph_id, graph_hash}
+    end
 
     defp evict(key) do
       :persistent_term.erase(key)

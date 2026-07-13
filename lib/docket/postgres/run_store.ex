@@ -56,6 +56,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     import Ecto.Query
 
+    @behaviour Docket.Storage.Runs
+
     alias Docket.Postgres.{RunCodec, Storage}
     alias Docket.Postgres.Schemas.Run
 
@@ -75,6 +77,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     update timestamps, `:run_initialized` checkpoint metadata, and an explicit
     first wake.
     """
+    @impl true
     @spec insert_run(
             ctx(),
             Docket.Storage.owner_scope(),
@@ -128,6 +131,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc """
     Fetches the last committed run under an explicit SQL-enforced scope.
     """
+    @impl true
     @spec fetch_run(ctx(), Docket.Storage.scope(), String.t()) ::
             {:ok, Docket.Run.t()} | {:error, :not_found}
     def fetch_run(ctx, scope, run_id) do
@@ -141,8 +145,53 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @doc """
+    Lists lightweight run summaries under an explicit SQL-enforced scope.
+
+    The query selects only summary columns, reads one row beyond the requested
+    limit, and uses the immutable `(started_at, run_id)` key for stable
+    newest-first pagination.
+    """
+    @impl Docket.Storage.Runs
+    @spec list_runs(ctx(), Docket.Storage.scope(), Docket.Storage.Runs.list_query()) ::
+            {:ok, Docket.RunPage.t()}
+    def list_runs(ctx, scope, query) do
+      store_operation(:run_list, fn ->
+        query = validate_list_query!(query)
+        {repo, prefix} = Storage.context!(ctx)
+
+        rows =
+          Run
+          |> scope_query(scope)
+          |> filter_graph_id(query.graph_id)
+          |> filter_graph_hash(query.graph_hash)
+          |> filter_statuses(query.statuses)
+          |> filter_before(query.before)
+          |> order_by([run], desc: run.started_at, desc: run.run_id)
+          |> limit(^(query.limit + 1))
+          |> select([run], %{
+            id: run.run_id,
+            tenant_id: run.tenant_id,
+            graph_id: run.graph_id,
+            graph_hash: run.graph_hash,
+            status: run.status,
+            step: run.step,
+            checkpoint_seq: run.checkpoint_seq,
+            started_at: run.started_at,
+            updated_at: run.updated_at,
+            finished_at: run.finished_at
+          })
+          |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
+          |> repo.all()
+
+        summaries = Enum.map(rows, &Docket.RunSummary.new!/1)
+        {:ok, Docket.RunPage.new(summaries, query.before, query.limit)}
+      end)
+    end
+
+    @doc """
     Fetches the committed run plus token-free backend operational state.
     """
+    @impl true
     @spec inspect_run(ctx(), Docket.Storage.scope(), String.t()) ::
             {:ok, Docket.RunInfo.t()} | {:error, :not_found}
     def inspect_run(ctx, scope, run_id) do
@@ -178,6 +227,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     limit receives a new token; an exhausted candidate is poisoned instead
     and is never returned as a lease.
     """
+    @impl true
     @spec claim_due(ctx(), :system, Docket.Storage.Runs.claim_policy()) ::
             {:ok, Docket.Storage.Runs.claim_batch()} | {:error, term()}
     def claim_due(ctx, :system, policy) do
@@ -219,6 +269,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     `claimed_at` backward past the commit's fresher stamp and re-expose the
     run to steal. The caller's `now` is validated but not written.
     """
+    @impl true
     @spec refresh_claim(
             ctx(),
             :system,
@@ -265,6 +316,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     `checkpoint_seq`, `claim_attempts`, or the committed run's `updated_at`;
     it only clears claim authority and restores `wake_at`.
     """
+    @impl true
     @spec release_claim(
             ctx(),
             :system,
@@ -314,6 +366,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     A `:non_poisoning` policy never poisons; with `:backoff` the recorded
     wake grows exponentially with the durable abandon count up to the cap.
     """
+    @impl true
     @spec abandon_claim(
             ctx(),
             :system,
@@ -466,6 +519,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @doc "Commits an exact-next run document under the current claim fence."
+    @impl true
     @spec commit(ctx(), Docket.Storage.scope(), Docket.Storage.Runs.commit_proposal()) ::
             {:ok, Docket.Run.t()} | {:error, :stale_fence | :invalid_commit | :not_found}
     def commit(ctx, scope, proposal) do
@@ -503,6 +557,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @doc "Serializes and applies one pure run mutation without requiring a claim fence."
+    @impl true
     @spec mutate_run(ctx(), Docket.Storage.scope(), String.t(), Docket.Storage.Runs.mutation()) ::
             Docket.Storage.Runs.mutation_result()
     def mutate_run(ctx, scope, run_id, mutation) when is_function(mutation, 1) do
@@ -525,6 +580,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @doc "Clears poison from a non-terminal run and records an immediate wake."
+    @impl true
     @spec retry_poisoned_run(
             ctx(),
             Docket.Storage.scope(),
@@ -674,6 +730,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           AND runs.poisoned_at IS NULL
         RETURNING
           runs.run_id,
+          runs.tenant_id,
           runs.graph_id,
           runs.graph_hash,
           runs.checkpoint_seq,
@@ -687,6 +744,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
       SELECT
         run_id,
+        tenant_id,
         graph_id,
         graph_hash,
         checkpoint_seq,
@@ -721,6 +779,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         nil -> {:error, :not_found}
         %Run{} = row -> {:ok, row}
       end
+    end
+
+    defp filter_graph_id(query, nil), do: query
+    defp filter_graph_id(query, graph_id), do: where(query, [run], run.graph_id == ^graph_id)
+
+    defp filter_graph_hash(query, nil), do: query
+
+    defp filter_graph_hash(query, graph_hash),
+      do: where(query, [run], run.graph_hash == ^graph_hash)
+
+    defp filter_statuses(query, nil), do: query
+    defp filter_statuses(query, statuses), do: where(query, [run], run.status in ^statuses)
+
+    defp filter_before(query, nil), do: query
+
+    defp filter_before(query, {%DateTime{} = started_at, run_id}) do
+      where(
+        query,
+        [run],
+        run.started_at < ^started_at or
+          (run.started_at == ^started_at and run.run_id < ^run_id)
+      )
     end
 
     defp validate_commit(%{
@@ -788,6 +868,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         proposed.id != stored.id -> {:error, :invalid_mutation}
         proposed.graph_id != stored.graph_id -> {:error, :invalid_mutation}
         proposed.graph_hash != stored.graph_hash -> {:error, :invalid_mutation}
+        proposed.started_at != stored.started_at -> {:error, :invalid_mutation}
         proposed.checkpoint_seq != stored.checkpoint_seq + 1 -> {:error, :invalid_mutation}
         checkpoint_type not in Docket.Checkpoint.types() -> {:error, :invalid_mutation}
         schedule == :retain_claim -> {:error, :invalid_mutation}
@@ -798,9 +879,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp validate_immutable_binding(stored, proposed) do
-      if stored.graph_id == proposed.graph_id and stored.graph_hash == proposed.graph_hash,
-        do: :ok,
-        else: {:error, :invalid_commit}
+      if stored.graph_id == proposed.graph_id and stored.graph_hash == proposed.graph_hash and
+           stored.started_at == proposed.started_at,
+         do: :ok,
+         else: {:error, :invalid_commit}
     end
 
     defp valid_schedule?(:retain_claim), do: true
@@ -899,6 +981,60 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             "scope must be :system, :tenantless, or {:tenant, tenant_id}, got: #{inspect(scope)}"
     end
 
+    defp validate_list_query!(
+           %{
+             limit: limit,
+             before: before,
+             graph_id: graph_id,
+             graph_hash: graph_hash,
+             statuses: statuses
+           } = query
+         )
+         when is_integer(limit) and limit > 0 do
+      validate_list_cursor!(before)
+      validate_optional_filter!(graph_id, :graph_id)
+      validate_optional_filter!(graph_hash, :graph_hash)
+
+      unless is_nil(statuses) or
+               (is_list(statuses) and statuses != [] and
+                  Enum.all?(statuses, &Docket.Run.durable_status?/1)) do
+        raise ArgumentError,
+              "run list statuses must be nil or a non-empty list of durable statuses, got: " <>
+                inspect(statuses)
+      end
+
+      query
+    end
+
+    defp validate_list_query!(query) do
+      raise ArgumentError,
+            "run list query requires positive limit and normalized before, graph_id, " <>
+              "graph_hash, and statuses fields, got: #{inspect(query)}"
+    end
+
+    defp validate_list_cursor!(nil), do: :ok
+
+    defp validate_list_cursor!({%DateTime{}, run_id})
+         when is_binary(run_id) and byte_size(run_id) > 0,
+         do: :ok
+
+    defp validate_list_cursor!(before) do
+      raise ArgumentError,
+            "run list before cursor must be nil or {DateTime, non-empty run_id}, got: " <>
+              inspect(before)
+    end
+
+    defp validate_optional_filter!(nil, _name), do: :ok
+
+    defp validate_optional_filter!(value, _name)
+         when is_binary(value) and byte_size(value) > 0,
+         do: :ok
+
+    defp validate_optional_filter!(value, name) do
+      raise ArgumentError,
+            "run list #{name} must be nil or a non-empty binary, got: #{inspect(value)}"
+    end
+
     defp scope_query(query, :system), do: query
     defp scope_query(query, :tenantless), do: where(query, [run], is_nil(run.tenant_id))
 
@@ -911,13 +1047,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp owner_tenant_id!(:tenantless), do: nil
-    defp owner_tenant_id!({:tenant, tenant_id}) when is_binary(tenant_id), do: tenant_id
+
+    defp owner_tenant_id!({:tenant, tenant_id})
+         when is_binary(tenant_id) and byte_size(tenant_id) > 0,
+         do: tenant_id
 
     defp owner_tenant_id!(scope) do
       raise ArgumentError,
             "run owner scope must be :tenantless or {:tenant, tenant_id}, got: " <>
               inspect(scope)
     end
+
+    defp tenant_owner_scope(nil), do: :tenantless
+    defp tenant_owner_scope(tenant_id) when is_binary(tenant_id), do: {:tenant, tenant_id}
 
     defp validate_initialized_run(
            %Docket.Run{
@@ -943,10 +1085,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp validate_initialized_run(_run, _checkpoint_type, _wake_at), do: {:error, :invalid_run}
 
     defp insert_error(%Ecto.Changeset{} = changeset) do
-      if Keyword.has_key?(changeset.errors, :run_id) do
-        {:error, :already_exists}
-      else
-        {:error, changeset}
+      cond do
+        Keyword.has_key?(changeset.errors, :run_id) ->
+          {:error, :already_exists}
+
+        Enum.any?(changeset.errors, fn
+          {:graph_hash, {_message, metadata}} ->
+            metadata[:constraint] == :foreign and
+                metadata[:constraint_name] == "docket_runs_graph_scope_fkey"
+
+          _other ->
+            false
+        end) ->
+          {:error, :not_found}
+
+        true ->
+          {:error, changeset}
       end
     end
 
@@ -965,6 +1119,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         Enum.reduce(rows, {{[], []}, @empty_claim_stats}, fn
           [
             run_id,
+            tenant_id,
             graph_id,
             graph_hash,
             checkpoint_seq,
@@ -981,6 +1136,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           {{leases, poisoned}, stats} ->
             lease = %{
               run_id: run_id,
+              owner_scope: tenant_owner_scope(tenant_id),
               graph_id: graph_id,
               graph_hash: graph_hash,
               checkpoint_seq: checkpoint_seq,
@@ -999,6 +1155,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
           [
             run_id,
+            _tenant_id,
             _graph_id,
             _graph_hash,
             _checkpoint_seq,
@@ -1121,7 +1278,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         [:docket, :postgres, :store],
         %{
           duration: System.monotonic_time() - started,
-          selected_rows: if(match?({:ok, _}, result), do: 1, else: 0)
+          selected_rows: selected_rows(result)
         },
         Map.merge(Docket.Telemetry.correlation_metadata(), %{
           operation: operation,
@@ -1131,6 +1288,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       result
     end
+
+    defp selected_rows({:ok, %Docket.RunPage{runs: runs}}), do: length(runs)
+    defp selected_rows({:ok, _result}), do: 1
+    defp selected_rows(_result), do: 0
 
     defp claim_operation_result(:ok), do: :ok
 

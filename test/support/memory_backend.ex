@@ -95,18 +95,29 @@ defmodule Docket.Test.MemoryBackend do
   end
 
   @impl Docket.Storage.Graphs
-  def save_graph(backend, graph_id, graph_hash, %Docket.Graph{id: id, diagnostics: []} = graph)
+  def save_graph(
+        backend,
+        owner_scope,
+        graph_id,
+        graph_hash,
+        %Docket.Graph{id: id, diagnostics: []} = graph
+      )
       when id == graph_id do
+    validate_owner_scope!(owner_scope)
     bytes = Docket.DurableCodec.encode!(:graph, graph)
     actual_hash = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
 
     if actual_hash == graph_hash do
       state_get_and_update(backend, fn state ->
-        case Map.fetch(state.graphs, {graph_id, graph_hash}) do
-          :error ->
-            {:ok, put_in(state.graphs[{graph_id, graph_hash}], graph)}
+        key = {owner_scope, graph_id, graph_hash}
 
-          {:ok, ^graph} ->
+        case Map.fetch(state.graphs, key) do
+          :error ->
+            version = %{graph: graph, published_at: current_time(state)}
+            state = put_in(state.graphs[key], version)
+            {:ok, state}
+
+          {:ok, %{graph: ^graph}} ->
             {:ok, state}
 
           {:ok, _other} ->
@@ -120,16 +131,60 @@ defmodule Docket.Test.MemoryBackend do
     _error in Docket.Error -> {:error, :invalid_graph_document}
   end
 
-  def save_graph(_backend, _graph_id, _graph_hash, _graph),
+  def save_graph(_backend, _owner_scope, _graph_id, _graph_hash, _graph),
     do: {:error, :invalid_graph_document}
 
   @impl Docket.Storage.Graphs
-  def fetch_graph(backend, graph_id, graph_hash) do
+  def fetch_graph(backend, owner_scope, graph_id, graph_hash) do
+    validate_owner_scope!(owner_scope)
+
     state_get(backend, fn state ->
-      case Map.fetch(state.graphs, {graph_id, graph_hash}) do
-        {:ok, document} -> {:ok, document}
+      case Map.fetch(state.graphs, {owner_scope, graph_id, graph_hash}) do
+        {:ok, %{graph: document}} -> {:ok, document}
         :error -> {:error, :not_found}
       end
+    end)
+  end
+
+  @impl Docket.Storage.Graphs
+  def fetch_latest_graph_ref(backend, owner_scope, graph_id) do
+    validate_owner_scope!(owner_scope)
+
+    state_get(backend, fn state ->
+      case graph_versions(state, owner_scope, graph_id) do
+        [{graph_hash, _version} | _rest] ->
+          {:ok, %Docket.GraphRef{graph_id: graph_id, graph_hash: graph_hash}}
+
+        [] ->
+          {:error, :not_found}
+      end
+    end)
+  end
+
+  @impl Docket.Storage.Graphs
+  def list_graph_versions(backend, owner_scope, graph_id, %{limit: limit, before: before}) do
+    validate_owner_scope!(owner_scope)
+
+    unless is_integer(limit) and limit > 0 do
+      raise ArgumentError, "graph version list limit must be positive"
+    end
+
+    state_get(backend, fn state ->
+      versions =
+        state
+        |> graph_versions(owner_scope, graph_id)
+        |> Enum.filter(fn {graph_hash, version} ->
+          graph_version_before?(version.published_at, graph_hash, before)
+        end)
+        |> Enum.take(limit + 1)
+        |> Enum.map(fn {graph_hash, version} ->
+          %Docket.GraphVersion{
+            ref: %Docket.GraphRef{graph_id: graph_id, graph_hash: graph_hash},
+            published_at: version.published_at
+          }
+        end)
+
+      {:ok, Docket.GraphVersionPage.new(versions, before, limit)}
     end)
   end
 
@@ -144,6 +199,9 @@ defmodule Docket.Test.MemoryBackend do
 
         Map.has_key?(state.runs, run.id) ->
           {{:error, :already_exists}, state}
+
+        not Map.has_key?(state.graphs, {owner_scope, run.graph_id, run.graph_hash}) ->
+          {{:error, :not_found}, state}
 
         true ->
           record = new_record(run, tenant_id, checkpoint_type, wake_at)
@@ -171,6 +229,39 @@ defmodule Docket.Test.MemoryBackend do
       with {:ok, record} <- fetch_scoped_record(state, scope, run_id) do
         {:ok, run_info(record)}
       end
+    end)
+  end
+
+  @impl Docket.Storage.Runs
+  def list_runs(
+        backend,
+        scope,
+        %{
+          limit: limit,
+          before: before,
+          graph_id: graph_id,
+          graph_hash: graph_hash,
+          statuses: statuses
+        }
+      ) do
+    validate_scope!(scope)
+
+    unless is_integer(limit) and limit > 0 do
+      raise ArgumentError, "run list limit must be positive"
+    end
+
+    state_get(backend, fn state ->
+      candidates =
+        state.runs
+        |> Map.values()
+        |> Enum.filter(&scope_matches?(&1, scope))
+        |> Enum.filter(&run_record_matches?(&1, graph_id, graph_hash, statuses))
+        |> Enum.filter(&run_record_before?(&1, before))
+        |> Enum.sort(&run_record_newer?/2)
+        |> Enum.map(&run_summary/1)
+        |> Enum.take(limit + 1)
+
+      {:ok, Docket.RunPage.new(candidates, before, limit)}
     end)
   end
 
@@ -345,6 +436,41 @@ defmodule Docket.Test.MemoryBackend do
   end
 
   @impl Docket.Storage.Events
+  def fetch_event(backend, scope, run_id, seq) do
+    validate_scope!(scope)
+
+    unless is_integer(seq) and seq > 0 do
+      raise ArgumentError, "event sequence must be a positive integer"
+    end
+
+    state_get(backend, fn state ->
+      with {:ok, record} <- fetch_scoped_record(state, scope, run_id),
+           {:ok, event} <- Map.fetch(record.events, seq) do
+        {:ok, event}
+      else
+        _missing -> {:error, :not_found}
+      end
+    end)
+  end
+
+  @impl Docket.Storage.Events
+  def fetch_latest_event(backend, scope, run_id) do
+    validate_scope!(scope)
+
+    state_get(backend, fn state ->
+      with {:ok, record} <- fetch_scoped_record(state, scope, run_id) do
+        latest =
+          case Map.keys(record.events) do
+            [] -> nil
+            seqs -> Map.fetch!(record.events, Enum.max(seqs))
+          end
+
+        {:ok, latest}
+      end
+    end)
+  end
+
+  @impl Docket.Storage.Events
   def list_events(backend, scope, run_id, %{after_seq: after_seq, limit: limit}) do
     validate_scope!(scope)
 
@@ -463,6 +589,74 @@ defmodule Docket.Test.MemoryBackend do
     )
   end
 
+  defp run_summary(record) do
+    run = record.run
+
+    Docket.RunSummary.new!(
+      id: run.id,
+      tenant_id: record.tenant_id,
+      graph_id: run.graph_id,
+      graph_hash: run.graph_hash,
+      status: run.status,
+      step: run.step,
+      checkpoint_seq: run.checkpoint_seq,
+      started_at: run.started_at,
+      updated_at: run.updated_at,
+      finished_at: run.finished_at
+    )
+  end
+
+  defp run_record_matches?(record, graph_id, graph_hash, statuses) do
+    run = record.run
+
+    (is_nil(graph_id) or run.graph_id == graph_id) and
+      (is_nil(graph_hash) or run.graph_hash == graph_hash) and
+      (is_nil(statuses) or run.status in statuses)
+  end
+
+  defp run_record_before?(_record, nil), do: true
+
+  defp run_record_before?(%{run: run}, {%DateTime{} = started_at, run_id}) do
+    case DateTime.compare(run.started_at, started_at) do
+      :lt -> true
+      :gt -> false
+      :eq -> run.id < run_id
+    end
+  end
+
+  defp run_record_newer?(left, right) do
+    case DateTime.compare(left.run.started_at, right.run.started_at) do
+      :gt -> true
+      :lt -> false
+      :eq -> left.run.id >= right.run.id
+    end
+  end
+
+  defp graph_versions(state, owner_scope, graph_id) do
+    state.graphs
+    |> Enum.flat_map(fn
+      {{^owner_scope, ^graph_id, graph_hash}, version} -> [{graph_hash, version}]
+      {_key, _version} -> []
+    end)
+    |> Enum.sort(fn {left_hash, left}, {right_hash, right} ->
+      case DateTime.compare(left.published_at, right.published_at) do
+        :gt -> true
+        :lt -> false
+        :eq -> left_hash >= right_hash
+      end
+    end)
+  end
+
+  defp graph_version_before?(_published_at, _graph_hash, nil), do: true
+
+  defp graph_version_before?(published_at, graph_hash, {%DateTime{} = before_at, before_hash}) do
+    case DateTime.compare(published_at, before_at) do
+      :lt -> true
+      :gt -> false
+      :eq -> graph_hash < before_hash
+    end
+  end
+
   defp apply_abandon(state, run_id, record, policy) do
     cond do
       record.run.checkpoint_seq != policy.expected_checkpoint_seq ->
@@ -560,6 +754,7 @@ defmodule Docket.Test.MemoryBackend do
 
           lease = %{
             run_id: run_id,
+            owner_scope: record_owner_scope(record),
             graph_id: record.run.graph_id,
             graph_hash: record.run.graph_hash,
             checkpoint_seq: record.run.checkpoint_seq,
@@ -686,7 +881,8 @@ defmodule Docket.Test.MemoryBackend do
 
   defp validate_immutable_binding(stored_run, proposed_run) do
     if stored_run.id == proposed_run.id and stored_run.graph_id == proposed_run.graph_id and
-         stored_run.graph_hash == proposed_run.graph_hash do
+         stored_run.graph_hash == proposed_run.graph_hash and
+         stored_run.started_at == proposed_run.started_at do
       :ok
     else
       {:error, :invalid_commit}
@@ -765,6 +961,7 @@ defmodule Docket.Test.MemoryBackend do
       proposed_run.id == record.run.id and
       proposed_run.graph_id == record.run.graph_id and
       proposed_run.graph_hash == record.run.graph_hash and
+      proposed_run.started_at == record.run.started_at and
       proposed_run.checkpoint_seq == record.run.checkpoint_seq + 1 and
       checkpoint_type in Docket.Checkpoint.types() and schedule != :retain_claim and
       valid_schedule?(schedule) and schedule_matches_status?(schedule, proposed_run.status) and
@@ -776,8 +973,8 @@ defmodule Docket.Test.MemoryBackend do
       nonempty_binary?(run.graph_id) and nonempty_binary?(run.graph_hash) and
       is_integer(run.checkpoint_seq) and run.checkpoint_seq >= 1 and
       checkpoint_type == :run_initialized and
-      is_struct(run.started_at, DateTime) and is_struct(wake_at, DateTime) and
-      Docket.Run.validate_failure(run) == :ok
+      is_struct(run.started_at, DateTime) and is_struct(run.updated_at, DateTime) and
+      is_struct(wake_at, DateTime) and Docket.Run.validate_durable(run) == :ok
   end
 
   defp nonempty_binary?(value), do: is_binary(value) and byte_size(value) > 0
@@ -838,7 +1035,8 @@ defmodule Docket.Test.MemoryBackend do
 
   defp owner_tenant_id!(:tenantless), do: nil
 
-  defp owner_tenant_id!({:tenant, tenant_id}) when is_binary(tenant_id) do
+  defp owner_tenant_id!({:tenant, tenant_id})
+       when is_binary(tenant_id) and byte_size(tenant_id) > 0 do
     tenant_id
   end
 
@@ -846,6 +1044,14 @@ defmodule Docket.Test.MemoryBackend do
     raise ArgumentError,
           "run owner scope must be :tenantless or {:tenant, tenant_id}, got: #{inspect(scope)}"
   end
+
+  defp validate_owner_scope!(scope) do
+    _tenant_id = owner_tenant_id!(scope)
+    :ok
+  end
+
+  defp record_owner_scope(%{tenant_id: nil}), do: :tenantless
+  defp record_owner_scope(%{tenant_id: tenant_id}), do: {:tenant, tenant_id}
 
   defp validate_scope!(:system), do: :ok
   defp validate_scope!(:tenantless), do: :ok

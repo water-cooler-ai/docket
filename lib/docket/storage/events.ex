@@ -36,6 +36,40 @@ defmodule Docket.Storage.Events do
             ) :: :ok | {:error, term()}
 
   @doc """
+  Reads one retained event by its assigned positive sequence.
+
+  Ownership is enforced through the owning run. An unknown or out-of-scope
+  run and an absent or pruned sequence all return `{:error, :not_found}`.
+  A present corrupt row returns a typed
+  `{:error, %Docket.Error{type: :corrupt_event_row}}` and is never reported as
+  absent.
+
+  `seq` is trusted to be pre-validated by the caller as a positive integer.
+  """
+  @callback fetch_event(
+              ctx(),
+              scope(),
+              run_id :: String.t(),
+              seq :: pos_integer()
+            ) :: {:ok, Docket.Event.t()} | {:error, :not_found} | {:error, term()}
+
+  @doc """
+  Reads the highest-sequence retained event for a run.
+
+  Ownership is enforced through the owning run. An unknown or out-of-scope
+  run returns `{:error, :not_found}`. A visible run with no retained events
+  returns `{:ok, nil}`, including when its complete history has been pruned.
+  A present corrupt latest row returns a typed
+  `{:error, %Docket.Error{type: :corrupt_event_row}}` and is never skipped in
+  favor of an older event.
+  """
+  @callback fetch_latest_event(
+              ctx(),
+              scope(),
+              run_id :: String.t()
+            ) :: {:ok, Docket.Event.t() | nil} | {:error, :not_found} | {:error, term()}
+
+  @doc """
   Reads a page of committed retained events for `run_id`.
 
   Events are returned in ascending sequence order, restricted to sequences
