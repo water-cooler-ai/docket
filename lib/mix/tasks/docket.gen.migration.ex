@@ -9,9 +9,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         $ mix docket.gen.migration
         $ mix docket.gen.migration -r MyApp.Repo
 
-    The generated file pins the current schema version; upgrading Docket
-    later means generating a new migration (or editing `version:`), never
-    editing this one.
+    The generated file pins the current installation schema. Commit it with
+    the host application and never edit it after it has been applied. Future
+    schema versions must be installed through a separate upgrade migration.
 
     ## Options
 

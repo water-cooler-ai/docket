@@ -38,8 +38,8 @@ coordination layer and the run itself is the scheduled unit.
 
 ## Tables
 
-Schema version 1 installs three tables; version 2 scopes graph versions and
-their run references to an explicit tenant owner.
+Schema version 1 installs three tables with graph versions and their run
+references scoped to an explicit tenant owner.
 
 ### `docket_graph_versions`
 
@@ -253,7 +253,7 @@ same versioned-migration pattern used by libraries such as Oban:
 defmodule MyApp.Repo.Migrations.AddDocketTables do
   use Ecto.Migration
 
-  def up, do: Docket.Postgres.Migration.up(version: 2)
+  def up, do: Docket.Postgres.Migration.up(version: 1)
   def down, do: Docket.Postgres.Migration.down(version: 1)
 end
 ```
@@ -269,7 +269,7 @@ For a PostgreSQL schema other than `public`, pass the same prefix to both
 directions:
 
 ```elixir
-def up, do: Docket.Postgres.Migration.up(version: 2, prefix: "automation")
+def up, do: Docket.Postgres.Migration.up(version: 1, prefix: "automation")
 def down, do: Docket.Postgres.Migration.down(version: 1, prefix: "automation")
 ```
 

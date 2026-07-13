@@ -33,7 +33,7 @@ backend boundary.
 | --- | --- | --- |
 | Backend contract | Implemented | `Docket.Backend` bundles storage, graph, run, event, context, and supervision capabilities. |
 | Public PostgreSQL bundle | Implemented | `Docket.Postgres` fixes the storage capabilities and owns their operational supervision. |
-| Versioned migration | Implemented | `Docket.Postgres.Migration` schema versions 1-2 create three tables, scope graph ownership, and install constraints and indexes. |
+| Versioned migration | Implemented | `Docket.Postgres.Migration` schema version 1 creates three tables, scopes graph ownership, and installs constraints and indexes. |
 | Graph store | Implemented | Tenant-owned immutable effective graph save/exact/latest/list reads with content-address conflict checks. |
 | Run aggregate store | Implemented | Scoped reads, insert, mutation, bounded claims, fencing, release, claim refresh, and poison retry. |
 | Event store | Implemented | Assigned event append in the lifecycle transaction. |
@@ -66,8 +66,8 @@ but claim and graph-state fencing update the same row.
 
 The version 1 migration enforces the five durable statuses and the valid
 status/schedule/claim/poison shapes with database constraints. Separate partial
-indexes serve ready, expired-claim, and poison inspection paths. Version 2 adds
-generated scope keys and the scoped graph-version foreign key.
+indexes serve ready, expired-claim, and poison inspection paths. Generated
+scope keys and the scoped graph-version foreign key enforce graph ownership.
 
 ### Runtime transitions are pre-commit values
 

@@ -30,19 +30,38 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def up(%{prefix: prefix}) do
       create_if_not_exists table(:docket_graph_versions, primary_key: false, prefix: prefix) do
         add(:id, :bigserial, primary_key: true)
+        add(:tenant_id, :text)
+
+        add(:scope_key, :text,
+          generated: "ALWAYS AS (COALESCE(tenant_id, '')) STORED",
+          null: false
+        )
+
         add(:graph_id, :text, null: false)
         add(:graph_hash, :text, null: false)
         add(:graph, :binary, null: false)
-        add(:inserted_at, :timestamptz, null: false)
+        add(:inserted_at, :timestamptz, null: false, default: fragment("clock_timestamp()"))
       end
 
-      create_if_not_exists(
-        unique_index(:docket_graph_versions, [:graph_id, :graph_hash], prefix: prefix)
+      create(
+        constraint(:docket_graph_versions, :docket_graph_versions_tenant_id_check,
+          check: "tenant_id IS NULL OR tenant_id <> ''",
+          prefix: prefix
+        )
       )
 
       create_if_not_exists(
-        index(:docket_graph_versions, [:graph_id, "inserted_at DESC", "id DESC"],
-          name: :docket_graph_versions_revision_order_index,
+        unique_index(:docket_graph_versions, [:scope_key, :graph_id, :graph_hash],
+          name: :docket_graph_versions_scope_graph_index,
+          prefix: prefix
+        )
+      )
+
+      create_if_not_exists(
+        index(
+          :docket_graph_versions,
+          [:scope_key, :graph_id, "inserted_at DESC", "graph_hash DESC"],
+          name: :docket_graph_versions_scope_revision_order_index,
           prefix: prefix
         )
       )
@@ -51,13 +70,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         add(:id, :bigserial, primary_key: true)
         add(:run_id, :text, null: false)
         add(:tenant_id, :text)
+
+        add(:scope_key, :text,
+          generated: "ALWAYS AS (COALESCE(tenant_id, '')) STORED",
+          null: false
+        )
+
         add(:graph_id, :text, null: false)
 
         add(
           :graph_hash,
           references(:docket_graph_versions,
+            name: :docket_runs_graph_scope_fkey,
             column: :graph_hash,
-            with: [graph_id: :graph_id],
+            with: [scope_key: :scope_key, graph_id: :graph_id],
             type: :text,
             on_delete: :restrict,
             prefix: prefix
@@ -82,6 +108,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         add(:updated_at, :timestamptz, null: false)
         add(:finished_at, :timestamptz)
       end
+
+      create(
+        constraint(:docket_runs, :docket_runs_tenant_id_check,
+          check: "tenant_id IS NULL OR tenant_id <> ''",
+          prefix: prefix
+        )
+      )
 
       for {name, check} <- @run_checks do
         create(constraint(:docket_runs, name, check: check, prefix: prefix))

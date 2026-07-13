@@ -159,7 +159,7 @@ entries below reflect what has landed so far.
 - In-memory conformance backend exercising the full bundle contract,
   including overlapping-transaction publication (test support) (DCKT-8, #12).
 - Postgres substrate scaffold behind optional dependencies: versioned
-  migrations (`Docket.Postgres.Migration`, v01-v02), `docket_graph_versions` /
+  migrations (`Docket.Postgres.Migration`, v01), `docket_graph_versions` /
   `docket_runs` / `docket_events` schemas, and `mix docket.gen.migration`
   (DCKT-13, #10).
 - Postgres `Docket.Postgres.RunStore` atomic, demand-bounded claims over
@@ -346,12 +346,10 @@ entries below reflect what has landed so far.
   expired-claim `(claimed_at, id)`, and poison-introspection partial
   indexes behind positive dispatch eligibility (`status = 'running' AND
   poisoned_at IS NULL`) (DCKT-29, #19).
-- Postgres v02 makes graph versions tenant-owned without adding a publication
-  table: generated non-null scope keys bind runs to
+- The unreleased Postgres v01 schema makes graph versions tenant-owned without
+  adding a publication table: generated non-null scope keys bind runs to
   `(scope_key, graph_id, graph_hash)` through a delete-restricted composite
-  foreign key. Legacy graph rows remain tenantless and are cloned only for
-  tenant ownership proven by existing runs; saved-but-never-run legacy
-  ownership cannot be reconstructed.
+  foreign key.
 - The runtime loop separates pure moment production from commitment. Durable
   backends commit moments transactionally before best-effort observation;
   processless helpers return read-only checkpoint values for assertions.

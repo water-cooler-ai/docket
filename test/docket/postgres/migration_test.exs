@@ -28,25 +28,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down(prefix: "select")
     end
 
-    defmodule InstallDocketV1 do
-      use Ecto.Migration
-
-      def up, do: Docket.Postgres.Migration.up(version: 1)
-      def down, do: Docket.Postgres.Migration.down(version: 1)
-    end
-
-    defmodule UpgradeDocketV2 do
-      use Ecto.Migration
-
-      def up, do: Docket.Postgres.Migration.up(version: 2)
-      def down, do: Docket.Postgres.Migration.down(version: 2)
-    end
-
     @migration_version 20_260_709_000_001
     @prefixed_migration_version 20_260_709_000_002
     @reserved_prefix_migration_version 20_260_709_000_003
-    @v1_migration_version 20_260_709_000_004
-    @v2_migration_version 20_260_709_000_005
 
     @tables ~w(docket_events docket_graph_versions docket_runs)
 
@@ -65,11 +49,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :ok
     end
 
-    test "migrates up, down, and back up cleanly on a fresh Postgres" do
+    test "V01 installs, removes, and reinstalls the final schema on a fresh Postgres" do
       install!()
 
       assert tables("public") == @tables
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
       assert columns("docket_runs") == Enum.sort(@run_columns)
 
       assert column_type("docket_graph_versions", "graph") == "bytea"
@@ -128,15 +112,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert indexes["docket_runs_graph_id_graph_hash_index"] =~ "(graph_id, graph_hash)"
 
-      assert indexes("docket_graph_versions")["docket_graph_versions_scope_graph_index"] =~
+      graph_indexes = indexes("docket_graph_versions")
+
+      assert graph_indexes["docket_graph_versions_scope_graph_index"] =~
                "CREATE UNIQUE INDEX"
 
       revision_order =
-        indexes("docket_graph_versions")[
-          "docket_graph_versions_scope_revision_order_index"
-        ]
+        graph_indexes["docket_graph_versions_scope_revision_order_index"]
 
       assert revision_order =~ "(scope_key, graph_id, inserted_at DESC, graph_hash DESC)"
+      refute Map.has_key?(graph_indexes, "docket_graph_versions_graph_id_graph_hash_index")
+      refute Map.has_key?(graph_indexes, "docket_graph_versions_revision_order_index")
 
       assert indexes("docket_events")["docket_events_run_id_seq_index"] =~
                "CREATE UNIQUE INDEX"
@@ -154,7 +140,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert :ok = Ecto.Migrator.up(TestRepo, @migration_version, InstallDocket, log: false)
 
       assert tables("public") == @tables
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
     end
 
     test "migrates up and down inside a dedicated schema prefix" do
@@ -172,7 +158,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Docket.Postgres.Migration.migrated_version(
                repo: TestRepo,
                prefix: "docket_private"
-             ) == 2
+             ) == 1
 
       assert {:ok, _} = insert_run([], "docket_private")
 
@@ -198,7 +184,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert tables("select") == @tables
 
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo, prefix: "select") == 2
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo, prefix: "select") == 1
 
       assert :ok =
                Ecto.Migrator.down(
@@ -389,72 +375,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  "docket_runs_tenant_id_check"
                ]
       end
-    end
-
-    test "upgrades V01 by retaining tenantless rows and cloning only proven run owners" do
-      assert :ok =
-               Ecto.Migrator.up(TestRepo, @v1_migration_version, InstallDocketV1, log: false)
-
-      first_at = ~U[2026-07-01 00:00:00.000000Z]
-      second_at = ~U[2026-07-02 00:00:00.000000Z]
-
-      for {graph_hash, inserted_at} <- [{"used", first_at}, {"unattached", second_at}] do
-        TestRepo.query!(
-          """
-          INSERT INTO docket_graph_versions (graph_id, graph_hash, graph, inserted_at)
-          VALUES ('legacy', $1, $2, $3)
-          """,
-          [graph_hash, <<131, 106>>, inserted_at]
-        )
-      end
-
-      now = DateTime.utc_now()
-
-      TestRepo.query!(
-        """
-        INSERT INTO docket_runs
-          (run_id, tenant_id, graph_id, graph_hash, status, step, state,
-           checkpoint_seq, wake_at, claim_attempts, claim_abandons,
-           inserted_at, started_at, updated_at)
-        VALUES
-          ('legacy_run', 'acme', 'legacy', 'used', 'running', 0, $1,
-           0, $2, 0, 0, $2, $2, $2)
-        """,
-        [<<131, 106>>, now]
-      )
-
-      assert :ok =
-               Ecto.Migrator.up(TestRepo, @v2_migration_version, UpgradeDocketV2, log: false)
-
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
-
-      assert %{rows: rows} =
-               TestRepo.query!("""
-               SELECT tenant_id, scope_key, graph_hash, graph, inserted_at
-               FROM docket_graph_versions
-               WHERE graph_id = 'legacy'
-               ORDER BY scope_key, graph_hash
-               """)
-
-      assert [
-               [nil, "", "unattached", <<131, 106>>, ^second_at],
-               [nil, "", "used", <<131, 106>>, ^first_at],
-               ["acme", "acme", "used", <<131, 106>>, ^first_at]
-             ] = rows
-
-      refute Enum.any?(rows, fn [tenant_id, _, graph_hash, _, _] ->
-               tenant_id == "acme" and graph_hash == "unattached"
-             end)
-
-      assert :ok =
-               Ecto.Migrator.down(TestRepo, @v2_migration_version, UpgradeDocketV2, log: false)
-
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
-      refute "scope_key" in columns("docket_runs")
-      refute "tenant_id" in columns("docket_graph_versions")
-
-      assert %{rows: [[2]]} =
-               TestRepo.query!("SELECT count(*) FROM docket_graph_versions", [])
     end
 
     test "dispatch and poison-introspection scans use their partial indexes" do

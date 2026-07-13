@@ -543,7 +543,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  log: false
                )
 
-      assert comment == "2"
+      assert comment == "1"
     end
 
     defp await_replacement(name, old_pid, attempts \\ 100)
