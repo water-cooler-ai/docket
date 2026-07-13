@@ -9,12 +9,11 @@ defmodule Docket.Interrupt do
   next superstep with the resolved value visible in its state snapshot.
   """
 
-  defstruct [:id, :node_id, :prompt, :schema, :resume_channel, metadata: %{}]
+  defstruct [:id, :node_id, :schema, :resume_channel, metadata: %{}]
 
   @type t :: %__MODULE__{
           id: String.t() | nil,
           node_id: String.t() | nil,
-          prompt: String.t() | nil,
           schema: Docket.Schema.t() | nil,
           resume_channel: String.t(),
           metadata: map()

@@ -311,22 +311,22 @@ Because `0.0.1` storage is application-defined, Docket cannot provide one
 universal database migration. The supported path is an explicit
 drain-and-cut-over rather than a transparent dual-driver period.
 
-## Human-in-the-loop interrupts
+## External interrupts
 
-A node pauses the run by returning an interrupt naming the state field the
-answer should land in:
+A node pauses the run by returning an interrupt naming the state field where
+the external resolution should be written:
 
 ```elixir
 def call(state, _config, _context) do
   case state["decision"] do
-    nil -> {:interrupt, %Docket.Interrupt{prompt: "Approve this draft?", resume_channel: "decision"}}
+    nil -> {:interrupt, %Docket.Interrupt{resume_channel: "decision"}}
     decision -> {:ok, %{"applied" => decision}}
   end
 end
 ```
 
 The run commits as `:waiting` without retaining a per-run process. When the
-human answers:
+external system resolves it:
 
 ```elixir
 {:ok, run} =

@@ -1366,7 +1366,7 @@ If the process crashed after local memory changed but before checkpoint, callers
 must not have received success. The run is resumed from the previous saved
 `Docket.Run` document.
 
-## 21. Interrupts and Human Input
+## 21. External Interrupts
 
 Nodes may pause a run:
 
@@ -1375,7 +1375,6 @@ Nodes may pause a run:
  %Docket.Interrupt{
    id: interrupt_id,
    node_id: node_id,
-   prompt: "Approve deployment?",
    schema: %{...},
    resume_channel: "approval"
  }}

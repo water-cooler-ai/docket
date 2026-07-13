@@ -959,7 +959,6 @@ Known interrupt return shape:
  %Docket.Interrupt{
    id: interrupt_id,
    node_id: node_id,
-   prompt: prompt,
    schema: schema,
    resume_channel: channel,
    metadata: %{}

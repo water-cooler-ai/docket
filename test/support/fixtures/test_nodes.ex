@@ -202,7 +202,6 @@ defmodule Docket.Test.Fixtures.Nodes do
         empty when empty in [nil, [], %{}] ->
           {:interrupt,
            %Docket.Interrupt{
-             prompt: "value for #{config["resume_field"]}?",
              resume_channel: config["resume_field"]
            }}
 
@@ -247,7 +246,6 @@ defmodule Docket.Test.Fixtures.Nodes do
         :error ->
           {:interrupt,
            %Docket.Interrupt{
-             prompt: "value for #{config["resume_field"]}?",
              schema: Docket.Schema.string(),
              resume_channel: config["resume_field"]
            }}
