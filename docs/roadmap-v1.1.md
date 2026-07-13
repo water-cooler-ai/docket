@@ -59,7 +59,7 @@ real semantic extension in the theme; everything else is additive descriptors.
   list type. Proposal: concatenate when the write is a list and `item` is not
   a list type; otherwise append — and let the compiler flag the ambiguous case.
 - **Interrupt resume.** `resolve_interrupt` writes through the resume field's
-  reducer, so answering into an `append` messages field accumulates naturally.
+  reducer, so resolving into an `append` field accumulates naturally.
 - **Wire format.** Reducer already serializes as `type` + `opts`; new types
   are additive. Old graphs load unchanged.
 

@@ -2,8 +2,8 @@
 
 Docket is an Elixir library for durable, graph-based workflow execution —
 built for long-running, interruptible work like agentic LLM sessions, where a
-run may pause for a human decision, survive a deploy, and resume exactly where
-it left off.
+run may pause for an external resolution, survive a deploy, and resume exactly
+where it left off.
 
 This branch is `0.1.0-dev`. Graph semantics are usable processlessly through
 `Docket.Test`; supervised production requires the assembled `Docket.Postgres`
@@ -335,7 +335,7 @@ external system resolves it:
 
 The value is validated against the interrupt's schema (if any), written to
 the resume field, and the interrupted node re-executes in the next superstep
-with the answer visible in its state.
+with the resolved value visible in its state.
 
 ## Execution model
 

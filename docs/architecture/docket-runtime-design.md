@@ -23,7 +23,7 @@ Flink, Timely Dataflow, and OTP.
 The library is not WaterCooler-specific. WaterCooler would be the first
 consumer, but the abstraction should be useful to any Elixir system that needs
 to run cyclic, parallel, stateful graphs with checkpoints, streaming updates,
-human interrupts, remote execution, and replay.
+external interrupts, remote execution, and replay.
 
 The central idea is:
 
@@ -61,7 +61,7 @@ break down once the workflow is no longer a simple ordered list:
 - Multiple downstream steps should run from the same result.
 - Multiple upstream branches should converge.
 - A step should loop until a channel or condition stabilizes.
-- A human or external system should resume a graph later.
+- An external signal should resume a graph later.
 - A long-running task should checkpoint progress.
 - An agent should write partial outputs while other actors continue.
 - A graph should support replay, debugging, time travel, and interrupts.
@@ -248,7 +248,7 @@ Sources:
 8. Checkpoint successful state transitions before acknowledging them.
 9. Record enough event history to replay, inspect, and debug.
 10. Separate deterministic graph control from external side effects.
-11. Support interrupts, human input, timers, and async completions.
+11. Support external resolutions, timers, and async completions.
 12. Support local and remote executors through a stable adapter contract.
 13. Expose telemetry and streaming events without making PubSub the source of
     truth.
@@ -1700,7 +1700,7 @@ Current WaterCooler concepts can map like this:
 | step result | channel write |
 | workflow output | output channel |
 | run history | event history |
-| elicitation | interrupt |
+| external resolution | interrupt |
 | session log | event stream projection |
 | RuntimeChannel step execution | Executor adapter |
 | project context | external store or application-owned channel adapter |
@@ -1713,7 +1713,7 @@ For WaterCooler, the server should still own:
 - graph definitions derived from workflows
 - run state and checkpoints
 - channel values that are user-visible or gate-visible
-- interrupts/elicitations
+- interrupts and their resolutions
 - event history
 - session logs
 - trigger evaluation
@@ -1917,7 +1917,7 @@ Benefits:
 Problems:
 
 - Heavy runtime assumptions.
-- Less natural for per-run agent workflows with human interrupts.
+- Less natural for per-run workflows with external interrupts.
 - More engine than library.
 
 Recommendation:
