@@ -6,7 +6,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     import Ecto.Query
 
-    alias Docket.{DurableCodec, Graph}
+    alias Docket.{DurableCodec, Graph, GraphRef, SavedGraph}
     alias Docket.Postgres.Schemas.GraphVersion
     alias Docket.Postgres.Storage
 
@@ -35,9 +35,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       result =
         with {:ok, bytes} <- fetch_bytes(ctx, graph_id, graph_hash),
-             :ok <- verify_stored(bytes, graph_id, graph_hash),
-             {:ok, graph} <- decode(bytes),
-             true <- valid_decoded?(graph, graph_id, bytes) do
+             {:ok, graph} <- load_graph(bytes, graph_id, graph_hash) do
           {:ok, graph}
         else
           {:error, :not_found} -> {:error, :not_found}
@@ -45,6 +43,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end
 
       emit_store(:graph_fetch, started, result, 0)
+      result
+    end
+
+    @impl Docket.Storage.Graphs
+    def fetch_latest_graph(ctx, graph_id) do
+      started = System.monotonic_time()
+
+      result =
+        with {:ok, {stored_graph_id, graph_hash, bytes}} <- fetch_latest_bytes(ctx, graph_id),
+             true <- stored_graph_id == graph_id,
+             {:ok, graph} <- load_graph(bytes, graph_id, graph_hash) do
+          {:ok,
+           SavedGraph.new!(
+             %GraphRef{graph_id: graph_id, graph_hash: graph_hash},
+             graph
+           )}
+        else
+          {:error, :not_found} -> {:error, :not_found}
+          _invalid -> {:error, :corrupt_graph}
+        end
+
+      emit_store(:graph_fetch_latest, started, result, 0)
       result
     end
 
@@ -56,7 +76,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           encoded_bytes: bytes,
           attempted_rows: if(operation == :graph_save, do: 1, else: 0),
           selected_rows:
-            if(operation == :graph_fetch and match?({:ok, _}, result), do: 1, else: 0)
+            if(operation in [:graph_fetch, :graph_fetch_latest] and match?({:ok, _}, result),
+              do: 1,
+              else: 0
+            )
         },
         Map.merge(Docket.Telemetry.correlation_metadata(), %{
           operation: operation,
@@ -112,6 +135,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    defp fetch_latest_bytes(ctx, graph_id) do
+      {repo, prefix} = Storage.context!(ctx)
+
+      query =
+        GraphVersion
+        |> where([version], version.graph_id == ^graph_id)
+        |> order_by([version], desc: version.inserted_at, desc: version.id)
+        |> limit(1)
+        |> select([version], {version.graph_id, version.graph_hash, version.graph})
+        |> with_prefix(prefix)
+
+      case repo.one(query) do
+        nil ->
+          {:error, :not_found}
+
+        {stored_graph_id, graph_hash, bytes}
+        when is_binary(stored_graph_id) and is_binary(graph_hash) and is_binary(bytes) ->
+          {:ok, {stored_graph_id, graph_hash, bytes}}
+
+        _invalid ->
+          {:error, :corrupt_graph}
+      end
+    end
+
     defp encode(graph) do
       {:ok, DurableCodec.encode!(:graph, graph)}
     rescue
@@ -126,7 +173,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    defp verify_stored(bytes, _graph_id, graph_hash), do: verify_hash(bytes, graph_hash)
+    defp load_graph(bytes, graph_id, graph_hash) do
+      with :ok <- verify_hash(bytes, graph_hash),
+           {:ok, graph} <- decode(bytes),
+           true <- valid_decoded?(graph, graph_id, bytes) do
+        {:ok, graph}
+      else
+        _invalid -> {:error, :corrupt_graph}
+      end
+    end
 
     defp verify_hash(bytes, graph_hash) when is_binary(graph_hash) do
       if digest(bytes) == graph_hash, do: :ok, else: {:error, :invalid_graph_hash}

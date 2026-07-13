@@ -6,7 +6,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
-    alias Docket.{DurableCodec, Graph}
+    alias Docket.{DurableCodec, Graph, GraphRef, SavedGraph}
     alias Docket.Postgres.{GraphStore, Storage}
     alias Docket.Postgres.GraphStoreTestRepo, as: TestRepo
     alias Docket.Postgres.Schemas.GraphVersion
@@ -63,6 +63,117 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, stored} = GraphStore.fetch_graph(TestRepo, graph.id, graph_hash)
       assert {:ok, runtime_graph} = Docket.ensure_compiled_effective(stored, [])
       assert runtime_graph.graph_hash == graph_hash
+    end
+
+    test "fetches the latest saved graph with its exact content address" do
+      {older, older_hash} = effective_graph("minimal-linear", "older")
+      {newer, newer_hash} = effective_graph("minimal-linear", "newer")
+
+      assert :ok = GraphStore.save_graph(TestRepo, older.id, older_hash, older)
+      assert :ok = GraphStore.save_graph(TestRepo, newer.id, newer_hash, newer)
+
+      assert {:ok,
+              %SavedGraph{
+                ref: %GraphRef{graph_id: "minimal-linear", graph_hash: ^newer_hash},
+                graph: ^newer
+              }} = GraphStore.fetch_latest_graph(TestRepo, "minimal-linear")
+
+      assert {:error, :not_found} = GraphStore.fetch_latest_graph(TestRepo, "missing")
+    end
+
+    test "latest graph order uses inserted_at and then the row id as a stable tie-break" do
+      {first, first_hash} = effective_graph("revision-order", "first")
+      {second, second_hash} = effective_graph("revision-order", "second")
+
+      assert :ok = GraphStore.save_graph(TestRepo, first.id, first_hash, first)
+      assert :ok = GraphStore.save_graph(TestRepo, second.id, second_hash, second)
+
+      TestRepo.update_all(
+        from(version in GraphVersion,
+          where: version.graph_id == "revision-order" and version.graph_hash == ^first_hash
+        ),
+        set: [inserted_at: ~U[2026-07-12 12:00:01.000000Z]]
+      )
+
+      TestRepo.update_all(
+        from(version in GraphVersion,
+          where: version.graph_id == "revision-order" and version.graph_hash == ^second_hash
+        ),
+        set: [inserted_at: ~U[2026-07-12 12:00:00.000000Z]]
+      )
+
+      assert {:ok, %SavedGraph{ref: %GraphRef{graph_hash: ^first_hash}, graph: ^first}} =
+               GraphStore.fetch_latest_graph(TestRepo, "revision-order")
+
+      TestRepo.update_all(
+        from(version in GraphVersion, where: version.graph_id == "revision-order"),
+        set: [inserted_at: ~U[2026-07-12 12:00:00.000000Z]]
+      )
+
+      assert {:ok, %SavedGraph{ref: %GraphRef{graph_hash: ^second_hash}, graph: ^second}} =
+               GraphStore.fetch_latest_graph(TestRepo, "revision-order")
+    end
+
+    test "latest graph verifies the stored hash, decoded id, and durable document" do
+      {hash_mismatch, _hash} = effective_graph("hash-mismatch", "document")
+
+      insert_raw!(
+        hash_mismatch.id,
+        String.duplicate("0", 64),
+        DurableCodec.encode!(:graph, hash_mismatch)
+      )
+
+      {wrong_id, wrong_id_hash} = effective_graph("actual-id", "document")
+      insert_raw!("wrong-id", wrong_id_hash, DurableCodec.encode!(:graph, wrong_id))
+
+      corrupt = <<131, 0, 1, 2, 3>>
+      insert_raw!("bad-document", digest(corrupt), corrupt)
+
+      assert {:error, :corrupt_graph} =
+               GraphStore.fetch_latest_graph(TestRepo, "hash-mismatch")
+
+      assert {:error, :corrupt_graph} = GraphStore.fetch_latest_graph(TestRepo, "wrong-id")
+      assert {:error, :corrupt_graph} = GraphStore.fetch_latest_graph(TestRepo, "bad-document")
+    end
+
+    test "a corrupt latest graph fails closed instead of falling back" do
+      {valid, valid_hash} = effective_graph("no-fallback", "valid")
+      assert :ok = GraphStore.save_graph(TestRepo, valid.id, valid_hash, valid)
+
+      corrupt = <<131, 0, 1, 2, 3>>
+      insert_raw!(valid.id, digest(corrupt), corrupt)
+
+      assert {:error, :corrupt_graph} = GraphStore.fetch_latest_graph(TestRepo, valid.id)
+    end
+
+    test "latest graph fetch emits bounded store telemetry" do
+      {graph, graph_hash} = effective_graph()
+      assert :ok = GraphStore.save_graph(TestRepo, graph.id, graph_hash, graph)
+
+      handler_id = "latest-graph-telemetry-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:docket, :postgres, :store],
+          &Docket.Test.TelemetryRelay.tagged/4,
+          {parent, :latest_graph_telemetry}
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assert {:ok, %SavedGraph{}} = GraphStore.fetch_latest_graph(TestRepo, graph.id)
+
+      assert_receive {:latest_graph_telemetry, measurements, metadata}
+      assert is_integer(measurements.duration) and measurements.duration >= 0
+      assert measurements.selected_rows == 1
+      assert measurements.attempted_rows == 0
+      assert measurements.encoded_bytes == 0
+      assert metadata.operation == :graph_fetch_latest
+      assert metadata.result == :ok
+      refute Map.has_key?(metadata, :graph_id)
+      refute Map.has_key?(metadata, :graph_hash)
     end
 
     test "rejects the wrong id, diagnostics, value type, and content address" do
@@ -132,11 +243,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, ^graph} = GraphStore.fetch_graph(ctx, graph.id, graph_hash)
       assert {:error, :not_found} = GraphStore.fetch_graph(TestRepo, graph.id, graph_hash)
+
+      assert {:ok,
+              %SavedGraph{
+                ref: %GraphRef{graph_id: "minimal-linear", graph_hash: ^graph_hash},
+                graph: ^graph
+              }} = GraphStore.fetch_latest_graph(ctx, graph.id)
+
+      assert {:error, :not_found} = GraphStore.fetch_latest_graph(TestRepo, graph.id)
     end
 
     defp effective_graph do
+      effective_graph("minimal-linear", nil)
+    end
+
+    defp effective_graph(graph_id, revision) do
+      metadata = if revision, do: %{"revision" => revision}, else: %{}
+      authored = %{Graphs.minimal_linear() | id: graph_id, metadata: metadata}
+
       {:ok, graph, runtime_graph} =
-        Graph.Compiler.compile_for_publication(Graphs.minimal_linear(), profile: :publish)
+        Graph.Compiler.compile_for_publication(authored, profile: :publish)
 
       {graph, runtime_graph.graph_hash}
     end

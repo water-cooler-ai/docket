@@ -24,7 +24,7 @@ defmodule Docket do
   For processless in-test execution of the same loop, use `Docket.Test`.
   """
 
-  alias Docket.{Error, Graph, GraphRef, Lifecycle, Run, RunInfo}
+  alias Docket.{Error, Graph, GraphRef, Lifecycle, Run, RunInfo, SavedGraph}
   alias Docket.Runtime.{Instance, Loop}
   alias Docket.Runtime.RunMutation
 
@@ -59,6 +59,47 @@ defmodule Docket do
 
   def save_graph(_runtime, graph, _opts) do
     {:error, Error.new(:invalid_graph, "expected a Docket.Graph, got #{inspect(graph)}")}
+  end
+
+  @doc """
+  Reads a saved effective graph.
+
+  A `Docket.GraphRef` selects its exact immutable version. A graph ID selects
+  the latest distinct version saved under that ID, ordered by publication
+  time. The result includes both the effective graph and its stable reference,
+  so it can be passed directly to `start_run` without re-publishing it.
+
+  Graphs are global to a backend rather than tenant scoped. An unknown ID or
+  reference returns `{:error, :not_found}`.
+  """
+  @spec fetch_graph(term(), GraphRef.t() | String.t(), keyword()) ::
+          {:ok, SavedGraph.t()} | {:error, term()}
+  def fetch_graph(runtime, graph_id_or_ref, opts \\ [])
+
+  def fetch_graph(runtime, %GraphRef{graph_id: graph_id, graph_hash: graph_hash} = ref, opts)
+      when is_binary(graph_id) and byte_size(graph_id) > 0 and is_binary(graph_hash) and
+             byte_size(graph_hash) > 0 do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, {backend, context}} <- configured_backend(opts),
+         {:ok, graph} <- backend.graphs().fetch_graph(context, graph_id, graph_hash) do
+      {:ok, SavedGraph.new!(ref, graph)}
+    end
+  end
+
+  def fetch_graph(runtime, graph_id, opts)
+      when is_binary(graph_id) and byte_size(graph_id) > 0 do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, {backend, context}} <- configured_backend(opts) do
+      backend.graphs().fetch_latest_graph(context, graph_id)
+    end
+  end
+
+  def fetch_graph(_runtime, graph_id_or_ref, _opts) do
+    {:error,
+     Error.new(
+       :invalid_graph_reference,
+       "expected a non-empty graph ID or Docket.GraphRef, got #{inspect(graph_id_or_ref)}"
+     )}
   end
 
   defp compile_for_publication(graph) do
@@ -181,6 +222,82 @@ defmodule Docket do
   end
 
   @doc """
+  Lists durable runs visible to the resolved tenant scope.
+
+  Runs are returned as lightweight `Docket.RunSummary` values in newest-first
+  order by the immutable `{started_at, run_id}` key. `:before` accepts the
+  previous page's `next_before` cursor. Optional filters are `:status`
+  (one durable status or a non-empty list), `:graph_id`, and `:graph_hash`.
+  `:limit` defaults to `100` and must be in `1..1000`.
+
+  An empty result is a successful empty `Docket.RunPage`. Under
+  `tenant_mode: :required`, `:tenant_id` is mandatory and is always an access
+  scope, never an optional filter.
+  """
+  @spec list_runs(term(), keyword()) :: {:ok, Docket.RunPage.t()} | {:error, term()}
+  def list_runs(runtime, opts \\ []) do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, query} <- list_runs_options(opts),
+         {:ok, {backend, context}, scope} <- durable_access(opts) do
+      backend.runs().list_runs(context, scope, query)
+    end
+  end
+
+  @doc """
+  Fetches the newest run summary matching the supplied tenant scope and
+  optional graph/status filters.
+
+  Returns `{:error, :not_found}` when the scoped query has no matches.
+  """
+  @spec fetch_latest_run(term(), keyword()) ::
+          {:ok, Docket.RunSummary.t()} | {:error, term()}
+  def fetch_latest_run(runtime, opts \\ []) do
+    with :ok <- validate_latest_run_options(opts),
+         {:ok, opts} <- instance_opts(runtime, opts),
+         query_opts = opts |> Keyword.delete(:before) |> Keyword.put(:limit, 1),
+         {:ok, query} <- list_runs_options(query_opts),
+         {:ok, {backend, context}, scope} <- durable_access(opts),
+         {:ok, page} <- backend.runs().list_runs(context, scope, query) do
+      case page.runs do
+        [latest] -> {:ok, latest}
+        [] -> {:error, :not_found}
+      end
+    end
+  end
+
+  @doc """
+  Reads one retained durable event by its positive sequence number.
+
+  A missing or pruned sequence, an unknown run, and a wrong tenant all return
+  `{:error, :not_found}`.
+  """
+  @spec fetch_event(term(), String.t(), pos_integer(), keyword()) ::
+          {:ok, Docket.Event.t()} | {:error, term()}
+  def fetch_event(runtime, run_id, seq, opts \\ []) do
+    with :ok <- validate_event_seq(seq),
+         {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, {backend, context}, scope} <- durable_access(opts) do
+      backend.events().fetch_event(context, scope, run_id, seq)
+    end
+  end
+
+  @doc """
+  Reads the latest retained durable event for a run.
+
+  A visible run whose complete event history has been pruned returns
+  `{:ok, nil}`. An unknown run and a wrong tenant return
+  `{:error, :not_found}`.
+  """
+  @spec fetch_latest_event(term(), String.t(), keyword()) ::
+          {:ok, Docket.Event.t() | nil} | {:error, term()}
+  def fetch_latest_event(runtime, run_id, opts \\ []) do
+    with {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, {backend, context}, scope} <- durable_access(opts) do
+      backend.events().fetch_latest_event(context, scope, run_id)
+    end
+  end
+
+  @doc """
   Reads a page of retained durable events for a run.
 
   Events come back in ascending sequence order, restricted to sequences
@@ -255,6 +372,9 @@ defmodule Docket do
 
       def save_graph(graph, opts \\ []), do: Docket.save_graph(__MODULE__, graph, opts)
 
+      def fetch_graph(graph_id_or_ref, opts \\ []),
+        do: Docket.fetch_graph(__MODULE__, graph_id_or_ref, opts)
+
       def resolve_interrupt(run_id, interrupt_id, value, opts \\ []) do
         Docket.resolve_interrupt(__MODULE__, run_id, interrupt_id, value, opts)
       end
@@ -267,6 +387,16 @@ defmodule Docket do
 
       def fetch_run(run_id, opts \\ []), do: Docket.fetch_run(__MODULE__, run_id, opts)
       def inspect_run(run_id, opts \\ []), do: Docket.inspect_run(__MODULE__, run_id, opts)
+      def list_runs(opts \\ []), do: Docket.list_runs(__MODULE__, opts)
+      def fetch_latest_run(opts \\ []), do: Docket.fetch_latest_run(__MODULE__, opts)
+
+      def fetch_event(run_id, seq, opts \\ []),
+        do: Docket.fetch_event(__MODULE__, run_id, seq, opts)
+
+      def fetch_latest_event(run_id, opts \\ []) do
+        Docket.fetch_latest_event(__MODULE__, run_id, opts)
+      end
+
       def list_events(run_id, opts \\ []), do: Docket.list_events(__MODULE__, run_id, opts)
       def await_run(run_id, opts \\ []), do: Docket.await_run(__MODULE__, run_id, opts)
       def drain_runs(opts \\ []), do: Docket.drain_runs(__MODULE__, opts)
@@ -421,6 +551,98 @@ defmodule Docket do
       true ->
         {:ok, %{after_seq: after_seq, limit: limit}}
     end
+  end
+
+  defp list_runs_options(opts) do
+    limit = Keyword.get(opts, :limit, 100)
+    before = Keyword.get(opts, :before)
+    graph_id = Keyword.get(opts, :graph_id)
+    graph_hash = Keyword.get(opts, :graph_hash)
+
+    with :ok <- validate_run_limit(limit),
+         :ok <- validate_run_cursor(before),
+         :ok <- validate_optional_id(graph_id, :graph_id),
+         :ok <- validate_optional_id(graph_hash, :graph_hash),
+         {:ok, statuses} <- normalize_run_statuses(Keyword.get(opts, :status)) do
+      {:ok,
+       %{
+         limit: limit,
+         before: before,
+         graph_id: graph_id,
+         graph_hash: graph_hash,
+         statuses: statuses
+       }}
+    end
+  end
+
+  defp validate_run_limit(limit) when is_integer(limit) and limit in 1..1000, do: :ok
+
+  defp validate_run_limit(_limit) do
+    {:error, Error.new(:invalid_options, "list_runs :limit must be an integer in 1..1000")}
+  end
+
+  defp validate_latest_run_options(opts) do
+    if Keyword.has_key?(opts, :limit) or Keyword.has_key?(opts, :before) do
+      {:error,
+       Error.new(
+         :invalid_options,
+         "fetch_latest_run accepts graph/status filters but not :limit or :before"
+       )}
+    else
+      :ok
+    end
+  end
+
+  defp validate_run_cursor(nil), do: :ok
+
+  defp validate_run_cursor({%DateTime{}, run_id})
+       when is_binary(run_id) and byte_size(run_id) > 0,
+       do: :ok
+
+  defp validate_run_cursor(_cursor) do
+    {:error,
+     Error.new(
+       :invalid_options,
+       "list_runs :before must be nil or a {DateTime, non-empty run_id} cursor"
+     )}
+  end
+
+  defp validate_optional_id(nil, _field), do: :ok
+  defp validate_optional_id(value, _field) when is_binary(value) and byte_size(value) > 0, do: :ok
+
+  defp validate_optional_id(_value, field) do
+    {:error,
+     Error.new(:invalid_options, "list_runs #{inspect(field)} must be a non-empty binary")}
+  end
+
+  defp normalize_run_statuses(nil), do: {:ok, nil}
+
+  defp normalize_run_statuses(status) when is_atom(status) do
+    if Run.durable_status?(status),
+      do: {:ok, [status]},
+      else: invalid_run_statuses()
+  end
+
+  defp normalize_run_statuses(statuses) when is_list(statuses) and statuses != [] do
+    if Enum.all?(statuses, &Run.durable_status?/1),
+      do: {:ok, Enum.uniq(statuses)},
+      else: invalid_run_statuses()
+  end
+
+  defp normalize_run_statuses(_statuses), do: invalid_run_statuses()
+
+  defp invalid_run_statuses do
+    {:error,
+     Error.new(
+       :invalid_options,
+       "list_runs :status must be a durable status or a non-empty list of durable statuses"
+     )}
+  end
+
+  defp validate_event_seq(seq) when is_integer(seq) and seq > 0, do: :ok
+
+  defp validate_event_seq(_seq) do
+    {:error, Error.new(:invalid_options, "fetch_event sequence must be a positive integer")}
   end
 
   defp durable_resolve_interrupt(opts, run_id, interrupt_id, value) do

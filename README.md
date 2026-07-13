@@ -176,12 +176,39 @@ finished.output #=> %{"result" => "HELLO WORLD"}
 
 {:ok, committed} = MyApp.DurableDocket.fetch_run(run.id)
 {:ok, operational} = MyApp.DurableDocket.inspect_run(run.id)
+
+{:ok, %Docket.SavedGraph{ref: latest_ref, graph: effective_graph}} =
+  MyApp.DurableDocket.fetch_graph("shout")
 ```
 
 `start_run` returns after the initialized run is durably committed; production
 advancement is asynchronous. `await_run` is a bounded convenience for callers
 that need to wait until a run pauses or terminates. Use `fetch_run` for the last
 committed graph state and `inspect_run` for scheduling and poison health.
+
+Use the tenant-scoped collection reader to discover runs without maintaining a
+second run-ID index in the host application. It returns lightweight summaries
+newest first, using the immutable `{started_at, run_id}` pair as its cursor:
+
+```elixir
+{:ok, page} =
+  MyApp.DurableDocket.list_runs(
+    graph_id: "shout",
+    status: [:running, :waiting],
+    limit: 100
+  )
+
+page.runs
+page.next_before
+page.has_more?
+
+{:ok, latest} = MyApp.DurableDocket.fetch_latest_run(graph_id: "shout")
+```
+
+Pass `before: page.next_before` to continue. `fetch_graph/1` resolves the
+latest distinct saved version for an ID and returns its exact `GraphRef` with
+the effective document; passing a `GraphRef` instead reads that immutable
+version.
 
 To read a run's history, page its retained events in ascending sequence order:
 
@@ -192,6 +219,12 @@ page.events            # this page, ascending by sequence
 page.next_after_seq    # cursor for the next page
 page.has_more?         # whether more retained events follow
 ```
+
+For point reads, use `fetch_event(run.id, seq)` or
+`fetch_latest_event(run.id)`. The latter means the latest *retained* event and
+returns `{:ok, nil}` when the run is visible but retention has removed its
+entire event history; a missing or wrong-tenant run still returns
+`{:error, :not_found}`.
 
 Pass `tenant_id:` under `tenant_mode: :required`; a wrong tenant and an unknown
 run both return `{:error, :not_found}`. This is the delivery-safe way to repair

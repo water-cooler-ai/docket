@@ -16,6 +16,20 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- Public saved-graph and run-query reads: `Docket.fetch_graph/3` resolves an
+  exact `Docket.GraphRef` or the latest distinct publication for a graph ID and
+  returns `%Docket.SavedGraph{}`; `Docket.list_runs/2` returns tenant-scoped,
+  newest-first `%Docket.RunPage{}` values containing lightweight
+  `%Docket.RunSummary{}` rows, with stable `{started_at, run_id}` keyset
+  pagination and graph/status filters; and `Docket.fetch_latest_run/2` returns
+  the newest matching summary. The graph store remains global and
+  content-addressed, while every run collection query uses the same explicit
+  tenant scope as point reads.
+- `Docket.fetch_event/4` and `Docket.fetch_latest_event/3` retained-event point
+  reads. Exact missing or pruned sequences return `:not_found`; latest returns
+  `{:ok, nil}` when a visible run has no retained events, preserving the
+  distinction from an unknown or wrong-tenant run. Both memory and PostgreSQL
+  backends implement the new graph, run, and event behavior callbacks.
 - `Docket.list_events/3` and the generated `list_events/2` host wrapper: a
   tenant-scoped, keyset-paged reader over retained durable events, backed by a
   new `Docket.Storage.Events.list_events/4` callback with memory and Postgres

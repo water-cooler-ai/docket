@@ -186,6 +186,15 @@ defmodule Docket.MemoryBackendTest do
                :step_committed,
                @initial_wake
              )
+
+    assert {:error, :invalid_run} =
+             MemoryBackend.insert_run(
+               b,
+               :tenantless,
+               %{run("missing-updated-at") | updated_at: nil},
+               :run_initialized,
+               @initial_wake
+             )
   end
 
   test "graph storage is content-addressed and structurally idempotent", %{backend: b} do
@@ -201,6 +210,25 @@ defmodule Docket.MemoryBackendTest do
              MemoryBackend.save_graph(b, "g", graph_hash, different)
 
     assert {:ok, ^first} = MemoryBackend.fetch_graph(b, "g", graph_hash)
+  end
+
+  test "latest graph lookup follows distinct publication order", %{backend: b} do
+    first = %{@graph | metadata: %{"revision" => 1}}
+    second = %{@graph | metadata: %{"revision" => 2}}
+    first_hash = durable_hash(first)
+    second_hash = durable_hash(second)
+
+    assert :ok = MemoryBackend.save_graph(b, "g", first_hash, first)
+    assert :ok = MemoryBackend.save_graph(b, "g", second_hash, second)
+    assert :ok = MemoryBackend.save_graph(b, "g", first_hash, first)
+
+    assert {:ok,
+            %Docket.SavedGraph{
+              ref: %Docket.GraphRef{graph_id: "g", graph_hash: ^second_hash},
+              graph: ^second
+            }} = MemoryBackend.fetch_latest_graph(b, "g")
+
+    assert {:error, :not_found} = MemoryBackend.fetch_latest_graph(b, "missing")
   end
 
   defp durable_hash(graph) do
@@ -876,7 +904,7 @@ defmodule Docket.MemoryBackendTest do
     assert [] == MemoryBackend.events(b, :system, "r1")
   end
 
-  test "commits and mutations cannot rebind the immutable graph version", %{backend: b} do
+  test "commits and mutations cannot rebind immutable graph or start identity", %{backend: b} do
     stored = run("r1")
     assert {:ok, _} = initialize(b, stored)
     lease = claim_one(b, @now)
@@ -885,6 +913,11 @@ defmodule Docket.MemoryBackendTest do
 
     assert {:error, :invalid_commit} =
              commit(b, rebound, lease.claim_token, :retain_claim)
+
+    moved = %{run("r1", checkpoint_seq: 2) | started_at: DateTime.add(@initial_wake, 1, :second)}
+
+    assert {:error, :invalid_commit} =
+             commit(b, moved, lease.claim_token, :retain_claim)
 
     assert {:error, :invalid_commit} =
              commit(b, run("r1", checkpoint_seq: 2), lease.claim_token, :retain_claim,
@@ -900,6 +933,17 @@ defmodule Docket.MemoryBackendTest do
                }
 
                {:commit, rebound, :interrupt_resolved, {:release_claim, :immediate}, :rebound}
+             end)
+
+    assert {:error, :invalid_mutation} =
+             MemoryBackend.mutate_run(b, :tenantless, "r1", fn current ->
+               moved = %{
+                 current
+                 | started_at: DateTime.add(current.started_at, 1, :second),
+                   checkpoint_seq: current.checkpoint_seq + 1
+               }
+
+               {:commit, moved, :interrupt_resolved, {:release_claim, :immediate}, :moved}
              end)
 
     assert {:ok, ^stored} = MemoryBackend.fetch_run(b, :system, "r1")

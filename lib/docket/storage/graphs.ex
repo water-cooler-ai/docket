@@ -44,4 +44,20 @@ defmodule Docket.Storage.Graphs do
               graph_id :: String.t(),
               graph_hash :: String.t()
             ) :: {:ok, Docket.Graph.t()} | {:error, :not_found | :corrupt_graph}
+
+  @doc """
+  Reads the latest saved version of a graph ID.
+
+  Latest is defined by durable publication order: descending `inserted_at`,
+  with the backend row ID as the stable descending tie-break. The returned
+  projection includes both the effective graph and its exact content address.
+
+  `:not_found` is reserved for an absent graph ID. A present latest row whose
+  content address or durable document is invalid returns `:corrupt_graph`; an
+  implementation must not fall back to an older version.
+  """
+  @callback fetch_latest_graph(
+              ctx(),
+              graph_id :: String.t()
+            ) :: {:ok, Docket.SavedGraph.t()} | {:error, :not_found | :corrupt_graph}
 end

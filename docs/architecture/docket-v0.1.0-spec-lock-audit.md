@@ -204,3 +204,27 @@ with an explicit `schema_version: 1`. The final contract:
 Non-goals held firm: no public `Docket.Run` map codec, no public
 `Docket.Graph.hash`, no Jason dependency (hosts own JSON encode/decode), and no
 change to the private ETF persistence codec.
+
+## Public query surface reopening (2026-07-12)
+
+The release lock also reopens the read surface without changing durable graph
+or run identity:
+
+- `fetch_graph` accepts an exact `Docket.GraphRef` or a graph ID. An ID selects
+  the latest distinct durable publication by `inserted_at DESC, id DESC`; the
+  result is a `Docket.SavedGraph` carrying both the effective document and its
+  exact reference. Graph versions remain backend-global and content-addressed,
+  not tenant owned.
+- `list_runs` returns a `Docket.RunPage` of lightweight `Docket.RunSummary`
+  projections. The query is always SQL-scoped to `:tenantless` or the required
+  tenant, supports graph and durable-status filters, and paginates newest first
+  with the immutable `(started_at, run_id)` key. `fetch_latest_run` is the
+  limit-one form of the same scoped query.
+- `fetch_event` reads one retained positive event sequence.
+  `fetch_latest_event` reads the highest retained sequence, returning
+  `{:ok, nil}` when the owning run is visible but no event rows survive
+  retention. Missing or wrong-scope runs remain indistinguishable as
+  `{:error, :not_found}`.
+
+The storage behaviors declare each operation, and the memory and PostgreSQL
+backends implement the same return, scope, ordering, and retention semantics.

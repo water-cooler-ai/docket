@@ -11,6 +11,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}
 
     @migration_version 20_260_710_000_024
+    @prefixed_migration_version 20_260_710_000_025
     @now ~U[2026-07-10 12:00:00Z]
 
     defmodule InstallDocket do
@@ -19,12 +20,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down()
     end
 
+    defmodule InstallDocketPrefixed do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(prefix: "docket_private")
+      def down, do: Docket.Postgres.Migration.down(prefix: "docket_private")
+    end
+
     setup_all do
       config = TestRepo.config()
       _ = Ecto.Adapters.Postgres.storage_down(config)
       :ok = Ecto.Adapters.Postgres.storage_up(config)
       start_supervised!(TestRepo)
       :ok = Ecto.Migrator.up(TestRepo, @migration_version, InstallDocket, log: false)
+
+      :ok =
+        Ecto.Migrator.up(TestRepo, @prefixed_migration_version, InstallDocketPrefixed, log: false)
+
       :ok
     end
 
@@ -32,6 +43,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       TestRepo.delete_all(Event)
       TestRepo.delete_all(Run)
       TestRepo.delete_all(GraphVersion)
+      Event |> put_query_prefix("docket_private") |> TestRepo.delete_all()
+      Run |> put_query_prefix("docket_private") |> TestRepo.delete_all()
+      GraphVersion |> put_query_prefix("docket_private") |> TestRepo.delete_all()
 
       {:ok, graph, runtime} =
         Docket.Graph.Compiler.compile_for_publication(Docket.Graph.new!(id: "graph"))
@@ -139,6 +153,198 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                EventStore.append_events(TestRepo, {:tenant, "t2"}, run.id, [event(run, 2)])
 
       assert :ok = EventStore.append_events(TestRepo, {:tenant, "t2"}, "missing", [])
+    end
+
+    describe "point event reads" do
+      test "fetches an exact retained sequence through the owning run scope", %{run: run} do
+        append(run, [2, 3])
+
+        assert {:ok, %Docket.Event{} = fetched} =
+                 EventStore.fetch_event(TestRepo, {:tenant, "t1"}, run.id, 2)
+
+        assert fetched.run_id == run.id
+        assert fetched.seq == 2
+        assert fetched.type == :checkpoint_committed
+        assert fetched.timestamp == db_time(@now)
+        assert fetched.payload == %{"value" => 1}
+        assert fetched.metadata == %{"checkpoint_seq" => 1}
+
+        assert {:ok, %Docket.Event{seq: 2}} =
+                 EventStore.fetch_event(TestRepo, :system, run.id, 2)
+
+        assert {:error, :not_found} =
+                 EventStore.fetch_event(TestRepo, {:tenant, "t2"}, run.id, 2)
+
+        assert {:error, :not_found} =
+                 EventStore.fetch_event(TestRepo, :tenantless, run.id, 2)
+
+        assert {:error, :not_found} =
+                 EventStore.fetch_event(TestRepo, :system, "missing", 2)
+      end
+
+      test "an absent, persistence-filtered, or pruned exact sequence is not found", %{run: run} do
+        append(run, [2, 4])
+
+        assert {:error, :not_found} = EventStore.fetch_event(TestRepo, :system, run.id, 1)
+        assert {:error, :not_found} = EventStore.fetch_event(TestRepo, :system, run.id, 3)
+
+        TestRepo.delete_all(
+          from(event in Event, where: event.run_id == ^run.id and event.seq == 2)
+        )
+
+        assert {:error, :not_found} = EventStore.fetch_event(TestRepo, :system, run.id, 2)
+        assert {:ok, %Docket.Event{seq: 4}} = EventStore.fetch_event(TestRepo, :system, run.id, 4)
+      end
+
+      test "fetches the highest retained sequence and distinguishes an empty visible run", %{
+        run: run
+      } do
+        append(run, [2, 4])
+
+        assert {:ok, %Docket.Event{seq: 4}} =
+                 EventStore.fetch_latest_event(TestRepo, {:tenant, "t1"}, run.id)
+
+        TestRepo.delete_all(
+          from(event in Event, where: event.run_id == ^run.id and event.seq == 4)
+        )
+
+        assert {:ok, %Docket.Event{seq: 2}} =
+                 EventStore.fetch_latest_event(TestRepo, :system, run.id)
+
+        TestRepo.delete_all(Event)
+
+        assert {:ok, nil} = EventStore.fetch_latest_event(TestRepo, :system, run.id)
+
+        assert {:error, :not_found} =
+                 EventStore.fetch_latest_event(TestRepo, {:tenant, "t2"}, run.id)
+
+        assert {:error, :not_found} =
+                 EventStore.fetch_latest_event(TestRepo, :tenantless, run.id)
+
+        assert {:error, :not_found} =
+                 EventStore.fetch_latest_event(TestRepo, :system, "missing")
+      end
+
+      test "exact and latest reads report typed event-row corruption", %{run: run} do
+        append(run, [2, 3])
+
+        TestRepo.update_all(
+          from(event in Event, where: event.run_id == ^run.id and event.seq == 2),
+          set: [payload: <<0, 1, 2>>]
+        )
+
+        assert {:error,
+                %Docket.Error{
+                  type: :corrupt_event_row,
+                  details: %{seq: 2, cause_type: :invalid_durable_state}
+                }} = EventStore.fetch_event(TestRepo, :system, run.id, 2)
+
+        TestRepo.update_all(
+          from(event in Event, where: event.run_id == ^run.id and event.seq == 3),
+          set: [metadata: <<0, 1, 2>>]
+        )
+
+        assert {:error,
+                %Docket.Error{
+                  type: :corrupt_event_row,
+                  details: %{seq: 3, cause_type: :invalid_durable_state}
+                }} = EventStore.fetch_latest_event(TestRepo, :system, run.id)
+      end
+
+      test "point reads emit bounded identity-free store telemetry", %{run: run} do
+        append(run, [2])
+        handler_id = "event-point-telemetry-#{System.unique_integer([:positive])}"
+        parent = self()
+
+        :ok =
+          :telemetry.attach(
+            handler_id,
+            [:docket, :postgres, :store],
+            &Docket.Test.TelemetryRelay.tagged/4,
+            {parent, :event_point_telemetry}
+          )
+
+        on_exit(fn -> :telemetry.detach(handler_id) end)
+
+        assert {:ok, %Docket.Event{seq: 2}} =
+                 EventStore.fetch_event(TestRepo, :system, run.id, 2)
+
+        assert_receive {:event_point_telemetry, exact_measurements, exact_metadata}
+        assert is_integer(exact_measurements.duration) and exact_measurements.duration >= 0
+        assert exact_measurements.selected_rows == 1
+        assert exact_measurements.encoded_bytes > 0
+        assert exact_metadata.operation == :event_fetch
+        assert exact_metadata.result == :ok
+        refute Map.has_key?(exact_metadata, :run_id)
+        refute Map.has_key?(exact_metadata, :seq)
+
+        assert {:ok, %Docket.Event{seq: 2}} =
+                 EventStore.fetch_latest_event(TestRepo, :system, run.id)
+
+        assert_receive {:event_point_telemetry, latest_measurements, latest_metadata}
+        assert is_integer(latest_measurements.duration) and latest_measurements.duration >= 0
+        assert latest_measurements.selected_rows == 1
+        assert latest_measurements.encoded_bytes > 0
+        assert latest_metadata.operation == :event_fetch_latest
+        assert latest_metadata.result == :ok
+        refute Map.has_key?(latest_metadata, :run_id)
+        refute Map.has_key?(latest_metadata, :seq)
+      end
+
+      test "exact reads assert their trusted positive sequence contract", %{run: run} do
+        assert_raise ArgumentError, ~r/event sequence must be a positive integer/, fn ->
+          EventStore.fetch_event(TestRepo, :system, run.id, 0)
+        end
+      end
+
+      test "point reads honor the configured Postgres prefix" do
+        ctx = %{repo: TestRepo, prefix: "docket_private"}
+
+        {:ok, graph, runtime} =
+          Docket.Graph.Compiler.compile_for_publication(Docket.Graph.new!(id: "private-graph"))
+
+        assert :ok = GraphStore.save_graph(ctx, graph.id, runtime.graph_hash, graph)
+
+        run = %Docket.Run{
+          id: "private-run",
+          graph_id: graph.id,
+          graph_hash: runtime.graph_hash,
+          status: :running,
+          input: %{},
+          checkpoint_seq: 1,
+          event_seq: 2,
+          started_at: db_time(@now),
+          updated_at: db_time(@now)
+        }
+
+        assert {:ok, ^run} =
+                 RunStore.insert_run(
+                   ctx,
+                   {:tenant, "private-tenant"},
+                   run,
+                   :run_initialized,
+                   db_time(@now)
+                 )
+
+        expected = event(run, 2)
+
+        assert :ok =
+                 EventStore.append_events(
+                   ctx,
+                   {:tenant, "private-tenant"},
+                   run.id,
+                   [expected]
+                 )
+
+        assert {:ok, %Docket.Event{seq: 2}} =
+                 EventStore.fetch_event(ctx, {:tenant, "private-tenant"}, run.id, 2)
+
+        assert {:ok, %Docket.Event{seq: 2}} =
+                 EventStore.fetch_latest_event(ctx, {:tenant, "private-tenant"}, run.id)
+
+        assert {:error, :not_found} = EventStore.fetch_event(TestRepo, :system, run.id, 2)
+        assert {:error, :not_found} = EventStore.fetch_latest_event(TestRepo, :system, run.id)
+      end
     end
 
     describe "list_events pages retained events with retention-aware bounds" do

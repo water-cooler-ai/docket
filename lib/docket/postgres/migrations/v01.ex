@@ -90,6 +90,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       create_if_not_exists(unique_index(:docket_runs, [:run_id], prefix: prefix))
 
       create_if_not_exists(
+        index(:docket_runs, ["started_at DESC", "run_id DESC"],
+          name: :docket_runs_list_order_index,
+          prefix: prefix
+        )
+      )
+
+      create_if_not_exists(
+        index(:docket_runs, [:tenant_id, "started_at DESC", "run_id DESC"],
+          name: :docket_runs_tenant_list_order_index,
+          prefix: prefix
+        )
+      )
+
+      create_if_not_exists(
         index(:docket_runs, [:tenant_id, :status],
           where: "tenant_id IS NOT NULL",
           prefix: prefix

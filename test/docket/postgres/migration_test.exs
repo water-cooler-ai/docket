@@ -71,6 +71,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert indexes["docket_runs_run_id_index"] =~ "CREATE UNIQUE INDEX"
 
+      assert indexes["docket_runs_list_order_index"] =~
+               "(started_at DESC, run_id DESC)"
+
+      assert indexes["docket_runs_tenant_list_order_index"] =~
+               "(tenant_id, started_at DESC, run_id DESC)"
+
       assert indexes["docket_runs_tenant_id_status_index"] =~
                "WHERE (tenant_id IS NOT NULL)"
 
@@ -351,6 +357,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert explain(ready_scan) =~ "docket_runs_wake_at_id_index"
       assert explain(expired_scan) =~ "docket_runs_claimed_at_id_index"
       assert explain(poison_scan) =~ "docket_runs_poisoned_at_index"
+    end
+
+    test "newest-first run collection scans use stable listing indexes" do
+      install!()
+
+      system_scan = """
+      SELECT run_id, started_at FROM docket_runs
+      ORDER BY started_at DESC, run_id DESC
+      LIMIT 10
+      """
+
+      tenant_scan = """
+      SELECT run_id, started_at FROM docket_runs
+      WHERE tenant_id = 'tenant-1'
+      ORDER BY started_at DESC, run_id DESC
+      LIMIT 10
+      """
+
+      assert explain(system_scan) =~ "docket_runs_list_order_index"
+      assert explain(tenant_scan) =~ "docket_runs_tenant_list_order_index"
     end
 
     defp install! do

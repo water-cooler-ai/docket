@@ -166,6 +166,153 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    test "lists tenant-scoped summaries with stable newest-first keyset pagination" do
+      tied_at = DateTime.add(@now, 10, :second)
+      older_at = DateTime.add(@now, -10, :second)
+
+      insert_run!("tenant-a", tenant_id: "tenant-1", started_at: tied_at)
+      insert_run!("tenant-z", tenant_id: "tenant-1", started_at: tied_at)
+      insert_run!("tenant-old", tenant_id: "tenant-1", started_at: older_at)
+
+      insert_run!("other-tenant",
+        tenant_id: "tenant-2",
+        started_at: DateTime.add(tied_at, -1, :second)
+      )
+
+      insert_run!("tenantless", started_at: DateTime.add(tied_at, -2, :second))
+
+      assert {:ok, %Docket.RunPage{} = first} =
+               RunStore.list_runs(TestRepo, {:tenant, "tenant-1"}, list_query(limit: 2))
+
+      assert Enum.map(first.runs, & &1.id) == ["tenant-z", "tenant-a"]
+      assert Enum.all?(first.runs, &match?(%Docket.RunSummary{tenant_id: "tenant-1"}, &1))
+      assert first.has_more?
+      assert first.next_before == {tied_at, "tenant-a"}
+
+      assert {:ok, second} =
+               RunStore.list_runs(
+                 TestRepo,
+                 {:tenant, "tenant-1"},
+                 list_query(limit: 2, before: first.next_before)
+               )
+
+      assert [%Docket.RunSummary{id: "tenant-old", started_at: ^older_at}] = second.runs
+      refute second.has_more?
+      assert second.next_before == {older_at, "tenant-old"}
+
+      assert {:ok, empty} =
+               RunStore.list_runs(
+                 TestRepo,
+                 {:tenant, "tenant-1"},
+                 list_query(limit: 2, before: second.next_before)
+               )
+
+      assert empty.runs == []
+      refute empty.has_more?
+      assert empty.next_before == second.next_before
+
+      assert {:ok, tenantless_page} =
+               RunStore.list_runs(TestRepo, :tenantless, list_query(limit: 10))
+
+      assert Enum.map(tenantless_page.runs, & &1.id) == ["tenantless"]
+
+      assert {:ok, system_page} = RunStore.list_runs(TestRepo, :system, list_query(limit: 10))
+
+      assert Enum.map(system_page.runs, & &1.id) == [
+               "tenant-z",
+               "tenant-a",
+               "other-tenant",
+               "tenantless",
+               "tenant-old"
+             ]
+    end
+
+    test "run listing applies graph and status filters in SQL without decoding state" do
+      TestRepo.insert!(
+        GraphVersion.changeset(%{
+          graph_id: "other-graph",
+          graph_hash: "other-hash",
+          graph: <<131, 106>>
+        })
+      )
+
+      insert_run!("base-running", tenant_id: "tenant", started_at: @now)
+
+      insert_run!("other-running",
+        tenant_id: "tenant",
+        graph_id: "other-graph",
+        graph_hash: "other-hash",
+        started_at: DateTime.add(@now, 2, :second)
+      )
+
+      insert_run!("other-waiting",
+        tenant_id: "tenant",
+        graph_id: "other-graph",
+        graph_hash: "other-hash",
+        status: :waiting,
+        wake_at: nil,
+        started_at: DateTime.add(@now, 1, :second)
+      )
+
+      # A collection read must never touch the full durable state column.
+      TestRepo.update_all(
+        from(run in Run, where: run.run_id == "other-running"),
+        set: [state: <<0, 1, 2, 3>>]
+      )
+
+      assert {:ok, graph_page} =
+               RunStore.list_runs(
+                 TestRepo,
+                 {:tenant, "tenant"},
+                 list_query(limit: 10, graph_id: "other-graph")
+               )
+
+      assert Enum.map(graph_page.runs, & &1.id) == ["other-running", "other-waiting"]
+
+      assert Enum.map(graph_page.runs, &Docket.RunSummary.graph_ref/1) == [
+               %Docket.GraphRef{graph_id: "other-graph", graph_hash: "other-hash"},
+               %Docket.GraphRef{graph_id: "other-graph", graph_hash: "other-hash"}
+             ]
+
+      assert {:ok, hash_page} =
+               RunStore.list_runs(
+                 TestRepo,
+                 {:tenant, "tenant"},
+                 list_query(limit: 10, graph_hash: "other-hash", statuses: [:waiting])
+               )
+
+      assert [%Docket.RunSummary{id: "other-waiting", status: :waiting}] = hash_page.runs
+
+      assert {:ok, running_page} =
+               RunStore.list_runs(
+                 TestRepo,
+                 {:tenant, "tenant"},
+                 list_query(limit: 10, statuses: [:running])
+               )
+
+      assert Enum.map(running_page.runs, & &1.id) == ["other-running", "base-running"]
+    end
+
+    test "run listing rejects malformed trusted queries and invalid scopes" do
+      invalid_queries = [
+        list_query(limit: 0),
+        list_query(before: {@now, ""}),
+        list_query(graph_id: ""),
+        list_query(graph_hash: 123),
+        list_query(statuses: []),
+        list_query(statuses: [:created]),
+        Map.delete(list_query(), :before)
+      ]
+
+      for query <- invalid_queries do
+        assert_raise ArgumentError, fn -> RunStore.list_runs(TestRepo, :system, query) end
+      end
+
+      assert_raise ArgumentError, ~r/scope must be/, fn ->
+        RunStore.list_runs(TestRepo, {:tenant, nil}, list_query())
+      end
+    end
+
     test "durable insertion rejects every non-initialized shape and missing graph binding" do
       base = initialized_run("invalid")
 
@@ -430,6 +577,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  TestRepo,
                  :system,
                  proposal(changed, lease.claim_token, run.checkpoint_seq)
+               )
+
+      changed_started_at = %{
+        run
+        | started_at: DateTime.add(run.started_at, 1, :second),
+          checkpoint_seq: run.checkpoint_seq + 1
+      }
+
+      assert {:error, :invalid_commit} =
+               RunStore.commit(
+                 TestRepo,
+                 :system,
+                 proposal(changed_started_at, lease.claim_token, run.checkpoint_seq)
                )
     end
 
@@ -1363,6 +1523,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp policy(now, overrides \\ []) do
       Map.merge(
         %{now: now, limit: 1, orphan_ttl_ms: 1_000, max_claim_attempts: 3},
+        Map.new(overrides)
+      )
+    end
+
+    defp list_query(overrides \\ []) do
+      Map.merge(
+        %{limit: 100, before: nil, graph_id: nil, graph_hash: nil, statuses: nil},
         Map.new(overrides)
       )
     end
