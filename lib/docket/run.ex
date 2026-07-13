@@ -399,8 +399,8 @@ defmodule Docket.Run do
 
   defp valid_interrupt_request?(%Interrupt{} = interrupt, node_id) do
     exact_struct?(interrupt, Interrupt) and (is_nil(interrupt.id) or valid_id?(interrupt.id)) and
-      interrupt.node_id in [nil, node_id] and optional_string?(interrupt.prompt) and
-      valid_id?(interrupt.resume_channel) and valid_schema?(interrupt.schema) and
+      interrupt.node_id in [nil, node_id] and valid_id?(interrupt.resume_channel) and
+      valid_schema?(interrupt.schema) and
       portable_map?(interrupt.metadata)
   end
 
@@ -419,7 +419,7 @@ defmodule Docket.Run do
     exact_struct?(interrupt, InterruptState) and valid_id?(id) and interrupt.id == id and
       valid_id?(interrupt.node_id) and
       interrupt.status in [:open, :resolved] and valid_id?(interrupt.resume_channel) and
-      optional_string?(interrupt.prompt) and valid_schema?(interrupt.schema) and
+      valid_schema?(interrupt.schema) and
       valid_datetime?(interrupt.created_at) and interrupt_resolution_time?(interrupt) and
       portable_map?(interrupt.metadata)
   end

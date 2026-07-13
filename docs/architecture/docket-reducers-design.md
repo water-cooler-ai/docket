@@ -51,7 +51,7 @@ the host and makes a module name durable graph content).
   numeric, `merge` ⇒ map/object) guarantee the reduction preserves the
   committed type.
 - **Interrupt resolutions flow through the reducer.** Resolution already
-  wrote through `apply_state_writes`, so answering into an `append` messages
+  wrote through `apply_state_writes`, so resolving into an `append`
   field accumulates with no special case. This fell out of the v1 design
   rather than being added.
 - **Union dedupes first-occurrence-wins.** `union` is list-as-set:

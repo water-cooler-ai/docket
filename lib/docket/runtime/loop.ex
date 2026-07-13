@@ -888,7 +888,6 @@ defmodule Docket.Runtime.Loop do
         node_id: result.node_id,
         status: :open,
         resume_channel: interrupt.resume_channel,
-        prompt: interrupt.prompt,
         schema: interrupt.schema,
         created_at: now,
         metadata: interrupt.metadata || %{}

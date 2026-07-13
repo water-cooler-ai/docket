@@ -2,8 +2,8 @@
 
 Docket is an Elixir library for durable, graph-based workflow execution —
 built for long-running, interruptible work like agentic LLM sessions, where a
-run may pause for a human decision, survive a deploy, and resume exactly where
-it left off.
+run may pause for an external resolution, survive a deploy, and resume exactly
+where it left off.
 
 This branch is `0.1.0-dev`. Graph semantics are usable processlessly through
 `Docket.Test`; supervised production requires the assembled `Docket.Postgres`
@@ -311,22 +311,22 @@ Because `0.0.1` storage is application-defined, Docket cannot provide one
 universal database migration. The supported path is an explicit
 drain-and-cut-over rather than a transparent dual-driver period.
 
-## Human-in-the-loop interrupts
+## External interrupts
 
-A node pauses the run by returning an interrupt naming the state field the
-answer should land in:
+A node pauses the run by returning an interrupt naming the state field where
+the external resolution should be written:
 
 ```elixir
 def call(state, _config, _context) do
   case state["decision"] do
-    nil -> {:interrupt, %Docket.Interrupt{prompt: "Approve this draft?", resume_channel: "decision"}}
+    nil -> {:interrupt, %Docket.Interrupt{resume_channel: "decision"}}
     decision -> {:ok, %{"applied" => decision}}
   end
 end
 ```
 
 The run commits as `:waiting` without retaining a per-run process. When the
-human answers:
+external system resolves it:
 
 ```elixir
 {:ok, run} =
@@ -335,7 +335,7 @@ human answers:
 
 The value is validated against the interrupt's schema (if any), written to
 the resume field, and the interrupted node re-executes in the next superstep
-with the answer visible in its state.
+with the resolved value visible in its state.
 
 ## Execution model
 

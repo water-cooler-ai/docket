@@ -50,7 +50,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         node_id: "review",
         status: :open,
         resume_channel: "decision",
-        prompt: "Approve?",
         schema: Docket.Schema.string(),
         created_at: @updated_at,
         metadata: %{}

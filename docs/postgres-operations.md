@@ -184,7 +184,6 @@ defmodule MyApp.Nodes.Review do
       :error ->
         {:interrupt,
          %Docket.Interrupt{
-           prompt: "Approve?",
            schema: Docket.Schema.string(),
            resume_channel: config["resume_field"]
          }}
