@@ -36,6 +36,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             id: integer() | nil,
             run_id: String.t() | nil,
             tenant_id: String.t() | nil,
+            scope_key: String.t() | nil,
             graph_id: String.t() | nil,
             graph_hash: String.t() | nil,
             status: Docket.Run.durable_status() | nil,
@@ -59,6 +60,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     schema "docket_runs" do
       field(:run_id, :string)
       field(:tenant_id, :string)
+      field(:scope_key, :string, read_after_writes: true)
       field(:graph_id, :string)
       field(:graph_hash, :string)
       field(:status, Ecto.Enum, values: Docket.Run.durable_statuses())
@@ -111,14 +113,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @spec changeset(t() | Ecto.Changeset.t(), map()) :: Ecto.Changeset.t()
     def changeset(run \\ %__MODULE__{}, attrs) do
       run
-      |> cast(attrs, @permitted)
+      |> cast(attrs, @permitted, empty_values: [])
       |> validate_required(@required)
+      |> validate_length(:tenant_id, min: 1)
       |> validate_number(:step, greater_than_or_equal_to: 0)
       |> validate_number(:checkpoint_seq, greater_than_or_equal_to: 0)
       |> validate_number(:claim_attempts, greater_than_or_equal_to: 0)
       |> validate_number(:claim_abandons, greater_than_or_equal_to: 0)
       |> unique_constraint(:run_id)
-      |> foreign_key_constraint(:graph_hash, name: :docket_runs_graph_hash_fkey)
+      |> foreign_key_constraint(:graph_hash, name: :docket_runs_graph_scope_fkey)
     end
   end
 end

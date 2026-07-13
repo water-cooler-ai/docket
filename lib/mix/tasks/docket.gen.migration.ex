@@ -43,6 +43,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         file = Path.join(path, "#{timestamp()}_add_docket_tables.exs")
         module = Module.concat([repo, Migrations, AddDocketTables])
         version = Docket.Postgres.Migration.current_version()
+        initial_version = Docket.Postgres.Migration.initial_version()
 
         create_directory(path)
 
@@ -52,7 +53,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
           def up, do: Docket.Postgres.Migration.up(version: #{version})
 
-          def down, do: Docket.Postgres.Migration.down(version: #{version})
+          def down, do: Docket.Postgres.Migration.down(version: #{initial_version})
         end
         """)
 

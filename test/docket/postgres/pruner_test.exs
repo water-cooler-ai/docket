@@ -70,7 +70,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       # Saving an existing historical version is idempotent, not a retention
       # lease. Its final retained run still governs its lifetime.
-      :ok = GraphStore.save_graph(TestRepo, "workflow", old_hash, old_graph)
+      :ok = GraphStore.save_graph(TestRepo, :tenantless, "workflow", old_hash, old_graph)
 
       handler = "pruner-test-#{System.unique_integer([:positive])}"
       parent = self()
@@ -107,12 +107,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert event_keys() == [{"failed-retained", 2}]
       assert {:ok, ^failed} = RunStore.fetch_run(TestRepo, :system, failed.id)
-      assert {:ok, ^current_graph} = GraphStore.fetch_graph(TestRepo, "workflow", current_hash)
-      assert {:error, :not_found} = GraphStore.fetch_graph(TestRepo, "workflow", old_hash)
+
+      assert {:ok, ^current_graph} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "workflow", current_hash)
+
+      assert {:error, :not_found} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "workflow", old_hash)
 
       # The newest ten revisions survive without runs. The separate graph ID
       # has only one revision, so it is protected by the same rule.
-      assert {:ok, _graph} = GraphStore.fetch_graph(TestRepo, "published", published_hash)
+      assert {:ok, _graph} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "published", published_hash)
 
       assert {:ok,
               %{
@@ -142,6 +147,29 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                Pruner.prune(TestRepo, policy(batch_size: 2))
 
       assert event_keys() == [{"active", 4}]
+    end
+
+    test "graph retention ranks and deletes independently per owner scope" do
+      {old_graph, old_hash} =
+        save_graph!("shared", %{"version" => 1}, {:tenant, "a"})
+
+      for version <- 2..11 do
+        save_graph!("shared", %{"version" => version}, {:tenant, "a"})
+      end
+
+      {tenant_b_graph, tenant_b_hash} =
+        save_graph!("shared", %{"version" => 1}, {:tenant, "b"})
+
+      assert tenant_b_hash == old_hash
+      assert tenant_b_graph == old_graph
+
+      assert {:ok, %{graphs_deleted: 1}} = Pruner.prune(TestRepo, policy())
+
+      assert {:error, :not_found} =
+               GraphStore.fetch_graph(TestRepo, {:tenant, "a"}, "shared", old_hash)
+
+      assert {:ok, ^old_graph} =
+               GraphStore.fetch_graph(TestRepo, {:tenant, "b"}, "shared", old_hash)
     end
 
     test "advisory lock makes concurrent same-schema passes skip safely" do
@@ -223,7 +251,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, :ok} = Task.await(inserter)
 
       assert {:ok, %{runs_deleted: 1, graphs_deleted: 0}} = Task.await(prune)
-      assert {:ok, ^graph} = GraphStore.fetch_graph(TestRepo, "workflow", graph_hash)
+
+      assert {:ok, ^graph} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "workflow", graph_hash)
+
       assert {:ok, _run} = RunStore.fetch_run(TestRepo, :system, "new-running")
     end
 
@@ -274,13 +305,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
     end
 
-    defp save_graph!(graph_id, metadata) do
+    defp save_graph!(graph_id, metadata, owner_scope \\ :tenantless) do
       {:ok, graph, runtime} =
         Docket.Graph.Compiler.compile_for_publication(
           Docket.Graph.new!(id: graph_id, metadata: metadata)
         )
 
-      :ok = GraphStore.save_graph(TestRepo, graph_id, runtime.graph_hash, graph)
+      :ok =
+        GraphStore.save_graph(TestRepo, owner_scope, graph_id, runtime.graph_hash, graph)
+
       {graph, runtime.graph_hash}
     end
 

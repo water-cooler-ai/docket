@@ -7,9 +7,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     shorter, then deletes terminal runs and relies on the event foreign key to
     cascade any remaining events. It deletes graph versions only when no run
     references them and they rank older than the newest ten publications for
-    their `graph_id`. Revision order is immutable `inserted_at`, with row `id`
-    as a deterministic tie-breaker. The newest ten revisions therefore survive
-    even when they have no runs.
+    their owner scope and `graph_id`. Revision order is immutable
+    `(inserted_at, graph_hash)`, matching the public graph-version API. The
+    newest ten revisions per owner therefore survive even when they have no
+    runs, and one tenant's publications cannot evict another tenant's history.
 
     Passes are serialized per database schema with a transaction-scoped
     advisory lock. A competing node reports a skipped pass instead of waiting.
@@ -275,8 +276,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       WITH ranked AS MATERIALIZED (
         SELECT id,
                row_number() OVER (
-                 PARTITION BY graph_id
-                 ORDER BY inserted_at DESC, id DESC
+                 PARTITION BY scope_key, graph_id
+                 ORDER BY inserted_at DESC, graph_hash DESC
                ) AS revision_rank
         FROM #{Storage.qualified_table(prefix, "docket_graph_versions")}
       ),
@@ -288,10 +289,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           AND NOT EXISTS (
             SELECT 1
             FROM #{Storage.qualified_table(prefix, "docket_runs")} AS runs
-            WHERE runs.graph_id = graphs.graph_id
+            WHERE runs.scope_key = graphs.scope_key
+              AND runs.graph_id = graphs.graph_id
               AND runs.graph_hash = graphs.graph_hash
           )
-        ORDER BY graphs.inserted_at, graphs.id
+        ORDER BY graphs.inserted_at, graphs.graph_hash, graphs.id
         LIMIT $1
         FOR UPDATE OF graphs SKIP LOCKED
       )
@@ -313,7 +315,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         AND NOT EXISTS (
           SELECT 1
           FROM #{Storage.qualified_table(prefix, "docket_runs")} AS runs
-          WHERE runs.graph_id = graphs.graph_id
+          WHERE runs.scope_key = graphs.scope_key
+            AND runs.graph_id = graphs.graph_id
             AND runs.graph_hash = graphs.graph_hash
         )
       """

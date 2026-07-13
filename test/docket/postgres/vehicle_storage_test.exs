@@ -30,7 +30,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule FailingEvents do
-      def append_events(_ctx, :system, _run_id, _events), do: {:error, :injected_event_failure}
+      def append_events(_ctx, _scope, _run_id, _events),
+        do: {:error, :injected_event_failure}
     end
 
     defmodule FailingEventsBackend do
@@ -746,7 +747,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp publish!(context, graph) do
       {:ok, effective, rtg} = Compiler.compile_for_publication(graph, profile: :publish)
-      :ok = GraphStore.save_graph(context, rtg.graph_id, rtg.graph_hash, effective)
+
+      :ok =
+        GraphStore.save_graph(context, :tenantless, rtg.graph_id, rtg.graph_hash, effective)
+
       rtg
     end
 

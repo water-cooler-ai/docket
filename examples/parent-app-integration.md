@@ -42,7 +42,8 @@ application's workflow record. Given an application-built `graph` and workflow
 record:
 
 ```elixir
-{:ok, graph_ref} = MyApp.Docket.save_graph(graph)
+tenant_id = to_string(workflow.account_id)
+{:ok, graph_ref} = MyApp.Docket.save_graph(graph, tenant_id: tenant_id)
 
 workflow =
   MyApp.Workflows.update_graph_ref!(workflow, %{

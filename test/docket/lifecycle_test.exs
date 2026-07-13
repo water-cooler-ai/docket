@@ -131,7 +131,12 @@ defmodule Docket.LifecycleTest do
     assert Process.get({MutableDefaultsNode, :calls}) == 1
 
     assert {:ok, calm_graph} =
-             backend.graphs().fetch_graph(context, calm_ref.graph_id, calm_ref.graph_hash)
+             backend.graphs().fetch_graph(
+               context,
+               :tenantless,
+               calm_ref.graph_id,
+               calm_ref.graph_hash
+             )
 
     assert calm_graph.nodes["copy"].config["tone"] == "calm"
     assert {:ok, calm_runtime} = Docket.ensure_compiled_effective(calm_graph, [])
@@ -156,7 +161,12 @@ defmodule Docket.LifecycleTest do
     assert {:ok, reference} = Host.save_graph(graph)
 
     assert {:ok, effective} =
-             backend.graphs().fetch_graph(context, reference.graph_id, reference.graph_hash)
+             backend.graphs().fetch_graph(
+               context,
+               :tenantless,
+               reference.graph_id,
+               reference.graph_hash
+             )
 
     refute Map.has_key?(effective.nodes["copy"].config, "future")
 
@@ -260,7 +270,11 @@ defmodule Docket.LifecycleTest do
   end
 
   test "tenant mode is resolved before storage and scopes never cross" do
-    assert {:ok, reference} = TenantHost.save_graph(Graphs.minimal_linear())
+    assert {:error, %Docket.Error{type: :invalid_tenant}} =
+             TenantHost.save_graph(Graphs.minimal_linear())
+
+    assert {:ok, reference} =
+             TenantHost.save_graph(Graphs.minimal_linear(), tenant_id: "a")
 
     assert {:error, %Docket.Error{type: :invalid_tenant}} =
              TenantHost.start_run(reference, %{"value" => "x"})
@@ -364,7 +378,7 @@ defmodule Docket.LifecycleTest do
     assert {:error, :not_found} = backend.runs().fetch_run(context, :system, "bad-start")
 
     assert {:ok, %Docket.Graph{}} =
-             backend.graphs().fetch_graph(context, graph.id, rtg.graph_hash)
+             backend.graphs().fetch_graph(context, :tenantless, graph.id, rtg.graph_hash)
 
     assert {:ok, started} = Host.start_run(reference, %{"value" => "x"})
 

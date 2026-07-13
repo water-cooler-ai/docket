@@ -410,14 +410,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       start_supervised!(TenantHost)
 
       assert {:ok, reference} = PollHost.save_graph(Graphs.minimal_linear())
-      assert {:ok, %Docket.SavedGraph{ref: ^reference}} = PollHost.fetch_graph(reference)
+      assert {:ok, %Docket.Graph{}} = PollHost.fetch_graph(reference)
 
-      assert {:ok, %Docket.SavedGraph{ref: ^reference}} =
-               TenantHost.fetch_graph(reference.graph_id)
+      assert {:error, %Docket.Error{type: :invalid_tenant}} = TenantHost.fetch_graph(reference)
+      assert {:error, :not_found} = TenantHost.fetch_graph(reference, tenant_id: "a")
 
       assert {:ok, tenantless} = PollHost.start_run(reference, %{"value" => "none"})
 
       assert {:error, :not_found} = TenantHost.fetch_run(tenantless.id, tenant_id: "a")
+
+      assert {:error, :not_found} =
+               TenantHost.start_run(reference, %{"value" => "a"}, tenant_id: "a")
+
+      assert {:ok, ^reference} =
+               TenantHost.save_graph(Graphs.minimal_linear(), tenant_id: "a")
 
       assert {:ok, tenant_a} =
                TenantHost.start_run(reference, %{"value" => "a"}, tenant_id: "a")
@@ -517,7 +523,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    test "revision-8 storage remains exactly the version-one three-table schema" do
+    test "storage remains exactly the current three-table schema" do
       tables =
         TestRepo.query!(
           "SELECT table_name FROM information_schema.tables " <>
@@ -537,7 +543,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  log: false
                )
 
-      assert comment == "1"
+      assert comment == "2"
     end
 
     defp await_replacement(name, old_pid, attempts \\ 100)

@@ -50,7 +50,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {:ok, graph, runtime} =
         Docket.Graph.Compiler.compile_for_publication(Docket.Graph.new!(id: "graph"))
 
-      :ok = GraphStore.save_graph(TestRepo, "graph", runtime.graph_hash, graph)
+      :ok =
+        GraphStore.save_graph(TestRepo, {:tenant, "t1"}, "graph", runtime.graph_hash, graph)
 
       run = %Docket.Run{
         id: "run",
@@ -303,7 +304,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {:ok, graph, runtime} =
           Docket.Graph.Compiler.compile_for_publication(Docket.Graph.new!(id: "private-graph"))
 
-        assert :ok = GraphStore.save_graph(ctx, graph.id, runtime.graph_hash, graph)
+        assert :ok =
+                 GraphStore.save_graph(
+                   ctx,
+                   {:tenant, "private-tenant"},
+                   graph.id,
+                   runtime.graph_hash,
+                   graph
+                 )
 
         run = %Docket.Run{
           id: "private-run",

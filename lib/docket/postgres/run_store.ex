@@ -730,6 +730,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           AND runs.poisoned_at IS NULL
         RETURNING
           runs.run_id,
+          runs.tenant_id,
           runs.graph_id,
           runs.graph_hash,
           runs.checkpoint_seq,
@@ -743,6 +744,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
       SELECT
         run_id,
+        tenant_id,
         graph_id,
         graph_hash,
         checkpoint_seq,
@@ -1045,13 +1047,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp owner_tenant_id!(:tenantless), do: nil
-    defp owner_tenant_id!({:tenant, tenant_id}) when is_binary(tenant_id), do: tenant_id
+
+    defp owner_tenant_id!({:tenant, tenant_id})
+         when is_binary(tenant_id) and byte_size(tenant_id) > 0,
+         do: tenant_id
 
     defp owner_tenant_id!(scope) do
       raise ArgumentError,
             "run owner scope must be :tenantless or {:tenant, tenant_id}, got: " <>
               inspect(scope)
     end
+
+    defp tenant_owner_scope(nil), do: :tenantless
+    defp tenant_owner_scope(tenant_id) when is_binary(tenant_id), do: {:tenant, tenant_id}
 
     defp validate_initialized_run(
            %Docket.Run{
@@ -1077,10 +1085,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp validate_initialized_run(_run, _checkpoint_type, _wake_at), do: {:error, :invalid_run}
 
     defp insert_error(%Ecto.Changeset{} = changeset) do
-      if Keyword.has_key?(changeset.errors, :run_id) do
-        {:error, :already_exists}
-      else
-        {:error, changeset}
+      cond do
+        Keyword.has_key?(changeset.errors, :run_id) ->
+          {:error, :already_exists}
+
+        Enum.any?(changeset.errors, fn
+          {:graph_hash, {_message, metadata}} ->
+            metadata[:constraint] == :foreign and
+                metadata[:constraint_name] == "docket_runs_graph_scope_fkey"
+
+          _other ->
+            false
+        end) ->
+          {:error, :not_found}
+
+        true ->
+          {:error, changeset}
       end
     end
 
@@ -1099,6 +1119,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         Enum.reduce(rows, {{[], []}, @empty_claim_stats}, fn
           [
             run_id,
+            tenant_id,
             graph_id,
             graph_hash,
             checkpoint_seq,
@@ -1115,6 +1136,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           {{leases, poisoned}, stats} ->
             lease = %{
               run_id: run_id,
+              owner_scope: tenant_owner_scope(tenant_id),
               graph_id: graph_id,
               graph_hash: graph_hash,
               checkpoint_seq: checkpoint_seq,
@@ -1133,6 +1155,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
           [
             run_id,
+            _tenant_id,
             _graph_id,
             _graph_hash,
             _checkpoint_seq,

@@ -111,7 +111,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:error, :not_found} = RunStore.fetch_run(TestRepo, :system, moment.run.id)
       assert TestRepo.aggregate(Run, :count) == 0
       assert TestRepo.aggregate(Event, :count) == 0
-      assert {:ok, ^document} = GraphStore.fetch_graph(TestRepo, graph_id, graph_hash)
+
+      assert {:ok, ^document} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, graph_id, graph_hash)
+
       assert TestRepo.aggregate(GraphVersion, :count) == 1
     end
 
@@ -625,7 +628,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, :published} =
                Storage.transaction(TestRepo, fn ctx ->
-                 with :ok <- GraphStore.save_graph(ctx, graph_id, graph_hash, graph) do
+                 with :ok <-
+                        GraphStore.save_graph(ctx, :tenantless, graph_id, graph_hash, graph) do
                    {:ok, :published}
                  end
                end)
@@ -636,7 +640,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp publish_document!(document, rtg) do
       assert {:ok, :published} =
                Storage.transaction(TestRepo, fn ctx ->
-                 with :ok <- GraphStore.save_graph(ctx, document.id, rtg.graph_hash, document) do
+                 with :ok <-
+                        GraphStore.save_graph(
+                          ctx,
+                          :tenantless,
+                          document.id,
+                          rtg.graph_hash,
+                          document
+                        ) do
                    {:ok, :published}
                  end
                end)

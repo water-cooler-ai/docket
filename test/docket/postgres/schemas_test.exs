@@ -33,6 +33,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert with_tenant.valid?
       end
 
+      test "rejects an empty tenant and keeps generated scope_key read-only" do
+        refute Run.changeset(Map.put(@valid_run, :tenant_id, "")).valid?
+
+        run =
+          @valid_run
+          |> Map.put(:scope_key, "forged")
+          |> Run.changeset()
+          |> Ecto.Changeset.apply_changes()
+
+        assert run.scope_key == nil
+      end
+
       test "applies operational defaults" do
         run = Ecto.Changeset.apply_changes(Run.changeset(@valid_run))
 
@@ -101,6 +113,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  graph_hash: "abc123",
                  graph: <<131, 106>>
                }).valid?
+      end
+
+      test "accepts a tenant owner, rejects empty tenants, and does not cast scope_key" do
+        attrs = %{
+          tenant_id: "acme",
+          scope_key: "forged",
+          graph_id: "g1",
+          graph_hash: "abc123",
+          graph: <<131, 106>>
+        }
+
+        graph = attrs |> GraphVersion.changeset() |> Ecto.Changeset.apply_changes()
+
+        assert graph.tenant_id == "acme"
+        assert graph.scope_key == nil
+        refute GraphVersion.changeset(%{attrs | tenant_id: ""}).valid?
       end
     end
 

@@ -48,11 +48,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, :committed} =
                Storage.transaction(TestRepo, fn ctx ->
                  assert ctx == %{repo: TestRepo, prefix: nil}
-                 assert :ok = GraphStore.save_graph(ctx, "committed", graph_hash, document)
+
+                 assert :ok =
+                          GraphStore.save_graph(
+                            ctx,
+                            :tenantless,
+                            "committed",
+                            graph_hash,
+                            document
+                          )
+
                  {:ok, :committed}
                end)
 
-      assert {:ok, ^document} = GraphStore.fetch_graph(TestRepo, "committed", graph_hash)
+      assert {:ok, ^document} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "committed", graph_hash)
     end
 
     test "error results, exceptions, throws, and invalid returns all roll back" do
@@ -61,48 +71,71 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:error, :stop} =
                Storage.transaction(TestRepo, fn ctx ->
-                 assert :ok = GraphStore.save_graph(ctx, "error", error_hash, error_doc)
+                 assert :ok =
+                          GraphStore.save_graph(ctx, :tenantless, "error", error_hash, error_doc)
+
                  {:error, :stop}
                end)
 
-      assert {:error, :not_found} = GraphStore.fetch_graph(TestRepo, "error", error_hash)
+      assert {:error, :not_found} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "error", error_hash)
 
       raised_doc = document("raised")
       raised_hash = hash(raised_doc)
 
       assert_raise RuntimeError, "boom", fn ->
         Storage.transaction(TestRepo, fn ctx ->
-          assert :ok = GraphStore.save_graph(ctx, "raised", raised_hash, raised_doc)
+          assert :ok =
+                   GraphStore.save_graph(ctx, :tenantless, "raised", raised_hash, raised_doc)
+
           raise "boom"
         end)
       end
 
-      assert {:error, :not_found} = GraphStore.fetch_graph(TestRepo, "raised", raised_hash)
+      assert {:error, :not_found} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "raised", raised_hash)
 
       thrown_doc = document("thrown")
       thrown_hash = hash(thrown_doc)
 
       assert catch_throw(
                Storage.transaction(TestRepo, fn ctx ->
-                 assert :ok = GraphStore.save_graph(ctx, "thrown", thrown_hash, thrown_doc)
+                 assert :ok =
+                          GraphStore.save_graph(
+                            ctx,
+                            :tenantless,
+                            "thrown",
+                            thrown_hash,
+                            thrown_doc
+                          )
+
                  throw(:halt)
                end)
              ) == :halt
 
-      assert {:error, :not_found} = GraphStore.fetch_graph(TestRepo, "thrown", thrown_hash)
+      assert {:error, :not_found} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "thrown", thrown_hash)
 
       invalid_doc = document("invalid-return")
       invalid_hash = hash(invalid_doc)
 
       assert_raise ArgumentError, ~r/transaction callback must return/, fn ->
         Storage.transaction(TestRepo, fn ctx ->
-          assert :ok = GraphStore.save_graph(ctx, "invalid-return", invalid_hash, invalid_doc)
+          assert :ok =
+                   GraphStore.save_graph(
+                     ctx,
+                     :tenantless,
+                     "invalid-return",
+                     invalid_hash,
+                     invalid_doc
+                   )
+
           :not_a_result
         end)
       end
 
       assert {:error, :not_found} =
-               GraphStore.fetch_graph(TestRepo, "invalid-return", invalid_hash)
+               GraphStore.fetch_graph(TestRepo, :tenantless, "invalid-return", invalid_hash)
     end
 
     test "nested transactions join and a swallowed nested rollback still aborts the outer write" do
@@ -113,7 +146,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:error, :rollback} =
                Storage.transaction(TestRepo, fn outer_ctx ->
-                 assert :ok = GraphStore.save_graph(outer_ctx, "outer", outer_hash, outer_doc)
+                 assert :ok =
+                          GraphStore.save_graph(
+                            outer_ctx,
+                            :tenantless,
+                            "outer",
+                            outer_hash,
+                            outer_doc
+                          )
 
                  assert {:error, :inner_stop} =
                           Storage.transaction(outer_ctx, fn inner_ctx ->
@@ -122,6 +162,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                             assert :ok =
                                      GraphStore.save_graph(
                                        inner_ctx,
+                                       :tenantless,
                                        "inner",
                                        inner_hash,
                                        inner_doc
@@ -133,8 +174,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  {:ok, :attempted_swallow}
                end)
 
-      assert {:error, :not_found} = GraphStore.fetch_graph(TestRepo, "outer", outer_hash)
-      assert {:error, :not_found} = GraphStore.fetch_graph(TestRepo, "inner", inner_hash)
+      assert {:error, :not_found} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "outer", outer_hash)
+
+      assert {:error, :not_found} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "inner", inner_hash)
     end
 
     test "nested success commits once and preserves the caller's result shape" do
@@ -150,6 +194,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                             assert :ok =
                                      GraphStore.save_graph(
                                        inner_ctx,
+                                       :tenantless,
                                        "nested-success",
                                        graph_hash,
                                        document
@@ -162,7 +207,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                end)
 
       assert {:ok, ^document} =
-               GraphStore.fetch_graph(TestRepo, "nested-success", graph_hash)
+               GraphStore.fetch_graph(TestRepo, :tenantless, "nested-success", graph_hash)
     end
 
     test "writes stay invisible to another connection until the transaction commits" do
@@ -173,7 +218,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       transaction =
         Task.async(fn ->
           Storage.transaction(TestRepo, fn ctx ->
-            assert :ok = GraphStore.save_graph(ctx, "isolated", graph_hash, document)
+            assert :ok =
+                     GraphStore.save_graph(
+                       ctx,
+                       :tenantless,
+                       "isolated",
+                       graph_hash,
+                       document
+                     )
+
             send(parent, {:inserted, self()})
 
             receive do
@@ -183,11 +236,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end)
 
       assert_receive {:inserted, transaction_pid}, 5_000
-      assert {:error, :not_found} = GraphStore.fetch_graph(TestRepo, "isolated", graph_hash)
+
+      assert {:error, :not_found} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "isolated", graph_hash)
 
       send(transaction_pid, :commit)
       assert Task.await(transaction, 5_000) == {:ok, :committed}
-      assert {:ok, ^document} = GraphStore.fetch_graph(TestRepo, "isolated", graph_hash)
+
+      assert {:ok, ^document} =
+               GraphStore.fetch_graph(TestRepo, :tenantless, "isolated", graph_hash)
     end
 
     defp document(id), do: Docket.Graph.new!(id: id)

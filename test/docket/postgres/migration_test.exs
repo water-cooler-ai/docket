@@ -28,14 +28,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down(prefix: "select")
     end
 
+    defmodule InstallDocketV1 do
+      use Ecto.Migration
+
+      def up, do: Docket.Postgres.Migration.up(version: 1)
+      def down, do: Docket.Postgres.Migration.down(version: 1)
+    end
+
+    defmodule UpgradeDocketV2 do
+      use Ecto.Migration
+
+      def up, do: Docket.Postgres.Migration.up(version: 2)
+      def down, do: Docket.Postgres.Migration.down(version: 2)
+    end
+
     @migration_version 20_260_709_000_001
     @prefixed_migration_version 20_260_709_000_002
     @reserved_prefix_migration_version 20_260_709_000_003
+    @v1_migration_version 20_260_709_000_004
+    @v2_migration_version 20_260_709_000_005
 
     @tables ~w(docket_events docket_graph_versions docket_runs)
 
     @run_columns ~w(
-      id run_id tenant_id graph_id graph_hash status step state
+      id run_id tenant_id scope_key graph_id graph_hash status step state
       checkpoint_seq latest_checkpoint_type claim_token
       claimed_at wake_at claim_attempts claim_abandons poisoned_at poison_reason
       inserted_at started_at updated_at finished_at
@@ -53,10 +69,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       install!()
 
       assert tables("public") == @tables
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
       assert columns("docket_runs") == Enum.sort(@run_columns)
 
       assert column_type("docket_graph_versions", "graph") == "bytea"
+      assert column_default("docket_graph_versions", "inserted_at") =~ "clock_timestamp()"
 
       assert column_type("docket_runs", "state") == "bytea"
 
@@ -65,6 +82,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert column_type("docket_events", "metadata") == "bytea"
 
       assert nullable?("docket_runs", "tenant_id")
+      refute nullable?("docket_runs", "scope_key")
+      assert nullable?("docket_graph_versions", "tenant_id")
+      refute nullable?("docket_graph_versions", "scope_key")
       refute nullable?("docket_runs", "started_at")
 
       indexes = indexes("docket_runs")
@@ -108,13 +128,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert indexes["docket_runs_graph_id_graph_hash_index"] =~ "(graph_id, graph_hash)"
 
-      assert indexes("docket_graph_versions")["docket_graph_versions_graph_id_graph_hash_index"] =~
+      assert indexes("docket_graph_versions")["docket_graph_versions_scope_graph_index"] =~
                "CREATE UNIQUE INDEX"
 
       revision_order =
-        indexes("docket_graph_versions")["docket_graph_versions_revision_order_index"]
+        indexes("docket_graph_versions")[
+          "docket_graph_versions_scope_revision_order_index"
+        ]
 
-      assert revision_order =~ "(graph_id, inserted_at DESC, id DESC)"
+      assert revision_order =~ "(scope_key, graph_id, inserted_at DESC, graph_hash DESC)"
 
       assert indexes("docket_events")["docket_events_run_id_seq_index"] =~
                "CREATE UNIQUE INDEX"
@@ -132,7 +154,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert :ok = Ecto.Migrator.up(TestRepo, @migration_version, InstallDocket, log: false)
 
       assert tables("public") == @tables
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
     end
 
     test "migrates up and down inside a dedicated schema prefix" do
@@ -150,7 +172,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Docket.Postgres.Migration.migrated_version(
                repo: TestRepo,
                prefix: "docket_private"
-             ) == 1
+             ) == 2
 
       assert {:ok, _} = insert_run([], "docket_private")
 
@@ -176,7 +198,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert tables("select") == @tables
 
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo, prefix: "select") == 1
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo, prefix: "select") == 2
 
       assert :ok =
                Ecto.Migrator.down(
@@ -290,7 +312,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:error, %Postgrex.Error{postgres: %{code: :foreign_key_violation} = pg}} =
                insert_run(graph_hash: "unpublished")
 
-      assert pg.constraint == "docket_runs_graph_hash_fkey"
+      assert pg.constraint == "docket_runs_graph_scope_fkey"
 
       assert {:ok, _} = insert_run([])
 
@@ -327,6 +349,112 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert %{rows: [[0]]} =
                TestRepo.query!("SELECT count(*) FROM docket_events WHERE run_id = $1", [run_id])
+    end
+
+    test "scoped graph identity binds tenantless and tenant-owned runs without NULL holes" do
+      install!()
+
+      assert {:ok, %{rows: [[tenantless_run]]}} = insert_run([])
+      assert {:ok, %{rows: [[tenant_run]]}} = insert_run(tenant_id: "acme")
+
+      assert %{rows: [["", nil]]} =
+               TestRepo.query!(
+                 "SELECT scope_key, tenant_id FROM docket_runs WHERE run_id = $1",
+                 [tenantless_run]
+               )
+
+      assert %{rows: [["acme", "acme"]]} =
+               TestRepo.query!(
+                 "SELECT scope_key, tenant_id FROM docket_runs WHERE run_id = $1",
+                 [tenant_run]
+               )
+
+      assert {:error, %Postgrex.Error{postgres: %{code: :foreign_key_violation} = pg}} =
+               TestRepo.query(
+                 "UPDATE docket_runs SET tenant_id = 'other' WHERE run_id = $1",
+                 [tenant_run]
+               )
+
+      assert pg.constraint == "docket_runs_graph_scope_fkey"
+
+      for table <- ["docket_graph_versions", "docket_runs"] do
+        assert {:error, %Postgrex.Error{postgres: %{code: :check_violation} = pg}} =
+                 TestRepo.query(
+                   "UPDATE #{table} SET tenant_id = '' WHERE tenant_id IS NULL",
+                   []
+                 )
+
+        assert pg.constraint in [
+                 "docket_graph_versions_tenant_id_check",
+                 "docket_runs_tenant_id_check"
+               ]
+      end
+    end
+
+    test "upgrades V01 by retaining tenantless rows and cloning only proven run owners" do
+      assert :ok =
+               Ecto.Migrator.up(TestRepo, @v1_migration_version, InstallDocketV1, log: false)
+
+      first_at = ~U[2026-07-01 00:00:00.000000Z]
+      second_at = ~U[2026-07-02 00:00:00.000000Z]
+
+      for {graph_hash, inserted_at} <- [{"used", first_at}, {"unattached", second_at}] do
+        TestRepo.query!(
+          """
+          INSERT INTO docket_graph_versions (graph_id, graph_hash, graph, inserted_at)
+          VALUES ('legacy', $1, $2, $3)
+          """,
+          [graph_hash, <<131, 106>>, inserted_at]
+        )
+      end
+
+      now = DateTime.utc_now()
+
+      TestRepo.query!(
+        """
+        INSERT INTO docket_runs
+          (run_id, tenant_id, graph_id, graph_hash, status, step, state,
+           checkpoint_seq, wake_at, claim_attempts, claim_abandons,
+           inserted_at, started_at, updated_at)
+        VALUES
+          ('legacy_run', 'acme', 'legacy', 'used', 'running', 0, $1,
+           0, $2, 0, 0, $2, $2, $2)
+        """,
+        [<<131, 106>>, now]
+      )
+
+      assert :ok =
+               Ecto.Migrator.up(TestRepo, @v2_migration_version, UpgradeDocketV2, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+
+      assert %{rows: rows} =
+               TestRepo.query!("""
+               SELECT tenant_id, scope_key, graph_hash, graph, inserted_at
+               FROM docket_graph_versions
+               WHERE graph_id = 'legacy'
+               ORDER BY scope_key, graph_hash
+               """)
+
+      assert [
+               [nil, "", "unattached", <<131, 106>>, ^second_at],
+               [nil, "", "used", <<131, 106>>, ^first_at],
+               ["acme", "acme", "used", <<131, 106>>, ^first_at]
+             ] = rows
+
+      refute Enum.any?(rows, fn [tenant_id, _, graph_hash, _, _] ->
+               tenant_id == "acme" and graph_hash == "unattached"
+             end)
+
+      assert :ok =
+               Ecto.Migrator.down(TestRepo, @v2_migration_version, UpgradeDocketV2, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
+      refute "scope_key" in columns("docket_runs")
+      refute "tenant_id" in columns("docket_graph_versions")
+
+      assert %{rows: [[2]]} =
+               TestRepo.query!("SELECT count(*) FROM docket_graph_versions", [])
     end
 
     test "dispatch and poison-introspection scans use their partial indexes" do
@@ -410,6 +538,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert run.poisoned_at == nil
       assert run.poison_reason == nil
       assert run.tenant_id == nil
+      assert run.scope_key == ""
 
       assert {:error, changeset} =
                %{
@@ -445,7 +574,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     # success.
     defp insert_run(overrides, prefix \\ "public") do
       now = DateTime.utc_now()
-      ensure_graph_version(prefix)
 
       base = %{
         run_id: "run_#{System.unique_integer([:positive])}",
@@ -471,6 +599,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       }
 
       row = Map.merge(base, Map.new(overrides))
+      ensure_graph_version(prefix, row.tenant_id)
       columns = Map.keys(base)
       placeholders = Enum.map_join(1..length(columns), ", ", &"$#{&1}")
 
@@ -497,18 +626,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
     end
 
-    defp ensure_graph_version(prefix) do
-      insert_graph_version!("g1", "abc123", prefix)
+    defp ensure_graph_version(prefix, tenant_id) do
+      insert_graph_version!("g1", "abc123", prefix, tenant_id)
     end
 
-    defp insert_graph_version!(graph_id, graph_hash, prefix \\ "public") do
+    defp insert_graph_version!(
+           graph_id,
+           graph_hash,
+           prefix \\ "public",
+           tenant_id \\ nil
+         ) do
       TestRepo.query!(
         """
-        INSERT INTO #{prefix}.docket_graph_versions (graph_id, graph_hash, graph, inserted_at)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO #{prefix}.docket_graph_versions
+          (tenant_id, graph_id, graph_hash, graph, inserted_at)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT DO NOTHING
         """,
-        [graph_id, graph_hash, <<131, 106>>, DateTime.utc_now()]
+        [tenant_id, graph_id, graph_hash, <<131, 106>>, DateTime.utc_now()]
       )
     end
 
@@ -580,6 +715,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       data_type
+    end
+
+    defp column_default(table, column) do
+      %{rows: [[default]]} =
+        TestRepo.query!(
+          """
+          SELECT column_default FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+          """,
+          [table, column]
+        )
+
+      default
     end
 
     defp indexes(table) do

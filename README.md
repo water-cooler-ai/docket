@@ -177,8 +177,13 @@ finished.output #=> %{"result" => "HELLO WORLD"}
 {:ok, committed} = MyApp.DurableDocket.fetch_run(run.id)
 {:ok, operational} = MyApp.DurableDocket.inspect_run(run.id)
 
-{:ok, %Docket.SavedGraph{ref: latest_ref, graph: effective_graph}} =
-  MyApp.DurableDocket.fetch_graph("shout")
+{:ok, latest_ref} = MyApp.DurableDocket.fetch_latest_graph_ref("shout")
+{:ok, effective_graph} = MyApp.DurableDocket.fetch_graph(latest_ref)
+
+{:ok, versions} = MyApp.DurableDocket.list_graph_versions("shout", limit: 100)
+versions.versions
+versions.next_before
+versions.has_more?
 ```
 
 `start_run` returns after the initialized run is durably committed; production
@@ -205,10 +210,12 @@ page.has_more?
 {:ok, latest} = MyApp.DurableDocket.fetch_latest_run(graph_id: "shout")
 ```
 
-Pass `before: page.next_before` to continue. `fetch_graph/1` resolves the
-latest distinct saved version for an ID and returns its exact `GraphRef` with
-the effective document; passing a `GraphRef` instead reads that immutable
-version.
+Pass `before: page.next_before` to continue. Graph reads are tenant-owned just
+like run reads: `fetch_latest_graph_ref/1` resolves the newest distinct version
+for an ID, `list_graph_versions/2` pages retained version metadata newest first,
+and `fetch_graph/1` reads only the exact `GraphRef` supplied by the caller.
+A `GraphRef` is relative to the resolved tenant scope and never acts as an
+authorization credential.
 
 To read a run's history, page its retained events in ascending sequence order:
 

@@ -33,8 +33,8 @@ backend boundary.
 | --- | --- | --- |
 | Backend contract | Implemented | `Docket.Backend` bundles storage, graph, run, event, context, and supervision capabilities. |
 | Public PostgreSQL bundle | Implemented | `Docket.Postgres` fixes the storage capabilities and owns their operational supervision. |
-| Versioned migration | Implemented | `Docket.Postgres.Migration` and schema version 1 create three tables with constraints and indexes. |
-| Graph store | Implemented | Immutable effective graph save/fetch with content-address conflict checks. |
+| Versioned migration | Implemented | `Docket.Postgres.Migration` schema versions 1-2 create three tables, scope graph ownership, and install constraints and indexes. |
+| Graph store | Implemented | Tenant-owned immutable effective graph save/exact/latest/list reads with content-address conflict checks. |
 | Run aggregate store | Implemented | Scoped reads, insert, mutation, bounded claims, fencing, release, claim refresh, and poison retry. |
 | Event store | Implemented | Assigned event append in the lifecycle transaction. |
 | Lifecycle composer | Implemented | `Docket.Lifecycle` owns start, moment commit, and signal transaction recipes. |
@@ -66,7 +66,8 @@ but claim and graph-state fencing update the same row.
 
 The version 1 migration enforces the five durable statuses and the valid
 status/schedule/claim/poison shapes with database constraints. Separate partial
-indexes serve ready, expired-claim, and poison inspection paths.
+indexes serve ready, expired-claim, and poison inspection paths. Version 2 adds
+generated scope keys and the scoped graph-version foreign key.
 
 ### Runtime transitions are pre-commit values
 
@@ -78,16 +79,19 @@ state, and schedules a future wake without sleeping in the durable path.
 ### Graph identity is the effective document
 
 Publication snapshots node schema defaults and hashes the canonical effective
-graph. Durable identity is `{graph_id, graph_hash}`. Starting or recovering a
-run compiles the retained effective document locally without injecting defaults
-from newer node code. Compiled runtime graphs aren't stored.
+graph. Durable identity is `{owner_scope, graph_id, graph_hash}`; the public
+`GraphRef` carries the content address while every operation supplies owner
+scope separately. Starting or recovering a run compiles the retained effective
+document locally without injecting defaults from newer node code. Compiled
+runtime graphs aren't stored.
 
 ### Scope is explicit
 
-All run and event operations require `:system`, `:tenantless`, or
-`{:tenant, tenant_id}`. Public tenant modes resolve to one of those scopes
-before a storage call, preventing an omitted tenant from becoming privileged
-access.
+All graph, run, and event operations carry explicit scope. Graph operations
+accept only the owning `:tenantless` or `{:tenant, tenant_id}` scope; internal
+execution derives it from the already-authorized run rather than performing an
+unscoped lookup. Public tenant modes resolve scope before a storage call,
+preventing an omitted tenant from becoming privileged access.
 
 ## Important differences from the proposed release
 
@@ -210,11 +214,12 @@ change to the private ETF persistence codec.
 The release lock also reopens the read surface without changing durable graph
 or run identity:
 
-- `fetch_graph` accepts an exact `Docket.GraphRef` or a graph ID. An ID selects
-  the latest distinct durable publication by `inserted_at DESC, id DESC`; the
-  result is a `Docket.SavedGraph` carrying both the effective document and its
-  exact reference. Graph versions remain backend-global and content-addressed,
-  not tenant owned.
+- `fetch_graph` accepts only an exact `Docket.GraphRef` and returns the effective
+  document. `fetch_latest_graph_ref` selects a graph ID's newest distinct
+  tenant-owned version, while `list_graph_versions` returns lightweight
+  metadata ordered by `published_at DESC, graph_hash DESC` with the same stable
+  cursor. Re-saving a version is idempotent and does not reorder it. A
+  `GraphRef` is scope-relative and never an authorization credential.
 - `list_runs` returns a `Docket.RunPage` of lightweight `Docket.RunSummary`
   projections. The query is always SQL-scoped to `:tenantless` or the required
   tenant, supports graph and durable-status filters, and paginates newest first

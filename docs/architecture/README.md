@@ -65,8 +65,10 @@ Durable public documents:
 
 Public read projection:
 
-- `Docket.SavedGraph`: an effective saved graph paired with the exact
-  content-addressed `Docket.GraphRef` selected by an exact or latest-ID read.
+- `Docket.GraphVersionSummary` and `Docket.GraphVersionPage`: lightweight,
+  tenant-scoped metadata for retained graph versions and their stable
+  newest-first keyset page. Exact documents are read separately with a
+  `Docket.GraphRef`.
 - `Docket.RunSummary` and `Docket.RunPage`: lightweight, tenant-scoped run
   collection rows and their stable newest-first keyset page.
 - `Docket.EventPage`: a keyset page of a run's retained events, returned by the

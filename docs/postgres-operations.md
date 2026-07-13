@@ -221,8 +221,9 @@ graph =
 ```
 
 With `tenant_mode: :required`, add the same authorized non-empty binary
-`tenant_id` to `start_run`, both `await_run` calls, and `resolve_interrupt`.
-Cancellation follows the same serialized signal path:
+`tenant_id` to `save_graph`, `fetch_graph`, graph-version listing/latest reads,
+`start_run`, both `await_run` calls, and `resolve_interrupt`. Cancellation
+follows the same serialized signal path:
 
 ```elixir
 {:ok, %Docket.Run{status: :cancelled}} =

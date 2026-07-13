@@ -81,6 +81,7 @@ defmodule Docket.Storage.Runs do
   """
   @type claim_lease :: %{
           required(:run_id) => String.t(),
+          required(:owner_scope) => owner_scope(),
           required(:graph_id) => String.t(),
           required(:graph_hash) => String.t(),
           required(:checkpoint_seq) => non_neg_integer(),

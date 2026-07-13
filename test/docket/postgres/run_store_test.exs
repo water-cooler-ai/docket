@@ -230,6 +230,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "run listing applies graph and status filters in SQL without decoding state" do
       TestRepo.insert!(
         GraphVersion.changeset(%{
+          tenant_id: "tenant",
           graph_id: "other-graph",
           graph_hash: "other-hash",
           graph: <<131, 106>>
@@ -347,7 +348,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       unpublished = initialized_run("unpublished", graph_hash: "missing")
 
-      assert {:error, %Ecto.Changeset{} = changeset} =
+      assert_raise ArgumentError, ~r/run owner scope must be/, fn ->
+        RunStore.insert_run(TestRepo, {:tenant, ""}, base, :run_initialized, @now)
+      end
+
+      assert {:error, :not_found} =
                RunStore.insert_run(
                  TestRepo,
                  :tenantless,
@@ -356,7 +361,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  @now
                )
 
-      assert {"does not exist", _meta} = changeset.errors[:graph_hash]
       assert TestRepo.aggregate(Run, :count) == 0
 
       assert_raise ArgumentError, ~r/run owner scope must be/, fn ->
@@ -678,9 +682,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       for lease <- leases do
         assert Map.keys(lease) |> Enum.sort() ==
-                 ~w(claim_attempt claim_token claimed_at checkpoint_seq graph_hash graph_id orphan_ttl_ms run_id)a
+                 ~w(claim_attempt claim_token claimed_at checkpoint_seq graph_hash graph_id orphan_ttl_ms owner_scope run_id)a
                  |> Enum.sort()
 
+        assert lease.owner_scope == :tenantless
         assert lease.graph_id == "graph"
         assert lease.graph_hash == "hash"
         assert lease.checkpoint_seq == 7
@@ -1502,6 +1507,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, %{leases: [lease], poisoned: []}} =
                RunStore.claim_due(ctx, :system, policy(@now))
 
+      assert lease.owner_scope == {:tenant, "prefix-tenant"}
       assert row!("prefixed", "docket_private").wake_at == nil
 
       refreshed_at = DateTime.add(@now, 1, :second)
@@ -1701,10 +1707,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp insert_graph!(prefix \\ nil) do
-      changeset =
-        GraphVersion.changeset(%{graph_id: "graph", graph_hash: "hash", graph: <<131, 106>>})
+      for tenant_id <- [nil, "t1", "t2", "tenant-1", "tenant-2", "tenant", "prefix-tenant", "x"] do
+        changeset =
+          GraphVersion.changeset(%{
+            tenant_id: tenant_id,
+            graph_id: "graph",
+            graph_hash: "hash",
+            graph: <<131, 106>>
+          })
 
-      TestRepo.insert!(changeset, prefix: prefix)
+        TestRepo.insert!(changeset, prefix: prefix)
+      end
     end
 
     defp initialized_run(run_id, overrides \\ []) do

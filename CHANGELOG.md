@@ -16,15 +16,18 @@ entries below reflect what has landed so far.
 
 ### Added
 
-- Public saved-graph and run-query reads: `Docket.fetch_graph/3` resolves an
-  exact `Docket.GraphRef` or the latest distinct publication for a graph ID and
-  returns `%Docket.SavedGraph{}`; `Docket.list_runs/2` returns tenant-scoped,
-  newest-first `%Docket.RunPage{}` values containing lightweight
+- Public saved-graph and run-query reads: `Docket.fetch_graph/3` reads the exact
+  tenant-owned version addressed by a `Docket.GraphRef`;
+  `Docket.fetch_latest_graph_ref/3` returns a graph ID's newest scoped
+  reference; and `Docket.list_graph_versions/3` returns newest-first
+  `%Docket.GraphVersionPage{}` values containing lightweight
+  `%Docket.GraphVersionSummary{}` metadata. `Docket.list_runs/2` returns
+  tenant-scoped, newest-first `%Docket.RunPage{}` values containing lightweight
   `%Docket.RunSummary{}` rows, with stable `{started_at, run_id}` keyset
   pagination and graph/status filters; and `Docket.fetch_latest_run/2` returns
-  the newest matching summary. The graph store remains global and
-  content-addressed, while every run collection query uses the same explicit
-  tenant scope as point reads.
+  the newest matching summary. Graph and run reads use the same explicit owner
+  scope; equal graph references may be saved independently by different
+  tenants without granting cross-tenant access.
 - `Docket.fetch_event/4` and `Docket.fetch_latest_event/3` retained-event point
   reads. Exact missing or pruned sequences return `:not_found`; latest returns
   `{:ok, nil}` when a visible run has no retained events, preserving the
@@ -88,9 +91,9 @@ entries below reflect what has landed so far.
   accounting, and low-cardinality pass telemetry. Event retention uses the
   persistence timestamp and cannot exceed run retention; only terminal runs
   expire. Graph cleanup deletes only unreferenced versions older than the ten
-  newest publications for the same graph ID, ordered by immutable publication
-  time and row ID. Referenced versions and the newest ten revisions survive
-  regardless of age (DCKT-21).
+  newest publications for the same owner scope and graph ID, ordered by
+  immutable publication time and graph hash. Referenced versions and the
+  newest ten scoped revisions survive regardless of age (DCKT-21).
 - `Docket.Postgres.Notifier`: the LISTEN fast path for immediate wakes. The
   Postgres RunStore announces every committed wake due at or before the
   database clock with `pg_notify` on the `docket_wake` channel (payload:
@@ -118,7 +121,8 @@ entries below reflect what has landed so far.
   claim-expiry recovery. Node execution holds no checked-out database
   connection (DCKT-20).
 - `Docket.Postgres.GraphCache`: optional node-local compiled-graph cache
-  keyed by store-provided `{graph_id, graph_hash}` and validated per read
+  keyed by storage namespace, owner scope, and store-provided
+  `{graph_id, graph_hash}`, and validated per read
   against the local generation (`:docket` module fingerprint plus each node
   implementation module's beam MD5, or an injected release identity), so a
   cached graph never crosses an incompatible local generation and cache loss
@@ -141,21 +145,21 @@ entries below reflect what has landed so far.
 - Substrate-neutral storage ports (DCKT-8, #12):
   - `Docket.Storage` — the shared backend transaction boundary
     (`transaction/2`);
-  - `Docket.Storage.Graphs` — immutable, content-addressed canonical graph
-    save/fetch;
+  - `Docket.Storage.Graphs` — explicitly owner-scoped immutable canonical graph
+    save, exact fetch, latest-reference fetch, and version listing;
   - `Docket.Storage.Runs` — the run-row aggregate: insert/fetch/inspect,
     atomic batched due/expired claims with poison outcomes, token-guarded
     claim refresh/release, mandatory token-and-sequence fenced commit, serialized
     mutation, and poison recovery;
   - `Docket.Storage.Events` — append-only persistence of already-assigned
     events.
-- Explicit `:system | :tenantless | {:tenant, id}` scope on every run/event
-  storage operation; missing tenant input never implies privileged access
-  (DCKT-8, #12).
+- Explicit owner scope on graph operations and
+  `:system | :tenantless | {:tenant, id}` scope on run/event operations;
+  missing tenant input never implies privileged access (DCKT-8, #12).
 - In-memory conformance backend exercising the full bundle contract,
   including overlapping-transaction publication (test support) (DCKT-8, #12).
 - Postgres substrate scaffold behind optional dependencies: versioned
-  migrations (`Docket.Postgres.Migration`, v01), `docket_graph_versions` /
+  migrations (`Docket.Postgres.Migration`, v01-v02), `docket_graph_versions` /
   `docket_runs` / `docket_events` schemas, and `mix docket.gen.migration`
   (DCKT-13, #10).
 - Postgres `Docket.Postgres.RunStore` atomic, demand-bounded claims over
@@ -342,6 +346,12 @@ entries below reflect what has landed so far.
   expired-claim `(claimed_at, id)`, and poison-introspection partial
   indexes behind positive dispatch eligibility (`status = 'running' AND
   poisoned_at IS NULL`) (DCKT-29, #19).
+- Postgres v02 makes graph versions tenant-owned without adding a publication
+  table: generated non-null scope keys bind runs to
+  `(scope_key, graph_id, graph_hash)` through a delete-restricted composite
+  foreign key. Legacy graph rows remain tenantless and are cloned only for
+  tenant ownership proven by existing runs; saved-but-never-run legacy
+  ownership cannot be reconstructed.
 - The runtime loop separates pure moment production from commitment. Durable
   backends commit moments transactionally before best-effort observation;
   processless helpers return read-only checkpoint values for assertions.

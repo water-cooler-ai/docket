@@ -15,7 +15,9 @@ defmodule Docket.Storage.ReadCapabilitiesTest do
     assert Code.ensure_loaded?(Docket.Test.MemoryBackend)
 
     for {name, arity} <- [
-          fetch_latest_graph: 2,
+          fetch_graph: 4,
+          fetch_latest_graph_ref: 3,
+          list_graph_versions: 4,
           list_runs: 3,
           fetch_event: 4,
           fetch_latest_event: 3

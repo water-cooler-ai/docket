@@ -53,6 +53,7 @@ defmodule Docket.MemoryBackendTest do
       with :ok <-
              MemoryBackend.save_graph(
                transaction,
+               owner_scope,
                run.graph_id,
                run.graph_hash,
                graph
@@ -139,12 +140,22 @@ defmodule Docket.MemoryBackendTest do
 
     assert {:ok, ^initialized} = initialize(b, initialized, events: [retained])
     assert {:ok, ^initialized} = MemoryBackend.fetch_run(b, :tenantless, "r1")
-    assert {:ok, @graph} = MemoryBackend.fetch_graph(b, "g", @graph_hash)
+    assert {:ok, @graph} = MemoryBackend.fetch_graph(b, :tenantless, "g", @graph_hash)
     assert [^retained] = MemoryBackend.events(b, :system, "r1")
     assert @initial_wake == MemoryBackend.wake_at(b, "r1")
   end
 
   test "durable insertion accepts only a scheduled initialized running run", %{backend: b} do
+    assert_raise ArgumentError, ~r/run owner scope must be/, fn ->
+      MemoryBackend.insert_run(
+        b,
+        {:tenant, ""},
+        run("empty-tenant"),
+        :run_initialized,
+        @initial_wake
+      )
+    end
+
     for status <- [:created, :waiting, :done, :failed, :cancelled] do
       id = Atom.to_string(status)
 
@@ -203,13 +214,13 @@ defmodule Docket.MemoryBackendTest do
     different = %{@graph | metadata: %{"a" => 2}}
     graph_hash = durable_hash(first)
 
-    assert :ok = MemoryBackend.save_graph(b, "g", graph_hash, first)
-    assert :ok = MemoryBackend.save_graph(b, "g", graph_hash, equal)
+    assert :ok = MemoryBackend.save_graph(b, :tenantless, "g", graph_hash, first)
+    assert :ok = MemoryBackend.save_graph(b, :tenantless, "g", graph_hash, equal)
 
     assert {:error, :invalid_graph_hash} =
-             MemoryBackend.save_graph(b, "g", graph_hash, different)
+             MemoryBackend.save_graph(b, :tenantless, "g", graph_hash, different)
 
-    assert {:ok, ^first} = MemoryBackend.fetch_graph(b, "g", graph_hash)
+    assert {:ok, ^first} = MemoryBackend.fetch_graph(b, :tenantless, "g", graph_hash)
   end
 
   test "latest graph lookup follows distinct publication order", %{backend: b} do
@@ -218,17 +229,18 @@ defmodule Docket.MemoryBackendTest do
     first_hash = durable_hash(first)
     second_hash = durable_hash(second)
 
-    assert :ok = MemoryBackend.save_graph(b, "g", first_hash, first)
-    assert :ok = MemoryBackend.save_graph(b, "g", second_hash, second)
-    assert :ok = MemoryBackend.save_graph(b, "g", first_hash, first)
+    assert :ok = MemoryBackend.save_graph(b, :tenantless, "g", first_hash, first)
+    assert :ok = MemoryBackend.save_graph(b, :tenantless, "g", second_hash, second)
+    assert :ok = MemoryBackend.save_graph(b, :tenantless, "g", first_hash, first)
 
-    assert {:ok,
-            %Docket.SavedGraph{
-              ref: %Docket.GraphRef{graph_id: "g", graph_hash: ^second_hash},
-              graph: ^second
-            }} = MemoryBackend.fetch_latest_graph(b, "g")
+    assert {:ok, %Docket.GraphRef{graph_id: "g", graph_hash: ^second_hash}} =
+             MemoryBackend.fetch_latest_graph_ref(b, :tenantless, "g")
 
-    assert {:error, :not_found} = MemoryBackend.fetch_latest_graph(b, "missing")
+    assert {:ok, %Docket.GraphVersionPage{versions: versions}} =
+             MemoryBackend.list_graph_versions(b, :tenantless, "g", %{limit: 10, before: nil})
+
+    assert Enum.map(versions, & &1.ref.graph_hash) == [second_hash, first_hash]
+    assert {:error, :not_found} = MemoryBackend.fetch_latest_graph_ref(b, :tenantless, "missing")
   end
 
   defp durable_hash(graph) do
@@ -238,6 +250,10 @@ defmodule Docket.MemoryBackendTest do
     |> Base.encode16(case: :lower)
   end
 
+  defp publish_default!(backend) do
+    assert :ok = MemoryBackend.save_graph(backend, :tenantless, "g", @graph_hash, @graph)
+  end
+
   test "failed event append rolls graph and run initialization back", %{backend: b} do
     initialized = run("r1")
     mismatched = event("another-run", 1)
@@ -245,11 +261,15 @@ defmodule Docket.MemoryBackendTest do
     assert {:error, :event_run_mismatch} =
              initialize(b, initialized, events: [mismatched])
 
-    assert {:error, :not_found} = MemoryBackend.fetch_graph(b, "g", @graph_hash)
+    assert {:error, :not_found} =
+             MemoryBackend.fetch_graph(b, :tenantless, "g", @graph_hash)
+
     assert {:error, :not_found} = MemoryBackend.fetch_run(b, :system, "r1")
   end
 
   test "transaction errors, exceptions, and throws roll back and propagate", %{backend: b} do
+    publish_default!(b)
+
     assert {:error, :stop} =
              MemoryBackend.transaction(b, fn tx ->
                assert {:ok, _} =
@@ -300,6 +320,8 @@ defmodule Docket.MemoryBackendTest do
   end
 
   test "nested transactions join the outer transaction", %{backend: b} do
+    publish_default!(b)
+
     assert {:ok, :outer} =
              MemoryBackend.transaction(b, fn tx ->
                assert {:ok, _} =
@@ -333,6 +355,7 @@ defmodule Docket.MemoryBackendTest do
   end
 
   test "overlapping transactions cannot erase each other's commits", %{backend: b} do
+    publish_default!(b)
     parent = self()
 
     first =
@@ -391,6 +414,7 @@ defmodule Docket.MemoryBackendTest do
   end
 
   test "a rolled-back overlapping transaction cannot erase a later commit", %{backend: b} do
+    publish_default!(b)
     parent = self()
 
     first =
@@ -449,6 +473,7 @@ defmodule Docket.MemoryBackendTest do
   end
 
   test "an overlapping direct root write cannot be overwritten by a transaction", %{backend: b} do
+    publish_default!(b)
     parent = self()
 
     transaction =

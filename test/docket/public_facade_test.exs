@@ -29,6 +29,8 @@ defmodule Docket.PublicFacadeTest do
     for {name, arity} <- [
           save_graph: 3,
           fetch_graph: 3,
+          fetch_latest_graph_ref: 3,
+          list_graph_versions: 3,
           start_run: 4,
           fetch_run: 3,
           inspect_run: 3,
@@ -50,6 +52,8 @@ defmodule Docket.PublicFacadeTest do
 
     for {name, arities} <- [
           fetch_graph: [1, 2],
+          fetch_latest_graph_ref: [1, 2],
+          list_graph_versions: [1, 2],
           list_runs: [0, 1],
           fetch_latest_run: [0, 1],
           fetch_event: [2, 3],
@@ -75,20 +79,40 @@ defmodule Docket.PublicFacadeTest do
       }
     end
 
-    test "fetches an exact or latest saved graph and keeps its reference" do
+    test "fetches exact graphs and lists their scoped version references" do
       graph = Docket.Test.Fixtures.Graphs.minimal_linear()
 
       assert {:ok, ref} = Host.save_graph(graph)
-      assert {:ok, %Docket.SavedGraph{ref: ^ref, graph: saved}} = Host.fetch_graph(ref)
+      assert {:ok, saved} = Host.fetch_graph(ref)
       assert saved.id == graph.id
 
-      assert {:ok, %Docket.SavedGraph{ref: ^ref, graph: ^saved}} =
-               Host.fetch_graph(graph.id)
+      assert {:ok, ^ref} = Host.fetch_latest_graph_ref(graph.id)
 
-      assert {:error, :not_found} = Host.fetch_graph("missing")
+      assert {:ok, %Docket.GraphVersionPage{versions: [version]}} =
+               Host.list_graph_versions(graph.id)
+
+      assert version.ref == ref
+
+      assert {:error, :not_found} = Host.fetch_latest_graph_ref("missing")
 
       assert {:error, %Docket.Error{type: :invalid_graph_reference}} =
                Host.fetch_graph("")
+
+      assert {:error, %Docket.Error{type: :invalid_graph_id}} =
+               Host.list_graph_versions("")
+
+      for result <- [
+            Host.fetch_graph(ref, %{}),
+            Host.fetch_latest_graph_ref(graph.id, %{}),
+            Host.list_graph_versions(graph.id, %{})
+          ] do
+        assert {:error, %Docket.Error{type: :invalid_options}} = result
+      end
+
+      malformed_ref = %Docket.GraphRef{graph_id: nil, graph_hash: nil}
+
+      assert {:error, %Docket.Error{type: :invalid_graph_reference}} =
+               Host.start_run(malformed_ref, %{})
     end
 
     test "lists and fetches latest run summaries with stable pagination", %{
@@ -174,8 +198,22 @@ defmodule Docket.PublicFacadeTest do
     assert {:ok, %Docket.Event{seq: 1}} = TenantHost.fetch_latest_event("a-run", tenant_id: "a")
     assert {:error, :not_found} = TenantHost.fetch_event("a-run", 1, tenant_id: "b")
 
-    assert {:ok, graph_ref} = TenantHost.save_graph(Docket.Test.Fixtures.Graphs.minimal_linear())
-    assert {:ok, %Docket.SavedGraph{ref: ^graph_ref}} = TenantHost.fetch_graph(graph_ref)
+    graph = Docket.Test.Fixtures.Graphs.minimal_linear()
+    assert {:error, %Docket.Error{type: :invalid_tenant}} = TenantHost.save_graph(graph)
+    assert {:ok, graph_ref} = TenantHost.save_graph(graph, tenant_id: "a")
+    assert {:ok, %Docket.Graph{}} = TenantHost.fetch_graph(graph_ref, tenant_id: "a")
+    assert {:error, :not_found} = TenantHost.fetch_graph(graph_ref, tenant_id: "b")
+    assert {:ok, ^graph_ref} = TenantHost.fetch_latest_graph_ref(graph.id, tenant_id: "a")
+    assert {:error, :not_found} = TenantHost.fetch_latest_graph_ref(graph.id, tenant_id: "b")
+
+    assert {:ok, %{versions: [%{ref: ^graph_ref}]}} =
+             TenantHost.list_graph_versions(graph.id, tenant_id: "a")
+
+    assert {:ok, %{versions: []}} =
+             TenantHost.list_graph_versions(graph.id, tenant_id: "b")
+
+    assert {:ok, ^graph_ref} = TenantHost.save_graph(graph, tenant_id: "b")
+    assert {:ok, %Docket.Graph{}} = TenantHost.fetch_graph(graph_ref, tenant_id: "b")
   end
 
   describe "list_events through a configured memory-backend runtime" do
@@ -215,6 +253,8 @@ defmodule Docket.PublicFacadeTest do
         started_at: ~U[2026-07-12 00:00:00Z],
         updated_at: ~U[2026-07-12 00:00:00Z]
       }
+
+      run = publish_for_run!(backend, context, :tenantless, run)
 
       events =
         for seq <- 1..2 do
@@ -257,10 +297,19 @@ defmodule Docket.PublicFacadeTest do
   end
 
   defp insert_run!(backend, context, scope, run) do
+    run = publish_for_run!(backend, context, scope, run)
+
     assert {:ok, ^run} =
              backend.insert_run(context, scope, run, :run_initialized, run.started_at)
 
     run
+  end
+
+  defp publish_for_run!(backend, context, scope, run) do
+    graph = %{Docket.Test.Fixtures.Graphs.minimal_linear() | id: run.graph_id}
+    {:ok, effective, rtg} = Docket.Graph.Compiler.compile_for_publication(graph)
+    :ok = backend.save_graph(context, scope, rtg.graph_id, rtg.graph_hash, effective)
+    %{run | graph_hash: rtg.graph_hash}
   end
 
   defp run(id, started_at, opts \\ []) do
