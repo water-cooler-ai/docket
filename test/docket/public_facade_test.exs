@@ -88,7 +88,7 @@ defmodule Docket.PublicFacadeTest do
 
       assert {:ok, ^ref} = Host.fetch_latest_graph_ref(graph.id)
 
-      assert {:ok, %Docket.GraphVersionPage{versions: [version]}} =
+      assert {:ok, %Docket.GraphVersionPage{versions: [%Docket.GraphVersion{} = version]}} =
                Host.list_graph_versions(graph.id)
 
       assert version.ref == ref
@@ -141,6 +141,15 @@ defmodule Docket.PublicFacadeTest do
 
       assert {:error, %Docket.Error{type: :invalid_options}} =
                Host.fetch_latest_run(limit: 1)
+
+      for result <- [
+            Host.list_runs(%{}),
+            Host.fetch_latest_run(%{}),
+            Host.list_runs([:not_a_keyword]),
+            Host.fetch_latest_run([:not_a_keyword])
+          ] do
+        assert {:error, %Docket.Error{type: :invalid_options}} = result
+      end
 
       assert {:ok, filtered} = Host.list_runs(graph_id: "g", status: :running)
       assert Enum.map(filtered.runs, & &1.id) == ["newer-a", "older"]

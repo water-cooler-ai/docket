@@ -86,8 +86,9 @@ defmodule Docket.Storage.Graphs do
   `query.before` is an exclusive `{published_at, graph_hash}` cursor and
   `query.limit` bounds the returned versions. Implementations read at most one
   lookahead row and construct a `Docket.GraphVersionPage`, which centralizes
-  trimming and next-cursor derivation. The metadata read never loads or decodes
-  effective graph documents. An unknown graph ID returns an empty page.
+  trimming and next-cursor derivation without revalidating the backend's order.
+  The metadata read never loads or decodes effective graph documents. An
+  unknown graph ID returns an empty page.
   """
   @callback list_graph_versions(
               ctx(),

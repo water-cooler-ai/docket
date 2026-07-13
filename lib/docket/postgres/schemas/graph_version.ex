@@ -1,13 +1,6 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.Schemas.GraphVersion do
-    @moduledoc """
-    Row schema for `docket_graph_versions` — effective durable graphs,
-    content-addressed by tenant scope + `graph_id` + `graph_hash`.
-
-    `graph` holds the private versioned ETF encoding. Compiled runtime graphs
-    stay node-local and are never persisted here. Rows are immutable once
-    inserted.
-    """
+    @moduledoc false
 
     use Ecto.Schema
 

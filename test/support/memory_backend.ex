@@ -178,10 +178,10 @@ defmodule Docket.Test.MemoryBackend do
         end)
         |> Enum.take(limit + 1)
         |> Enum.map(fn {graph_hash, version} ->
-          Docket.GraphVersionSummary.new!(
+          %Docket.GraphVersion{
             ref: %Docket.GraphRef{graph_id: graph_id, graph_hash: graph_hash},
             published_at: version.published_at
-          )
+          }
         end)
 
       {:ok, Docket.GraphVersionPage.new(versions, before, limit)}

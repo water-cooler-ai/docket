@@ -111,8 +111,8 @@ defmodule Docket do
   def fetch_latest_graph_ref(runtime, graph_id, opts)
       when is_binary(graph_id) and byte_size(graph_id) > 0 do
     with :ok <- validate_keyword_options(opts, :fetch_latest_graph_ref),
-         {:ok, opts} <- instance_opts(runtime, opts),
          :ok <- validate_latest_graph_options(opts),
+         {:ok, opts} <- instance_opts(runtime, opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
       backend.graphs().fetch_latest_graph_ref(context, scope, graph_id)
     end
@@ -298,7 +298,8 @@ defmodule Docket do
   """
   @spec list_runs(term(), keyword()) :: {:ok, Docket.RunPage.t()} | {:error, term()}
   def list_runs(runtime, opts \\ []) do
-    with {:ok, opts} <- instance_opts(runtime, opts),
+    with :ok <- validate_keyword_options(opts, :list_runs),
+         {:ok, opts} <- instance_opts(runtime, opts),
          {:ok, query} <- list_runs_options(opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
       backend.runs().list_runs(context, scope, query)
@@ -314,7 +315,8 @@ defmodule Docket do
   @spec fetch_latest_run(term(), keyword()) ::
           {:ok, Docket.RunSummary.t()} | {:error, term()}
   def fetch_latest_run(runtime, opts \\ []) do
-    with :ok <- validate_latest_run_options(opts),
+    with :ok <- validate_keyword_options(opts, :fetch_latest_run),
+         :ok <- validate_latest_run_options(opts),
          {:ok, opts} <- instance_opts(runtime, opts),
          query_opts = opts |> Keyword.delete(:before) |> Keyword.put(:limit, 1),
          {:ok, query} <- list_runs_options(query_opts),

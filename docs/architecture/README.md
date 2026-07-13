@@ -65,7 +65,7 @@ Durable public documents:
 
 Public read projection:
 
-- `Docket.GraphVersionSummary` and `Docket.GraphVersionPage`: lightweight,
+- `Docket.GraphVersion` and `Docket.GraphVersionPage`: lightweight,
   tenant-scoped metadata for retained graph versions and their stable
   newest-first keyset page. Exact documents are read separately with a
   `Docket.GraphRef`.

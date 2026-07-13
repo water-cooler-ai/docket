@@ -6,10 +6,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
-    alias Docket.{DurableCodec, Graph, GraphRef, GraphVersionPage, GraphVersionSummary}
+    alias Docket.{DurableCodec, Graph, GraphRef, GraphVersion, GraphVersionPage}
     alias Docket.Postgres.{GraphStore, Storage}
     alias Docket.Postgres.GraphStoreTestRepo, as: TestRepo
-    alias Docket.Postgres.Schemas.GraphVersion
+    alias Docket.Postgres.Schemas.GraphVersion, as: GraphVersionSchema
     alias Docket.Test.Fixtures.Graphs
 
     @migration_version 20_260_710_000_021
@@ -39,8 +39,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     setup do
-      TestRepo.delete_all(GraphVersion)
-      GraphVersion |> put_query_prefix("docket_private") |> TestRepo.delete_all()
+      TestRepo.delete_all(GraphVersionSchema)
+      GraphVersionSchema |> put_query_prefix("docket_private") |> TestRepo.delete_all()
       :ok
     end
 
@@ -55,8 +55,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, ^graph} =
                GraphStore.fetch_graph(TestRepo, :tenantless, graph.id, graph_hash)
 
-      assert TestRepo.one(from(version in GraphVersion, select: version.graph)) == bytes
-      assert TestRepo.aggregate(GraphVersion, :count) == 1
+      assert TestRepo.one(from(version in GraphVersionSchema, select: version.graph)) == bytes
+      assert TestRepo.aggregate(GraphVersionSchema, :count) == 1
     end
 
     test "a fetched graph compiles directly from durable storage" do
@@ -92,14 +92,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert :ok = GraphStore.save_graph(TestRepo, :tenantless, second.id, second_hash, second)
 
       TestRepo.update_all(
-        from(version in GraphVersion,
+        from(version in GraphVersionSchema,
           where: version.graph_id == "revision-order" and version.graph_hash == ^first_hash
         ),
         set: [inserted_at: ~U[2026-07-12 12:00:01.000000Z]]
       )
 
       TestRepo.update_all(
-        from(version in GraphVersion,
+        from(version in GraphVersionSchema,
           where: version.graph_id == "revision-order" and version.graph_hash == ^second_hash
         ),
         set: [inserted_at: ~U[2026-07-12 12:00:00.000000Z]]
@@ -109,7 +109,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                GraphStore.fetch_latest_graph_ref(TestRepo, :tenantless, "revision-order")
 
       TestRepo.update_all(
-        from(version in GraphVersion, where: version.graph_id == "revision-order"),
+        from(version in GraphVersionSchema, where: version.graph_id == "revision-order"),
         set: [inserted_at: ~U[2026-07-12 12:00:00.000000Z]]
       )
 
@@ -121,8 +121,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok,
               %GraphVersionPage{
                 versions: [
-                  %GraphVersionSummary{ref: %GraphRef{graph_hash: ^expected_hash}},
-                  %GraphVersionSummary{}
+                  %GraphVersion{ref: %GraphRef{graph_hash: ^expected_hash}},
+                  %GraphVersion{}
                 ],
                 has_more?: false
               }} =
@@ -194,7 +194,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  })
       end
 
-      assert TestRepo.aggregate(GraphVersion, :count) == 2
+      assert TestRepo.aggregate(GraphVersionSchema, :count) == 2
     end
 
     test "version lists use an exclusive cursor and preserve it on an empty page" do
@@ -207,7 +207,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       for {graph_hash, inserted_at} <- versions do
         TestRepo.update_all(
-          from(version in GraphVersion,
+          from(version in GraphVersionSchema,
             where: version.graph_id == "paged" and version.graph_hash == ^graph_hash
           ),
           set: [inserted_at: inserted_at]
@@ -224,7 +224,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok,
               %GraphVersionPage{
-                versions: [%GraphVersionSummary{}],
+                versions: [%GraphVersion{}],
                 next_before: final_cursor,
                 has_more?: false
               }} =
@@ -365,7 +365,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp insert_raw!(graph_id, graph_hash, bytes) do
       %{graph_id: graph_id, graph_hash: graph_hash, graph: bytes}
-      |> GraphVersion.changeset()
+      |> GraphVersionSchema.changeset()
       |> TestRepo.insert!()
     end
 

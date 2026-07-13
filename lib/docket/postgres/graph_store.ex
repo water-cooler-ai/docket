@@ -6,8 +6,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     import Ecto.Query
 
-    alias Docket.{DurableCodec, Graph, GraphRef, GraphVersionPage, GraphVersionSummary}
-    alias Docket.Postgres.Schemas.GraphVersion
+    alias Docket.{DurableCodec, Graph, GraphRef, GraphVersion, GraphVersionPage}
+    alias Docket.Postgres.Schemas.GraphVersion, as: GraphVersionSchema
     alias Docket.Postgres.Storage
 
     @impl Docket.Storage.Graphs
@@ -117,7 +117,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {repo, prefix} = Storage.context!(ctx)
 
       changeset =
-        GraphVersion.changeset(%{
+        GraphVersionSchema.changeset(%{
           tenant_id: owner_tenant_id!(owner_scope),
           graph_id: graph_id,
           graph_hash: graph_hash,
@@ -151,7 +151,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {repo, prefix} = Storage.context!(ctx)
 
       query =
-        GraphVersion
+        GraphVersionSchema
         |> scope_query(owner_scope)
         |> where([version], version.graph_id == ^graph_id and version.graph_hash == ^graph_hash)
         |> select([version], version.graph)
@@ -168,7 +168,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {repo, prefix} = Storage.context!(ctx)
 
       query =
-        GraphVersion
+        GraphVersionSchema
         |> scope_query(owner_scope)
         |> where([version], version.graph_id == ^graph_id)
         |> order_by([version], desc: version.inserted_at, desc: version.graph_hash)
@@ -191,7 +191,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp list_version_candidates(ctx, owner_scope, graph_id, before, limit) do
       {repo, prefix} = Storage.context!(ctx)
 
-      GraphVersion
+      GraphVersionSchema
       |> scope_query(owner_scope)
       |> where([version], version.graph_id == ^graph_id)
       |> before_query(before)
@@ -200,26 +200,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> select([version], {version.graph_hash, version.inserted_at})
       |> with_prefix(prefix)
       |> repo.all()
-      |> build_version_summaries(graph_id)
+      |> build_graph_versions(graph_id)
     end
 
-    defp build_version_summaries(rows, graph_id) do
+    defp build_graph_versions(rows, graph_id) do
       Enum.reduce_while(rows, {:ok, []}, fn
-        {graph_hash, %DateTime{} = published_at}, {:ok, summaries}
+        {graph_hash, %DateTime{} = published_at}, {:ok, versions}
         when is_binary(graph_hash) and byte_size(graph_hash) > 0 ->
-          summary =
-            GraphVersionSummary.new!(
+          version =
+            %GraphVersion{
               ref: %GraphRef{graph_id: graph_id, graph_hash: graph_hash},
               published_at: published_at
-            )
+            }
 
-          {:cont, {:ok, [summary | summaries]}}
+          {:cont, {:ok, [version | versions]}}
 
-        _invalid, _summaries ->
+        _invalid, _versions ->
           {:halt, {:error, :corrupt_graph}}
       end)
       |> case do
-        {:ok, summaries} -> {:ok, Enum.reverse(summaries)}
+        {:ok, versions} -> {:ok, Enum.reverse(versions)}
         {:error, :corrupt_graph} = error -> error
       end
     end

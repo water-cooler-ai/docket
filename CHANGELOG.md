@@ -21,7 +21,7 @@ entries below reflect what has landed so far.
   `Docket.fetch_latest_graph_ref/3` returns a graph ID's newest scoped
   reference; and `Docket.list_graph_versions/3` returns newest-first
   `%Docket.GraphVersionPage{}` values containing lightweight
-  `%Docket.GraphVersionSummary{}` metadata. `Docket.list_runs/2` returns
+  `%Docket.GraphVersion{}` metadata. `Docket.list_runs/2` returns
   tenant-scoped, newest-first `%Docket.RunPage{}` values containing lightweight
   `%Docket.RunSummary{}` rows, with stable `{started_at, run_id}` keyset
   pagination and graph/status filters; and `Docket.fetch_latest_run/2` returns

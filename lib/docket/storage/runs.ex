@@ -194,6 +194,8 @@ defmodule Docket.Storage.Runs do
 
   No matching rows is successful and returns an empty `Docket.RunPage` whose
   `next_before` preserves the supplied cursor and whose `has_more?` is false.
+  Page construction trusts implementations to uphold ordering and cursor
+  exclusivity rather than scanning backend output again.
   """
   @callback list_runs(ctx(), scope(), list_query()) :: {:ok, Docket.RunPage.t()}
 
