@@ -126,14 +126,31 @@ A future `Docket.Postgres.ClaimPolicy.TenantFair` should:
 6. run the reusable ClaimPolicy contract plus direct, transaction, supervised,
    manual-drain, concurrency, query-plan, and telemetry suites.
 
-Selecting it requires only instance configuration:
+Its locked instance-configuration shape is:
 
 ```elixir
 use Docket,
   backend: Docket.Postgres,
   repo: MyApp.Repo,
-  claim_policy: [implementation: MyApp.TenantFairClaimPolicy]
+  tenant_mode: :required,
+  dispatcher: [concurrency: 100],
+  claim_policy: [
+    implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+    partition_by: :tenant_id,
+    default_preferred_active: 2,
+    default_max_active: 2,
+    default_weight: 1,
+    borrowing: false
+  ]
 ```
+
+TenantFair owns validation of those implementation options in `init/2`.
+Fairness configuration does not belong under `:dispatcher`: dispatcher
+concurrency is a per-runtime vehicle ceiling, whereas TenantFair policy is an
+instance-selected PostgreSQL admission engine configuration shared by every
+admission path. The source-owned TenantFair implementation is not present yet;
+the example records the contract for the next slices and must not be used until
+that module and its schema prerequisites ship.
 
 No policy-specific change belongs in RunStore, dispatcher, synchronous drain,
 vehicle, executor, or the portable `Docket.Backend.RunStore` contract. Rolling

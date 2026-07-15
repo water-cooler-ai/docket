@@ -317,19 +317,20 @@ concurrency limit still bounds all active vehicles, while a database-wide
 partition limit bounds how many live claims one tenant may hold at once:
 
 ```elixir
-dispatcher: [
-  concurrency: 100,
-  claim_partitions: [
-    by: :tenant_id,
-    preferred_active: 2,
-    max_active: 4,
-    weight: 1,
-    borrowing: true
-  ]
+dispatcher: [concurrency: 100],
+claim_policy: [
+  implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+  partition_by: :tenant_id,
+  default_preferred_active: 2,
+  default_max_active: 4,
+  default_weight: 1,
+  borrowing: true
 ]
 ```
 
-The exact public option names remain design work. The intended behavior is:
+These names are locked by the DCKT-58 contract. The TenantFair module and its
+schema are later delivery slices; this example does not describe currently
+available behavior. The intended behavior is:
 
 - Claim selection is fair across eligible tenant partitions and stable within
   a tenant by wake time and run ID. A tenant with a deep backlog must not hide

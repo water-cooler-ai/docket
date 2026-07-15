@@ -102,6 +102,48 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
     end
 
+    test "owner scope is the sole trusted claim partition identity" do
+      untrusted_identity = %{
+        "tenant_id" => "payload-tenant",
+        "scope_key" => "payload-scope",
+        "account" => %{"tenant_id" => "nested-payload-tenant"}
+      }
+
+      expected = [
+        {"trusted-tenant", {:tenant, "tenant"}, "tenant", "tenant"},
+        {"trusted-tenantless", :tenantless, nil, ""}
+      ]
+
+      for {run_id, owner_scope, tenant_id, scope_key} <- expected do
+        run =
+          initialized_run(run_id,
+            input: untrusted_identity,
+            metadata: %{"fairness" => untrusted_identity}
+          )
+
+        assert {:ok, ^run} =
+                 RunStore.insert_run(
+                   TestRepo,
+                   owner_scope,
+                   run,
+                   :run_initialized,
+                   @now
+                 )
+
+        row = row!(run_id)
+        assert row.tenant_id == tenant_id
+        assert row.scope_key == scope_key
+      end
+
+      assert {:ok, %{leases: leases, poisoned: []}} =
+               claim_due(@now, limit: length(expected))
+
+      assert Map.new(leases, &{&1.run_id, &1.owner_scope}) == %{
+               "trusted-tenant" => {:tenant, "tenant"},
+               "trusted-tenantless" => :tenantless
+             }
+    end
+
     test "run listing applies graph and status filters in SQL without decoding state" do
       TestRepo.insert!(
         GraphVersion.changeset(%{
