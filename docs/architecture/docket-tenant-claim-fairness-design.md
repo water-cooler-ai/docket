@@ -1,10 +1,11 @@
 # Docket Tenant Claim Fairness
 
-Status: proposed design for the PostgreSQL durable runtime after `0.1.0`
+Status: implementation design for the PostgreSQL durable runtime after `0.1.0`;
+the identity, vocabulary, and instance-configuration contract is locked by
+DCKT-58, while the TenantFair engine and its schema remain unimplemented.
 
 This document turns the tenant-fairness roadmap item into an implementation
-plan. The public option names and migration version remain provisional until
-the first implementation slice is reviewed.
+plan. The migration version and later query-tuning values remain provisional.
 
 ## Summary
 
@@ -49,6 +50,38 @@ service time than another. Later service accounting can improve scheduling,
 but the first release should be described precisely as **tenant claim
 fairness**.
 
+## Trusted partition identity
+
+The fairness partition is the persisted `docket_runs.scope_key`. Docket derives
+that value only from the owner scope resolved by the configured runtime:
+
+- `tenant_mode: :required` requires a non-empty `tenant_id` operation option
+  and resolves it to `{:tenant, tenant_id}`;
+- `tenant_mode: :none` resolves public operations to `:tenantless`; and
+- PostgreSQL stores the resolved owner as `tenant_id` and generates
+  `scope_key`, using the tenant ID for tenant-owned rows and the empty string
+  for tenantless rows.
+
+The host is responsible for authenticating and authorizing the principal from
+which it supplies `tenant_id`; Docket cannot establish that application-level
+trust. Once the host calls Docket, however, the scheduling identity is not
+caller-extensible. Run input, graph fields, node output, checkpoint state,
+event payloads, execution context, tier names, and other run-controlled data
+cannot select or override `scope_key`. ClaimPolicy implementations read the
+persisted generated value and never re-derive a partition from a run document
+or payload.
+
+The tenantless empty string is one real scheduling partition, not a wildcard or
+an absence of policy. Empty tenant IDs are invalid, so it cannot collide with a
+tenant-owned partition. A product tier may resolve numeric policy for many
+tenants but is never itself a partition key.
+
+The fairness domain is one physical PostgreSQL database and resolved table
+schema. Every dispatcher that addresses those same prefixed Docket tables
+coordinates over the same `scope_key` partitions. `prefix: nil` follows the
+connection `search_path`; operators must account for the possibility that it
+resolves to the same physical schema as an explicit prefix such as `"public"`.
+
 ## Goals
 
 1. A hot tenant cannot occupy every dispatcher vehicle while another tenant
@@ -86,7 +119,26 @@ fairness**.
 
 ## Fairness vocabulary
 
-The design separates three controls that are often conflated:
+The following terms and units are normative for implementation, telemetry, and
+SLO work:
+
+| Term | Operational definition | Unit |
+|------|------------------------|------|
+| claim | Execution authority represented by a non-null claim token on one running, non-poisoned run row. Installing a token starts a claim; a fenced clear, terminal/cancel transition, poison transition, or token-replacing steal ends that particular authority. | event |
+| active claim / live claim | A `status = 'running'`, non-poisoned run with a non-null claim token at the observation instant. Expiry alone does not remove it; a successful steal replaces one active claim with one active claim. | claims |
+| active claim residency | Time from token installation until that token is cleared or replaced, measured with database timestamps. | microseconds |
+| preferred concurrency / `preferred_active` | The active-claim threshold below which an eligible partition receives preferred admission. It is neither reserved capacity nor a minimum guarantee. | claims |
+| hard cap / `max_active` | The exact maximum active claims additive ready admission may leave in one partition. Expired replacement does not add a claim. | claims |
+| weight | A positive integer relative-service coefficient. Ratios are meaningful only among continuously eligible partitions in the same active set; implementations scale fractional host ratios to a common integer base. | dimensionless integer |
+| entitlement | A partition's normalized target service share within an active set: `weight / sum(active weights)`. Before weighted service is enabled, entitlement means only preferred-before-borrowed admission and does not imply a numeric share guarantee. | ratio in `[0, 1]` |
+| borrowing | An active-claim count above `preferred_active` and at or below `max_active`, admitted only when borrowing is enabled and no preferred admission is hidden. | claims; classification is boolean per claim at admission |
+| claim wait | For a ready claim, database `claimed_at - wake_at`. Expired recovery wait is reported separately from the expiry boundary and is not mixed into ready claim wait. | milliseconds |
+| concurrency share | A partition's active claims divided by total active claims in the fairness domain. Windowed concurrency share is the time integral of that ratio divided by window duration. | ratio in `[0, 1]` |
+| processing-time share | A partition's measured service time divided by total measured service time for the same signal and window. The signal must be named, initially claim-residency or executor-task time; the two are never combined implicitly. | ratio in `[0, 1]` |
+| service skew | `observed processing-time share - entitlement` for one partition over a stated active-set window. Positive values mean excess service and negative values mean deficient service; aggregate reports may use the maximum absolute value. | percentage points |
+| bounded reclaim lag | From a previously quiet eligible partition crossing below `preferred_active` until its next preferred admission, conditional on capacity turnover. A numeric upper bound exists only when maximum residual slice duration, poll delay, and admission-transaction delay are all bounded. | milliseconds |
+
+The policy deliberately separates three controls that are often conflated:
 
 - `preferred_active` is the tenant's preferred non-borrowing threshold. It is
   an admission preference, not a reservation, guarantee, or held-aside fleet
@@ -110,29 +162,36 @@ This distinction allows product tiers such as:
 These numbers are examples, not Docket defaults. The host application owns
 the mapping from plans to resolved numeric policy.
 
-## Proposed configuration
+## Instance configuration contract
 
-Tenant fairness remains opt-in for compatibility:
+Tenant fairness remains opt-in for compatibility. DCKT-46 made ClaimPolicy an
+instance-selected boundary, so fairness configuration belongs to the selected
+implementation at the top level, not inside dispatcher mechanics:
 
 ```elixir
 use Docket,
   backend: Docket.Postgres,
   tenant_mode: :required,
-  dispatcher: [
-    concurrency: 100,
-    claim_partitions: [
-      by: :tenant_id,
-      default_preferred_active: 2,
-      default_max_active: 2,
-      default_weight: 1,
-      borrowing: false
-    ]
+  dispatcher: [concurrency: 100],
+  claim_policy: [
+    implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+    partition_by: :tenant_id,
+    default_preferred_active: 2,
+    default_max_active: 2,
+    default_weight: 1,
+    borrowing: false
   ]
 ```
 
+This is the locked configuration shape, not a claim that TenantFair is already
+selectable. DCKT-61 adds and validates the source-owned configuration value;
+the later hard-cap phase adds the selectable engine and schema. Merely accepting
+the configuration must not silently run Legacy under a TenantFair name or imply
+that caps, fair rotation, weights, or borrowing are active.
+
 Initial validation rules:
 
-- `by` must be `:tenant_id`.
+- `partition_by` must be `:tenant_id`.
 - preferred and maximum values are non-negative bounded integers.
 - `preferred_active <= max_active`.
 - `weight` is a positive bounded integer. Integer weights avoid inconsistent
@@ -156,21 +215,23 @@ concurrency.
 
 ### Configuration integration
 
-The current PostgreSQL option surface is a closed whitelist. Implementation
-must thread `claim_partitions` through all of these paths rather than only the
-supervised dispatcher:
+The public option surface is a closed whitelist. Top-level `:claim_policy` is
+already an instance-owned option; `Docket.Postgres.context/1` passes its
+implementation options to the selected implementation's `init/2` exactly once.
+TenantFair owns the closed nested key set and range/relationship validation.
+Unknown, duplicate, or invalid values fail context construction before backend
+children start.
 
-- `Docket.Postgres.@dispatcher_keys` and nested validation;
-- `Docket.Postgres.Dispatcher.init/1` state;
-- one shared claim-policy constructor used by dispatcher polling;
-- `Docket.Postgres.drain_runs/2`, which receives the resolved backend context;
-- testing/manual runtime configuration and validation;
-- storage behavior types and test doubles.
+The resolved ClaimPolicy value is then reused unchanged by dispatcher polling,
+manual and inline drain, recovery, and transaction-scoped contexts. Per-call
+options cannot replace it. No `:claim_partitions` dispatcher key or second
+effective-policy constructor is added. Integer-only weights represent
+fractional ratios by scaling every weight to a common base.
 
-There must be one effective-policy construction path. Manual drain must not
-silently bypass tenant caps, administrative state, or database policy version.
-Integer-only weights represent fractional ratios by scaling every weight to a
-common base.
+Legacy remains the default when `:claim_policy` is omitted. Configuration
+acceptance, engine selection, and database policy activation are separate
+rollout steps; a partially deployed fleet must never interpret the same
+database policy with instance-local fallback defaults.
 
 ## Database model
 

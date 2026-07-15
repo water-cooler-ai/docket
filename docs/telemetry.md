@@ -56,6 +56,43 @@ Claims fence durable state only. A stolen claim can execute node code and
 external effects more than once even though only one moment commits. External
 effects require their own stable idempotency scheme.
 
+## Tenant fairness telemetry boundary
+
+The DCKT-58 contract defines tenant fairness over the persisted PostgreSQL
+`scope_key`, but raw `scope_key` and `tenant_id` are forbidden as ordinary
+telemetry metadata and metric labels. Run ID, graph ID/hash, claim token, tier,
+and host account identity are forbidden for the same reason. The current
+generic ClaimPolicy event remains bounded by implementation and result; DCKT-59
+adds TenantFair aggregate measurements after the engine observation shape is
+available.
+
+Fairness reports use the following locked meanings:
+
+- ready claim wait is database `claimed_at - wake_at`, in milliseconds;
+  expired recovery wait is measured separately from the expiry boundary;
+- concurrency share is one partition's active claims divided by all active
+  claims in the same physical database/schema fairness domain, either at an
+  instant or time-integrated over a named window;
+- processing-time share names one service signal, initially claim-residency or
+  executor-task time, and divides a partition's measured time by the domain
+  total for the same signal and window; and
+- service skew is observed processing-time share minus normalized active-set
+  weight entitlement, reported in percentage points.
+
+Those per-partition values belong to a trusted, cardinality-bounded inspection
+or offline aggregation plane, not default metrics. Ordinary TenantFair events
+emit only aggregate counts/durations and bounded enums needed to detect cap
+denial, partition-lock contention, under-claim, and query delay. A host may join
+trusted inspection output to its own tenant/account model under its own access,
+retention, and cardinality controls.
+
+Preferred-capacity reclaim lag is measured from an eligible partition crossing
+below `preferred_active` until its next preferred admission. It is not assigned
+a numeric SLO unless maximum residual slice duration, poll delay, and admission
+transaction delay all have enforceable numeric bounds. The full operational
+vocabulary and formulas live in
+[`architecture/docket-tenant-claim-fairness-design.md`](architecture/docket-tenant-claim-fairness-design.md).
+
 ## Benchmark derivations
 
 - Throughput: rate of `lifecycle.committed.count`; checkpoint and superstep
