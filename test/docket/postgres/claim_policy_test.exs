@@ -132,6 +132,39 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    test "normalizes now before an independent implementation builds its plan" do
+      context = %{repo: __MODULE__.Repo, prefix: nil}
+
+      claim_policy =
+        ClaimPolicy.new(
+          [implementation: Docket.Test.AlternateClaimPolicy, marker: :normalized_clock],
+          context
+        )
+
+      non_utc_high_precision = %{
+        ~U[2026-07-15 12:00:00.123456Z]
+        | hour: 14,
+          time_zone: "Etc/GMT-2",
+          zone_abbr: "+02",
+          utc_offset: 7_200,
+          microsecond: {123_456, 9}
+      }
+
+      effective =
+        ClaimPolicy.effective_policy!(%{
+          now: non_utc_high_precision,
+          limit: 2,
+          orphan_ttl_ms: 1_000,
+          max_claim_attempts: 3,
+          preference: :expired
+        })
+
+      assert effective.now == ~U[2026-07-15 12:00:00.123456Z]
+
+      plan = ClaimPolicy.build_plan(claim_policy, context, effective)
+      assert hd(plan.params) == effective.now
+    end
+
     test "rejects capability-bearing or multi-statement plans before execution" do
       context = %{repo: __MODULE__.Repo, prefix: nil}
       policy = ClaimPolicy.new([implementation: InvalidPlanImplementation], context)

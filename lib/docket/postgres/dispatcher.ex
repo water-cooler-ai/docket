@@ -5,6 +5,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     use GenServer
 
     alias Docket.Postgres.ClaimPolicy
+    alias Docket.Runtime.Clock
 
     @default_poll_interval_ms 1_000
     @default_drain_timeout_ms 30_000
@@ -63,7 +64,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         drain_timeout_ms: non_negative!(opts, :drain_timeout_ms, @default_drain_timeout_ms),
         launch: Keyword.fetch!(opts, :launch),
         on_poisoned: Keyword.get(opts, :on_poisoned, fn _ -> :ok end),
-        clock: Keyword.get(opts, :clock, &DateTime.utc_now/0),
+        clock: Clock.wall_clock(opts),
         jitter: Keyword.get(opts, :jitter, &:rand.uniform/1),
         poll: nil,
         poll_pending?: false,

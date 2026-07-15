@@ -291,7 +291,7 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `executor` | `Docket.Executor.Local` | Instance-owned executor used by inline, manual, and supervised vehicles. All executors run inside runtime-owned per-activation processes with the same hard deadline. |
 | `executor_opts` | `[]` | Instance-owned options passed to the configured executor. |
 | `max_supersteps` | unbounded | Optional host safety ceiling; publish a graph policy when it is graph identity. |
-| `clock` | system clock | One instance-owned wall clock shared by public lifecycle operations, admission, and vehicles. |
+| `clock` | system clock | Testing-only deterministic wall clock shared by public lifecycle operations, admission, and vehicles; requires `testing: :inline` or `:manual` and cannot be nested or overridden per call. |
 | dispatcher/vehicle `jitter` | random jitter | Separate polling and abandon-backoff injection points; production overrides should distribute work. |
 | `dispatcher.on_poisoned` | no-op | Best-effort operational callback for newly poisoned claims; inspect durable rows for truth. |
 | `notifier:` | enabled | Use `:none` for poll-only. LISTEN needs a direct/session-pooled endpoint. |

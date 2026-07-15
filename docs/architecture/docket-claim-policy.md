@@ -31,6 +31,12 @@ generic result plumbing. It does not contain candidate SQL, ordering, caps,
 poison rules, row decoding, selection statistics, or implementation-specific
 claim telemetry.
 
+Before plan construction, the boundary converts `now` to UTC at microsecond
+precision. Every implementation therefore receives a value that can be bound
+directly as `:utc_datetime_usec`, regardless of the caller clock's timezone or
+declared precision; implementations must not depend on the caller's original
+timezone representation.
+
 ## Implementation contract
 
 An implementation declares `@behaviour Docket.Postgres.ClaimPolicy` and

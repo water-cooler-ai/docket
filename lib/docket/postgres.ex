@@ -22,6 +22,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     explicit: starting the bundle without a complete `:pruner` policy fails
     instead of silently choosing when durable records are deleted.
 
+    `:clock` is a testing-only, instance-owned wall-clock seam. It requires
+    `testing: :inline` or `testing: :manual`, is configured only at the top
+    level, and cannot be replaced by individual calls. Production dispatch,
+    execution, and retention use their authoritative default clocks.
+
     Store modules are fixed by this bundle and are not public mix-and-match
     configuration. Public operations resolve tenant scope before calling the
     stores; only the supervised dispatcher and vehicles use `:system` scope.
@@ -143,9 +148,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       reject_top_level_vehicle!(opts)
       validate_tenant_mode!(opts)
       validate_testing!(opts)
+      validate_wall_clock!(opts)
+      reject_nested_wall_clocks!(opts)
       validate_nested!(Keyword.get(opts, :dispatcher, []), :dispatcher)
       validate_nested!(Keyword.get(opts, :vehicle, []), :vehicle)
-      dispatcher = Keyword.merge(@default_dispatcher, Keyword.get(opts, :dispatcher, []))
+      dispatcher = effective_dispatcher(opts)
       validate_dispatcher!(dispatcher)
       _resolved_claim_policy = ClaimPolicy.resolve(context)
       execution = effective_execution(opts)
@@ -182,9 +189,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def drain_runs(context, opts) when is_list(opts) do
       reject_top_level_vehicle!(opts)
       validate_testing!(opts)
+      validate_wall_clock!(opts)
+      reject_nested_wall_clocks!(opts)
       validate_nested!(Keyword.get(opts, :dispatcher, []), :dispatcher)
       validate_nested!(Keyword.get(opts, :vehicle, []), :vehicle)
-      dispatcher_config = Keyword.merge(@default_dispatcher, Keyword.get(opts, :dispatcher, []))
+      dispatcher_config = effective_dispatcher(opts)
       execution_config = effective_execution(opts)
       vehicle_config = effective_vehicle(Keyword.get(opts, :vehicle, []))
       validate_dispatcher!(dispatcher_config)
@@ -201,11 +210,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           {:error, :invalid_max_runs}
 
         true ->
-          dispatcher =
-            @default_dispatcher
-            |> Keyword.merge(Keyword.get(opts, :dispatcher, []))
-            |> Keyword.put(:clock, Keyword.get(opts, :clock, &DateTime.utc_now/0))
-
+          dispatcher = dispatcher_config
           vehicle = testing_vehicle_opts(opts, context)
 
           drain_due(
@@ -228,7 +233,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       do: {:ok, %{summary | limit_reached: true}}
 
     defp drain_due(context, phase, dispatcher, vehicle, remaining, summary) do
-      now = Keyword.get(dispatcher, :clock, &DateTime.utc_now/0).()
+      now = Keyword.fetch!(dispatcher, :clock).()
 
       result =
         AdmissionPhase.run(phase, 1, fn preference ->
@@ -417,6 +422,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    defp validate_wall_clock!(opts) do
+      case Keyword.get(opts, :clock) do
+        nil ->
+          :ok
+
+        clock when is_function(clock, 0) ->
+          if Keyword.get(opts, :testing) in @testing_modes do
+            :ok
+          else
+            raise ArgumentError,
+                  ":clock is a testing-only option and requires testing: :inline or :manual"
+          end
+
+        other ->
+          raise ArgumentError,
+                ":clock must be a zero-argument function, got: #{inspect(other)}"
+      end
+    end
+
+    defp reject_nested_wall_clocks!(opts) do
+      nested =
+        for key <- [:dispatcher, :vehicle, :pruner],
+            value = Keyword.get(opts, key),
+            Keyword.keyword?(value),
+            Keyword.has_key?(value, :clock),
+            do: key
+
+      if nested != [] do
+        raise ArgumentError,
+              ":clock is instance-owned; configure it once at the top level, not under " <>
+                Enum.map_join(nested, ", ", &inspect/1)
+      end
+    end
+
     defp validate_repo!(repo) do
       valid? =
         is_atom(repo) and Code.ensure_loaded?(repo) and function_exported?(repo, :__adapter__, 0) and
@@ -473,6 +512,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         @default_execution
         |> Keyword.merge(Keyword.take(host_opts, Docket.Runtime.Config.instance_keys()))
 
+    @doc false
+    def effective_dispatcher(host_opts) do
+      @default_dispatcher
+      |> Keyword.merge(Keyword.get(host_opts, :dispatcher, []))
+      |> Keyword.put(:clock, Docket.Runtime.Clock.wall_clock(host_opts))
+    end
+
     defp effective_vehicle(nested), do: Keyword.merge(@default_vehicle, nested)
 
     defp reject_top_level_vehicle!(opts) do
@@ -516,8 +562,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         dispatcher_name = Keyword.fetch!(opts, :dispatcher)
         vehicle_supervisor = Keyword.fetch!(opts, :vehicle_supervisor)
 
-        dispatcher_opts =
-          nested_opts!(host_opts, :dispatcher, Docket.Postgres.default_dispatcher())
+        dispatcher_opts = Docket.Postgres.effective_dispatcher(host_opts)
 
         vehicle_opts =
           Docket.Postgres.default_execution()
@@ -541,7 +586,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           Keyword.merge(dispatcher_opts,
             name: dispatcher_name,
             context: context,
-            clock: Keyword.get(host_opts, :clock, &DateTime.utc_now/0),
             launch: launch
           )
 

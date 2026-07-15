@@ -11,6 +11,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     """
 
     alias Docket.Postgres.Storage
+    alias Docket.Runtime.Clock
 
     @default_implementation Docket.Postgres.ClaimPolicy.Legacy
     @max_observation_keys 32
@@ -155,7 +156,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       %{
-        now: now,
+        now: Clock.normalize!(now),
         limit: limit,
         orphan_ttl_ms: orphan_ttl_ms,
         max_claim_attempts: max_claim_attempts,

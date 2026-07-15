@@ -29,7 +29,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     alias Docket.{Error, Lifecycle, Run}
     alias Docket.Postgres.GraphCache
-    alias Docket.Runtime.Loop
+    alias Docket.Runtime.{Clock, Loop}
 
     @default_abandon_backoff_ms 30_000
     @default_abandon_backoff_cap_ms 3_600_000
@@ -105,6 +105,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             (Docket.Backend.RunStore.claim_lease() -> {:ok, pid()} | {:error, term()})
     def launcher(opts) do
       _drain_budget = drain_budget!(opts)
+      _clock = Clock.wall_clock(opts)
       _monotonic_clock = monotonic_clock!(opts)
       _max_attempt_elapsed_ms = max_attempt_elapsed_ms!(opts)
       _abandon_backoff = abandon_backoff!(opts)
@@ -201,7 +202,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         context: context,
         runs: backend.runs(),
         graphs: backend.graphs(),
-        clock: Keyword.get(opts, :clock, &DateTime.utc_now/0),
+        clock: Clock.wall_clock(opts),
         monotonic_clock: monotonic_clock!(opts),
         drain_budget: drain_budget!(opts),
         max_attempt_elapsed_ms: max_attempt_elapsed_ms!(opts),

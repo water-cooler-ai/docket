@@ -35,7 +35,7 @@ defmodule Docket do
   """
 
   alias Docket.{Error, Graph, GraphRef, Lifecycle, Run, RunInfo}
-  alias Docket.Runtime.{Instance, Loop}
+  alias Docket.Runtime.{Clock, Instance, Loop}
   alias Docket.Runtime.RunMutation
 
   @instance_owned_options [
@@ -867,7 +867,7 @@ defmodule Docket do
     end
   end
 
-  defp operation_now(opts), do: Keyword.get(opts, :clock, &DateTime.utc_now/0).()
+  defp operation_now(opts), do: opts |> Keyword.get(:clock, &DateTime.utc_now/0) |> Clock.now!()
 
   defp await_options(opts) do
     timeout = Keyword.get(opts, :timeout)

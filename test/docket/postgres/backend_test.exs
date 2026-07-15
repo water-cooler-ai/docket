@@ -27,6 +27,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down()
     end
 
+    defmodule FixedClock do
+      def now, do: ~U[2030-01-02 03:04:05.000000Z]
+    end
+
     defmodule FailingObserver do
       @behaviour Docket.Checkpoint.Observer
 
@@ -135,6 +139,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         notifier: :none
     end
 
+    defmodule ClockedManualHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        testing: :manual,
+        clock: &FixedClock.now/0,
+        notifier: :none
+    end
+
     defmodule AlternatePolicyManualHost do
       use Docket,
         backend: Docket.Postgres,
@@ -205,6 +218,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       stop_host(PoisonHost)
       stop_host(InlineHost)
       stop_host(ManualHost)
+      stop_host(ClockedManualHost)
       stop_host(AlternatePolicyManualHost)
       stop_host(AlternatePolicySupervisedHost)
       stop_host(SandboxInlineHost)
@@ -294,6 +308,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, %{drained: 0, poisoned: [], outcomes: [], limit_reached: false}} =
                ManualHost.drain_runs(max_runs: 10)
+    end
+
+    test "one instance clock governs facade timestamps and manual claims" do
+      start_supervised!(ClockedManualHost)
+      assert {:ok, reference} = ClockedManualHost.save_graph(Graphs.minimal_linear())
+
+      assert {:ok, %Docket.Run{status: :running, started_at: started_at} = started} =
+               ClockedManualHost.start_run(reference, %{"value" => "clocked"})
+
+      assert started_at == FixedClock.now()
+
+      per_call_clock = fn -> ~U[2020-01-01 00:00:00.000000Z] end
+
+      assert {:ok, %{drained: 1}} =
+               ClockedManualHost.drain_runs(max_runs: 1, clock: per_call_clock)
+
+      assert {:ok, %Docket.Run{status: :done, updated_at: updated_at}} =
+               ClockedManualHost.fetch_run(started.id)
+
+      assert updated_at == FixedClock.now()
     end
 
     test "manual drain uses the instance-selected ClaimPolicy and ignores per-call switches" do
@@ -676,13 +710,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
       end
 
-      assert_raise ArgumentError, ~r/:dispatcher has unknown keys.*clock/, fn ->
+      assert_raise ArgumentError, ~r/:clock is a testing-only option/, fn ->
         postgres_init(
-          name: __MODULE__.NestedDispatcherClock,
+          name: __MODULE__.ProductionClock,
           repo: TestRepo,
-          dispatcher: [clock: &DateTime.utc_now/0],
-          pruner: @pruner
+          clock: &FixedClock.now/0
         )
+      end
+
+      for {key, value} <- [
+            dispatcher: [clock: &FixedClock.now/0],
+            vehicle: [clock: &FixedClock.now/0],
+            pruner: [clock: &FixedClock.now/0]
+          ] do
+        assert_raise ArgumentError, ~r/:clock is instance-owned/, fn ->
+          opts =
+            [name: __MODULE__.NestedClock, repo: TestRepo, testing: :manual]
+            |> Keyword.put(key, value)
+
+          postgres_init(opts)
+        end
       end
 
       assert_raise ArgumentError, ~r/:vehicle has unknown keys.*executor/, fn ->

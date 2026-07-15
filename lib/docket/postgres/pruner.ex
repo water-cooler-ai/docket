@@ -116,7 +116,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         raise ArgumentError, "pruner clock must be a zero-argument function"
       end
 
-      _ = validate_policy!(Map.put(state.policy, :now, state.clock.()))
+      _ = validate_policy!(Map.put(state.policy, :now, clock_now!(state.clock)))
       {:ok, state, {:continue, :prune}}
     end
 
@@ -138,10 +138,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp run_and_schedule(state) do
-      _ = prune(state.context, Map.put(state.policy, :now, state.clock.()))
+      _ = prune(state.context, Map.put(state.policy, :now, clock_now!(state.clock)))
       token = make_ref()
       timer = Process.send_after(self(), {:prune, token}, state.interval_ms)
       %{state | timer: {timer, token}}
+    end
+
+    defp clock_now!(clock) do
+      case clock.() do
+        :database -> :database
+        %DateTime{} = now -> now
+        other -> raise ArgumentError, "pruner clock must return a DateTime or :database, got: #{inspect(other)}"
+      end
     end
 
     defp prune_locked(repo, prefix, policy) do

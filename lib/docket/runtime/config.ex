@@ -1,6 +1,8 @@
 defmodule Docket.Runtime.Config do
   @moduledoc false
 
+  alias Docket.Runtime.Clock
+
   @instance_keys [
     :executor,
     :executor_opts,
@@ -96,7 +98,7 @@ defmodule Docket.Runtime.Config do
     %{
       executor: Keyword.get(opts, :executor, Docket.Executor.Local),
       executor_opts: Keyword.get(opts, :executor_opts, []),
-      clock: Keyword.get(opts, :clock, &DateTime.utc_now/0),
+      clock: Clock.wall_clock(opts),
       id_generator: Keyword.get(opts, :id_generator, &default_id/1),
       sleeper: Keyword.get(opts, :sleeper, &sleep/1),
       max_attempt_elapsed_ms: max_attempt_elapsed_ms,
