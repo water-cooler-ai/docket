@@ -2,6 +2,10 @@
 
 Status: implementation guide for the `0.1.0-dev` branch
 
+The canonical boundary matrix for durable commits, replayable execution,
+external effects, event export, and best-effort observers is
+[Delivery and Execution Guarantees](../delivery-guarantees.md).
+
 Docket's PostgreSQL backend stores published graphs, durable run state, and an
 optional event history. It also provides the queue primitives needed to claim
 and recover runs without a separate jobs table.
@@ -129,8 +133,10 @@ transaction it:
 `SKIP LOCKED` allows dispatchers on many BEAM nodes to poll concurrently
 without a leader. A claim is a lease on commit authority, not an exactly-once
 execution guarantee. If a worker pauses long enough for its claim to expire,
-another worker may execute the same graph work. Only the transaction holding
-the current token and expected checkpoint sequence can win the durable commit.
+another worker may execute the same graph work. Execution is therefore
+replayable: the same attempt may run more than once, while only the transaction
+holding the current token and expected checkpoint sequence can win the durable
+commit.
 
 Every `:retain_claim` commit refreshes claimed time. Between commits, finite
 runtime-owned node attempt deadlines bound executor callback residency and
@@ -335,8 +341,10 @@ v0.1.0. A configured backend is the only supervised production lifecycle.
 
 - Docket schedules graph runs, not arbitrary jobs. Run Oban beside Docket when
   the application also needs a general-purpose job queue.
-- Node external effects are at-least-once around claim loss. Use Docket's
-  stable task/idempotency identity in integrations that require deduplication.
+- Node attempts are replayable around claim loss; this describes duplicate
+  risk, not an unconditional promise that every effect eventually occurs. Use
+  Docket's stable task/idempotency identity in integrations that require
+  deduplication, and apply it atomically with the external effect.
 - Compiled graphs are local and ephemeral. Deployments must keep retained run
   state compatible with installed node modules or version those modules.
 - The opaque ETF columns are private storage. Applications should store run

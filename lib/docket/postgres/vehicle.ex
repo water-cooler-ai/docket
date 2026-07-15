@@ -22,9 +22,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     configured headroom below orphan-TTL crash recovery. Token/sequence fencing
     remains the sole authority for commits after a crash or steal.
 
-    Vehicles never refresh claims. Attempt timeout and retry remain
-    at-least-once boundaries: external effects and unlinked children cannot be
-    retracted, so expected long work must park or detach durably.
+    Vehicles never refresh claims. Attempt timeout and retry are replay
+    boundaries: external effects and unlinked children cannot be retracted, so
+    expected long work must park or detach durably.
     """
 
     alias Docket.{Error, Lifecycle, Run}

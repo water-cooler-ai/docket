@@ -181,9 +181,10 @@ Postgres implementations. The final contract:
   MIN/MAX retention bounds, and run state in one SQL statement so every field
   reflects one consistent snapshot.
 
-This is the delivery-safe path for observers: `checkpoint_observers:` are
-best-effort and may drop or duplicate, while the reader replays exactly what
-durably committed.
+This is the durable repair source for observer gaps: `checkpoint_observers:`
+are best-effort and may drop or duplicate, while the reader exposes what
+durably committed within the retained window. Delivery still requires an
+application-owned durable cursor and idempotent downstream handling.
 
 ### Authored graph interchange contract
 

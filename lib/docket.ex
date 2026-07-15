@@ -22,6 +22,16 @@ defmodule Docket do
   internal dispatch/recovery.
 
   For processless in-test execution of the same loop, use `Docket.Test`.
+
+  ## Delivery boundary
+
+  A durable backend commits each accepted run transition and its retained
+  events atomically under the current claim and checkpoint fences. Node
+  attempts are replayable and may execute more than once even though only one
+  transition can commit. External effects require a cooperating idempotency
+  scheme when duplicates are unacceptable. Checkpoint observers,
+  notifications, and telemetry are best effort rather than durable delivery
+  mechanisms.
   """
 
   alias Docket.{Error, Graph, GraphRef, Lifecycle, Run, RunInfo}

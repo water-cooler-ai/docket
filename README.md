@@ -18,6 +18,23 @@ fields they read and write, and edges (optionally guarded) that decide what
 runs next. Docket executes the graph in deterministic supersteps, emitting a
 checkpoint at every durable transition boundary.
 
+## Delivery and execution guarantees
+
+Docket guarantees one atomic durable winner for each committed run transition:
+the claim-fenced run update, schedule change, and retained events commit
+together in PostgreSQL. That guarantee ends at the database transaction
+boundary. A node attempt that proposes the transition may execute more than
+once after a crash, timeout, or claim steal, even though only one proposal can
+commit. External effects therefore require a cooperating idempotency scheme
+when duplicates are unacceptable.
+
+Checkpoint observers, notifications, and telemetry are best effort and are
+not business-delivery mechanisms. Retained events are durable facts during
+their configured retention period, but exporting or consuming them is a
+separate delivery boundary. See the
+[delivery and execution guarantees](docs/delivery-guarantees.md) for the full
+matrix, partition behavior, and integration rules.
+
 ## Docket.Postgres quickstart
 
 This path starts a durable, tenantless runtime in an existing Ecto application.
@@ -234,9 +251,10 @@ entire event history; a missing or wrong-tenant run still returns
 `{:error, :not_found}`.
 
 Pass `tenant_id:` under `tenant_mode: :required`; a wrong tenant and an unknown
-run both return `{:error, :not_found}`. This is the delivery-safe way to repair
+run both return `{:error, :not_found}`. This is the durable repair source for
 observer gaps: `checkpoint_observers:` run best-effort after commit and may drop
-or duplicate, but the reader replays exactly what durably committed. Sequence
+or duplicate, but the reader exposes what durably committed within the retained
+window. Sequence
 gaps are normal — persistence filtering and retention pruning both leave holes,
 so pages are never contiguous. `oldest_available_seq`/`latest_available_seq`
 report the retained window, while `latest_seq` is the run's latest committed
@@ -268,8 +286,9 @@ backend-neutral durable facade also provides
 only tenantless rows; `tenant_mode: :required` requires a non-empty
 `tenant_id` before storage access. Durable `checkpoint_observers:` run after
 commit, are best-effort, and cannot veto state. Durable consumers that cannot
-tolerate lost or duplicate delivery should consume retained events instead of
-observer callbacks. Production `checkpoint:` configuration is rejected;
+tolerate lost or duplicate delivery should export retained events with a
+durable cursor and idempotent downstream handling instead of using observer
+callbacks. Production `checkpoint:` configuration is rejected;
 `Docket.Test` returns read-only checkpoint values for processless semantic
 assertions; those values cannot affect execution.
 
@@ -304,8 +323,9 @@ The intended cutover is:
 4. Publish graphs with `save_graph` and retain the returned `GraphRef`.
 5. Replace `run` with `start_run`, `get_run` with `fetch_run` or
    `inspect_run`, and remove host-owned `resume` orchestration.
-6. Use observers only for best-effort after-commit notifications; consume
-   retained events when delivery must survive crashes.
+6. Use observers only for best-effort after-commit notifications; export
+   retained events with a durable cursor and idempotent downstream handling
+   when delivery must survive crashes.
 
 Because `0.0.1` storage is application-defined, Docket cannot provide one
 universal database migration. The supported path is an explicit

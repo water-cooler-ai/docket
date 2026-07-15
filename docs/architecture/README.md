@@ -11,29 +11,35 @@ when you want to understand *why* the contracts are shaped the way they are.
 
 ## Reading Order
 
-1. `migration-0.0.1-to-0.1.0.md`
+1. `../delivery-guarantees.md`
+   - Current guarantee matrix for atomic durable transitions, replayable node
+     execution, external effects, event export, and best-effort callbacks.
+2. `migration-0.0.1-to-0.1.0.md`
    - Drain-and-cut-over instructions for existing 0.0.1 adopters.
-2. `docket-operational-transition-spec.md`
+3. `docket-operational-transition-spec.md`
    - A public-facing guide to the implemented PostgreSQL data model, queue
      semantics, claim fencing, tenancy, migrations, and backend operations.
-3. `docket-v0.1.0-spec-lock-audit.md`
+4. `docket-v0.1.0-spec-lock-audit.md`
    - A historical pre-cutover audit retained to explain the final sequencing.
-4. `docket-graph-construction-design.md`
+5. `docket-graph-construction-design.md`
    - The public `Docket.Graph` editing API, ID rules, publication boundary,
      private effective-graph identity contract, and the rationale for the
      authored map interchange (`to_map`/`from_map`).
-5. `docket-compiler-design.md`
+6. `docket-compiler-design.md`
    - Compiler verification, diagnostics, and lowering from the public graph
      to the internal runtime graph.
-6. `docket-graph-execution-contract-design.md`
+7. `docket-graph-execution-contract-design.md`
    - Historical 0.0.1 execution contract: the removed resident runtime and
      host-checkpoint APIs, plus still-relevant executor, guard, failure, and
      interrupt rationale.
-7. `docket-reducers-design.md`
+8. `docket-reducers-design.md`
    - Why the v1.1 reducer contract folds the prior committed value, and the
      rationale behind list-write concatenation, natural zeros, and
      reducer-aware write validation.
-8. `docket-runtime-design.md`
+9. `docket-tenant-claim-fairness-design.md`
+   - Proposed database-wide tenant claim caps, dynamic tier policy, fair
+     partition selection, weighted service, borrowing, telemetry, and rollout.
+10. `docket-runtime-design.md`
    - Historical 0.0.1 runtime research and background: goals, alternatives
      considered (Pregel, LangGraph, Temporal), and future design space.
 

@@ -67,6 +67,12 @@ assigned events, checkpoint metadata, and scheduling disposition.
 schedule, and events atomically, then invokes best-effort observers only after
 commit. A failed event append or lost claim fence commits none of the moment.
 
+This is the exact durable guarantee boundary, not an exactly-once execution
+promise. Node code that proposed the moment may already have executed, and may
+execute again after a crash, timeout, claim steal, or ambiguous commit result.
+The complete boundary matrix and external idempotency requirements are in
+[Delivery and Execution Guarantees](delivery-guarantees.md).
+
 ## Durable statuses and derived operational views
 
 The durable status enum is deliberately flat:
@@ -158,8 +164,10 @@ Any committed progress resets the abandon count.
 
 Claims and checkpoint fences guarantee one durable winner. They do not
 guarantee one executor, cancel arbitrary in-flight effects, or make external
-calls exactly-once. Persist and check the stable task/idempotency identity in
-an external integration when duplicate effects are unacceptable.
+calls exactly-once. Replaying an uncommitted attempt preserves its stable task
+and idempotency identity. An external integration must atomically deduplicate
+that identity with the effect when duplicates are unacceptable; a separate
+check followed by an effect retains the crash window.
 
 ## Failure, poison, and signals
 
@@ -315,10 +323,12 @@ runtime events plus one metadata-only `:checkpoint_committed` event.
 
 `checkpoint_observers` run after commit and may be lost or duplicated around
 a crash. They are suitable for cache/UI hints, not an outbox. Retained events
-are the durable integration source; v0.1.0 does not expose a high-level export
-API, so an authorized application exporter must read the retained rows or add
-a backend-specific capability that applies tenant predicates and uses supported
-decoding. Raw payload and metadata columns are private binary formats. The
+are the durable integration source during their configured retention period,
+but persistence is not delivery. Docket exposes tenant-scoped event reads, not
+a managed exporter or durable consumer cursor. An authorized application
+exporter must page through that API, advance its cursor only after downstream
+acceptance, and make downstream handling idempotent by `{run_id, seq}`. Raw
+payload and metadata columns are private binary formats. The
 removed 0.0.1 host-owned `checkpoint:`
 committer belongs only in migration documentation.
 
