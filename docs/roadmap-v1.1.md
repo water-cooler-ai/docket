@@ -307,6 +307,10 @@ can't be expressed with `path`/`equals`/`all`/`any`.
 
 ## Theme 9 — Tenant-partitioned claim fairness (v0.1.1 follow-up)
 
+The detailed implementation plan, including dynamic per-tenant policy,
+weighted service, strict ceilings, and non-preemptive borrowing, is maintained in
+[`architecture/docket-tenant-claim-fairness-design.md`](architecture/docket-tenant-claim-fairness-design.md).
+
 Add moderate multi-tenant fairness to the shared durable dispatcher without
 preempting node execution or weakening claim fencing. A global dispatcher
 concurrency limit still bounds all active vehicles, while a database-wide
@@ -317,8 +321,10 @@ dispatcher: [
   concurrency: 100,
   claim_partitions: [
     by: :tenant_id,
-    max_active: 2,
-    burst: true
+    preferred_active: 2,
+    max_active: 4,
+    weight: 1,
+    borrowing: true
   ]
 ]
 ```
@@ -328,17 +334,20 @@ The exact public option names remain design work. The intended behavior is:
 - Claim selection is fair across eligible tenant partitions and stable within
   a tenant by wake time and run ID. A tenant with a deep backlog must not hide
   another tenant's first eligible run.
-- `max_active` is enforced across every dispatcher sharing the database and
-  prefix, not independently per BEAM node. Acquisition remains atomic and
-  compatible with the existing token, sequence fence, expiry, poison, and
-  `FOR UPDATE SKIP LOCKED` paths.
-- With `burst: false`, no tenant may exceed its partition limit. With
-  `burst: true`, one tenant may consume otherwise-idle global capacity, but
-  burst claims yield to other eligible tenants as capacity turns over. Bursting
-  improves utilization; it must not turn into a permanent reservation.
-- Tenantless runs form their own partition. Future partition keys such as
-  project, account, or plan tier are out of scope until tenant partitioning
-  proves the storage and scheduling contract.
+- `max_active` is an absolute ceiling enforced across every dispatcher sharing
+  the database and prefix, not independently per BEAM node. Acquisition
+  remains atomic and compatible with the existing token, sequence fence,
+  expiry, poison, and `FOR UPDATE SKIP LOCKED` paths.
+- With `borrowing: false`, a tenant stops at `preferred_active`. With borrowing
+  enabled, one tenant may consume otherwise-idle capacity up to `max_active`,
+  but new admissions prefer tenants below their preferred threshold as
+  capacity turns over. Preferred capacity is not reserved or guaranteed.
+  Borrowing improves utilization; it must not turn into a permanent
+  reservation.
+- Tenantless runs form their own partition. Product tiers may resolve to
+  different numeric limits for each tenant, but a tier is not itself a
+  partition key. Future keys such as project or account remain out of scope
+  until tenant partitioning proves the storage and scheduling contract.
 
 This is deliberately separate from the two existing vehicle mechanisms:
 
@@ -421,9 +430,11 @@ the full constraint list):
   `:waiting` with neither wake nor deadline.
 - The completion needs a live home after the vehicle exits (node-local holder,
   unreplicated); holder crash resolves through deadline expiry.
-- External effects stay at-least-once. A rejected late result's effects
-  already happened; stable task/idempotency keys remain the only dedupe
-  surface. No exactly-once promise, ever.
+- External effects stay replayable. A rejected late result's effects already
+  happened; stable task/idempotency keys remain the only dedupe surface. This
+  preserves the current boundary in
+  [`delivery-guarantees.md`](delivery-guarantees.md): Docket makes no
+  exactly-once external-effect promise.
 
 Epic-sized (~15+ files: executor behaviour and both executors, runtime
 dispatcher, TaskResult/TaskState/Moment, Loop/Algorithm, RunMutation,

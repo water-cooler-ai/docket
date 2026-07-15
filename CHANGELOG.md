@@ -16,6 +16,10 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- A canonical delivery and execution guarantee matrix documenting the exact
+  PostgreSQL transaction boundary, replayable node attempts, external-effect
+  idempotency requirements, retained-event export boundary, best-effort
+  observer/notification semantics, and consistency behavior during partitions.
 - Public saved-graph and run-query reads: `Docket.fetch_graph/3` reads the exact
   tenant-owned version addressed by a `Docket.GraphRef`;
   `Docket.fetch_latest_graph_ref/3` returns a graph ID's newest scoped
