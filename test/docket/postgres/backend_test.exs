@@ -148,6 +148,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ]
     end
 
+    defmodule AlternatePolicySupervisedHost do
+      @pruner [
+        interval_ms: :timer.hours(1),
+        event_retention_ms: :timer.hours(24 * 30),
+        run_retention_ms: :timer.hours(24 * 90),
+        batch_size: 100
+      ]
+
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        notifier: :none,
+        dispatcher: [concurrency: 1, poll_interval_ms: 10],
+        pruner: @pruner,
+        claim_policy: [
+          implementation: Docket.Test.AlternateClaimPolicy,
+          marker: :supervised_runtime
+        ]
+    end
+
     defmodule SandboxInlineHost do
       use Docket,
         backend: Docket.Postgres,
@@ -186,6 +206,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       stop_host(PoisonHost)
       stop_host(InlineHost)
       stop_host(ManualHost)
+      stop_host(AlternatePolicyManualHost)
+      stop_host(AlternatePolicySupervisedHost)
       stop_host(SandboxInlineHost)
       stop_host(ObserverInlineHost)
 
@@ -276,7 +298,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "manual drain uses the instance-selected ClaimPolicy and ignores per-call switches" do
+      Process.register(self(), :docket_claim_policy_relay)
+
+      on_exit(fn ->
+        if Process.whereis(:docket_claim_policy_relay),
+          do: Process.unregister(:docket_claim_policy_relay)
+      end)
+
       start_supervised!(AlternatePolicyManualHost)
+
+      assert_receive {:alternate_claim_policy, :init, :manual_runtime,
+                      %{prefix: nil, identifiers: %{runs: ~s("docket_runs")}}}
+
       assert {:ok, reference} = AlternatePolicyManualHost.save_graph(Graphs.minimal_linear())
 
       assert {:ok, %{status: :running}} =
@@ -304,6 +337,36 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                         implementation: Docket.Test.AlternateClaimPolicy,
                         result: :ok
                       }}
+
+      assert_receive {:alternate_claim_policy, :build_plan, :manual_runtime, _pid}
+      assert_receive {:alternate_claim_policy, :decode, :manual_runtime, _pid}
+      refute_receive {:alternate_claim_policy, :init, :manual_runtime, _context}
+    end
+
+    test "supervised dispatch initializes once and executes the independent selected engine" do
+      Process.register(self(), :docket_claim_policy_relay)
+
+      on_exit(fn ->
+        if Process.whereis(:docket_claim_policy_relay),
+          do: Process.unregister(:docket_claim_policy_relay)
+      end)
+
+      start_supervised!(AlternatePolicySupervisedHost)
+
+      assert_receive {:alternate_claim_policy, :init, :supervised_runtime,
+                      %{prefix: nil, identifiers: %{runs: ~s("docket_runs")}}}
+
+      assert {:ok, reference} = AlternatePolicySupervisedHost.save_graph(Graphs.minimal_linear())
+
+      assert {:ok, started} =
+               AlternatePolicySupervisedHost.start_run(reference, %{"value" => "alternate"})
+
+      assert {:ok, %Docket.Run{status: :done}} =
+               AlternatePolicySupervisedHost.await_run(started.id, timeout: 5_000)
+
+      assert_receive {:alternate_claim_policy, :build_plan, :supervised_runtime, _pid}
+      assert_receive {:alternate_claim_policy, :decode, :supervised_runtime, _pid}
+      refute_receive {:alternate_claim_policy, :init, :supervised_runtime, _context}
     end
 
     test "manual drains preserve retry attempt state across separate claims" do

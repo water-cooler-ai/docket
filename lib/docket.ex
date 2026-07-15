@@ -817,7 +817,7 @@ defmodule Docket do
   end
 
   defp inline_result(backend, opts, scope, run_id, summary) do
-    context = backend.context(opts)
+    context = Keyword.fetch!(opts, :backend_context)
 
     with {:ok, current} <- backend.runs().fetch_run(context, scope, run_id) do
       if summary.limit_reached and current.status == :running do

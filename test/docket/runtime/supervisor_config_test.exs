@@ -16,6 +16,7 @@ defmodule Docket.Runtime.SupervisorConfigTest do
              Enum.find(children, &(&1.id == MemoryBackend))
 
     assert Keyword.fetch!(backend_opts, :name) == Module.concat(@runtime, Backend)
+    assert Keyword.fetch!(backend_opts, :backend_context) == Module.concat(@runtime, Backend)
 
     assert %{start: {Docket.Runtime.Instance, :start_link, [{@runtime, defaults}]}} =
              Enum.find(children, &(&1.id == Docket.Runtime.Instance))

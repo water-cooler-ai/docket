@@ -65,7 +65,8 @@ defmodule Docket.Runtime.Supervisor do
         validate_backend!(backend)
         backend_opts = Keyword.put(defaults, :name, Module.concat(name, Backend))
         context = Docket.Backend.resolve_context(backend, backend_opts)
-        {[backend.child_spec(backend_opts)], Keyword.put(defaults, :backend_context, context)}
+        child_opts = Keyword.put(backend_opts, :backend_context, context)
+        {[backend.child_spec(child_opts)], Keyword.put(defaults, :backend_context, context)}
 
       other ->
         raise ArgumentError, ":backend must be one Docket.Backend module, got: #{inspect(other)}"

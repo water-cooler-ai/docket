@@ -12,7 +12,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @type option ::
             {:name, GenServer.name()}
             | {:context, Docket.Backend.ctx()}
-            | {:claim_policy, ClaimPolicy.t()}
+            | {:claim_policy_implementation, module()}
             | {:run_store, module()}
             | {:concurrency, pos_integer()}
             | {:poll_interval_ms, pos_integer()}
@@ -49,10 +49,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @impl true
     def init(opts) do
       Process.flag(:trap_exit, true)
+      context = Keyword.fetch!(opts, :context)
 
       state = %{
-        context: Keyword.fetch!(opts, :context),
-        claim_policy: Keyword.get_lazy(opts, :claim_policy, &ClaimPolicy.new/0),
+        context: context,
+        claim_policy_implementation: claim_policy_implementation(context, opts),
         run_store: Keyword.get(opts, :run_store, Docket.Postgres.RunStore),
         concurrency: positive!(opts, :concurrency),
         poll_interval_ms: positive!(opts, :poll_interval_ms, @default_poll_interval_ms),
@@ -171,13 +172,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         {pid, monitor} =
           spawn_monitor(fn ->
-            result =
-              ClaimPolicy.claim_due(
-                state.claim_policy,
-                state.run_store,
-                state.context,
-                runtime_input
-              )
+            result = state.run_store.claim_due(state.context, :system, runtime_input)
 
             send(parent, {:claim_result, request_ref, result})
           end)
@@ -312,7 +307,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           poisoned: poisoned
         },
         %{
-          claim_policy: ClaimPolicy.implementation(state.claim_policy),
+          claim_policy: state.claim_policy_implementation,
           result: Docket.Telemetry.result_kind(result),
           source: source
         }
@@ -349,6 +344,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         max_claim_attempts: state.max_claim_attempts,
         preference: state.preference
       }
+    end
+
+    defp claim_policy_implementation(%{claim_policy: %ClaimPolicy{} = policy}, _opts),
+      do: ClaimPolicy.implementation(policy)
+
+    defp claim_policy_implementation(_context, opts) do
+      Keyword.get(opts, :claim_policy_implementation, Docket.Postgres.ClaimPolicy.Legacy)
     end
 
     defp schedule_poll(%{poll_timer: nil} = state) do

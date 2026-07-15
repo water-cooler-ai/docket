@@ -110,7 +110,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       %{
         repo: repo,
         prefix: prefix,
-        claim_policy: ClaimPolicy.new(Keyword.get(opts, :claim_policy, []))
+        claim_policy:
+          ClaimPolicy.new(Keyword.get(opts, :claim_policy, []), %{repo: repo, prefix: prefix})
       }
     end
 
@@ -140,21 +141,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       validate_nested!(Keyword.get(opts, :vehicle, []), :vehicle)
       dispatcher = Keyword.merge(@default_dispatcher, Keyword.get(opts, :dispatcher, []))
       validate_dispatcher!(dispatcher)
-      _claim_policy = ClaimPolicy.new(Keyword.get(opts, :claim_policy, []))
+      context = Keyword.get_lazy(opts, :backend_context, fn -> context(opts) end)
+      _resolved_claim_policy = ClaimPolicy.resolve(context)
       vehicle = effective_vehicle(opts, Keyword.get(opts, :vehicle, []))
       validate_vehicle!(opts, Keyword.get(opts, :vehicle, []))
       validate_runtime_limits!(dispatcher, vehicle)
 
-      children = children(opts, name)
+      children = children(opts, name, context)
 
       Supervisor.init(children, strategy: :one_for_one)
     end
 
-    defp children(opts, name) do
+    defp children(opts, name, context) do
       if Keyword.get(opts, :testing) in @testing_modes do
         []
       else
-        context = context(opts)
         dispatcher = dispatcher_name(name)
 
         [
@@ -195,7 +196,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         true ->
           context = Keyword.get(opts, :backend_context) || context(opts)
-          claim_policy = Map.fetch!(context, :claim_policy)
 
           dispatcher =
             @default_dispatcher
@@ -204,7 +204,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
           vehicle = testing_vehicle_opts(opts, context)
 
-          drain_due(context, claim_policy, dispatcher, vehicle, max_runs, %{
+          drain_due(context, dispatcher, vehicle, max_runs, %{
             drained: 0,
             poisoned: [],
             outcomes: [],
@@ -213,10 +213,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    defp drain_due(_context, _claim_policy, _dispatcher, _vehicle, 0, summary),
+    defp drain_due(_context, _dispatcher, _vehicle, 0, summary),
       do: {:ok, %{summary | limit_reached: true}}
 
-    defp drain_due(context, claim_policy, dispatcher, vehicle, remaining, summary) do
+    defp drain_due(context, dispatcher, vehicle, remaining, summary) do
       now = Keyword.get(dispatcher, :clock, &DateTime.utc_now/0).()
 
       runtime_input = %{
@@ -227,7 +227,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         preference: :ready
       }
 
-      case ClaimPolicy.claim_due(claim_policy, RunStore, context, runtime_input) do
+      case RunStore.claim_due(context, :system, runtime_input) do
         {:ok, %{leases: [], poisoned: []}} ->
           {:ok, summary}
 
@@ -243,7 +243,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
           case outcome do
             {:ok, {:parked, _kind}} ->
-              drain_due(context, claim_policy, dispatcher, vehicle, remaining - 1, next)
+              drain_due(context, dispatcher, vehicle, remaining - 1, next)
 
             {:ok, reason} ->
               {:error, {:drain_stopped, reason, next}}
@@ -553,7 +553,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           Keyword.merge(dispatcher_opts,
             name: dispatcher_name,
             context: context,
-            claim_policy: Map.fetch!(context, :claim_policy),
             launch: launch
           )
 

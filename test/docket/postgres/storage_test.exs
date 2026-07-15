@@ -4,7 +4,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
-    alias Docket.Postgres.{GraphStore, Storage}
+    alias Docket.Postgres.{ClaimPolicy, GraphStore, Storage}
     alias Docket.Postgres.StorageTestRepo, as: TestRepo
 
     @migration_version 20_260_710_000_020
@@ -63,6 +63,31 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, ^document} =
                GraphStore.fetch_graph(TestRepo, :tenantless, "committed", graph_hash)
+    end
+
+    test "outer and nested transactions preserve the exact resolved ClaimPolicy value" do
+      root = %{repo: TestRepo, prefix: nil}
+
+      claim_policy =
+        ClaimPolicy.new(
+          [implementation: Docket.Test.AlternateClaimPolicy, marker: :transaction_identity],
+          root
+        )
+
+      root = Map.put(root, :claim_policy, claim_policy)
+
+      assert {:ok, :preserved} =
+               Docket.Postgres.transaction(root, fn outer_ctx ->
+                 assert outer_ctx.claim_policy === claim_policy
+
+                 assert {:ok, :nested} =
+                          Docket.Postgres.transaction(outer_ctx, fn inner_ctx ->
+                            assert inner_ctx.claim_policy === claim_policy
+                            {:ok, :nested}
+                          end)
+
+                 {:ok, :preserved}
+               end)
     end
 
     test "error results, exceptions, throws, and invalid returns all roll back" do
