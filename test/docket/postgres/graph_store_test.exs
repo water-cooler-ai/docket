@@ -70,20 +70,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert runtime_graph.graph_hash == graph_hash
     end
 
-    test "fetches the latest saved graph reference in its owner scope" do
-      {older, older_hash} = effective_graph("minimal-linear", "older")
-      {newer, newer_hash} = effective_graph("minimal-linear", "newer")
-
-      assert :ok = GraphStore.save_graph(TestRepo, :tenantless, older.id, older_hash, older)
-      assert :ok = GraphStore.save_graph(TestRepo, :tenantless, newer.id, newer_hash, newer)
-
-      assert {:ok, %GraphRef{graph_id: "minimal-linear", graph_hash: ^newer_hash}} =
-               GraphStore.fetch_latest_graph_ref(TestRepo, :tenantless, "minimal-linear")
-
-      assert {:error, :not_found} =
-               GraphStore.fetch_latest_graph_ref(TestRepo, :tenantless, "missing")
-    end
-
     test "latest and list use inserted_at and graph hash as the stable ordering key" do
       {first, first_hash} = effective_graph("revision-order", "first")
       {second, second_hash} = effective_graph("revision-order", "second")
@@ -163,38 +149,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert metadata.result == :ok
       refute Map.has_key?(metadata, :graph_id)
       refute Map.has_key?(metadata, :graph_hash)
-    end
-
-    test "exact, latest, and list reads isolate tenant-owned copies" do
-      {graph, graph_hash} = effective_graph("scoped", "shared")
-
-      assert :ok =
-               GraphStore.save_graph(TestRepo, {:tenant, "a"}, graph.id, graph_hash, graph)
-
-      assert :ok =
-               GraphStore.save_graph(TestRepo, {:tenant, "b"}, graph.id, graph_hash, graph)
-
-      assert {:ok, ^graph} =
-               GraphStore.fetch_graph(TestRepo, {:tenant, "a"}, graph.id, graph_hash)
-
-      assert {:ok, ^graph} =
-               GraphStore.fetch_graph(TestRepo, {:tenant, "b"}, graph.id, graph_hash)
-
-      for scope <- [:tenantless, {:tenant, "c"}] do
-        assert {:error, :not_found} =
-                 GraphStore.fetch_graph(TestRepo, scope, graph.id, graph_hash)
-
-        assert {:error, :not_found} =
-                 GraphStore.fetch_latest_graph_ref(TestRepo, scope, graph.id)
-
-        assert {:ok, %GraphVersionPage{versions: [], has_more?: false}} =
-                 GraphStore.list_graph_versions(TestRepo, scope, graph.id, %{
-                   limit: 10,
-                   before: nil
-                 })
-      end
-
-      assert TestRepo.aggregate(GraphVersionSchema, :count) == 2
     end
 
     test "version lists use an exclusive cursor and preserve it on an empty page" do

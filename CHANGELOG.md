@@ -16,6 +16,12 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- `Docket.Backend.Conformance`, a packaged, core-only ExUnit profile with a
+  documented lifecycle/isolation harness. The identical black-box cases run
+  against the memory and PostgreSQL bundles and cover callback completeness,
+  transaction and cross-store atomicity, scopes, graph/event identity and
+  reads, claim fencing and recovery, checkpoint sequencing, and serialized
+  mutation safety (DCKT-52).
 - A canonical delivery and execution guarantee matrix documenting the exact
   PostgreSQL transaction boundary, replayable node attempts, external-effect
   idempotency requirements, retained-event export boundary, best-effort

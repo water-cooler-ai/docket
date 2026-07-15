@@ -416,6 +416,8 @@ the package page.
 
 ## Learn more
 
+- [Backend conformance guide](docs/backend-conformance.md) — the reusable,
+  core-only ExUnit contract for third-party backend implementations.
 - [examples/parent-app-integration.md](examples/parent-app-integration.md) —
   the durable parent-application integration boundary.
 - [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).

@@ -1,6 +1,20 @@
 defmodule Docket.Backend.StoreCapabilitiesTest do
   use ExUnit.Case, async: true
 
+  defmodule MissingRunStore do
+    @moduledoc false
+  end
+
+  defmodule IncompleteBundle do
+    @moduledoc false
+
+    def transaction(context, fun), do: fun.(context)
+    def graphs, do: Docket.Test.MemoryBackend
+    def runs, do: MissingRunStore
+    def events, do: Docket.Test.MemoryBackend
+    def child_spec(_opts), do: %{id: __MODULE__, start: {Task, :start_link, [fn -> :ok end]}}
+  end
+
   test "the backend owns the transaction boundary and focused stores" do
     callbacks = Docket.Backend.behaviour_info(:callbacks)
 
@@ -37,5 +51,15 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
         ] do
       assert function_exported?(Docket.Test.MemoryBackend, name, arity)
     end
+  end
+
+  test "conformance completeness failures name the accessor and exact callback" do
+    violations = Docket.Backend.Conformance.Contract.violations(IncompleteBundle)
+
+    assert Enum.any?(violations, fn violation ->
+             violation ==
+               "backend #{inspect(IncompleteBundle)} runs/0 -> #{inspect(MissingRunStore)}: " <>
+                 "missing Docket.Backend.RunStore.commit/3"
+           end)
   end
 end
