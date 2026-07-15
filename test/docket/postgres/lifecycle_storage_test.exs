@@ -142,7 +142,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
 
       assert {:ok, %{leases: [lease], poisoned: []}} =
-               RunStore.claim_due(TestRepo, :system, %{
+               RunStore.claim_due(admission_context(), :system, %{
                  now: @now,
                  limit: 1,
                  orphan_ttl_ms: 60_000,
@@ -214,7 +214,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, ^initial} = Docket.Lifecycle.start(noop_backend, :tenantless, initial)
 
       assert {:ok, %{leases: [lease]}} =
-               RunStore.claim_due(TestRepo, :system, %{
+               RunStore.claim_due(admission_context(), :system, %{
                  now: @now,
                  limit: 1,
                  orphan_ttl_ms: 60_000,
@@ -301,7 +301,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, ^initial} = Docket.Lifecycle.start(noop_backend, :tenantless, initial)
 
       lease =
-        RunStore.claim_due(TestRepo, :system, %{
+        RunStore.claim_due(admission_context(), :system, %{
           now: @now,
           limit: 1,
           orphan_ttl_ms: 60_000,
@@ -335,7 +335,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
 
       assert {:ok, %{leases: [lease]}} =
-               RunStore.claim_due(TestRepo, :system, %{
+               RunStore.claim_due(admission_context(), :system, %{
                  now: @now,
                  limit: 1,
                  orphan_ttl_ms: 60_000,
@@ -585,7 +585,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
 
       assert {:ok, %{leases: [lease]}} =
-               RunStore.claim_due(TestRepo, :system, %{
+               RunStore.claim_due(admission_context(), :system, %{
                  now: @now,
                  limit: 1,
                  orphan_ttl_ms: 60_000,
@@ -688,6 +688,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           error
       end
     end
+
+    defp admission_context,
+      do: Docket.Postgres.TestAdmissionContext.resolve(TestRepo)
 
     defp initialization_moment(run_id, graph_id, graph_hash) do
       run = %Docket.Run{

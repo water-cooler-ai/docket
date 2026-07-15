@@ -6,7 +6,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     alias Docket.{Graph, Lifecycle, Reducer, RunInfo, Schema}
     alias Docket.Graph.Compiler
-    alias Docket.Postgres.{Dispatcher, GraphStore, RunStore, Vehicle}
+    alias Docket.Postgres.{AdmissionPhase, Dispatcher, GraphStore, RunStore, Vehicle}
     alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}
     alias Docket.Postgres.VehicleStorageTestRepo, as: TestRepo
     alias Docket.Runtime.{Loop, RunMutation}
@@ -87,7 +87,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       TestRepo.delete_all(Run)
       TestRepo.delete_all(GraphVersion)
 
-      context = %{repo: TestRepo}
+      phase = start_supervised!(AdmissionPhase)
+
+      context =
+        Docket.Postgres.TestAdmissionContext.resolve(%{repo: TestRepo}, %{
+          admission_phase: phase
+        })
+
       %{context: context, backend: {Backend, context}}
     end
 

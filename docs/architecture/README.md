@@ -40,8 +40,8 @@ when you want to understand *why* the contracts are shaped the way they are.
    - Proposed database-wide tenant claim caps, dynamic tier policy, fair
      partition selection, weighted service, borrowing, telemetry, and rollout.
 10. `docket-claim-policy.md`
-    - Implemented phase-0 ClaimPolicy extension contract, atomicity rule,
-      instance-level rollout switch, conformance tests, and legacy rollback.
+    - Implemented phase-0 RunStore-to-ClaimPolicy plan boundary, atomicity rule,
+      instance-level rollout switch, conformance tests, and Legacy rollback.
 11. `docket-runtime-design.md`
     - Historical 0.0.1 runtime research and background: goals, alternatives
       considered (Pregel, LangGraph, Temporal), and future design space.

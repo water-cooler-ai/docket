@@ -82,7 +82,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         backend: Docket.Postgres,
         repo: TestRepo,
         context: %{coordinator: :docket_backend_vehicle_relay},
-        executor: Docket.Executor.Task,
         dispatcher: [concurrency: 1, poll_interval_ms: 60_000],
         pruner: @pruner
     end
@@ -148,6 +147,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ]
     end
 
+    defmodule AlternatePolicySupervisedHost do
+      @pruner [
+        interval_ms: :timer.hours(1),
+        event_retention_ms: :timer.hours(24 * 30),
+        run_retention_ms: :timer.hours(24 * 90),
+        batch_size: 100
+      ]
+
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        notifier: :none,
+        dispatcher: [concurrency: 1, poll_interval_ms: 10],
+        pruner: @pruner,
+        claim_policy: [
+          implementation: Docket.Test.AlternateClaimPolicy,
+          marker: :supervised_runtime
+        ]
+    end
+
     defmodule SandboxInlineHost do
       use Docket,
         backend: Docket.Postgres,
@@ -186,6 +205,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       stop_host(PoisonHost)
       stop_host(InlineHost)
       stop_host(ManualHost)
+      stop_host(AlternatePolicyManualHost)
+      stop_host(AlternatePolicySupervisedHost)
       stop_host(SandboxInlineHost)
       stop_host(ObserverInlineHost)
 
@@ -276,7 +297,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "manual drain uses the instance-selected ClaimPolicy and ignores per-call switches" do
+      Process.register(self(), :docket_claim_policy_relay)
+
+      on_exit(fn ->
+        if Process.whereis(:docket_claim_policy_relay),
+          do: Process.unregister(:docket_claim_policy_relay)
+      end)
+
       start_supervised!(AlternatePolicyManualHost)
+
+      assert_receive {:alternate_claim_policy, :init, :manual_runtime,
+                      %{prefix: nil, identifiers: %{runs: ~s("docket_runs")}}}
+
       assert {:ok, reference} = AlternatePolicyManualHost.save_graph(Graphs.minimal_linear())
 
       assert {:ok, %{status: :running}} =
@@ -304,6 +336,36 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                         implementation: Docket.Test.AlternateClaimPolicy,
                         result: :ok
                       }}
+
+      assert_receive {:alternate_claim_policy, :build_plan, :manual_runtime, _pid}
+      assert_receive {:alternate_claim_policy, :decode, :manual_runtime, _pid}
+      refute_receive {:alternate_claim_policy, :init, :manual_runtime, _context}
+    end
+
+    test "supervised dispatch initializes once and executes the independent selected engine" do
+      Process.register(self(), :docket_claim_policy_relay)
+
+      on_exit(fn ->
+        if Process.whereis(:docket_claim_policy_relay),
+          do: Process.unregister(:docket_claim_policy_relay)
+      end)
+
+      start_supervised!(AlternatePolicySupervisedHost)
+
+      assert_receive {:alternate_claim_policy, :init, :supervised_runtime,
+                      %{prefix: nil, identifiers: %{runs: ~s("docket_runs")}}}
+
+      assert {:ok, reference} = AlternatePolicySupervisedHost.save_graph(Graphs.minimal_linear())
+
+      assert {:ok, started} =
+               AlternatePolicySupervisedHost.start_run(reference, %{"value" => "alternate"})
+
+      assert {:ok, %Docket.Run{status: :done}} =
+               AlternatePolicySupervisedHost.await_run(started.id, timeout: 5_000)
+
+      assert_receive {:alternate_claim_policy, :build_plan, :supervised_runtime, _pid}
+      assert_receive {:alternate_claim_policy, :decode, :supervised_runtime, _pid}
+      refute_receive {:alternate_claim_policy, :init, :supervised_runtime, _context}
     end
 
     test "manual drains preserve retry attempt state across separate claims" do
@@ -311,13 +373,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, reference} = ManualHost.save_graph(Graphs.retry_then_continue())
       assert {:ok, started} = ManualHost.start_run(reference, %{})
 
+      handler = "manual-admission-phase-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:docket, :postgres, :run_store, :claim],
+        &Docket.Test.TelemetryRelay.raw/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
       assert {:ok, %{drained: 1, limit_reached: true}} = ManualHost.drain_runs(max_runs: 1)
+
+      assert_receive {[:docket, :postgres, :run_store, :claim], _, %{preference: :ready}}
 
       assert {:ok, %Docket.Run{status: :running, active_tasks: first_tasks}} =
                ManualHost.fetch_run(started.id)
 
       assert first_tasks != %{}
       assert {:ok, %{drained: 1, limit_reached: true}} = ManualHost.drain_runs(max_runs: 1)
+
+      assert_receive {[:docket, :postgres, :run_store, :claim], _, %{preference: :expired}}
 
       assert {:ok, %Docket.Run{status: :running, active_tasks: second_tasks}} =
                ManualHost.fetch_run(started.id)
@@ -326,8 +403,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert second_tasks != first_tasks
       assert {:ok, %{drained: 1}} = ManualHost.drain_runs(max_runs: 1)
 
+      assert_receive {[:docket, :postgres, :run_store, :claim], _, %{preference: :ready}}
+
       assert {:ok, %Docket.Run{status: :done, active_tasks: %{}}} =
                ManualHost.fetch_run(started.id)
+    end
+
+    test "poison admission consumes a bounded slot and drain continues to later work" do
+      start_supervised!(ManualHost)
+      assert {:ok, reference} = ManualHost.save_graph(Graphs.minimal_linear())
+      assert {:ok, poison} = ManualHost.start_run(reference, %{"value" => "poison"})
+      assert {:ok, normal} = ManualHost.start_run(reference, %{"value" => "normal"})
+      poison_at = DateTime.add(DateTime.utc_now(), -1, :second)
+
+      TestRepo.update_all(
+        from(row in Run, where: row.run_id == ^poison.id),
+        set: [wake_at: poison_at, claim_attempts: 5]
+      )
+
+      assert {:ok, %{drained: 1, poisoned: [%{run_id: poison_id}], limit_reached: true}} =
+               ManualHost.drain_runs(max_runs: 2)
+
+      assert poison_id == poison.id
+      assert {:ok, %Docket.RunInfo{poisoned_at: %DateTime{}}} = ManualHost.inspect_run(poison.id)
+      assert {:ok, %Docket.Run{status: :done}} = ManualHost.fetch_run(normal.id)
     end
 
     test "manual cancel, poison halt, inspection, and recovery are deterministic" do
@@ -379,6 +478,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       backend_name = Module.concat(PollHost, Backend)
       assert Process.whereis(Docket.Postgres.runner_name(backend_name))
+      assert Process.whereis(Docket.Postgres.admission_phase_name(backend_name))
       assert Process.whereis(Docket.Postgres.vehicle_supervisor_name(backend_name))
       assert Process.whereis(Docket.Postgres.dispatcher_name(backend_name))
       assert Process.whereis(Docket.Postgres.pruner_name(backend_name))
@@ -532,6 +632,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "configuration is explicit and fails before partial backend operation" do
+      opts = [name: __MODULE__.ExplicitContext, repo: TestRepo]
+      context = Docket.Postgres.context(opts)
+
+      assert %{start: {Docket.Postgres, :start_link, [^opts, ^context]}} =
+               Docket.Postgres.child_spec(opts, context)
+
+      assert_raise ArgumentError, ~r/requires a resolved backend context/, fn ->
+        Docket.Postgres.child_spec(opts)
+      end
+
       assert_raise KeyError, fn ->
         Docket.Postgres.context([])
       end
@@ -541,15 +651,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       assert_raise ArgumentError, ~r/:pruner must be a keyword list/, fn ->
-        Docket.Postgres.init(name: __MODULE__.MissingPruner, repo: TestRepo)
+        postgres_init(name: __MODULE__.MissingPruner, repo: TestRepo)
       end
 
       assert_raise ArgumentError, ~r/:pruner requires/, fn ->
-        Docket.Postgres.init(name: __MODULE__.PartialPruner, repo: TestRepo, pruner: [])
+        postgres_init(name: __MODULE__.PartialPruner, repo: TestRepo, pruner: [])
       end
 
       assert_raise ArgumentError, ~r/:notifier must be :none or a keyword list/, fn ->
-        Docket.Postgres.init(
+        postgres_init(
           name: __MODULE__.BadNotifier,
           repo: TestRepo,
           notifier: false,
@@ -558,13 +668,44 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       assert_raise ArgumentError, ~r/:dispatcher has unknown keys/, fn ->
-        Docket.Postgres.init(
+        postgres_init(
           name: __MODULE__.MixedStore,
           repo: TestRepo,
           dispatcher: [run_store: SomeOtherStore],
           pruner: @pruner
         )
       end
+
+      assert_raise ArgumentError, ~r/:dispatcher has unknown keys.*clock/, fn ->
+        postgres_init(
+          name: __MODULE__.NestedDispatcherClock,
+          repo: TestRepo,
+          dispatcher: [clock: &DateTime.utc_now/0],
+          pruner: @pruner
+        )
+      end
+
+      assert_raise ArgumentError, ~r/:vehicle has unknown keys.*executor/, fn ->
+        postgres_init(
+          name: __MODULE__.NestedVehicleExecution,
+          repo: TestRepo,
+          vehicle: [executor: Docket.Executor.Local],
+          pruner: @pruner
+        )
+      end
+
+      assert_raise ArgumentError, ~r/must be configured under :vehicle.*drain_budget/, fn ->
+        postgres_init(
+          name: __MODULE__.TopLevelVehicleMechanic,
+          repo: TestRepo,
+          drain_budget: [max_moments: 1, max_elapsed_ms: 3_000],
+          pruner: @pruner
+        )
+      end
+    end
+
+    defp postgres_init(opts) do
+      Docket.Postgres.init({opts, Docket.Postgres.context(opts)})
     end
 
     test "storage remains exactly the current three-table schema" do

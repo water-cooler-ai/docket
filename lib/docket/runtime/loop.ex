@@ -8,20 +8,13 @@ defmodule Docket.Runtime.Loop do
   # `Docket.Runtime.Moment`: the proposed run, its assigned events, the
   # checkpoint type, and an explicit disposition. Calculation delivers no
   # checkpoint and emits no telemetry. `propose_init/3` and
-  # `propose_advance/3` expose the raw moments to drivers that commit
-  # externally; the processless entrypoints (`init/3`, `plan/3`,
-  # `apply_results/5`, `resolve_interrupt/5`) adapt the same moments through
-  # the processless driver and return a new run plus checkpoint values - or a
-  # typed error with the previous run untouched.
+  # `propose_advance/3` expose the raw moments to durable and processless
+  # drivers alike.
   # Deterministic execution logic lives in `Docket.Runtime.Algorithm`.
-  #
-  # Processless test effects are `{:checkpoint, checkpoint}` values.
-  # Production observers are a separate after-commit path owned by
-  # `Docket.Lifecycle`.
 
   alias Docket.{Error, Run, Schema, Wire}
   alias Docket.Run.{ChannelState, Failure, InterruptState, PendingWrite, TaskState, TimerState}
-  alias Docket.Runtime.{Algorithm, Config, Dispatcher, Moment, RunMutation, TaskResult}
+  alias Docket.Runtime.{Algorithm, Config, Dispatcher, Moment, TaskResult}
 
   @doc false
   # Builds the fresh `:created` run document consumed by `init/3`. Shared by
@@ -38,31 +31,6 @@ defmodule Docket.Runtime.Loop do
       input: input || %{},
       metadata: Keyword.get(opts, :metadata, %{})
     }
-  end
-
-  # ---------------------------------------------------------------------------
-  # init/3
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Single loop entrypoint for a live run.
-
-  Infers fresh-versus-saved execution from the supplied run document: a
-  `:created` run is initialized (inputs validated and written, `$start`
-  edges evaluated); a `:running`/`:waiting` run continues as-is; a terminal
-  run is returned unchanged with no checkpoint and no execution restart.
-
-  For any run it is going to execute, emits the required sync
-  `:run_initialized` checkpoint before returning.
-  """
-  def init(rtg, %Run{} = run, opts) do
-    config = Config.resolve(opts)
-
-    case do_propose_init(rtg, run, config) do
-      {:ok, %Moment{} = moment} -> accept(moment, config)
-      {:terminal, run} -> {:ok, run, []}
-      {:error, error} -> {:error, error}
-    end
   end
 
   @doc """
@@ -233,60 +201,6 @@ defmodule Docket.Runtime.Loop do
   # ---------------------------------------------------------------------------
   # plan/3
   # ---------------------------------------------------------------------------
-
-  @doc """
-  Plans the next node attempts from committed state.
-
-  A run carrying durable active-superstep state resumes that superstep: the
-  parked attempts whose retry deadlines have arrived are rebuilt with their
-  committed identity. Otherwise a fresh superstep is planned.
-
-  Returns:
-
-  - `{:execute, run, activations}` - dispatch these, then call
-    `apply_results/5`; the run is unchanged (planning commits nothing)
-  - `{:park, run, park}` - the active superstep has no attempt due yet;
-    `park` is `%{resume_at: DateTime.t(), wait_ms: non_neg_integer()}` and
-    the run is unchanged
-  - `{:wait, run, interrupt_ids}` - blocked on open interrupts
-  - `{:terminal, run, effects}` - the run just completed or failed (the
-    terminal checkpoint has been emitted), or was already terminal
-  - `{:error, error}` - invalid or uninitialized run; the caller keeps the
-    previous run
-
-  Shells that have already served a park's wait pass the served instant -
-  the park's `resume_at`, or a durable claim's `claimed_at`, which is never
-  earlier than the wake it served - as `:resume_floor` in `opts`, so
-  deadline checks do not depend on the wall clock having advanced
-  (deterministic inline tests inject `:sleeper` instead of sleeping). The
-  floor must never exceed the caller's real current instant: flooring at
-  the served instant makes exactly the elapsed attempts eligible while
-  later deadlines stay parked.
-  """
-  def plan(rtg, %Run{} = run, opts) do
-    config = Config.resolve(opts)
-
-    case do_propose_plan(rtg, run, opts, config) do
-      {:moment, %Moment{} = moment} ->
-        {:ok, run, effects} = accept(moment, config)
-        {:terminal, run, effects}
-
-      {:already_terminal, run} ->
-        {:terminal, run, []}
-
-      {:execute, run, activations} ->
-        {:execute, run, activations}
-
-      {:wait, run, interrupt_ids} ->
-        {:wait, run, interrupt_ids}
-
-      {:park, run, park} ->
-        {:park, run, park}
-
-      {:error, error} ->
-        {:error, error}
-    end
-  end
 
   @doc """
   Calculates the next commit-boundary moment for one advancement.
@@ -477,45 +391,6 @@ defmodule Docket.Runtime.Loop do
       extra_entries ++ [entry(:run_failed, run.step, payload: Keyword.fetch!(opts, :payload))]
 
     {:moment, propose(run, :run_failed, entries, {:park, :terminal, :run_failed}, config)}
-  end
-
-  # ---------------------------------------------------------------------------
-  # apply_results/5
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Commits the outcome of one dispatch of the active superstep.
-
-  When every task of the superstep has a final result, this is the update
-  barrier: pending sibling results parked by earlier retry commits are
-  merged with this dispatch's results, reducers apply, edge triggers
-  evaluate, interrupts register, and the barrier checkpoint commits with
-  the active-superstep state cleared.
-
-  When any dispatched attempt failed retryably with budget remaining - or
-  parked attempts not yet due remain active - the superstep parks instead:
-  completed results become pending writes (invisible until the barrier),
-  each failed task's next attempt and retry deadline commit through a sync
-  `:retry_scheduled` checkpoint without advancing the graph step, and
-  `{:park, run, park, effects}` tells the shell when to wake.
-
-  Any permanent node failure fails the superstep: no writes from the
-  superstep commit and the run commits as `:failed` through a sync
-  `:run_failed` checkpoint. Returns `{:ok, run, effects}` (the run may be
-  terminal), `{:park, run, park, effects}`, or `{:error, error}` on sync
-  checkpoint failure, keeping the previous committed run.
-  """
-  def apply_results(rtg, %Run{} = run, activations, results, opts) do
-    config = Config.resolve(opts)
-
-    case do_propose_results(rtg, run, config, activations, results) do
-      {:moment, %Moment{} = moment} ->
-        accept(moment, config)
-
-      {:moment, %Moment{} = moment, park} ->
-        {:ok, run, effects} = accept(moment, config)
-        {:park, run, park, effects}
-    end
   end
 
   defp do_propose_results(rtg, run, config, activations, results) do
@@ -978,28 +853,7 @@ defmodule Docket.Runtime.Loop do
   end
 
   # ---------------------------------------------------------------------------
-  # resolve_interrupt/5
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Resolves an open interrupt: validates the value, writes it to the resume
-  field, marks the interrupt resolved, and emits the sync
-  `:interrupt_resolved` checkpoint.
-
-  The interrupted node stays in `pending_nodes` and re-executes in the next
-  superstep with the resolved value in its snapshot.
-  """
-  def resolve_interrupt(rtg, %Run{} = run, interrupt_id, value, opts) do
-    config = Config.resolve(opts)
-
-    case RunMutation.resolve_interrupt(rtg, run, interrupt_id, value, config.clock.()) do
-      {:ok, %Moment{} = moment} -> accept(moment, config)
-      {:error, error} -> {:error, error}
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Moment production and legacy adaptation
+  # Moment production
   # ---------------------------------------------------------------------------
 
   defp entry(type, step, opts) do
@@ -1019,14 +873,5 @@ defmodule Docket.Runtime.Loop do
   # no executor work is ever in flight when it runs.
   defp propose(run, type, entries, disposition, config, identity_opts \\ []) do
     Moment.propose(run, type, entries, disposition, config.clock.(), identity_opts)
-  end
-
-  # Adapts one moment for processless tests. Production backends do not call
-  # this path and persist moments directly before delivering observers.
-  defp accept(%Moment{} = moment, config) do
-    checkpoint = Moment.checkpoint(moment)
-    _ = config
-    Docket.Telemetry.emit_events(moment.run, moment.events)
-    {:ok, moment.run, [{:checkpoint, checkpoint}]}
   end
 end

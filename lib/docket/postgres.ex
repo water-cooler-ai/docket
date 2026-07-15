@@ -32,6 +32,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @behaviour Docket.Backend
 
     alias Docket.Postgres.{
+      AdmissionPhase,
       ClaimPolicy,
       EventStore,
       GraphStore,
@@ -48,10 +49,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       max_claim_attempts: 5,
       drain_timeout_ms: 30_000
     ]
-    @default_vehicle [
-      max_attempt_elapsed_ms: 2_000,
-      drain_budget: [max_moments: 100, max_elapsed_ms: 3_000]
-    ]
+    @default_execution [max_attempt_elapsed_ms: 2_000]
+    @default_vehicle [drain_budget: [max_moments: 100, max_elapsed_ms: 3_000]]
 
     @dispatcher_keys [
       :concurrency,
@@ -60,24 +59,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :max_claim_attempts,
       :drain_timeout_ms,
       :on_poisoned,
-      :clock,
       :jitter
     ]
     @vehicle_keys [
-      :clock,
       :monotonic_clock,
       :drain_budget,
-      :max_attempt_elapsed_ms,
       :jitter,
       :abandon_backoff_ms,
       :abandon_backoff_cap_ms,
-      :max_claim_abandons,
-      :executor,
-      :executor_opts,
-      :max_supersteps,
-      :context,
-      :id_generator,
-      :checkpoint_observers
+      :max_claim_abandons
     ]
     @pruner_keys [
       :interval_ms,
@@ -106,55 +96,72 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       validate_repo!(repo)
       context = %{repo: repo, prefix: Keyword.get(opts, :prefix)}
       {^repo, prefix} = Storage.context!(context)
+      name = Keyword.get(opts, :name)
 
-      %{
+      resolved = %{
         repo: repo,
         prefix: prefix,
-        claim_policy: ClaimPolicy.new(Keyword.get(opts, :claim_policy, []))
+        claim_policy:
+          ClaimPolicy.new(Keyword.get(opts, :claim_policy, []), %{repo: repo, prefix: prefix})
       }
+
+      if name, do: Map.put(resolved, :admission_phase, admission_phase_name(name)), else: resolved
     end
 
     @impl Docket.Backend
-    def child_spec(opts) do
+    def child_spec(opts, context) do
       name = Keyword.fetch!(opts, :name)
 
       %{
         id: name,
-        start: {__MODULE__, :start_link, [opts]},
+        start: {__MODULE__, :start_link, [opts, context]},
         type: :supervisor
       }
     end
 
-    @spec start_link(keyword()) :: Supervisor.on_start()
-    def start_link(opts) do
-      Supervisor.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
+    @doc false
+    def child_spec(_opts) do
+      raise ArgumentError,
+            "Docket.Postgres requires a resolved backend context; " <>
+              "start it through Docket.Runtime.Supervisor"
+    end
+
+    @doc false
+    @spec start_link(keyword(), Docket.Backend.ctx()) :: Supervisor.on_start()
+    def start_link(opts, context) do
+      Supervisor.start_link(__MODULE__, {opts, context}, name: Keyword.fetch!(opts, :name))
     end
 
     @impl true
-    def init(opts) do
+    def init({opts, context}) when is_list(opts) do
+      init_with_context(opts, context)
+    end
+
+    defp init_with_context(opts, context) do
       name = Keyword.fetch!(opts, :name)
+      Docket.Runtime.Config.validate_instance!(opts)
+      reject_top_level_vehicle!(opts)
       validate_tenant_mode!(opts)
       validate_testing!(opts)
-      validate_observers!(opts)
       validate_nested!(Keyword.get(opts, :dispatcher, []), :dispatcher)
       validate_nested!(Keyword.get(opts, :vehicle, []), :vehicle)
       dispatcher = Keyword.merge(@default_dispatcher, Keyword.get(opts, :dispatcher, []))
       validate_dispatcher!(dispatcher)
-      _claim_policy = ClaimPolicy.new(Keyword.get(opts, :claim_policy, []))
-      vehicle = effective_vehicle(opts, Keyword.get(opts, :vehicle, []))
-      validate_vehicle!(opts, Keyword.get(opts, :vehicle, []))
-      validate_runtime_limits!(dispatcher, vehicle)
+      _resolved_claim_policy = ClaimPolicy.resolve(context)
+      execution = effective_execution(opts)
+      vehicle = effective_vehicle(Keyword.get(opts, :vehicle, []))
+      validate_vehicle!(vehicle)
+      validate_runtime_limits!(dispatcher, execution, vehicle)
 
-      children = children(opts, name)
+      children = children(opts, name, context)
 
       Supervisor.init(children, strategy: :one_for_one)
     end
 
-    defp children(opts, name) do
+    defp children(opts, name, context) do
       if Keyword.get(opts, :testing) in @testing_modes do
-        []
+        [{AdmissionPhase, name: admission_phase_name(name)}]
       else
-        context = context(opts)
         dispatcher = dispatcher_name(name)
 
         [
@@ -170,19 +177,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    @doc false
-    def testing_mode(opts), do: Keyword.get(opts, :testing)
-
     @doc "Synchronously claims and drains due runs in the calling process."
-    def drain_runs(opts) when is_list(opts) do
+    @impl Docket.Backend
+    def drain_runs(context, opts) when is_list(opts) do
+      reject_top_level_vehicle!(opts)
       validate_testing!(opts)
       validate_nested!(Keyword.get(opts, :dispatcher, []), :dispatcher)
       validate_nested!(Keyword.get(opts, :vehicle, []), :vehicle)
       dispatcher_config = Keyword.merge(@default_dispatcher, Keyword.get(opts, :dispatcher, []))
-      vehicle_config = effective_vehicle(opts, Keyword.get(opts, :vehicle, []))
+      execution_config = effective_execution(opts)
+      vehicle_config = effective_vehicle(Keyword.get(opts, :vehicle, []))
       validate_dispatcher!(dispatcher_config)
-      validate_vehicle!(opts, Keyword.get(opts, :vehicle, []))
-      validate_runtime_limits!(dispatcher_config, vehicle_config)
+      validate_vehicle!(vehicle_config)
+      validate_runtime_limits!(dispatcher_config, execution_config, vehicle_config)
 
       max_runs = Keyword.get(opts, :max_runs, 100)
 
@@ -194,9 +201,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           {:error, :invalid_max_runs}
 
         true ->
-          context = Keyword.get(opts, :backend_context) || context(opts)
-          claim_policy = Map.fetch!(context, :claim_policy)
-
           dispatcher =
             @default_dispatcher
             |> Keyword.merge(Keyword.get(opts, :dispatcher, []))
@@ -204,30 +208,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
           vehicle = testing_vehicle_opts(opts, context)
 
-          drain_due(context, claim_policy, dispatcher, vehicle, max_runs, %{
-            drained: 0,
-            poisoned: [],
-            outcomes: [],
-            limit_reached: false
-          })
+          drain_due(
+            context,
+            Map.fetch!(context, :admission_phase),
+            dispatcher,
+            vehicle,
+            max_runs,
+            %{
+              drained: 0,
+              poisoned: [],
+              outcomes: [],
+              limit_reached: false
+            }
+          )
       end
     end
 
-    defp drain_due(_context, _claim_policy, _dispatcher, _vehicle, 0, summary),
+    defp drain_due(_context, _phase, _dispatcher, _vehicle, 0, summary),
       do: {:ok, %{summary | limit_reached: true}}
 
-    defp drain_due(context, claim_policy, dispatcher, vehicle, remaining, summary) do
+    defp drain_due(context, phase, dispatcher, vehicle, remaining, summary) do
       now = Keyword.get(dispatcher, :clock, &DateTime.utc_now/0).()
 
-      runtime_input = %{
-        now: now,
-        limit: 1,
-        orphan_ttl_ms: Keyword.fetch!(dispatcher, :orphan_ttl_ms),
-        max_claim_attempts: Keyword.fetch!(dispatcher, :max_claim_attempts),
-        preference: :ready
-      }
+      result =
+        AdmissionPhase.run(phase, 1, fn preference ->
+          RunStore.claim_due(context, :system, %{
+            now: now,
+            limit: 1,
+            orphan_ttl_ms: Keyword.fetch!(dispatcher, :orphan_ttl_ms),
+            max_claim_attempts: Keyword.fetch!(dispatcher, :max_claim_attempts),
+            preference: preference
+          })
+        end)
 
-      case ClaimPolicy.claim_due(claim_policy, RunStore, context, runtime_input) do
+      case result do
         {:ok, %{leases: [], poisoned: []}} ->
           {:ok, summary}
 
@@ -243,14 +257,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
           case outcome do
             {:ok, {:parked, _kind}} ->
-              drain_due(context, claim_policy, dispatcher, vehicle, remaining - 1, next)
+              drain_due(context, phase, dispatcher, vehicle, remaining - 1, next)
 
             {:ok, reason} ->
               {:error, {:drain_stopped, reason, next}}
           end
 
         {:ok, %{leases: [], poisoned: poisoned}} ->
-          {:ok, %{summary | poisoned: summary.poisoned ++ poisoned}}
+          drain_due(
+            context,
+            phase,
+            dispatcher,
+            vehicle,
+            remaining - 1,
+            %{summary | poisoned: summary.poisoned ++ poisoned}
+          )
 
         {:error, reason} ->
           {:error, reason}
@@ -258,11 +279,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp testing_vehicle_opts(opts, context) do
-      vehicle = Keyword.merge(@default_vehicle, Keyword.get(opts, :vehicle, []))
-
-      opts
-      |> Keyword.take(@vehicle_keys)
-      |> Keyword.merge(vehicle)
+      effective_execution(opts)
+      |> Keyword.merge(effective_vehicle(Keyword.get(opts, :vehicle, [])))
       |> Keyword.put(:graph_cache, false)
       |> Keyword.put(:task_supervisor, Keyword.fetch!(opts, :task_supervisor))
       |> Keyword.put(:backend, {__MODULE__, context})
@@ -276,6 +294,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @doc false
     def vehicle_supervisor_name(name), do: Module.concat(name, "VehicleSupervisor")
+
+    @doc false
+    def admission_phase_name(name), do: Module.concat(name, "AdmissionPhase")
 
     @doc false
     def notifier_name(name), do: Module.concat(name, "Notifier")
@@ -406,70 +427,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    defp validate_observers!(opts) do
-      validate_observer_modules!(Keyword.get(opts, :checkpoint_observers, []))
-    end
-
-    defp validate_observer_modules!(observers) do
-      observers = List.wrap(observers)
-
-      Enum.each(observers, fn observer ->
-        unless is_atom(observer) and Code.ensure_loaded?(observer) and
-                 function_exported?(observer, :observe, 2) do
-          raise ArgumentError,
-                ":checkpoint_observers must implement observe/2, got: #{inspect(observer)}"
-        end
-      end)
-    end
-
-    defp validate_vehicle!(host_opts, vehicle_opts) do
-      effective =
-        host_opts
-        |> Keyword.take(@vehicle_keys)
-        |> Keyword.merge(vehicle_opts)
-
-      for {key, arity} <- [clock: 0, monotonic_clock: 0, jitter: 1, id_generator: 1],
-          callback = Keyword.get(effective, key),
+    defp validate_vehicle!(vehicle) do
+      for {key, arity} <- [monotonic_clock: 0, jitter: 1],
+          callback = Keyword.get(vehicle, key),
           callback != nil and not is_function(callback, arity) do
         raise ArgumentError, ":vehicle #{key} must be a function of arity #{arity}"
       end
 
       for key <- [
-            :max_supersteps,
-            :max_attempt_elapsed_ms,
             :abandon_backoff_ms,
             :abandon_backoff_cap_ms,
             :max_claim_abandons
           ],
-          value = Keyword.get(effective, key),
+          value = Keyword.get(vehicle, key),
           value != nil and not (is_integer(value) and value > 0) do
         raise ArgumentError, ":vehicle #{key} must be a positive integer"
       end
-
-      case Keyword.get(effective, :context) do
-        nil -> :ok
-        context when is_map(context) -> :ok
-        other -> raise ArgumentError, ":vehicle context must be a map, got: #{inspect(other)}"
-      end
-
-      case Keyword.get(effective, :executor) do
-        nil ->
-          :ok
-
-        executor when is_atom(executor) ->
-          unless Code.ensure_loaded?(executor) and function_exported?(executor, :execute, 6) do
-            raise ArgumentError, ":vehicle executor must implement execute/6"
-          end
-
-        _ ->
-          raise ArgumentError, ":vehicle executor must implement execute/6"
-      end
-
-      validate_observer_modules!(Keyword.get(effective, :checkpoint_observers, []))
     end
 
-    defp validate_runtime_limits!(dispatcher, vehicle) do
-      maximum = Keyword.fetch!(vehicle, :max_attempt_elapsed_ms)
+    defp validate_runtime_limits!(dispatcher, execution, vehicle) do
+      maximum = Keyword.fetch!(execution, :max_attempt_elapsed_ms)
       budget = Docket.Postgres.Vehicle.drain_budget!(vehicle)
       elapsed = budget.max_elapsed_ms
       orphan_ttl = Keyword.fetch!(dispatcher, :orphan_ttl_ms)
@@ -491,10 +468,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       _abandon_backoff = Docket.Postgres.Vehicle.abandon_backoff!(vehicle)
     end
 
-    defp effective_vehicle(host_opts, nested) do
-      host_opts
-      |> Keyword.take(@vehicle_keys)
-      |> Keyword.merge(Keyword.merge(@default_vehicle, nested))
+    defp effective_execution(host_opts),
+      do:
+        @default_execution
+        |> Keyword.merge(Keyword.take(host_opts, Docket.Runtime.Config.instance_keys()))
+
+    defp effective_vehicle(nested), do: Keyword.merge(@default_vehicle, nested)
+
+    defp reject_top_level_vehicle!(opts) do
+      case Enum.filter(@vehicle_keys, &Keyword.has_key?(opts, &1)) do
+        [] ->
+          :ok
+
+        keys ->
+          raise ArgumentError,
+                "Postgres vehicle mechanics must be configured under :vehicle, not at the " <>
+                  "top level: #{Enum.map_join(keys, ", ", &inspect/1)}"
+      end
     end
 
     defp assert_keyword!(value, key) do
@@ -529,12 +519,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         dispatcher_opts =
           nested_opts!(host_opts, :dispatcher, Docket.Postgres.default_dispatcher())
 
-        vehicle_opts = nested_opts!(host_opts, :vehicle, Docket.Postgres.default_vehicle())
-
         vehicle_opts =
-          host_opts
-          |> Keyword.take(Docket.Postgres.vehicle_keys())
-          |> Keyword.merge(vehicle_opts)
+          Docket.Postgres.default_execution()
+          |> Keyword.merge(Keyword.take(host_opts, Docket.Runtime.Config.instance_keys()))
+          |> Keyword.merge(nested_opts!(host_opts, :vehicle, Docket.Postgres.default_vehicle()))
           |> Keyword.merge(
             backend: {Docket.Postgres, context},
             task_supervisor: vehicle_supervisor
@@ -553,18 +541,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           Keyword.merge(dispatcher_opts,
             name: dispatcher_name,
             context: context,
-            claim_policy: Map.fetch!(context, :claim_policy),
+            clock: Keyword.get(host_opts, :clock, &DateTime.utc_now/0),
             launch: launch
           )
 
         children = [
+          {Docket.Postgres.AdmissionPhase, name: Map.fetch!(context, :admission_phase)},
           {Task.Supervisor, name: vehicle_supervisor},
           {Docket.Postgres.Dispatcher, dispatcher_opts}
         ]
 
-        # Dispatcher and its vehicles are one accounting unit. If either
-        # supervisor boundary fails, terminate both so a replacement
-        # dispatcher never loses track of still-running vehicles.
+        # Admission phase, dispatcher, and vehicles are one accounting unit.
+        # If any boundary fails, replace the unit so claim preference and
+        # in-flight vehicle accounting cannot diverge.
         Supervisor.init(children, strategy: :one_for_all)
       end
 
@@ -577,6 +566,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @doc false
     def default_dispatcher, do: @default_dispatcher
+
+    @doc false
+    def default_execution, do: @default_execution
 
     @doc false
     def default_vehicle, do: @default_vehicle

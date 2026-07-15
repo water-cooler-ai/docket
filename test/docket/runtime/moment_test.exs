@@ -107,11 +107,8 @@ defmodule Docket.Runtime.MomentTest do
       rtg = compile!(Graphs.minimal_linear())
       moment = propose_init!(rtg, %{"value" => "hello"}, opts())
 
-      accepted_opts = opts()
-      run = Loop.build_initial_run(rtg, %{"value" => "hello"}, accepted_opts)
-
-      {:ok, committed, [{:checkpoint, checkpoint}]} =
-        Loop.init(rtg, run, accepted_opts)
+      committed = moment.run
+      checkpoint = Moment.checkpoint(moment)
 
       assert moment.run == committed
       assert moment.events == checkpoint.events
@@ -444,7 +441,8 @@ defmodule Docket.Runtime.MomentTest do
     defp schedule_for({:park, :terminal, _reason}), do: {:release_claim, :terminal}
 
     defp start_backend do
-      backend = start_supervised!({MemoryBackend, clock: fn -> @now end})
+      opts = [clock: fn -> @now end]
+      backend = start_supervised!(MemoryBackend.child_spec(opts, nil))
       backend
     end
 

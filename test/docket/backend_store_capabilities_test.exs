@@ -12,7 +12,11 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     def graphs, do: Docket.Test.MemoryBackend
     def runs, do: MissingRunStore
     def events, do: Docket.Test.MemoryBackend
-    def child_spec(_opts), do: %{id: __MODULE__, start: {Task, :start_link, [fn -> :ok end]}}
+    def drain_runs(_context, _opts), do: {:error, :unsupported}
+    def context(opts), do: Keyword.fetch!(opts, :name)
+
+    def child_spec(_opts, _context),
+      do: %{id: __MODULE__, start: {Task, :start_link, [fn -> :ok end]}}
   end
 
   test "the backend owns the transaction boundary and focused stores" do
@@ -20,7 +24,10 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     optional_callbacks = Docket.Backend.behaviour_info(:optional_callbacks)
 
     assert {:transaction, 2} in callbacks
-    assert {:context, 1} in optional_callbacks
+    assert {:context, 1} in callbacks
+    assert {:child_spec, 2} in callbacks
+    assert {:drain_runs, 2} in callbacks
+    assert optional_callbacks == []
     refute {:storage, 0} in callbacks
     refute Code.ensure_loaded?(Docket.Storage)
     refute Code.ensure_loaded?(Docket.Storage.Graphs)

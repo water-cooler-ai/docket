@@ -9,7 +9,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     def transaction(ctx, fun) when is_function(fun, 1) do
       {repo, prefix} = context!(ctx)
-      transaction_ctx = %{repo: repo, prefix: prefix}
+      transaction_ctx = transaction_context(ctx, repo, prefix)
       invalid_result = make_ref()
 
       case repo.transaction(fn ->
@@ -71,6 +71,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             "Postgres context must be a Repo or contain :repo and optional :prefix, got: " <>
               inspect(ctx)
     end
+
+    defp transaction_context(%{claim_policy: claim_policy}, repo, prefix) do
+      %{repo: repo, prefix: prefix, claim_policy: claim_policy}
+    end
+
+    defp transaction_context(_context, repo, prefix), do: %{repo: repo, prefix: prefix}
 
     @doc false
     @spec valid_prefix?(term()) :: boolean()

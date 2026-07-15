@@ -34,7 +34,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       subject = %{
         backend: Docket.Postgres,
-        context: %{repo: TestRepo},
+        context: Docket.Postgres.TestAdmissionContext.resolve(%{repo: TestRepo}),
         namespace: "postgres-#{System.unique_integer([:positive, :monotonic])}",
         now: now
       }
