@@ -11,9 +11,6 @@ defmodule Docket.Backend.Conformance.Cases do
         assert Contract.violations(instance.backend) == [],
                "backend contract violations:\n" <>
                  Enum.map_join(Contract.violations(instance.backend), "\n", &"  * #{&1}")
-
-        optional = Docket.Backend.behaviour_info(:optional_callbacks)
-        assert {:context, 1} in optional
       end
 
       @tag docket_invariant: "TX-COMMIT-ROLLBACK-PROPAGATION"
@@ -142,6 +139,56 @@ defmodule Docket.Backend.Conformance.Cases do
 
         assert {:ok, ^inner} =
                  graphs.fetch_graph(instance.context, :tenantless, inner.id, inner_hash)
+
+        {outer_failure, outer_failure_hash} =
+          Fixture.graph(instance, "nested-outer-failure-outer")
+
+        {inner_success, inner_success_hash} =
+          Fixture.graph(instance, "nested-outer-failure-inner")
+
+        assert {:error, :outer_stop} =
+                 backend.transaction(instance.context, fn outer_tx ->
+                   assert :ok =
+                            graphs.save_graph(
+                              outer_tx,
+                              :tenantless,
+                              outer_failure.id,
+                              outer_failure_hash,
+                              outer_failure
+                            )
+
+                   assert {:ok, :inner_committed} =
+                            backend.transaction(outer_tx, fn inner_tx ->
+                              assert :ok =
+                                       graphs.save_graph(
+                                         inner_tx,
+                                         :tenantless,
+                                         inner_success.id,
+                                         inner_success_hash,
+                                         inner_success
+                                       )
+
+                              {:ok, :inner_committed}
+                            end)
+
+                   {:error, :outer_stop}
+                 end)
+
+        assert {:error, :not_found} =
+                 graphs.fetch_graph(
+                   instance.context,
+                   :tenantless,
+                   outer_failure.id,
+                   outer_failure_hash
+                 )
+
+        assert {:error, :not_found} =
+                 graphs.fetch_graph(
+                   instance.context,
+                   :tenantless,
+                   inner_success.id,
+                   inner_success_hash
+                 )
 
         for kind <- [:error, :invalid, :exception, :throw] do
           {outer_marker, outer_marker_hash} = Fixture.graph(instance, "nested-#{kind}-outer")
@@ -334,11 +381,18 @@ defmodule Docket.Backend.Conformance.Cases do
                    end
                  end)
 
+        assert {:ok, ^graph} =
+                 graphs.fetch_graph(
+                   instance.context,
+                   :tenantless,
+                   graph.id,
+                   graph_hash
+                 )
+
         assert {:ok, ^run} = runs.fetch_run(instance.context, :tenantless, run.id)
         assert {:ok, ^event} = events.fetch_event(instance.context, :tenantless, run.id, 1)
 
-        {rollback_graph, rollback_hash} =
-          Fixture.publish_graph(instance, :tenantless, "bundle-rollback")
+        {rollback_graph, rollback_hash} = Fixture.graph(instance, "bundle-rollback")
 
         rollback_run =
           Fixture.run(
@@ -354,7 +408,15 @@ defmodule Docket.Backend.Conformance.Cases do
 
         assert {:error, :event_run_mismatch} =
                  backend.transaction(instance.context, fn tx ->
-                   with {:ok, _} <-
+                   with :ok <-
+                          graphs.save_graph(
+                            tx,
+                            :tenantless,
+                            rollback_graph.id,
+                            rollback_hash,
+                            rollback_graph
+                          ),
+                        {:ok, _} <-
                           runs.insert_run(
                             tx,
                             :tenantless,
@@ -369,7 +431,7 @@ defmodule Docket.Backend.Conformance.Cases do
                    end
                  end)
 
-        assert {:ok, ^rollback_graph} =
+        assert {:error, :not_found} =
                  graphs.fetch_graph(
                    instance.context,
                    :tenantless,
@@ -385,7 +447,7 @@ defmodule Docket.Backend.Conformance.Cases do
       end
 
       @tag docket_invariant: "TX-UNCOMMITTED-VISIBILITY"
-      test "[TX-UNCOMMITTED-VISIBILITY] run and events are never visible before owning transition commits",
+      test "[TX-UNCOMMITTED-VISIBILITY] completed root reads cannot expose a partial uncommitted transition",
            %{docket_backend_conformance: instance} do
         backend = instance.backend
         runs = backend.runs()
@@ -493,6 +555,14 @@ defmodule Docket.Backend.Conformance.Cases do
                  runs.fetch_run(instance.context, :system, tenantless_run.id)
 
         assert {:ok, ^tenant_run} = runs.fetch_run(instance.context, :system, tenant_run.id)
+
+        assert {:ok, ^tenant_run} = runs.fetch_run(instance.context, tenant_a, tenant_run.id)
+
+        assert {:ok, %Docket.RunInfo{run: ^tenant_run}} =
+                 runs.inspect_run(instance.context, tenant_a, tenant_run.id)
+
+        assert {:ok, ^tenant_event} =
+                 events.fetch_event(instance.context, tenant_a, tenant_run.id, 1)
 
         assert {:error, :not_found} =
                  runs.fetch_run(instance.context, tenant_a, tenantless_run.id)
@@ -943,8 +1013,16 @@ defmodule Docket.Backend.Conformance.Cases do
           max_claim_abandons: 1
         }
 
+        assert {:ok, before_stale_abandon} =
+                 runs.inspect_run(instance.context, :system, abandon_run.id)
+
         assert {:ok, :stale} =
                  runs.abandon_claim(instance.context, :system, abandon_run.id, "wrong", policy)
+
+        assert {:ok, after_stale_abandon} =
+                 runs.inspect_run(instance.context, :system, abandon_run.id)
+
+        assert after_stale_abandon == before_stale_abandon
 
         assert {:ok, :rescheduled} =
                  runs.abandon_claim(
@@ -954,6 +1032,17 @@ defmodule Docket.Backend.Conformance.Cases do
                    abandon_lease.claim_token,
                    policy
                  )
+
+        assert {:ok,
+                %Docket.RunInfo{
+                  run: ^abandon_run,
+                  wake_at: ^retry_at,
+                  claimed_at: nil,
+                  claim_attempts: 0,
+                  claim_abandons: 1,
+                  poisoned_at: nil,
+                  poison_reason: nil
+                }} = runs.inspect_run(instance.context, :system, abandon_run.id)
 
         next_lease = Fixture.claim(instance, now: retry_at)
         poisoned_at = DateTime.add(retry_at, 1, :second)
@@ -970,6 +1059,11 @@ defmodule Docket.Backend.Conformance.Cases do
         assert {:ok, poisoned_info} =
                  runs.inspect_run(instance.context, :system, abandon_run.id)
 
+        assert poisoned_info.run == abandon_run
+        assert poisoned_info.claimed_at == nil
+        assert poisoned_info.claim_attempts == 0
+        assert poisoned_info.claim_abandons == 1
+        assert poisoned_info.poisoned_at == poisoned_at
         assert poisoned_info.poison_reason == "max_claim_abandons_exceeded"
         assert poisoned_info.wake_at == nil
         recovered_at = DateTime.add(poisoned_at, 1, :second)
@@ -985,7 +1079,11 @@ defmodule Docket.Backend.Conformance.Cases do
         assert {:ok, recovered_info} =
                  runs.inspect_run(instance.context, :tenantless, abandon_run.id)
 
+        assert recovered_info.run == abandon_run
+        assert recovered_info.wake_at == recovered_at
+        assert recovered_info.claimed_at == nil
         assert recovered_info.poisoned_at == nil
+        assert recovered_info.poison_reason == nil
         assert recovered_info.claim_attempts == 0
         assert recovered_info.claim_abandons == 0
       end
@@ -1112,23 +1210,36 @@ defmodule Docket.Backend.Conformance.Cases do
           {:commit, next, :step_committed, {:release_claim, :immediate}, count}
         end
 
-        tasks =
-          for _ <- 1..2 do
-            Task.async(fn ->
-              send(parent, {:mutation_ready, self()})
-              receive do: (:mutation_go -> :ok)
-              runs.mutate_run(instance.context, :tenantless, stored.id, mutate)
+        first =
+          Task.async(fn ->
+            runs.mutate_run(instance.context, :tenantless, stored.id, fn current ->
+              send(parent, {:first_mutation_entered, self()})
+              receive do: (:release_first_mutation -> :ok)
+              mutate.(current)
             end)
-          end
+          end)
 
-        ready =
-          for _ <- 1..2 do
-            assert_receive {:mutation_ready, pid}, 5_000
-            pid
-          end
+        assert_receive {:first_mutation_entered, mutation_holder}, 5_000
 
-        Enum.each(ready, &send(&1, :mutation_go))
-        results = Enum.map(tasks, &Task.await(&1, 5_000))
+        second =
+          Task.async(fn ->
+            send(parent, :second_mutation_attempting)
+
+            runs.mutate_run(instance.context, :tenantless, stored.id, fn current ->
+              send(parent, :second_mutation_entered)
+              mutate.(current)
+            end)
+          end)
+
+        assert_receive :second_mutation_attempting, 5_000
+        second_result = Task.yield(second, 100)
+        refute_received :second_mutation_entered
+        send(mutation_holder, :release_first_mutation)
+
+        results = [
+          Task.await(first, 5_000),
+          Docket.Backend.Conformance.await_task(second, second_result)
+        ]
 
         assert Enum.sort(results) == [ok: {:committed, 1}, ok: {:committed, 2}]
 

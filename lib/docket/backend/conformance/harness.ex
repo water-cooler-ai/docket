@@ -10,6 +10,11 @@ defmodule Docket.Backend.Conformance.Harness do
   and migrations. `setup_case/2` must return a fresh namespace or isolated
   state for each test. Optional teardown callbacks run through ExUnit `on_exit`
   callbacks, including after a failed test.
+
+  The harness is part of the trusted test boundary. Keeping fixtures and
+  expected results in the profile prevents accidental coupling, but the suite
+  is not designed to certify a harness that selects fake backends or seeds
+  answers based on the ExUnit context.
   """
 
   alias Docket.Backend.Conformance.Instance

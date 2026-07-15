@@ -17,8 +17,10 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
 
   test "the backend owns the transaction boundary and focused stores" do
     callbacks = Docket.Backend.behaviour_info(:callbacks)
+    optional_callbacks = Docket.Backend.behaviour_info(:optional_callbacks)
 
     assert {:transaction, 2} in callbacks
+    assert {:context, 1} in optional_callbacks
     refute {:storage, 0} in callbacks
     refute Code.ensure_loaded?(Docket.Storage)
     refute Code.ensure_loaded?(Docket.Storage.Graphs)

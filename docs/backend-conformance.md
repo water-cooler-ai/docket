@@ -21,6 +21,11 @@ profile derives stores exclusively from `backend.graphs/0`, `backend.runs/0`,
 and `backend.events/0`, and it owns every graph, run, event, scope, claim
 policy, and expected result.
 
+The harness is inside the trusted test boundary. This separation prevents
+accidental coupling between backend setup and expected values; it is not a
+tamper-resistant certification against a harness that selects fake backends or
+manufactures answers from ExUnit context.
+
 A minimal process-backed harness looks like this:
 
 ```elixir
@@ -70,7 +75,8 @@ Each failure includes a stable invariant ID. The profile checks:
   callbacks, with `context/1` treated explicitly as optional;
 - transaction commit, error rollback, exception/throw propagation, invalid
   return handling, nested participation, rollback-only propagation, concurrent
-  publication, and pre-commit visibility;
+  publication, and the rule that a completed pre-commit root read cannot expose
+  a partial or uncommitted run/event transition (blocking reads are allowed);
 - graph/run/event compatibility and atomicity through one yielded context;
 - explicit graph ownership and run/event tenant scope isolation;
 - graph content addressing, idempotence, latest/version reads, and owner
