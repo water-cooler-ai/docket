@@ -595,6 +595,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "configuration is explicit and fails before partial backend operation" do
+      opts = [name: __MODULE__.ExplicitContext, repo: TestRepo]
+      context = Docket.Postgres.context(opts)
+
+      assert %{start: {Docket.Postgres, :start_link, [^opts, ^context]}} =
+               Docket.Postgres.child_spec(opts, context)
+
+      assert_raise ArgumentError, ~r/requires a resolved backend context/, fn ->
+        Docket.Postgres.child_spec(opts)
+      end
+
       assert_raise KeyError, fn ->
         Docket.Postgres.context([])
       end
@@ -604,15 +614,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       assert_raise ArgumentError, ~r/:pruner must be a keyword list/, fn ->
-        Docket.Postgres.init(name: __MODULE__.MissingPruner, repo: TestRepo)
+        postgres_init(name: __MODULE__.MissingPruner, repo: TestRepo)
       end
 
       assert_raise ArgumentError, ~r/:pruner requires/, fn ->
-        Docket.Postgres.init(name: __MODULE__.PartialPruner, repo: TestRepo, pruner: [])
+        postgres_init(name: __MODULE__.PartialPruner, repo: TestRepo, pruner: [])
       end
 
       assert_raise ArgumentError, ~r/:notifier must be :none or a keyword list/, fn ->
-        Docket.Postgres.init(
+        postgres_init(
           name: __MODULE__.BadNotifier,
           repo: TestRepo,
           notifier: false,
@@ -621,13 +631,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       assert_raise ArgumentError, ~r/:dispatcher has unknown keys/, fn ->
-        Docket.Postgres.init(
+        postgres_init(
           name: __MODULE__.MixedStore,
           repo: TestRepo,
           dispatcher: [run_store: SomeOtherStore],
           pruner: @pruner
         )
       end
+    end
+
+    defp postgres_init(opts) do
+      Docket.Postgres.init({opts, Docket.Postgres.context(opts)})
     end
 
     test "storage remains exactly the current three-table schema" do

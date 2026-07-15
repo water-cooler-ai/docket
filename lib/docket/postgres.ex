@@ -116,23 +116,35 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @impl Docket.Backend
-    def child_spec(opts) do
+    def child_spec(opts, context) do
       name = Keyword.fetch!(opts, :name)
 
       %{
         id: name,
-        start: {__MODULE__, :start_link, [opts]},
+        start: {__MODULE__, :start_link, [opts, context]},
         type: :supervisor
       }
     end
 
-    @spec start_link(keyword()) :: Supervisor.on_start()
-    def start_link(opts) do
-      Supervisor.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
+    @doc false
+    def child_spec(_opts) do
+      raise ArgumentError,
+            "Docket.Postgres requires a resolved backend context; " <>
+              "start it through Docket.Runtime.Supervisor"
+    end
+
+    @doc false
+    @spec start_link(keyword(), Docket.Backend.ctx()) :: Supervisor.on_start()
+    def start_link(opts, context) do
+      Supervisor.start_link(__MODULE__, {opts, context}, name: Keyword.fetch!(opts, :name))
     end
 
     @impl true
-    def init(opts) do
+    def init({opts, context}) when is_list(opts) do
+      init_with_context(opts, context)
+    end
+
+    defp init_with_context(opts, context) do
       name = Keyword.fetch!(opts, :name)
       validate_tenant_mode!(opts)
       validate_testing!(opts)
@@ -141,7 +153,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       validate_nested!(Keyword.get(opts, :vehicle, []), :vehicle)
       dispatcher = Keyword.merge(@default_dispatcher, Keyword.get(opts, :dispatcher, []))
       validate_dispatcher!(dispatcher)
-      context = Keyword.get_lazy(opts, :backend_context, fn -> context(opts) end)
       _resolved_claim_policy = ClaimPolicy.resolve(context)
       vehicle = effective_vehicle(opts, Keyword.get(opts, :vehicle, []))
       validate_vehicle!(opts, Keyword.get(opts, :vehicle, []))

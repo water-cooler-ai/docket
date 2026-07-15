@@ -39,7 +39,7 @@ defmodule Docket.Test.MemoryBackend do
   def context(opts), do: Keyword.fetch!(opts, :name)
 
   @impl Docket.Backend
-  def child_spec(opts) do
+  def child_spec(opts, _context) do
     %{
       id: Keyword.get(opts, :id, __MODULE__),
       start: {__MODULE__, :start_link, [opts]},

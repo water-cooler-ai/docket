@@ -131,8 +131,10 @@ defmodule Docket.MemoryBackendTest do
     assert MemoryBackend.runs() == MemoryBackend
     assert MemoryBackend.events() == MemoryBackend
 
-    assert %{start: {MemoryBackend, :start_link, [_opts]}} =
-             MemoryBackend.child_spec(name: {:global, {:memory_backend, backend}})
+    opts = [name: {:global, {:memory_backend, backend}}]
+
+    assert %{start: {MemoryBackend, :start_link, [^opts]}} =
+             MemoryBackend.child_spec(opts, backend)
   end
 
   test "initialization composes graph, run, schedule, and assigned events", %{backend: b} do

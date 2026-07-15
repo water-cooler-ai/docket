@@ -444,7 +444,8 @@ defmodule Docket.Runtime.MomentTest do
     defp schedule_for({:park, :terminal, _reason}), do: {:release_claim, :terminal}
 
     defp start_backend do
-      backend = start_supervised!({MemoryBackend, clock: fn -> @now end})
+      opts = [clock: fn -> @now end]
+      backend = start_supervised!(MemoryBackend.child_spec(opts, nil))
       backend
     end
 

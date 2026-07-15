@@ -8,9 +8,11 @@ defmodule Docket.Backend do
   modules remain focused and independently testable, but callers must not
   assemble capabilities from unrelated backends.
 
-  The backend also owns its supervision entry point. `child_spec/1` receives
-  the backend options selected by the host application and returns the single
-  child specification the host places in its supervision tree.
+  The backend also owns its supervision entry point. `child_spec/2` receives
+  the backend options selected by the host application and the already-resolved
+  opaque context as separate arguments. It returns the single child
+  specification the host places in its supervision tree. Keeping the context
+  separate prevents core from injecting private keys into backend-owned options.
   """
 
   @typedoc "A module implementing one of Docket's focused store contracts."
@@ -65,20 +67,9 @@ defmodule Docket.Backend do
   @doc "Returns the backend's `Docket.Backend.EventStore` implementation."
   @callback events() :: capability()
 
-  @doc "Builds the backend's supervision child specification."
-  @callback child_spec(opts :: keyword()) :: Supervisor.child_spec()
+  @doc "Builds the backend's supervision child specification from options and its resolved context."
+  @callback child_spec(opts :: keyword(), ctx()) :: Supervisor.child_spec()
 
   @doc "Resolves the opaque root context passed to the backend transaction boundary."
   @callback context(opts :: keyword()) :: ctx()
-
-  @optional_callbacks context: 1
-
-  @doc false
-  def resolve_context(backend, opts) when is_atom(backend) and is_list(opts) do
-    if function_exported?(backend, :context, 1) do
-      backend.context(opts)
-    else
-      Keyword.fetch!(opts, :name)
-    end
-  end
 end
