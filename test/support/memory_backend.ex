@@ -39,12 +39,20 @@ defmodule Docket.Test.MemoryBackend do
   def context(opts), do: Keyword.fetch!(opts, :name)
 
   @impl Docket.Backend
-  def child_spec(opts) do
+  def child_spec(opts, _context) do
     %{
       id: Keyword.get(opts, :id, __MODULE__),
       start: {__MODULE__, :start_link, [opts]},
       type: :worker
     }
+  end
+
+  @impl Docket.Backend
+  def drain_runs(context, opts) do
+    if pid = opts[:drain_probe], do: send(pid, {:memory_backend_drain, context, opts})
+
+    {:error,
+     Docket.Error.new(:unsupported_operation, "configured backend does not support drain_runs")}
   end
 
   def start_link(opts \\ []) do

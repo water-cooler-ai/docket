@@ -14,7 +14,8 @@ defmodule Docket.Runtime.Supervisor do
 
   `:name` is required and becomes the runtime identity passed to
   durable facade functions. All other options are stored as the instance's
-  default run options and merged under per-call options. A configured
+  instance configuration. Execution policy is resolved once at startup and
+  cannot be replaced by per-call options. A configured
   `backend: BackendModule` contributes its own supervised child and is the
   only public durable backend substitution point; individual stores cannot be mixed.
 
@@ -55,6 +56,7 @@ defmodule Docket.Runtime.Supervisor do
 
   defp backend_children(name, defaults) do
     reject_component_configuration!(defaults)
+    Docket.Runtime.Config.validate_instance!(defaults)
 
     case Keyword.get(defaults, :backend) do
       nil ->
@@ -64,8 +66,10 @@ defmodule Docket.Runtime.Supervisor do
       backend when is_atom(backend) ->
         validate_backend!(backend)
         backend_opts = Keyword.put(defaults, :name, Module.concat(name, Backend))
-        context = Docket.Backend.resolve_context(backend, backend_opts)
-        {[backend.child_spec(backend_opts)], Keyword.put(defaults, :backend_context, context)}
+        context = backend.context(backend_opts)
+
+        {[backend.child_spec(backend_opts, context)],
+         Keyword.put(defaults, :backend_context, context)}
 
       other ->
         raise ArgumentError, ":backend must be one Docket.Backend module, got: #{inspect(other)}"
@@ -73,6 +77,11 @@ defmodule Docket.Runtime.Supervisor do
   end
 
   defp reject_component_configuration!(defaults) do
+    if Keyword.has_key?(defaults, :backend_context) do
+      raise ArgumentError,
+            ":backend_context is resolved internally and cannot be configured on a runtime"
+    end
+
     if Keyword.has_key?(defaults, :checkpoint) do
       raise ArgumentError,
             "production :checkpoint configuration was removed; use :checkpoint_observers " <>
@@ -95,7 +104,15 @@ defmodule Docket.Runtime.Supervisor do
       raise ArgumentError, ":backend module #{inspect(backend)} could not be loaded"
 
     missing =
-      for {name, arity} <- [transaction: 2, graphs: 0, runs: 0, events: 0, child_spec: 1],
+      for {name, arity} <- [
+            transaction: 2,
+            graphs: 0,
+            runs: 0,
+            events: 0,
+            context: 1,
+            child_spec: 2,
+            drain_runs: 2
+          ],
           not function_exported?(backend, name, arity),
           do: "#{name}/#{arity}"
 

@@ -8,6 +8,77 @@ defmodule Docket.Runtime.SupervisorConfigTest do
   defmodule IncompleteBackend do
   end
 
+  defmodule MissingContextBackend do
+    def transaction(context, fun), do: fun.(context)
+    def graphs, do: Docket.Test.MemoryBackend
+    def runs, do: Docket.Test.MemoryBackend
+    def events, do: Docket.Test.MemoryBackend
+
+    def drain_runs(_context, _opts), do: {:error, :unsupported}
+
+    def child_spec(_opts, _context),
+      do: %{id: __MODULE__, start: {Task, :start_link, [fn -> :ok end]}}
+  end
+
+  defmodule MissingChildSpecBackend do
+    def transaction(context, fun), do: fun.(context)
+    def graphs, do: Docket.Test.MemoryBackend
+    def runs, do: Docket.Test.MemoryBackend
+    def events, do: Docket.Test.MemoryBackend
+    def context(opts), do: Keyword.fetch!(opts, :name)
+    def drain_runs(_context, _opts), do: {:error, :unsupported}
+  end
+
+  defmodule StrictBackend do
+    @behaviour Docket.Backend
+
+    @allowed_options [:backend, :custom, :name, :test_pid]
+
+    @impl true
+    def transaction(context, fun), do: fun.(context)
+
+    @impl true
+    def graphs, do: Docket.Test.MemoryBackend
+
+    @impl true
+    def runs, do: Docket.Test.MemoryBackend
+
+    @impl true
+    def events, do: Docket.Test.MemoryBackend
+
+    @impl true
+    def drain_runs(_context, _opts), do: {:error, :unsupported}
+
+    @impl true
+    def context(opts) do
+      validate_options!(opts)
+      context = {:strict, Keyword.fetch!(opts, :name), make_ref()}
+
+      if test_pid = opts[:test_pid], do: send(test_pid, {:strict_context_resolved, context})
+      context
+    end
+
+    @impl true
+    def child_spec(opts, context) do
+      validate_options!(opts)
+      if test_pid = opts[:test_pid], do: send(test_pid, {:strict_child_context, context})
+
+      %{
+        id: __MODULE__,
+        start: {__MODULE__, :start_link, [opts, context]}
+      }
+    end
+
+    def start_link(_opts, _context), do: Task.start_link(fn -> Process.sleep(:infinity) end)
+
+    defp validate_options!(opts) do
+      case Keyword.keys(opts) -- @allowed_options do
+        [] -> :ok
+        unknown -> raise ArgumentError, "unknown backend options: #{inspect(unknown)}"
+      end
+    end
+  end
+
   test "one backend bundle contributes its child and resolved context" do
     assert {:ok, {_flags, children}} =
              Docket.Runtime.Supervisor.init({@runtime, backend: MemoryBackend})
@@ -16,12 +87,43 @@ defmodule Docket.Runtime.SupervisorConfigTest do
              Enum.find(children, &(&1.id == MemoryBackend))
 
     assert Keyword.fetch!(backend_opts, :name) == Module.concat(@runtime, Backend)
+    refute Keyword.has_key?(backend_opts, :backend_context)
 
     assert %{start: {Docket.Runtime.Instance, :start_link, [{@runtime, defaults}]}} =
              Enum.find(children, &(&1.id == Docket.Runtime.Instance))
 
     assert Keyword.fetch!(defaults, :backend) == MemoryBackend
     assert Keyword.fetch!(defaults, :backend_context) == Module.concat(@runtime, Backend)
+  end
+
+  test "resolved context is separate from strict backend-owned options" do
+    assert {:ok, {_flags, children}} =
+             Docket.Runtime.Supervisor.init(
+               {@runtime, backend: StrictBackend, custom: :accepted, test_pid: self()}
+             )
+
+    assert %{start: {StrictBackend, :start_link, [backend_opts, context]}} =
+             Enum.find(children, &(&1.id == StrictBackend))
+
+    assert Keyword.keys(backend_opts) |> Enum.sort() == [:backend, :custom, :name, :test_pid]
+    assert {:strict, runtime_backend, _identity} = context
+    assert runtime_backend == Module.concat(@runtime, Backend)
+    assert_receive {:strict_context_resolved, ^context}
+    assert_receive {:strict_child_context, ^context}
+    refute_receive {:strict_context_resolved, _other_context}
+
+    assert %{start: {Docket.Runtime.Instance, :start_link, [{@runtime, defaults}]}} =
+             Enum.find(children, &(&1.id == Docket.Runtime.Instance))
+
+    assert Keyword.fetch!(defaults, :backend_context) === context
+  end
+
+  test "runtime configuration cannot spoof the internally resolved backend context" do
+    assert_raise ArgumentError, ~r/:backend_context is resolved internally/, fn ->
+      Docket.Runtime.Supervisor.init(
+        {@runtime, backend: StrictBackend, backend_context: :spoofed}
+      )
+    end
   end
 
   test "a production instance requires a backend" do
@@ -61,6 +163,14 @@ defmodule Docket.Runtime.SupervisorConfigTest do
 
     assert_raise ArgumentError, ~r/does not implement Docket.Backend.*transaction\/2/, fn ->
       Docket.Runtime.Supervisor.init({@runtime, backend: IncompleteBackend})
+    end
+
+    assert_raise ArgumentError, ~r/does not implement Docket.Backend.*context\/1/, fn ->
+      Docket.Runtime.Supervisor.init({@runtime, backend: MissingContextBackend})
+    end
+
+    assert_raise ArgumentError, ~r/does not implement Docket.Backend.*child_spec\/2/, fn ->
+      Docket.Runtime.Supervisor.init({@runtime, backend: MissingChildSpecBackend})
     end
   end
 

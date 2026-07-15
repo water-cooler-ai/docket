@@ -162,40 +162,28 @@ Loop functions take a runtime graph plus a `Docket.Run` and return an updated
 `Docket.Run` plus any internal effects the caller must perform or observe.
 
 ```elixir
-Docket.Runtime.Loop.init(runtime_graph, run, opts)
-Docket.Runtime.Loop.plan(runtime_graph, run, opts)
-Docket.Runtime.Loop.apply_results(runtime_graph, run, task_results, opts)
-Docket.Runtime.Loop.resolve_interrupt(runtime_graph, run, interrupt_id, value, opts)
+Docket.Runtime.Loop.propose_init(runtime_graph, run, opts)
+Docket.Runtime.Loop.propose_advance(runtime_graph, run, opts)
+Docket.Runtime.RunMutation.resolve_interrupt(runtime_graph, run, interrupt_id, value, now)
 ```
 
-`Loop.init/3` is the single loop entrypoint for a live run. It receives a
-public `Docket.Run` document and derives what to do from that run document. A
-normal `Docket.run/4` call builds a fresh `Docket.Run` from the graph input
-first; `Docket.resume/4` passes the durable run document loaded by the host. A
-fresh run means the loop initializes channels, tasks, frontier, and timestamps.
-A saved run means the loop continues from the recorded graph execution status.
+Every accepted transition has one representation: a pre-commit
+`Docket.Runtime.Moment`. Durable drivers persist the moment before exposing its
+checkpoint; `Docket.Test` accepts the same moment directly. Initialization,
+advancement, and signals do not return an older `{run, effects}` shape.
 
 Expected return shapes:
 
 ```elixir
-{:ok, Docket.Run.t()}
-| {:ok, Docket.Run.t(), term()}
+{:ok, Docket.Runtime.Moment.t()}
+| {:terminal, Docket.Run.t()}
+| {:wait, Docket.Run.t(), [String.t()]}
+| {:park, Docket.Run.t(), map()}
 | {:error, Docket.Error.t()}
 ```
 
-The extra return value is internal and should be limited to concrete values the
-Runtime already needs, such as selected activations or async checkpoint refs to
-observe or drain. The loop does not expose staged transitions as an API.
-
-When a transition requires a checkpoint, `Docket.Runtime.Loop` builds the
-checkpoint and calls the configured `Docket.Checkpoint` callback from runtime
-configuration such as `use Docket, checkpoint: MyApp.DocketCheckpoint`. For
-`:sync` checkpoints, the loop calls the callback before installing the
-transition. If the sync checkpoint fails, the caller keeps the previous
-`Docket.Run` and receives a typed checkpoint error. For `:async` checkpoints,
-the loop returns the committed run and invokes the configured checkpoint
-callback asynchronously. Async checkpoint failure is observable but does not
-roll back the active in-memory run.
+The loop calculates but never commits a moment, calls observers, or emits
+telemetry. The driver owns acceptance and after-commit delivery.
 
 `Docket.Runtime.Algorithm` holds deterministic helper functions. It has no
 mailbox, no checkpoint side effects, and no direct executor calls.
@@ -334,11 +322,10 @@ Known sequence:
 2. Docket verifies/compiles the supplied Docket.Graph.
 3. Docket builds a fresh Docket.Run document from the input.
 4. Docket starts or locates the Runtime with that run document.
-5. Runtime calls Docket.Runtime.Loop.init(runtime_graph, run, opts).
-6. Loop sees a fresh run, initializes it, and emits a required
-   :run_initialized checkpoint through the configured checkpoint callback.
-7. The checkpoint handler upserts the host run record by run ID.
-8. Only after the checkpoint handler returns :ok may node execution begin.
+5. The driver calls `Docket.Runtime.Loop.propose_init/3`.
+6. The loop returns one `:run_initialized` moment.
+7. The driver commits the run and events atomically.
+8. Only after commit may node execution begin.
 ```
 
 No node execution, event publication, interrupt, timer, or later step checkpoint
@@ -352,12 +339,11 @@ Resolved v1 contract:
 - `Docket.run/4` starts a Runtime in a `:starting` state.
 - `Docket.run/4` creates the initial `Docket.Run`, then uses the same Runtime
   launch path as resume.
-- `Loop.init/3` decides from the supplied `Docket.Run` whether it is
+- `Loop.propose_init/3` decides from the supplied `Docket.Run` whether it is
   initializing a fresh run or continuing a saved run. There is no explicit
   fresh/resumed mode.
-- `Loop.init/3` produces an initialized public run document and synchronously
-  emits the required `:run_initialized` checkpoint before any execution it is
-  going to schedule.
+- `Loop.propose_init/3` produces the required `:run_initialized` moment before
+  any execution can be scheduled.
 - After the checkpoint handler returns `:ok`, the Runtime transitions to
   an active process state, schedules the first execution tick if graph execution
   can proceed, and `Docket.run/4` returns `{:ok, run}`.
@@ -399,7 +385,7 @@ Known contract:
 - `Docket.resume/4` materializes `Docket.Runtime.Graph`.
 - `Docket.resume/4` uses the same Runtime launch path as `run/4`, passing the
   durable run document instead of building a new one from input.
-- The Runtime calls `Docket.Runtime.Loop.init/3`; the loop sees a saved
+- The driver calls `Docket.Runtime.Loop.propose_init/3`; the loop sees a saved
   `Docket.Run` and continues from it.
 - Active runs stay on their original graph content hash.
 
@@ -413,7 +399,7 @@ Resolved v1 contract:
   should return/fold that into
   `{:error, %Docket.Error{type: :graph_unavailable}}`.
 - `resume/4` skips only the input-to-run prelude: it does not create a new
-  `Docket.Run`, but it still passes through the same `Loop.init/3` durable
+  `Docket.Run`, but it still passes through the same `Loop.propose_init/3` durable
   barrier. The checkpoint handler upserts the run by ID, updating an existing
   host row if one exists.
 - v1 does not support queue/remote active-task reconciliation. Local/task
@@ -422,7 +408,7 @@ Resolved v1 contract:
 - Resume must not treat Runtime process startup as graph progress. It should
   preserve graph execution status unless the loop's scheduling rules actually
   advance, wait, complete, fail, or cancel the run.
-- If a supplied run is already terminal, `Loop.init/3` should return the
+- If a supplied run is already terminal, `Loop.propose_init/3` should return the
   terminal public snapshot or a typed inactive-run error according to the public
   API contract, but it must not restart graph execution.
 
@@ -550,7 +536,7 @@ Docket.run
   compile graph
   build initial Docket.Run
   start or locate Runtime with run
-  Loop.init(runtime_graph, run, opts)
+  Loop.propose_init(runtime_graph, run, opts)
   Loop initializes blank state
   emit :run_initialized checkpoint
   return {:ok, run}
@@ -722,7 +708,6 @@ treats it as a permanent node failure.
 Design-space executor families:
 
 - `Docket.Executor.Local`
-- `Docket.Executor.Task`
 - `Docket.Executor.Queue`
 - `Docket.Executor.Remote`
 
@@ -740,11 +725,9 @@ Known effect rule:
 
 Resolved v1 contract:
 
-- First implementation supports `Docket.Executor.Local` and
-  `Docket.Executor.Task`.
-- `Docket.Executor.Task` may use supervised tasks internally, but the superstep
-  contract remains barrier-synchronous: the runtime collects all selected results
-  before update.
+- First implementation supports `Docket.Executor.Local`. The superstep contract
+  remains barrier-synchronous: the runtime collects all selected results before
+  update.
 - Queue, remote, replay-only, and late-completion protocols are post-v1.
 - Timeouts become node attempt failures. Retry policy decides whether to
   dispatch another attempt or mark the failure permanent.

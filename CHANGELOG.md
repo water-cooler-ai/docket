@@ -293,6 +293,11 @@ entries below reflect what has landed so far.
 
 ### Changed
 
+- PostgreSQL wall-clock injection is now a testing-only, top-level,
+  instance-owned option shared by facade operations, synchronous claims, and
+  vehicles; nested and per-call overrides are rejected or ignored. Runtime
+  clocks validate `DateTime` results, and the ClaimPolicy boundary normalizes
+  `now` to UTC microsecond precision before every implementation receives it.
 - The main README now leads with a complete Docket.Postgres quickstart covering
   dependencies, migration, supervision, retention, publication, and durable
   execution. Release documentation consistently describes the backend-owned

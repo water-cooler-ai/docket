@@ -314,6 +314,14 @@ production `Docket.Lifecycle`/storage transaction per logical moment; neither
 wraps node execution or a whole drain in a Docket transaction. An SQL Sandbox
 owner transaction may still surround the test itself.
 
+Tests that need deterministic durable timestamps may configure one top-level
+zero-arity `clock:` function alongside either testing mode. That clock belongs
+to the runtime instance: facade calls, synchronous claims, and vehicles share
+it, and per-call or nested dispatcher/vehicle/pruner clock overrides are not
+accepted. Claim inputs are normalized to UTC microsecond precision before the
+selected policy receives them. Production instances always use the
+system/database clock.
+
 The intended cutover is:
 
 1. Drain or terminate active `0.0.1` runs and stop old writers.

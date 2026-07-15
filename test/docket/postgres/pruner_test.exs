@@ -291,6 +291,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           Pruner.prune(TestRepo, policy(batch_size: invalid))
         end
       end
+
+      assert_raise ArgumentError, ~r/pruner clock must return a DateTime or :database/, fn ->
+        Pruner.init(
+          context: TestRepo,
+          interval_ms: 1_000,
+          event_retention_ms: 1_000,
+          run_retention_ms: 2_000,
+          batch_size: 10,
+          clock: fn -> :invalid end
+        )
+      end
     end
 
     defp policy(overrides \\ []) do

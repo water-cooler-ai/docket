@@ -44,8 +44,14 @@ defmodule Docket.Runtime.CheckpointOrderTest do
 
       opts = []
 
-      {:execute, _run, first} = Docket.Runtime.Loop.plan(runtime_graph, run, opts)
-      {:execute, _run, second} = Docket.Runtime.Loop.plan(runtime_graph, run, opts)
+      config = Docket.Runtime.Config.resolve(opts)
+      {:execute, node_ids} = Docket.Runtime.Algorithm.plan(runtime_graph, run, config)
+
+      {:ok, first} =
+        Docket.Runtime.Algorithm.prepare_activations(runtime_graph, run, node_ids, config)
+
+      {:ok, second} =
+        Docket.Runtime.Algorithm.prepare_activations(runtime_graph, run, node_ids, config)
 
       assert Enum.map(first, & &1.task_id) == Enum.map(second, & &1.task_id)
       assert Enum.map(first, & &1.idempotency_key) == Enum.map(second, & &1.idempotency_key)

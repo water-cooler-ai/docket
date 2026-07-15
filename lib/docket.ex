@@ -16,8 +16,8 @@ defmodule Docket do
 
   Hosts save graph versions explicitly and use `start_run`, storage-backed
   reads, named signals, and `await_run`. Options given to the instance at
-  startup act as defaults; per-call options win except for the instance-owned
-  `:backend` and `:tenant_mode` boundaries. Public durable calls resolve only
+  startup own backend and execution policy. Per-call options carry only
+  operation data and cannot replace instance configuration. Public durable calls resolve only
   `:tenantless` or an explicit `{:tenant, id}`; `:system` is reserved for
   internal dispatch/recovery.
 
@@ -35,8 +35,38 @@ defmodule Docket do
   """
 
   alias Docket.{Error, Graph, GraphRef, Lifecycle, Run, RunInfo}
-  alias Docket.Runtime.{Instance, Loop}
+  alias Docket.Runtime.{Clock, Instance, Loop}
   alias Docket.Runtime.RunMutation
+
+  @instance_owned_options [
+    :backend,
+    :backend_context,
+    :tenant_mode,
+    :testing,
+    :repo,
+    :prefix,
+    :claim_policy,
+    :dispatcher,
+    :notifier,
+    :pruner,
+    :vehicle,
+    :executor,
+    :executor_opts,
+    :clock,
+    :sleeper,
+    :id_generator,
+    :monotonic_clock,
+    :drain_budget,
+    :jitter,
+    :abandon_backoff_ms,
+    :abandon_backoff_cap_ms,
+    :max_claim_abandons,
+    :max_attempt_elapsed_ms,
+    :max_supersteps,
+    :context,
+    :checkpoint_observers,
+    :task_supervisor
+  ]
 
   @doc """
   Child spec integration point: `{Docket, name: MyRuntime, backend: ...}`
@@ -59,7 +89,7 @@ defmodule Docket do
   def save_graph(runtime, graph, opts \\ [])
 
   def save_graph(runtime, %Graph{} = graph, opts) do
-    with {:ok, opts} <- instance_opts(runtime, opts),
+    with {:ok, opts} <- instance_opts(runtime, :save_graph, opts),
          {:ok, {backend, context}, scope} <- durable_access(opts),
          {:ok, effective, rtg} <- compile_for_publication(graph),
          :ok <-
@@ -93,7 +123,7 @@ defmodule Docket do
       when is_binary(graph_id) and byte_size(graph_id) > 0 and is_binary(graph_hash) and
              byte_size(graph_hash) > 0 do
     with :ok <- validate_keyword_options(opts, :fetch_graph),
-         {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, opts} <- instance_opts(runtime, :fetch_graph, opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
       backend.graphs().fetch_graph(context, scope, graph_id, graph_hash)
     end
@@ -122,7 +152,7 @@ defmodule Docket do
       when is_binary(graph_id) and byte_size(graph_id) > 0 do
     with :ok <- validate_keyword_options(opts, :fetch_latest_graph_ref),
          :ok <- validate_latest_graph_options(opts),
-         {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, opts} <- instance_opts(runtime, :fetch_latest_graph_ref, opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
       backend.graphs().fetch_latest_graph_ref(context, scope, graph_id)
     end
@@ -150,7 +180,7 @@ defmodule Docket do
   def list_graph_versions(runtime, graph_id, opts)
       when is_binary(graph_id) and byte_size(graph_id) > 0 do
     with :ok <- validate_keyword_options(opts, :list_graph_versions),
-         {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, opts} <- instance_opts(runtime, :list_graph_versions, opts),
          {:ok, query} <- list_graph_versions_options(opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
       backend.graphs().list_graph_versions(context, scope, graph_id, query)
@@ -198,7 +228,7 @@ defmodule Docket do
       when is_binary(graph_id) and byte_size(graph_id) > 0 and is_binary(graph_hash) and
              byte_size(graph_hash) > 0 do
     with :ok <- validate_keyword_options(opts, :start_run),
-         {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, opts} <- instance_opts(runtime, :start_run, opts),
          {:ok, {backend, context} = backend_ref, scope} <- durable_access(opts),
          {:ok, graph} <-
            backend.graphs().fetch_graph(
@@ -213,7 +243,7 @@ defmodule Docket do
          {:ok, moment} <- Loop.propose_init(rtg, run, opts),
          {:ok, moment} <- Lifecycle.start(backend_ref, scope, moment) do
       :ok = Lifecycle.after_commit(moment, opts)
-      maybe_inline_drain(backend, opts, scope, moment.run)
+      maybe_inline_drain(backend_ref, opts, scope, moment.run)
     end
   end
 
@@ -235,14 +265,14 @@ defmodule Docket do
   Authorization remains host-owned.
   """
   def resolve_interrupt(runtime, run_id, interrupt_id, value, opts \\ []) do
-    with {:ok, resolved} <- instance_opts(runtime, opts) do
+    with {:ok, resolved} <- instance_opts(runtime, :resolve_interrupt, opts) do
       durable_resolve_interrupt(resolved, run_id, interrupt_id, value)
     end
   end
 
   @doc "Cancels a durable active run and confirms the committed terminal state."
   def cancel_run(runtime, run_id, opts \\ []) do
-    with {:ok, opts} <- instance_opts(runtime, opts),
+    with {:ok, opts} <- instance_opts(runtime, :cancel_run, opts),
          {:ok, backend, scope} <- durable_access(opts),
          now = operation_now(opts),
          result <-
@@ -255,10 +285,10 @@ defmodule Docket do
 
   @doc "Clears a non-terminal run's poison state and schedules it immediately."
   def retry_poisoned_run(runtime, run_id, opts \\ []) do
-    with {:ok, opts} <- instance_opts(runtime, opts),
-         {:ok, {backend, context}, scope} <- durable_access(opts) do
+    with {:ok, opts} <- instance_opts(runtime, :retry_poisoned_run, opts),
+         {:ok, {backend, context} = backend_ref, scope} <- durable_access(opts) do
       case backend.runs().retry_poisoned_run(context, scope, run_id, operation_now(opts)) do
-        {:ok, run} -> maybe_inline_drain(backend, opts, scope, run)
+        {:ok, run} -> maybe_inline_drain(backend_ref, opts, scope, run)
         other -> other
       end
     end
@@ -266,20 +296,15 @@ defmodule Docket do
 
   @doc "Synchronously claims and drains due durable runs in a backend testing mode."
   def drain_runs(runtime, opts \\ []) do
-    with {:ok, opts} <- instance_opts(runtime, opts),
-         {:ok, {backend, _context}, _scope} <- durable_access(opts) do
-      if function_exported?(backend, :drain_runs, 1) do
-        backend.drain_runs(opts)
-      else
-        {:error,
-         Error.new(:unsupported_operation, "configured backend does not support drain_runs")}
-      end
+    with {:ok, opts} <- instance_opts(runtime, :drain_runs, opts),
+         {:ok, {backend, context}} <- configured_backend(opts) do
+      backend.drain_runs(context, Keyword.delete(opts, :backend_context))
     end
   end
 
   @doc "Reads the last committed durable `Docket.Run`."
   def fetch_run(runtime, run_id, opts \\ []) do
-    with {:ok, opts} <- instance_opts(runtime, opts),
+    with {:ok, opts} <- instance_opts(runtime, :fetch_run, opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
       backend.runs().fetch_run(context, scope, run_id)
     end
@@ -287,7 +312,7 @@ defmodule Docket do
 
   @doc "Reads a durable run plus token-free operational state."
   def inspect_run(runtime, run_id, opts \\ []) do
-    with {:ok, opts} <- instance_opts(runtime, opts),
+    with {:ok, opts} <- instance_opts(runtime, :inspect_run, opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
       backend.runs().inspect_run(context, scope, run_id)
     end
@@ -309,7 +334,7 @@ defmodule Docket do
   @spec list_runs(term(), keyword()) :: {:ok, Docket.RunPage.t()} | {:error, term()}
   def list_runs(runtime, opts \\ []) do
     with :ok <- validate_keyword_options(opts, :list_runs),
-         {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, opts} <- instance_opts(runtime, :list_runs, opts),
          {:ok, query} <- list_runs_options(opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
       backend.runs().list_runs(context, scope, query)
@@ -327,7 +352,7 @@ defmodule Docket do
   def fetch_latest_run(runtime, opts \\ []) do
     with :ok <- validate_keyword_options(opts, :fetch_latest_run),
          :ok <- validate_latest_run_options(opts),
-         {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, opts} <- instance_opts(runtime, :fetch_latest_run, opts),
          query_opts = opts |> Keyword.delete(:before) |> Keyword.put(:limit, 1),
          {:ok, query} <- list_runs_options(query_opts),
          {:ok, {backend, context}, scope} <- durable_access(opts),
@@ -349,7 +374,7 @@ defmodule Docket do
           {:ok, Docket.Event.t()} | {:error, term()}
   def fetch_event(runtime, run_id, seq, opts \\ []) do
     with :ok <- validate_event_seq(seq),
-         {:ok, opts} <- instance_opts(runtime, opts),
+         {:ok, opts} <- instance_opts(runtime, :fetch_event, opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
       backend.events().fetch_event(context, scope, run_id, seq)
     end
@@ -365,7 +390,7 @@ defmodule Docket do
   @spec fetch_latest_event(term(), String.t(), keyword()) ::
           {:ok, Docket.Event.t() | nil} | {:error, term()}
   def fetch_latest_event(runtime, run_id, opts \\ []) do
-    with {:ok, opts} <- instance_opts(runtime, opts),
+    with {:ok, opts} <- instance_opts(runtime, :fetch_latest_event, opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
       backend.events().fetch_latest_event(context, scope, run_id)
     end
@@ -389,7 +414,7 @@ defmodule Docket do
       page.events
   """
   def list_events(runtime, run_id, opts \\ []) do
-    with {:ok, opts} <- instance_opts(runtime, opts),
+    with {:ok, opts} <- instance_opts(runtime, :list_events, opts),
          {:ok, page_opts} <- list_events_options(opts),
          {:ok, {backend, context}, scope} <- durable_access(opts) do
       backend.events().list_events(context, scope, run_id, page_opts)
@@ -403,7 +428,7 @@ defmodule Docket do
   defaults to 50 milliseconds.
   """
   def await_run(runtime, run_id, opts \\ []) do
-    with {:ok, opts} <- instance_opts(runtime, opts),
+    with {:ok, opts} <- instance_opts(runtime, :await_run, opts),
          {:ok, backend, scope} <- durable_access(opts),
          {:ok, timeout, poll_interval} <- await_options(opts) do
       deadline = System.monotonic_time(:millisecond) + timeout
@@ -418,7 +443,7 @@ defmodule Docket do
         use Docket, backend: Docket.Postgres, repo: MyApp.Repo
       end
 
-  The options become the instance's default run options. The host module
+  The options become immutable configuration for the runtime instance. The host module
   gets supervision and operational wrappers that call `Docket` with the
   module as the runtime instance.
   """
@@ -536,26 +561,30 @@ defmodule Docket do
   # Runtime instance plumbing
   # ---------------------------------------------------------------------------
 
-  defp instance_opts(runtime, opts) do
+  defp instance_opts(runtime, operation, opts) do
+    with :ok <- validate_keyword_options(opts, operation),
+         {:ok, defaults} <- fetch_instance_defaults(runtime) do
+      task_supervisor = Docket.Runtime.Supervisor.task_supervisor(runtime)
+
+      merged =
+        defaults
+        |> Keyword.merge(opts)
+        |> preserve_instance_options(defaults)
+        |> Keyword.put(:task_supervisor, task_supervisor)
+        |> Keyword.update(
+          :executor_opts,
+          [task_supervisor: task_supervisor],
+          &Keyword.put_new(&1, :task_supervisor, task_supervisor)
+        )
+
+      {:ok, merged}
+    end
+  end
+
+  defp fetch_instance_defaults(runtime) do
     case Instance.defaults(runtime) do
       {:ok, defaults} ->
-        task_supervisor = Docket.Runtime.Supervisor.task_supervisor(runtime)
-
-        merged =
-          defaults
-          |> Keyword.merge(opts)
-          |> preserve_instance_option(defaults, :backend)
-          |> preserve_instance_option(defaults, :backend_context)
-          |> preserve_instance_option(defaults, :tenant_mode)
-          |> preserve_instance_option(defaults, :testing)
-          |> Keyword.put(:task_supervisor, task_supervisor)
-          |> Keyword.update(
-            :executor_opts,
-            [task_supervisor: task_supervisor],
-            &Keyword.put_new(&1, :task_supervisor, task_supervisor)
-          )
-
-        {:ok, merged}
+        {:ok, defaults}
 
       :error ->
         {:error,
@@ -566,11 +595,13 @@ defmodule Docket do
     end
   end
 
-  defp preserve_instance_option(opts, defaults, key) do
-    case Keyword.fetch(defaults, key) do
-      {:ok, value} -> Keyword.put(opts, key, value)
-      :error -> Keyword.delete(opts, key)
-    end
+  defp preserve_instance_options(opts, defaults) do
+    Enum.reduce(@instance_owned_options, opts, fn key, resolved ->
+      case Keyword.fetch(defaults, key) do
+        {:ok, value} -> Keyword.put(resolved, key, value)
+        :error -> Keyword.delete(resolved, key)
+      end
+    end)
   end
 
   defp durable_access(opts) do
@@ -797,18 +828,17 @@ defmodule Docket do
 
   defp finish_signal({:ok, %Docket.Runtime.Moment{} = moment}, opts) do
     :ok = Lifecycle.after_commit(moment, opts)
-    {:ok, {backend, _context}, scope} = durable_access(opts)
-    maybe_inline_drain(backend, opts, scope, moment.run)
+    {:ok, backend_ref, scope} = durable_access(opts)
+    maybe_inline_drain(backend_ref, opts, scope, moment.run)
   end
 
   defp finish_signal({:ok, %Run{} = run}, _opts), do: {:ok, run}
   defp finish_signal({:error, reason}, _opts), do: {:error, reason}
 
-  defp maybe_inline_drain(backend, opts, scope, run) do
-    if not Run.terminal?(run) and function_exported?(backend, :testing_mode, 1) and
-         backend.testing_mode(opts) == :inline do
-      case backend.drain_runs(opts) do
-        {:ok, summary} -> inline_result(backend, opts, scope, run.id, summary)
+  defp maybe_inline_drain({backend, context} = backend_ref, opts, scope, run) do
+    if not Run.terminal?(run) and Keyword.get(opts, :testing) == :inline do
+      case backend.drain_runs(context, Keyword.delete(opts, :backend_context)) do
+        {:ok, summary} -> inline_result(backend_ref, opts, scope, run.id, summary)
         {:error, reason} -> {:error, reason}
       end
     else
@@ -816,9 +846,7 @@ defmodule Docket do
     end
   end
 
-  defp inline_result(backend, opts, scope, run_id, summary) do
-    context = backend.context(opts)
-
+  defp inline_result({backend, context}, opts, scope, run_id, summary) do
     with {:ok, current} <- backend.runs().fetch_run(context, scope, run_id) do
       if summary.limit_reached and current.status == :running do
         case backend.runs().inspect_run(context, scope, run_id) do
@@ -839,7 +867,7 @@ defmodule Docket do
     end
   end
 
-  defp operation_now(opts), do: Keyword.get(opts, :clock, &DateTime.utc_now/0).()
+  defp operation_now(opts), do: opts |> Keyword.get(:clock, &DateTime.utc_now/0) |> Clock.now!()
 
   defp await_options(opts) do
     timeout = Keyword.get(opts, :timeout)

@@ -2,12 +2,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.DispatcherTest do
     use ExUnit.Case, async: false
 
-    alias Docket.Postgres.Dispatcher
+    alias Docket.Postgres.{AdmissionPhase, ClaimPolicy, Dispatcher}
 
     @now ~U[2026-07-11 12:00:00.000000Z]
 
     defmodule RunStore do
-      def claim_due(agent, :system, policy) do
+      def claim_due(%{agent: agent}, :system, policy) do
         action =
           Agent.get_and_update(agent, fn state ->
             {action, rest} =
@@ -25,7 +25,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end
       end
 
-      def release_claim(agent, :system, run_id, token, now) do
+      def release_claim(%{agent: agent}, :system, run_id, token, now) do
         Agent.update(agent, fn state ->
           %{state | releases: state.releases ++ [{run_id, token, now}]}
         end)
@@ -35,11 +35,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     setup do
+      phase = start_supervised!(AdmissionPhase)
+
       {:ok, agent} =
         start_supervised(
           {Agent,
            fn ->
-             %{claims: [], policies: [], releases: []}
+             %{claims: [], policies: [], releases: [], phase: phase}
            end}
         )
 
@@ -94,6 +96,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       Process.sleep(20)
       assert length(policies(agent)) == 2
+    end
+
+    test "a hard dispatcher exit kills its in-flight claim worker", %{agent: agent} do
+      parent = self()
+
+      set_claims(agent, [
+        fn _policy ->
+          send(parent, {:claim_worker, self()})
+          Process.sleep(:infinity)
+        end
+      ])
+
+      dispatcher = start_dispatcher!(agent)
+      assert_receive {:claim_worker, worker}
+      worker_monitor = Process.monitor(worker)
+
+      Process.exit(dispatcher, :kill)
+
+      assert_receive {:DOWN, ^worker_monitor, :process, ^worker, :killed}
     end
 
     @tag capture_log: true
@@ -330,9 +351,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp dispatcher_opts(agent, overrides) do
+      base_context = %{repo: __MODULE__.Repo, prefix: nil}
+
+      context =
+        Map.merge(base_context, %{
+          agent: agent,
+          admission_phase: Agent.get(agent, & &1.phase),
+          claim_policy: ClaimPolicy.new([], base_context)
+        })
+
       Keyword.merge(
         [
-          context: agent,
+          context: context,
           run_store: RunStore,
           concurrency: 1,
           poll_interval_ms: 60_000,

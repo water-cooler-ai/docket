@@ -277,20 +277,22 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `backend:` | required | Use the complete `Docket.Postgres` bundle. |
 | `prefix:` | `public` | Must match both directions of the generated migration. |
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
+| `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` | Internal instance-level admission rollout switch. Implementations are validated before startup and cannot be selected per call. |
 | `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
 | `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
 | `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
 | `dispatcher.max_claim_attempts` | `5` | Launches allowed before the next recovery need poisons. |
 | `dispatcher.drain_timeout_ms` | `30_000` | Shutdown wait for tracked vehicles. |
-| `vehicle.max_attempt_elapsed_ms` | `2_000` | Finite host maximum inherited by nodes without `timeout_ms`; larger explicit graph timeouts are rejected before execution. |
+| `max_attempt_elapsed_ms` | `2_000` | Instance-owned finite host maximum inherited by nodes without `timeout_ms`; larger explicit graph timeouts are rejected before execution. |
 | `vehicle.drain_budget` | 100 moments / 3 seconds | Cooperative moment-boundary yield; `max_elapsed_ms` must be finite, at least the attempt maximum, and below orphan TTL. |
 | `vehicle.abandon_backoff_ms` | `30_000` | Base delay before retrying a pre-execution incompatibility; host-limit handbacks double it per consecutive abandon. |
 | `vehicle.abandon_backoff_cap_ms` | `3_600_000` | Ceiling on the exponential host-incompatibility backoff. |
 | `vehicle.max_claim_abandons` | `5` | Abandons allowed before incompatibility poison; host-limit handbacks share the counter but never poison. |
-| `vehicle.executor` | `Docket.Executor.Local` | All executors run inside runtime-owned per-activation processes with the same hard deadline. |
-| `vehicle.executor_opts` | `[]` | Passed to the configured executor. |
+| `executor` | `Docket.Executor.Local` | Instance-owned executor used by inline, manual, and supervised vehicles. All executors run inside runtime-owned per-activation processes with the same hard deadline. |
+| `executor_opts` | `[]` | Instance-owned options passed to the configured executor. |
 | `max_supersteps` | unbounded | Optional host safety ceiling; publish a graph policy when it is graph identity. |
-| dispatcher/vehicle `clock`, `jitter` | system clock/random jitter | Injection points for deterministic tests; production overrides must stay monotonic and distribute polling/backoff. |
+| `clock` | system clock | Testing-only deterministic wall clock shared by public lifecycle operations, admission, and vehicles; requires `testing: :inline` or `:manual` and cannot be nested or overridden per call. |
+| dispatcher/vehicle `jitter` | random jitter | Separate polling and abandon-backoff injection points; production overrides should distribute work. |
 | `dispatcher.on_poisoned` | no-op | Best-effort operational callback for newly poisoned claims; inspect durable rows for truth. |
 | `notifier:` | enabled | Use `:none` for poll-only. LISTEN needs a direct/session-pooled endpoint. |
 | `notifier.connection` | derived from Repo | Override only to use a direct/session-pooled LISTEN endpoint. |
@@ -313,6 +315,13 @@ retry policy defaults `max_attempts` to `1` and `backoff_ms` to `0`; raise the
 attempt count and choose a positive backoff to enable durable retry parking.
 Testing modes start no dispatcher, notifier, vehicle supervisor, or pruner;
 their caller-owned drain still uses the production lifecycle transactions.
+Manual and inline drains call the same `RunStore.claim_due/3` entrypoint as the
+supervised dispatcher. One backend-instance admission phase alternates
+demand-one ready/expired preference across supervised, manual, and inline
+claims. RunStore dispatches through the instance-resolved ClaimPolicy, and a
+public `drain_runs` call cannot override the selected admission
+implementation. See the [ClaimPolicy boundary](architecture/docket-claim-policy.md)
+for its plan/decoder contract, atomicity requirement, and rollout procedure.
 
 ## Checkpoints, events, and notifications
 

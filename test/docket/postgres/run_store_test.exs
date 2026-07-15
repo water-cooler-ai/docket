@@ -7,7 +7,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduletag :postgres
 
     alias Docket.DurableCodec
-    alias Docket.Postgres.{RunCodec, RunStore}
+    alias Docket.Postgres.{ClaimPolicy, RunCodec, RunStore}
     alias Docket.Postgres.RunStoreTestRepo, as: TestRepo
     alias Docket.Postgres.Schemas.GraphVersion
     alias Docket.Postgres.Schemas.Run
@@ -487,8 +487,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "returns an empty typed batch when no work is eligible" do
       assert {:ok, %{leases: [], poisoned: []}} = claim_due(@now)
 
+      assert_raise ArgumentError, ~r/requires a resolved ClaimPolicy/, fn ->
+        RunStore.claim_due(%{repo: TestRepo}, :system, policy(@now))
+      end
+
       assert_raise ArgumentError, fn ->
-        RunStore.claim_due(TestRepo, :tenantless, policy(@now))
+        RunStore.claim_due(admission_context(), :tenantless, policy(@now))
       end
 
       for invalid <- [
@@ -496,8 +500,101 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             %{policy(@now) | orphan_ttl_ms: -1},
             %{policy(@now) | max_claim_attempts: 0}
           ] do
-        assert_raise ArgumentError, fn -> RunStore.claim_due(TestRepo, :system, invalid) end
+        assert_raise ArgumentError, fn ->
+          RunStore.claim_due(admission_context(), :system, invalid)
+        end
       end
+    end
+
+    test "configured RunStore dispatch uses one independent plan query and decoder" do
+      insert_run!("alternate-direct")
+      root = %{repo: TestRepo, prefix: nil}
+
+      claim_policy =
+        ClaimPolicy.new(
+          [implementation: Docket.Test.AlternateClaimPolicy, marker: :direct],
+          root
+        )
+
+      context = Map.put(root, :claim_policy, claim_policy)
+      handler = "alternate-direct-query-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:docket, :postgres, :run_store_test_repo, :query],
+        &Docket.Test.TelemetryRelay.raw/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert {:ok, %{leases: [%{run_id: "alternate-direct"}], poisoned: []}} =
+               RunStore.claim_due(context, :system, policy(@now))
+
+      assert_receive {[:docket, :postgres, :run_store_test_repo, :query], _measurements,
+                      %{query: query}}
+
+      assert query =~ "independent alternate claim plan: direct"
+      refute_receive {[:docket, :postgres, :run_store_test_repo, :query], _, _}
+      refute function_exported?(RunStore, :claim_statement, 0)
+      refute function_exported?(RunStore, :claim_statement, 1)
+    end
+
+    test "Legacy success executes exactly one admission statement with no pre-read" do
+      insert_run!("legacy-one-query")
+      handler = "legacy-one-query-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:docket, :postgres, :run_store_test_repo, :query],
+        &Docket.Test.TelemetryRelay.raw/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert {:ok, %{leases: [%{run_id: "legacy-one-query"}], poisoned: []}} =
+               RunStore.claim_due(admission_context(), :system, policy(@now))
+
+      assert_receive {[:docket, :postgres, :run_store_test_repo, :query], _measurements,
+                      %{query: query}}
+
+      assert query =~ "WITH ready_candidates AS MATERIALIZED"
+      assert query =~ "UPDATE \"docket_runs\" AS runs"
+      refute_receive {[:docket, :postgres, :run_store_test_repo, :query], _, _}
+    end
+
+    test "transaction-scoped RunStore dispatch preserves and selects the resolved implementation" do
+      Process.register(self(), :docket_claim_policy_relay)
+
+      on_exit(fn ->
+        if Process.whereis(:docket_claim_policy_relay),
+          do: Process.unregister(:docket_claim_policy_relay)
+      end)
+
+      insert_run!("alternate-transaction")
+      root = %{repo: TestRepo, prefix: nil}
+
+      claim_policy =
+        ClaimPolicy.new(
+          [implementation: Docket.Test.AlternateClaimPolicy, marker: :transaction],
+          root
+        )
+
+      assert_receive {:alternate_claim_policy, :init, :transaction,
+                      %{prefix: nil, identifiers: %{runs: ~s("docket_runs")}}}
+
+      root = Map.put(root, :claim_policy, claim_policy)
+
+      assert {:ok, %{leases: [%{run_id: "alternate-transaction"}], poisoned: []}} =
+               Docket.Postgres.transaction(root, fn tx ->
+                 assert tx.claim_policy === claim_policy
+                 RunStore.claim_due(tx, :system, policy(@now))
+               end)
+
+      assert_receive {:alternate_claim_policy, :build_plan, :transaction, _pid}
+      assert_receive {:alternate_claim_policy, :decode, :transaction, _pid}
+      refute_receive {:alternate_claim_policy, :init, :transaction, _context}
     end
 
     test "claims ready and expired paths under one demand bound and returns lightweight leases" do
@@ -653,7 +750,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert claim_one(@now, limit: 1, preference: :expired).run_id == "ready-only"
 
       assert_raise ArgumentError, fn ->
-        RunStore.claim_due(TestRepo, :system, policy(@now, preference: :sideways))
+        RunStore.claim_due(admission_context(), :system, policy(@now, preference: :sideways))
       end
     end
 
@@ -773,6 +870,155 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert_receive {:claim_telemetry, %{demand: 1, expired_selected: 1},
                       %{preference: :ready, fallback: true}}
+    end
+
+    test "Legacy claim telemetry has exact cardinality for empty, success, steal, poison, and fallthrough" do
+      handler_id = "claim-cardinality-#{System.unique_integer([:positive])}"
+
+      events = [
+        [:docket, :postgres, :run_store, :claim],
+        [:docket, :postgres, :claim_policy, :admission],
+        [:docket, :postgres, :claim, :attempt],
+        [:docket, :postgres, :claim, :poisoned]
+      ]
+
+      :telemetry.attach_many(
+        handler_id,
+        events,
+        &Docket.Test.TelemetryRelay.raw/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      refute_more = fn ->
+        Enum.each(events, fn event -> refute_receive {^event, _, _}, 10 end)
+      end
+
+      assert {:ok, %{leases: [], poisoned: []}} = claim_due(@now)
+
+      assert_receive {[:docket, :postgres, :run_store, :claim],
+                      %{leases: 0, poisoned: 0, steals: 0, claim_attempts: 0},
+                      %{result: :ok, fallback: false}}
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission],
+                      %{demand: 1, leases: 0, poisoned: 0},
+                      %{implementation: Docket.Postgres.ClaimPolicy.Legacy, result: :ok}}
+
+      refute_more.()
+
+      insert_run!("telemetry-ready")
+      assert {:ok, %{leases: [%{run_id: "telemetry-ready"}], poisoned: []}} = claim_due(@now)
+
+      assert_receive {[:docket, :postgres, :run_store, :claim],
+                      %{leases: 1, poisoned: 0, ready_selected: 1, claim_attempts: 1},
+                      %{result: :ok}}
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission], %{leases: 1},
+                      %{implementation: Docket.Postgres.ClaimPolicy.Legacy, result: :ok}}
+
+      assert_receive {[:docket, :postgres, :claim, :attempt], %{count: 1, claim_attempts: 1},
+                      %{result: :acquired}}
+
+      refute_more.()
+
+      insert_run!("telemetry-expired",
+        wake_at: nil,
+        claim_token: Ecto.UUID.generate(),
+        claimed_at: DateTime.add(@now, -2, :second),
+        claim_attempts: 1
+      )
+
+      assert {:ok, %{leases: [%{run_id: "telemetry-expired"}], poisoned: []}} = claim_due(@now)
+
+      assert_receive {[:docket, :postgres, :run_store, :claim],
+                      %{leases: 1, steals: 1, expired_selected: 1, claim_attempts: 2},
+                      %{result: :ok}}
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission], %{leases: 1},
+                      %{implementation: Docket.Postgres.ClaimPolicy.Legacy, result: :ok}}
+
+      assert_receive {[:docket, :postgres, :claim, :attempt], %{count: 1, claim_attempts: 2},
+                      %{result: :reacquired}}
+
+      refute_more.()
+
+      insert_run!("telemetry-poison", claim_attempts: 3)
+
+      assert {:ok, %{leases: [], poisoned: [%{run_id: "telemetry-poison"}]}} =
+               claim_due(@now, max_claim_attempts: 3)
+
+      assert_receive {[:docket, :postgres, :run_store, :claim],
+                      %{leases: 0, poisoned: 1, claim_attempts: 0}, %{result: :ok}}
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission], %{poisoned: 1},
+                      %{implementation: Docket.Postgres.ClaimPolicy.Legacy, result: :ok}}
+
+      assert_receive {[:docket, :postgres, :claim, :poisoned], %{count: 1},
+                      %{reason: :max_claim_attempts}}
+
+      refute_more.()
+
+      insert_run!("telemetry-fallthrough")
+
+      assert {:ok, %{leases: [%{run_id: "telemetry-fallthrough"}], poisoned: []}} =
+               claim_due(@now, preference: :expired)
+
+      assert_receive {[:docket, :postgres, :run_store, :claim], %{leases: 1},
+                      %{preference: :expired, fallback: true, result: :ok}}
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission], %{leases: 1},
+                      %{implementation: Docket.Postgres.ClaimPolicy.Legacy, result: :ok}}
+
+      assert_receive {[:docket, :postgres, :claim, :attempt], %{count: 1}, %{result: :acquired}}
+
+      refute_more.()
+    end
+
+    @tag capture_log: true
+    test "SQL errors emit each claim result event once and no outcome events" do
+      handler_id = "claim-error-telemetry-#{System.unique_integer([:positive])}"
+
+      events = [
+        [:docket, :postgres, :run_store, :claim],
+        [:docket, :postgres, :claim_policy, :admission],
+        [:docket, :postgres, :claim, :attempt],
+        [:docket, :postgres, :claim, :poisoned],
+        [:docket, :postgres, :run_store_test_repo, :query]
+      ]
+
+      :telemetry.attach_many(
+        handler_id,
+        events,
+        &Docket.Test.TelemetryRelay.raw/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assert {:error, %Postgrex.Error{}} =
+               RunStore.claim_due(
+                 admission_context(%{repo: TestRepo, prefix: "missing_claim_schema"}),
+                 :system,
+                 policy(@now)
+               )
+
+      assert_receive {[:docket, :postgres, :run_store, :claim],
+                      %{demand: 1, leases: 0, poisoned: 0, steals: 0, claim_attempts: 0},
+                      %{preference: nil, fallback: false, result: :error}}
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission],
+                      %{demand: 1, leases: 0, poisoned: 0},
+                      %{implementation: Docket.Postgres.ClaimPolicy.Legacy, result: :error}}
+
+      assert_receive {[:docket, :postgres, :run_store_test_repo, :query], _, %{query: query}}
+      assert query =~ ~s("missing_claim_schema"."docket_runs")
+
+      refute_receive {[:docket, :postgres, :claim, :attempt], _, _}
+      refute_receive {[:docket, :postgres, :claim, :poisoned], _, _}
+      refute_receive {[:docket, :postgres, :run_store, :claim], _, _}
+      refute_receive {[:docket, :postgres, :claim_policy, :admission], _, _}
+      refute_receive {[:docket, :postgres, :run_store_test_repo, :query], _, _}
     end
 
     test "leases and poison outcomes across both paths share one limit" do
@@ -1278,15 +1524,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
       end
 
-      cutoff = DateTime.add(@now, -1, :second)
+      claim_policy = ClaimPolicy.resolve(admission_context())
+
+      admission_plan =
+        ClaimPolicy.build_plan(
+          claim_policy,
+          TestRepo,
+          ClaimPolicy.effective_policy!(policy(@now, limit: 3))
+        )
 
       plan =
         TestRepo.transaction(fn ->
           TestRepo.query!("SET LOCAL enable_seqscan = off")
 
           TestRepo.query!(
-            "EXPLAIN (COSTS OFF) " <> RunStore.claim_statement(),
-            [@now, cutoff, 3, 3, nil]
+            "EXPLAIN (COSTS OFF) " <> admission_plan.statement,
+            admission_plan.params
           ).rows
         end)
         |> elem(1)
@@ -1330,7 +1583,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                )
 
       insert_graph!("docket_private")
-      ctx = %{repo: TestRepo, prefix: "docket_private"}
+      ctx = admission_context(%{repo: TestRepo, prefix: "docket_private"})
       run = initialized_run("prefixed")
 
       assert {:ok, ^run} =
@@ -1527,8 +1780,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp claim_due(now, overrides \\ []) do
-      RunStore.claim_due(TestRepo, :system, policy(now, overrides))
+      RunStore.claim_due(admission_context(), :system, policy(now, overrides))
     end
+
+    defp admission_context(context \\ TestRepo),
+      do: Docket.Postgres.TestAdmissionContext.resolve(context)
 
     defp claim_one(now, overrides \\ []) do
       assert {:ok, %{leases: [lease], poisoned: []}} = claim_due(now, overrides)

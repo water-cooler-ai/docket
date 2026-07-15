@@ -18,6 +18,32 @@ defmodule Docket.TelemetryTest do
     assert Docket.Telemetry.metric_metadata([:docket, :run, :completed], metadata) == %{}
   end
 
+  test "metric metadata retains only bounded ClaimPolicy implementation labels" do
+    metadata = %{
+      implementation: Docket.Postgres.ClaimPolicy.Legacy,
+      claim_policy: Docket.Postgres.ClaimPolicy.Legacy,
+      result: :ok,
+      source: :scheduled,
+      run_id: "run-1",
+      tenant_id: "tenant-1",
+      implementation_state: %{unbounded: "state"}
+    }
+
+    assert Docket.Telemetry.metric_metadata(
+             [:docket, :postgres, :claim_policy, :admission],
+             metadata
+           ) == %{implementation: Docket.Postgres.ClaimPolicy.Legacy, result: :ok}
+
+    assert Docket.Telemetry.metric_metadata(
+             [:docket, :postgres, :dispatcher, :poll],
+             metadata
+           ) == %{
+             claim_policy: Docket.Postgres.ClaimPolicy.Legacy,
+             result: :ok,
+             source: :scheduled
+           }
+  end
+
   test "lifecycle and nested store spans share correlation without leaking it to labels" do
     parent = self()
     id = "lifecycle-correlation-#{System.unique_integer([:positive])}"
