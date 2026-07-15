@@ -1,4 +1,4 @@
-defmodule Docket.Backend.Conformance.Contract do
+defmodule Docket.BackendTests.Contract do
   @moduledoc false
 
   @capabilities [

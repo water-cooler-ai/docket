@@ -1,13 +1,12 @@
-defmodule Docket.Backend.Conformance.Fixture do
+defmodule Docket.BackendTests.Fixture do
   @moduledoc false
 
-  alias Docket.Backend.Conformance.Instance
   alias Docket.{DurableCodec, Event, Graph, Run}
 
-  @spec id(Instance.t(), String.t()) :: String.t()
-  def id(%Instance{namespace: namespace}, suffix), do: "#{namespace}-#{suffix}"
+  @spec id(Docket.BackendTests.subject(), String.t()) :: String.t()
+  def id(%{namespace: namespace}, suffix), do: "#{namespace}-#{suffix}"
 
-  @spec graph(Instance.t(), String.t(), map()) :: {Graph.t(), String.t()}
+  @spec graph(Docket.BackendTests.subject(), String.t(), map()) :: {Graph.t(), String.t()}
   def graph(instance, suffix, metadata \\ %{}) do
     graph = Graph.new!(id: id(instance, suffix), metadata: metadata)
     {graph, hash(graph)}
@@ -21,7 +20,8 @@ defmodule Docket.Backend.Conformance.Fixture do
     |> Base.encode16(case: :lower)
   end
 
-  @spec run(Instance.t(), String.t(), Graph.t(), String.t(), keyword()) :: Run.t()
+  @spec run(Docket.BackendTests.subject(), String.t(), Graph.t(), String.t(), keyword()) ::
+          Run.t()
   def run(instance, suffix, graph, graph_hash, opts \\ []) do
     now = Keyword.get(opts, :now, instance.now)
 
@@ -53,7 +53,12 @@ defmodule Docket.Backend.Conformance.Fixture do
     }
   end
 
-  @spec publish_graph(Instance.t(), Docket.Backend.owner_scope(), String.t(), map()) ::
+  @spec publish_graph(
+          Docket.BackendTests.subject(),
+          Docket.Backend.owner_scope(),
+          String.t(),
+          map()
+        ) ::
           {Graph.t(), String.t()}
   def publish_graph(instance, owner_scope, suffix, metadata \\ %{}) do
     {graph, graph_hash} = graph(instance, suffix, metadata)
@@ -70,7 +75,8 @@ defmodule Docket.Backend.Conformance.Fixture do
     {graph, graph_hash}
   end
 
-  @spec insert_run(Instance.t(), Docket.Backend.owner_scope(), Run.t()) :: {:ok, Run.t()}
+  @spec insert_run(Docket.BackendTests.subject(), Docket.Backend.owner_scope(), Run.t()) ::
+          {:ok, Run.t()}
   def insert_run(instance, owner_scope, run) do
     instance.backend.runs().insert_run(
       instance.context,
@@ -81,7 +87,9 @@ defmodule Docket.Backend.Conformance.Fixture do
     )
   end
 
-  @spec initialize(Instance.t(), Docket.Backend.owner_scope(), Run.t(), [Event.t()]) ::
+  @spec initialize(Docket.BackendTests.subject(), Docket.Backend.owner_scope(), Run.t(), [
+          Event.t()
+        ]) ::
           Docket.Backend.transaction_result()
   def initialize(instance, owner_scope, run, events \\ []) do
     backend = instance.backend
@@ -97,7 +105,8 @@ defmodule Docket.Backend.Conformance.Fixture do
     end)
   end
 
-  @spec claim(Instance.t(), keyword()) :: Docket.Backend.RunStore.claim_lease()
+  @spec claim(Docket.BackendTests.subject(), keyword()) ::
+          Docket.Backend.RunStore.claim_lease()
   def claim(instance, opts \\ []) do
     policy = %{
       now: Keyword.get(opts, :now, instance.now),

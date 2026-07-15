@@ -38,7 +38,7 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     assert {:list_events, 4} in event_callbacks
   end
 
-  test "the conformance backend implements every new read callback" do
+  test "the shared memory backend implements every new read callback" do
     assert Code.ensure_loaded?(Docket.Test.MemoryBackend)
     assert function_exported?(Docket.Test.MemoryBackend, :transaction, 2)
     refute function_exported?(Docket.Test.MemoryBackend, :storage, 0)
@@ -55,8 +55,8 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     end
   end
 
-  test "conformance completeness failures name the accessor and exact callback" do
-    violations = Docket.Backend.Conformance.Contract.violations(IncompleteBundle)
+  test "shared backend completeness failures name the accessor and exact callback" do
+    violations = Docket.BackendTests.Contract.violations(IncompleteBundle)
 
     assert Enum.any?(violations, fn violation ->
              violation ==

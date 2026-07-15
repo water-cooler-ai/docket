@@ -1,6 +1,6 @@
 defmodule Docket.Test.MemoryBackend do
   @moduledoc """
-  Agent-backed conformance backend for Docket's durable storage contracts.
+  Agent-backed implementation used by Docket's shared backend tests.
 
   An outer transaction owns a backend-wide lock, works against an isolated
   Agent snapshot, and publishes the snapshot only after `{:ok, value}`. Every
@@ -529,7 +529,7 @@ defmodule Docket.Test.MemoryBackend do
     Docket.EventPage.new(events, after_seq, oldest, latest, record.run.event_seq)
   end
 
-  # Conformance-test inspection helpers. These deliberately bypass public
+  # Shared-test inspection helpers. These deliberately bypass public
   # tenant policy and never participate in application-facing code.
 
   def events(backend, run_id) do

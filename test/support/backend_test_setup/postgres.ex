@@ -1,10 +1,8 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
-  defmodule Docket.Test.BackendConformance.PostgresHarness do
+  defmodule Docket.Test.BackendTestSetup.Postgres do
     @moduledoc false
-    @behaviour Docket.Backend.Conformance.Harness
 
-    alias Docket.Backend.Conformance.Instance
-    alias Docket.Postgres.ConformanceTestRepo, as: TestRepo
+    alias Docket.Postgres.SharedBackendTestRepo, as: TestRepo
     alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}
 
     @migration_version 20_260_715_000_052
@@ -17,34 +15,31 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down()
     end
 
-    @impl true
     def setup_suite do
       config = TestRepo.config()
       _ = Ecto.Adapters.Postgres.storage_down(config)
       :ok = Ecto.Adapters.Postgres.storage_up(config)
       ExUnit.Callbacks.start_supervised!(TestRepo)
       :ok = Ecto.Migrator.up(TestRepo, @migration_version, InstallDocket, log: false)
-      {:ok, TestRepo}
+      {:ok, backend_test_suite: TestRepo}
     end
 
-    @impl true
-    def setup_case(TestRepo, _context) do
+    def setup(%{backend_test_suite: TestRepo}) do
       TestRepo.delete_all(Event)
       TestRepo.delete_all(Run)
       TestRepo.delete_all(GraphVersion)
       Docket.Postgres.GraphCache.clear()
+      ExUnit.Callbacks.on_exit(&Docket.Postgres.GraphCache.clear/0)
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
-      {:ok,
-       %Instance{
-         backend: Docket.Postgres,
-         context: %{repo: TestRepo},
-         namespace: "postgres-#{System.unique_integer([:positive, :monotonic])}",
-         now: now
-       }}
-    end
+      subject = %{
+        backend: Docket.Postgres,
+        context: %{repo: TestRepo},
+        namespace: "postgres-#{System.unique_integer([:positive, :monotonic])}",
+        now: now
+      }
 
-    @impl true
-    def teardown_case(_instance), do: Docket.Postgres.GraphCache.clear()
+      {:ok, backend_test: subject}
+    end
   end
 end

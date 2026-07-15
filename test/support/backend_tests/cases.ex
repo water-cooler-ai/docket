@@ -1,13 +1,13 @@
-defmodule Docket.Backend.Conformance.Cases do
+defmodule Docket.BackendTests.Cases do
   @moduledoc false
 
   defmacro __using__(_opts) do
     quote location: :keep do
-      alias Docket.Backend.Conformance.{Contract, Fixture}
+      alias Docket.BackendTests.{Contract, Fixture}
 
       @tag docket_invariant: "CONTRACT-CALLBACK-COMPLETENESS"
       test "[CONTRACT-CALLBACK-COMPLETENESS] bundle exports every required callback",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         assert Contract.violations(instance.backend) == [],
                "backend contract violations:\n" <>
                  Enum.map_join(Contract.violations(instance.backend), "\n", &"  * #{&1}")
@@ -15,7 +15,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "TX-COMMIT-ROLLBACK-PROPAGATION"
       test "[TX-COMMIT-ROLLBACK-PROPAGATION] commit, error, exception, throw, and invalid return",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         backend = instance.backend
         graphs = backend.graphs()
 
@@ -100,7 +100,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "TX-NESTING-ROLLBACK-ONLY"
       test "[TX-NESTING-ROLLBACK-ONLY] nested work joins and swallowed failures abort outer publication",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         backend = instance.backend
         graphs = backend.graphs()
         {outer, outer_hash} = Fixture.graph(instance, "nested-success-outer")
@@ -255,7 +255,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "TX-CONCURRENT-PUBLICATION"
       test "[TX-CONCURRENT-PUBLICATION] overlapping commits and rollback publication cannot erase winners",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         backend = instance.backend
         graphs = backend.graphs()
         parent = self()
@@ -292,7 +292,7 @@ defmodule Docket.Backend.Conformance.Cases do
         assert {:ok, :first} = Task.await(first, 5_000)
 
         assert {:ok, :second} =
-                 Docket.Backend.Conformance.await_task(second, second_result)
+                 Docket.BackendTests.await_task(second, second_result)
 
         assert {:ok, ^first_graph} =
                  graphs.fetch_graph(instance.context, :tenantless, first_graph.id, first_hash)
@@ -335,7 +335,7 @@ defmodule Docket.Backend.Conformance.Cases do
         assert {:error, :rolled_back} = Task.await(rollback, 5_000)
 
         assert {:ok, :winner} =
-                 Docket.Backend.Conformance.await_task(commit, commit_result)
+                 Docket.BackendTests.await_task(commit, commit_result)
 
         assert {:error, :not_found} =
                  graphs.fetch_graph(
@@ -351,7 +351,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "BUNDLE-CROSS-STORE-ATOMICITY"
       test "[BUNDLE-CROSS-STORE-ATOMICITY] one yielded context commits and rolls back graph, run, and events",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         backend = instance.backend
         graphs = backend.graphs()
         runs = backend.runs()
@@ -448,7 +448,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "TX-UNCOMMITTED-VISIBILITY"
       test "[TX-UNCOMMITTED-VISIBILITY] completed root reads cannot expose a partial uncommitted transition",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         backend = instance.backend
         runs = backend.runs()
         events = backend.events()
@@ -491,7 +491,7 @@ defmodule Docket.Backend.Conformance.Cases do
         send(transaction.pid, :commit_transition)
         assert {:ok, :committed} = Task.await(transaction, 5_000)
 
-        read_result = Docket.Backend.Conformance.await_task(reader, early_read)
+        read_result = Docket.BackendTests.await_task(reader, early_read)
 
         assert read_result in [
                  {{:error, :not_found}, {:error, :not_found}},
@@ -504,7 +504,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "SCOPE-OWNER-ISOLATION"
       test "[SCOPE-OWNER-ISOLATION] graph, run, and event access preserves explicit ownership",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         backend = instance.backend
         graphs = backend.graphs()
         runs = backend.runs()
@@ -594,7 +594,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "GRAPH-CONTENT-ADDRESS-AND-VERSIONS"
       test "[GRAPH-CONTENT-ADDRESS-AND-VERSIONS] publication is idempotent, addressed, and owner-scoped",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         graphs = instance.backend.graphs()
         tenant = {:tenant, Fixture.id(instance, "graph-tenant")}
         {graph, graph_hash} = Fixture.graph(instance, "graph-version", %{"revision" => 1})
@@ -706,7 +706,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "EVENT-IDEMPOTENCY-CURSOR-GAPS"
       test "[EVENT-IDEMPOTENCY-CURSOR-GAPS] assigned events preserve conflict, scope, ordering, and sparse bounds",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         events = instance.backend.events()
         {graph, graph_hash} = Fixture.publish_graph(instance, :tenantless, "event-graph")
         run = Fixture.run(instance, "event-run", graph, graph_hash, event_seq: 4)
@@ -794,7 +794,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "RUN-CLAIM-FENCE-SEQUENCE"
       test "[RUN-CLAIM-FENCE-SEQUENCE] stale authority cannot commit and exact next sequence wins once",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         backend = instance.backend
         runs = backend.runs()
         events = backend.events()
@@ -906,7 +906,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "RUN-CLAIM-LIVENESS-RECOVERY"
       test "[RUN-CLAIM-LIVENESS-RECOVERY] refresh, release, abandon, poison, and recovery preserve authority",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         runs = instance.backend.runs()
         {graph, graph_hash} = Fixture.publish_graph(instance, :tenantless, "claim-graph")
         run = Fixture.run(instance, "claim-run", graph, graph_hash)
@@ -1090,7 +1090,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "RUN-READS-MUTATION-RESULTS"
       test "[RUN-READS-MUTATION-RESULTS] list cursors, scopes, and mutation result shapes are preserved",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         runs = instance.backend.runs()
         {graph, graph_hash} = Fixture.publish_graph(instance, :tenantless, "run-read-graph")
         first = Fixture.run(instance, "run-read-first", graph, graph_hash)
@@ -1188,7 +1188,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
       @tag docket_invariant: "RUN-SERIALIZED-MUTATION"
       test "[RUN-SERIALIZED-MUTATION] concurrent updates are not lost and failed event publication rolls back",
-           %{docket_backend_conformance: instance} do
+           %{backend_test: instance} do
         backend = instance.backend
         runs = backend.runs()
         events = backend.events()
@@ -1238,7 +1238,7 @@ defmodule Docket.Backend.Conformance.Cases do
 
         results = [
           Task.await(first, 5_000),
-          Docket.Backend.Conformance.await_task(second, second_result)
+          Docket.BackendTests.await_task(second, second_result)
         ]
 
         assert Enum.sort(results) == [ok: {:committed, 1}, ok: {:committed, 2}]

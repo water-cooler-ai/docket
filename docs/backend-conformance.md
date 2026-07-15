@@ -1,109 +1,111 @@
-# Backend conformance
+# Backend tests
 
-`Docket.Backend.Conformance` is Docket's reusable ExUnit profile for backend
-authors. The memory and PostgreSQL backends run the same generated cases. A
-third-party backend can run them from its own test environment without Ecto,
-Postgrex, or access to Docket's `test/support` modules.
+`Docket.BackendTests` is Docket's shared black-box test suite for backend
+implementations. It lives under `test/support`, not in the shipped library API.
+The production contract is defined by `Docket.Backend`,
+`Docket.Backend.GraphStore`, `Docket.Backend.RunStore`, and
+`Docket.Backend.EventStore`.
 
-## Harness contract
+## Docket-owned backends
 
-Implement `Docket.Backend.Conformance.Harness`. The harness owns only
-substrate lifecycle and isolation:
+Docket keeps one explicit backend matrix in
+`test/docket/backend_tests_test.exs`. A `for` comprehension generates a test
+module for each backend and applies the same `Docket.BackendTests` cases.
+Backend-specific setup remains ordinary ExUnit setup code under
+`test/support/backend_test_setup`.
 
-- start shared services or apply migrations in optional `setup_suite/0`;
-- start, reset, or isolate one backend in `setup_case/2`;
-- return the backend module, its opaque root context, a unique namespace, and
-  a UTC test time in a `Docket.Backend.Conformance.Instance`;
-- release resources in optional teardown callbacks.
+Adding an in-repository backend therefore requires two things:
 
-The harness must not return focused stores or seed Docket fixtures. The shared
-profile derives stores exclusively from `backend.graphs/0`, `backend.runs/0`,
-and `backend.events/0`, and it owns every graph, run, event, scope, claim
-policy, and expected result.
+1. an ordinary setup module that starts or resets its substrate and returns a
+   test subject;
+2. one entry in the backend matrix.
 
-The harness is inside the trusted test boundary. This separation prevents
-accidental coupling between backend setup and expected values; it is not a
-tamper-resistant certification against a harness that selects fake backends or
-manufactures answers from ExUnit context.
+The shared suite constructs every graph, run, event, scope, claim policy, and
+expected result. Setup owns only substrate lifecycle and isolation.
 
-A minimal process-backed harness looks like this:
+## External backends
+
+External backend projects should run the shared tests from a Docket source
+checkout pinned to the same release tag they support. Do not test a released
+backend against Docket's moving default branch.
+
+Load the shared support files from the checkout in `test/test_helper.exs`:
 
 ```elixir
-defmodule MyApp.BackendConformanceHarness do
-  @behaviour Docket.Backend.Conformance.Harness
+docket_source = System.fetch_env!("DOCKET_SOURCE_PATH")
 
-  alias Docket.Backend.Conformance.Instance
+for file <- [
+      "test/support/backend_tests.ex",
+      "test/support/backend_tests/contract.ex",
+      "test/support/backend_tests/fixture.ex",
+      "test/support/backend_tests/cases.ex"
+    ] do
+  Code.require_file(Path.join(docket_source, file))
+end
 
-  @impl true
-  def setup_case(_suite_state, _ex_unit_context) do
-    name = Module.concat(__MODULE__, "Case#{System.unique_integer([:positive])}")
-    ExUnit.Callbacks.start_supervised!({MyApp.Backend, name: name})
+ExUnit.start()
+```
+
+Then provide normal ExUnit setup and use the cases:
+
+```elixir
+defmodule MyBackend.SharedBackendTest do
+  use ExUnit.Case, async: false
+
+  setup do
+    context = start_or_reset_backend!()
+    on_exit(fn -> stop_backend(context) end)
 
     {:ok,
-     %Instance{
-       backend: MyApp.Backend,
-       context: MyApp.Backend.context(name: name),
+     backend_test: %{
+       backend: MyBackend,
+       context: context,
        namespace: "case-#{System.unique_integer([:positive, :monotonic])}",
        now: DateTime.utc_now() |> DateTime.truncate(:microsecond)
      }}
   end
+
+  use Docket.BackendTests
 end
 ```
 
-Then invoke the Docket-owned cases unchanged:
-
-```elixir
-defmodule MyApp.BackendConformanceTest do
-  use ExUnit.Case, async: false
-
-  use Docket.Backend.Conformance,
-    harness: MyApp.BackendConformanceHarness
-end
-```
-
-`setup_suite/0` defaults to `{:ok, nil}`. When implemented, it must return
-`{:ok, suite_state}`; that state is passed to every `setup_case/2` call.
-`setup_case/2` must return `{:ok, %Instance{}}`. Optional
-`teardown_case/1` and `teardown_suite/1` callbacks run through ExUnit
-`on_exit`, including after failures.
+The subject map contains the backend module, its opaque root context, a unique
+namespace, and a deterministic microsecond-precision UTC timestamp. The suite
+resolves focused stores exclusively through the returned backend.
 
 ## What passing demonstrates
 
-Each failure includes a stable invariant ID. The profile checks:
+Each failure includes a stable invariant ID. The shared cases currently cover:
 
-- all mandatory `Docket.Backend`, `GraphStore`, `RunStore`, and `EventStore`
-  callbacks, with `context/1` treated explicitly as optional;
-- transaction commit, error rollback, exception/throw propagation, invalid
-  return handling, nested participation, rollback-only propagation, concurrent
-  publication, and the rule that a completed pre-commit root read cannot expose
-  a partial or uncommitted run/event transition (blocking reads are allowed);
+- mandatory backend and focused-store callbacks;
+- commit, rollback, nested participation, rollback-only propagation,
+  concurrent publication outcomes, and completed-read visibility;
 - graph/run/event compatibility and atomicity through one yielded context;
-- explicit graph ownership and run/event tenant scope isolation;
-- graph content addressing, idempotence, latest/version reads, and owner
-  isolation;
-- event idempotence, conflict and mismatch rejection, point/latest/page reads,
-  cursors, ordering, and sparse retained histories;
+- graph ownership and run/event tenant isolation;
+- graph content addressing, idempotence, latest/version reads, and pagination;
+- event idempotence, conflict and mismatch rejection, ordering, cursors, and
+  sparse retained histories;
 - claim fencing, exact checkpoint sequencing, refresh/release authority,
-  abandonment, poisoning, recovery, same-fence concurrency, and serialized
+  abandonment, poisoning, recovery, same-fence outcomes, and serialized
   mutation safety.
 
-The yielded context is opaque and only guaranteed for transactional
-participation inside the callback. The profile does not require value identity
-between nested callbacks or runtime invalidation after a callback returns.
+Passing is evidence for the portable cases above, not a claim that every
+backend is operationally equivalent. In particular, the shared suite does not
+currently establish the complete `claim_due` selection matrix, all run-list
+filters, restart durability, migrations, substrate configuration, deterministic
+lock timing, or end-to-end runtime advancement.
 
-## Deliberate implementation-specific coverage
+## Backend-specific coverage
 
-Some guarantees cannot be induced through the public store contract. Keep
-these in backend-specific suites:
+Keep implementation and operational guarantees with the backend that owns
+them. Examples include:
 
-- physical pruning and fully corrupted retained histories;
-- raw stored-content corruption and the impossible-without-a-hash-collision
-  graph conflict branch;
-- SQL locks, query plans, prefixes, migrations, schemas, and notifications;
-- Agent snapshot/lock mechanics and deterministic substrate race hooks;
-- performance and failure injection.
+- restart/reopen durability and independent-process access;
+- migrations, schemas, prefixes, SQLite pragmas, and PostgreSQL notifications;
+- physical pruning, deliberately corrupted rows, and query plans;
+- deterministic lock/contention hooks, performance, and failure injection;
+- starting the real backend supervision tree and proving due work advances.
 
-Core lifecycle integration tests separately verify the semantic event sets and
-checkpoint proposals constructed by Docket itself. The backend profile verifies
-that a backend stores those proposed run/event transitions atomically; it does
-not reimplement the lifecycle planner.
+Portable omissions should be promoted into `Docket.BackendTests` so every
+backend receives the same assertion. Substrate mechanics should remain in
+backend-specific suites.

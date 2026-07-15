@@ -20,8 +20,8 @@ generated_database_repos =
        10},
       {Docket.Postgres.BackendTestRepo, "DOCKET_BACKEND_TEST_DATABASE_URL", "docket_backend_test",
        10},
-      {Docket.Postgres.ConformanceTestRepo, "DOCKET_CONFORMANCE_TEST_DATABASE_URL",
-       "docket_conformance_test", 10}
+      {Docket.Postgres.SharedBackendTestRepo, "DOCKET_SHARED_BACKEND_TEST_DATABASE_URL",
+       "docket_shared_backend_test", 10}
     ]
 
     Enum.reduce(repo_specs, [], fn {repo, environment_variable, database, pool_size}, generated ->
@@ -78,7 +78,7 @@ generated_database_repos =
 # DOCKET_LIFECYCLE_STORAGE_TEST_DATABASE_URL, DOCKET_EVENT_STORE_TEST_DATABASE_URL,
 # DOCKET_VEHICLE_STORAGE_TEST_DATABASE_URL, DOCKET_NOTIFIER_TEST_DATABASE_URL,
 # DOCKET_PRUNER_TEST_DATABASE_URL, and DOCKET_BACKEND_TEST_DATABASE_URL.
-# The reusable backend profile uses DOCKET_CONFORMANCE_TEST_DATABASE_URL.
+# The shared backend matrix uses DOCKET_SHARED_BACKEND_TEST_DATABASE_URL.
 ExUnit.start(exclude: [:postgres])
 
 ExUnit.after_suite(fn _result ->
