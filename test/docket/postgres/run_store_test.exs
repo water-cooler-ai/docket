@@ -42,6 +42,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :ok
     end
 
+    require Docket.Test.ClaimPolicyRunStoreTests
+
+    Docket.Test.ClaimPolicyRunStoreTests.run_store_matrix(
+      repo: TestRepo,
+      query_event: [:docket, :postgres, :run_store_test_repo, :query]
+    )
+
     test "inserts and reconstructs the exact committed run document" do
       run =
         initialized_run("inserted",
@@ -504,64 +511,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           RunStore.claim_due(admission_context(), :system, invalid)
         end
       end
-    end
-
-    test "configured RunStore dispatch uses one independent plan query and decoder" do
-      insert_run!("alternate-direct")
-      root = %{repo: TestRepo, prefix: nil}
-
-      claim_policy =
-        ClaimPolicy.new(
-          [implementation: Docket.Test.AlternateClaimPolicy, marker: :direct],
-          root
-        )
-
-      context = Map.put(root, :claim_policy, claim_policy)
-      handler = "alternate-direct-query-#{System.unique_integer([:positive])}"
-
-      :telemetry.attach(
-        handler,
-        [:docket, :postgres, :run_store_test_repo, :query],
-        &Docket.Test.TelemetryRelay.raw/4,
-        self()
-      )
-
-      on_exit(fn -> :telemetry.detach(handler) end)
-
-      assert {:ok, %{leases: [%{run_id: "alternate-direct"}], poisoned: []}} =
-               RunStore.claim_due(context, :system, policy(@now))
-
-      assert_receive {[:docket, :postgres, :run_store_test_repo, :query], _measurements,
-                      %{query: query}}
-
-      assert query =~ "independent alternate claim plan: direct"
-      refute_receive {[:docket, :postgres, :run_store_test_repo, :query], _, _}
-      refute function_exported?(RunStore, :claim_statement, 0)
-      refute function_exported?(RunStore, :claim_statement, 1)
-    end
-
-    test "Legacy success executes exactly one admission statement with no pre-read" do
-      insert_run!("legacy-one-query")
-      handler = "legacy-one-query-#{System.unique_integer([:positive])}"
-
-      :telemetry.attach(
-        handler,
-        [:docket, :postgres, :run_store_test_repo, :query],
-        &Docket.Test.TelemetryRelay.raw/4,
-        self()
-      )
-
-      on_exit(fn -> :telemetry.detach(handler) end)
-
-      assert {:ok, %{leases: [%{run_id: "legacy-one-query"}], poisoned: []}} =
-               RunStore.claim_due(admission_context(), :system, policy(@now))
-
-      assert_receive {[:docket, :postgres, :run_store_test_repo, :query], _measurements,
-                      %{query: query}}
-
-      assert query =~ "WITH ready_candidates AS MATERIALIZED"
-      assert query =~ "UPDATE \"docket_runs\" AS runs"
-      refute_receive {[:docket, :postgres, :run_store_test_repo, :query], _, _}
     end
 
     test "transaction-scoped RunStore dispatch preserves and selects the resolved implementation" do

@@ -1,16 +1,13 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
-  implementations = [
-    {Docket.Postgres.ClaimPolicy.Legacy, []},
-    {Docket.Test.AlternateClaimPolicy, marker: :contract}
-  ]
-
-  for {implementation, options} <- implementations do
+  for %{implementation: implementation, options: options, fixture: fixture} <-
+        Docket.Test.ClaimPolicyMatrix.implementations() do
     defmodule Module.concat(implementation, ContractTest) do
       use ExUnit.Case, async: true
 
       use Docket.Test.ClaimPolicyTests,
         implementation: implementation,
-        options: options
+        options: options,
+        fixture: fixture
     end
   end
 
@@ -300,6 +297,31 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert_receive {[:docket, :postgres, :claim_policy, :admission], %{leases: 0},
                       %{implementation: FailingCallbackImplementation, result: :ok}}
+    end
+
+    test "the built Hex artifact excludes ClaimPolicy test support" do
+      output =
+        Path.join(
+          System.tmp_dir!(),
+          "docket-claim-policy-package-#{System.unique_integer([:positive, :monotonic])}"
+        )
+
+      on_exit(fn -> File.rm_rf!(output) end)
+
+      assert {_build_output, 0} =
+               System.cmd("mix", ["hex.build", "--unpack", "--output", output],
+                 stderr_to_stdout: true
+               )
+
+      packaged_files = Path.wildcard(Path.join(output, "**/*"), match_dot: true)
+
+      refute Enum.any?(packaged_files, fn path ->
+               relative = Path.relative_to(path, output)
+
+               relative == "test" or String.starts_with?(relative, "test/") or
+                 String.contains?(relative, "claim_policy_tests") or
+                 String.contains?(relative, "claim_policy_run_store_tests")
+             end)
     end
 
     test "source ownership forbids reverse dispatch and duplicate Legacy admission code" do

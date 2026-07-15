@@ -114,10 +114,22 @@ backend-specific suites.
 
 ClaimPolicy is a PostgreSQL-backend extension seam rather than a portable
 `Docket.Backend` capability. Its source-owned reusable cases live in
-`test/support/claim_policy_tests.ex`, with the implementation matrix in
-`test/docket/postgres/claim_policy_test.exs`. Every implementation must run
-that independent plan-builder matrix in addition to direct RunStore,
-transaction, supervised dispatcher, manual drain, PostgreSQL claim, fencing,
-poison, telemetry, query-plan, and contention tests. Implementations build and
-decode plans; they never call RunStore admission. These test modules remain
-source support and are not part of the Hex runtime API.
+`test/support/claim_policy_tests.ex` and
+`test/support/claim_policy_run_store_tests.ex`. Implementations are registered
+once in `test/support/claim_policy_matrix.ex`, and both the focused ClaimPolicy
+suite and live RunStore suite consume that registry so an implementation cannot
+silently omit either contract. The pure contract verifies policy construction and
+selected-implementation binding, invalid runtime inputs, one data-only
+statement, suite-owned decoded-batch semantics, decoder error normalization,
+bounded observations, and generic success/error telemetry metadata. Each
+implementation fixture only encodes the suite-owned batch as its row format
+and identifies input that its decoder must reject. The RunStore contract uses
+live PostgreSQL to verify one selected plan query, decoded batch return, and
+unchanged query-error return for the same implementations.
+
+The shared matrix complements direct RunStore, transaction, supervised
+dispatcher, manual drain, PostgreSQL claim, fencing, poison, telemetry,
+query-plan, and contention tests. Implementations build and decode plans; they
+never call RunStore admission. The matrix and its fixtures compile only from
+`test/support` in the test environment. The package allowlist in `mix.exs`
+excludes `test`, so none of these modules are part of the Hex runtime API.
