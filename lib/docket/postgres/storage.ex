@@ -1,27 +1,12 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.Storage do
-    @moduledoc """
-    Shared Postgres transaction boundary for Docket stores.
-
-    A context is either an Ecto Repo module or a map containing `:repo` and an
-    optional Postgres `:prefix`. Transaction callbacks always receive the
-    normalized `%{repo: repo, prefix: prefix}` form so every participating
-    store uses the same connection owner and namespace.
-
-    Transactions are delegated directly to the Repo, including nested calls.
-    This preserves Ecto's rollback-only semantics: a nested rollback taints the
-    outer transaction even if its immediate return value is caught by caller
-    code.
-    """
-
-    @behaviour Docket.Storage
+    @moduledoc false
 
     @type ctx :: module() | %{required(:repo) => module(), optional(:prefix) => String.t() | nil}
     @type normalized_ctx :: %{required(:repo) => module(), required(:prefix) => String.t() | nil}
 
     @prefix_pattern ~r/^[a-z_][a-z0-9_]*$/
 
-    @impl Docket.Storage
     def transaction(ctx, fun) when is_function(fun, 1) do
       {repo, prefix} = context!(ctx)
       transaction_ctx = %{repo: repo, prefix: prefix}

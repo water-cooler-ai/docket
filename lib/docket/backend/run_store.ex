@@ -1,4 +1,4 @@
-defmodule Docket.Storage.Runs do
+defmodule Docket.Backend.RunStore do
   @moduledoc """
   Persistence contract for the durable run aggregate.
 
@@ -17,9 +17,9 @@ defmodule Docket.Storage.Runs do
   at which the transition becomes durable.
   """
 
-  @type ctx :: Docket.Storage.ctx()
-  @type scope :: Docket.Storage.scope()
-  @type owner_scope :: Docket.Storage.owner_scope()
+  @type ctx :: Docket.Backend.ctx()
+  @type scope :: Docket.Backend.scope()
+  @type owner_scope :: Docket.Backend.owner_scope()
   @type claim_token :: nonempty_binary()
   @type checkpoint_type :: atom()
 
@@ -360,7 +360,7 @@ defmodule Docket.Storage.Runs do
   `:retain_claim` refreshes the current claim for a continuing vehicle; every
   release schedule clears it. This callback never appends events. Lifecycle
   code appends the proposal's already-assigned events through
-  `Docket.Storage.Events` in the same outer transaction.
+  `Docket.Backend.EventStore` in the same outer transaction.
 
   An unknown run or scope mismatch returns `{:error, :not_found}`. Proposal
   shape and exact-next-sequence validation happen before any run lookup, so

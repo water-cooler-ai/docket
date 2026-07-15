@@ -9,15 +9,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @type option ::
             {:name, GenServer.name()}
-            | {:context, Docket.Storage.ctx()}
+            | {:context, Docket.Backend.ctx()}
             | {:run_store, module()}
             | {:concurrency, pos_integer()}
             | {:poll_interval_ms, pos_integer()}
             | {:orphan_ttl_ms, non_neg_integer()}
             | {:max_claim_attempts, pos_integer()}
             | {:drain_timeout_ms, non_neg_integer()}
-            | {:launch, (Docket.Storage.Runs.claim_lease() -> {:ok, pid()} | {:error, term()})}
-            | {:on_poisoned, ([Docket.Storage.Runs.poisoned_claim()] -> term())}
+            | {:launch,
+               (Docket.Backend.RunStore.claim_lease() -> {:ok, pid()} | {:error, term()})}
+            | {:on_poisoned, ([Docket.Backend.RunStore.poisoned_claim()] -> term())}
             | {:clock, (-> DateTime.t())}
             | {:jitter, (pos_integer() -> non_neg_integer())}
 

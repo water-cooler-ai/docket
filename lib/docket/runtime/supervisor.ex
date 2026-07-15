@@ -95,7 +95,7 @@ defmodule Docket.Runtime.Supervisor do
       raise ArgumentError, ":backend module #{inspect(backend)} could not be loaded"
 
     missing =
-      for {name, arity} <- [storage: 0, graphs: 0, runs: 0, events: 0, child_spec: 1],
+      for {name, arity} <- [transaction: 2, graphs: 0, runs: 0, events: 0, child_spec: 1],
           not function_exported?(backend, name, arity),
           do: "#{name}/#{arity}"
 

@@ -13,26 +13,54 @@ defmodule Docket.Backend do
   child specification the host places in its supervision tree.
   """
 
-  @typedoc "A module implementing one of Docket's storage capability contracts."
+  @typedoc "A module implementing one of Docket's focused store contracts."
   @type capability :: module()
 
-  @doc "Returns the backend's `Docket.Storage` implementation."
-  @callback storage() :: capability()
+  @typedoc "Opaque backend context passed through without interpretation by core."
+  @type ctx :: term()
 
-  @doc "Returns the backend's `Docket.Storage.Graphs` implementation."
+  @typedoc "Authorization and tenancy scope for a run or its events."
+  @type scope :: :system | :tenantless | {:tenant, String.t()}
+
+  @typedoc "Scope that determines graph/run ownership; tenant identifiers are non-empty."
+  @type owner_scope :: :tenantless | {:tenant, String.t()}
+
+  @type transaction_result :: {:ok, term()} | {:error, term()}
+  @type transaction_fun :: (ctx() -> transaction_result())
+
+  @doc """
+  Runs `fun` in one backend transaction.
+
+  The callback receives a transaction-scoped opaque context, which must be
+  passed to every graph, run, and event operation participating in the
+  transaction. It returns `{:ok, value}` to commit or `{:error, reason}` to
+  roll back. The backend returns that result unchanged, which lets lifecycle
+  code compose store operations naturally with `with`.
+
+  Exceptions and throws also roll back, then propagate unchanged. A backend
+  joins a transaction already represented by `ctx` rather than opening an
+  invalid nested transaction.
+
+  Publication must be concurrency safe. An implementation may serialize
+  transactions or compare-and-swap their publication, but it must never take
+  an unlocked snapshot and later replace newer committed state blindly.
+  """
+  @callback transaction(ctx(), transaction_fun()) :: transaction_result()
+
+  @doc "Returns the backend's `Docket.Backend.GraphStore` implementation."
   @callback graphs() :: capability()
 
-  @doc "Returns the backend's `Docket.Storage.Runs` implementation."
+  @doc "Returns the backend's `Docket.Backend.RunStore` implementation."
   @callback runs() :: capability()
 
-  @doc "Returns the backend's `Docket.Storage.Events` implementation."
+  @doc "Returns the backend's `Docket.Backend.EventStore` implementation."
   @callback events() :: capability()
 
   @doc "Builds the backend's supervision child specification."
   @callback child_spec(opts :: keyword()) :: Supervisor.child_spec()
 
   @doc "Resolves the opaque root context passed to the backend transaction boundary."
-  @callback context(opts :: keyword()) :: Docket.Storage.ctx()
+  @callback context(opts :: keyword()) :: ctx()
 
   @optional_callbacks context: 1
 

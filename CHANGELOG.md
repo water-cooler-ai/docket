@@ -39,8 +39,8 @@ entries below reflect what has landed so far.
   backends implement the new graph, run, and event behavior callbacks.
 - `Docket.list_events/3` and the generated `list_events/2` host wrapper: a
   tenant-scoped, keyset-paged reader over retained durable events, backed by a
-  new `Docket.Storage.Events.list_events/4` callback with memory and Postgres
-  implementations. Events return in ascending sequence order (`:after_seq`
+  new `Docket.Backend.EventStore.list_events/4` callback with memory and
+  Postgres implementations. Events return in ascending sequence order (`:after_seq`
   default `0`, `:limit` default `250` in `1..1000`); a wrong tenant and an
   unknown run both report `{:error, :not_found}`, invalid options are rejected
   before storage, and an undecodable stored row surfaces as a typed
@@ -79,8 +79,8 @@ entries below reflect what has landed so far.
   rationale, derived queue views, scope, claims and poison, failure recovery,
   configuration defaults, checkpoint/event delivery boundaries, and the
   0.0.1 cutover.
-- `Docket.Postgres`: the fixed Postgres backend bundle supplying Storage,
-  GraphStore, RunStore, and EventStore while supervising a one-for-all
+- `Docket.Postgres`: the fixed Postgres backend bundle supplying its transaction
+  boundary, GraphStore, RunStore, and EventStore while supervising a one-for-all
   dispatcher/vehicle execution subtree, optional LISTEN/NOTIFY fast path, and
   explicit-policy pruner. The host owns its Repo; schema prefixes and all
   operational children derive from one backend context. Dispatcher failure
@@ -132,7 +132,7 @@ entries below reflect what has landed so far.
   cached graph never crosses an incompatible local generation and cache loss
   only affects latency. Known-incompatible versions are negative-cached, with
   a bounded TTL when the stored document could not even be decoded (DCKT-20).
-- `Docket.Storage.Runs.abandon_claim/5` and its Postgres and conformance
+- `Docket.Backend.RunStore.abandon_claim/5` and its Postgres and conformance
   implementations: the token-and-sequence fenced, non-poisoning disposition
   for a claimed run whose graph the executing node cannot compile
   (deployment incompatibility). A matched abandon hands the acquisition
@@ -143,19 +143,18 @@ entries below reflect what has landed so far.
   distinct `max_claim_abandons_exceeded` reason instead of retrying
   unboundedly (DCKT-35).
 
-- `Docket.Backend`: one backend bundle as the public durable backend
-  substitution boundary, supplying compatible transaction, graph,
-  run-aggregate, event, and supervision capabilities (DCKT-8, #12).
+- `Docket.Backend`: the only public durable backend substitution boundary,
+  directly owning the opaque context and scope types plus `transaction/2`, and
+  supplying compatible graph, run-aggregate, event, and supervision
+  capabilities (DCKT-8, DCKT-51, #12).
 - Substrate-neutral storage ports (DCKT-8, #12):
-  - `Docket.Storage` — the shared backend transaction boundary
-    (`transaction/2`);
-  - `Docket.Storage.Graphs` — explicitly owner-scoped immutable canonical graph
-    save, exact fetch, latest-reference fetch, and version listing;
-  - `Docket.Storage.Runs` — the run-row aggregate: insert/fetch/inspect,
+  - `Docket.Backend.GraphStore` — explicitly owner-scoped immutable canonical
+    graph save, exact fetch, latest-reference fetch, and version listing;
+  - `Docket.Backend.RunStore` — the run-row aggregate: insert/fetch/inspect,
     atomic batched due/expired claims with poison outcomes, token-guarded
     claim refresh/release, mandatory token-and-sequence fenced commit, serialized
     mutation, and poison recovery;
-  - `Docket.Storage.Events` — append-only persistence of already-assigned
+  - `Docket.Backend.EventStore` — append-only persistence of already-assigned
     events.
 - Explicit owner scope on graph operations and
   `:system | :tenantless | {:tenant, id}` scope on run/event operations;
@@ -175,8 +174,9 @@ entries below reflect what has landed so far.
   sequence-and-claim fence while applying schedule state, and
   `Docket.Postgres.EventStore` idempotently appends assigned, versioned event
   facts inside the same lifecycle transaction (DCKT-16).
-- Postgres storage/read foundation: `Docket.Postgres.Storage` supplies the
-  shared Repo/prefix transaction context; `Docket.Postgres.GraphStore`
+- Postgres storage/read foundation: the private `Docket.Postgres.Storage`
+  implementation supplies the shared Repo/prefix transaction context behind
+  `Docket.Postgres.transaction/2`; `Docket.Postgres.GraphStore`
   persists immutable content-addressed graph versions with concurrent conflict
   arbitration; and the private run row codec plus scoped
   `RunStore.insert_run`/`fetch_run`/`inspect_run` reconstruct the exact
@@ -207,7 +207,7 @@ entries below reflect what has landed so far.
   (DCKT-31, #17).
 - `Docket.RunInfo`: token-free operational projection (`run`, `wake_at`,
   `claimed_at`, `claim_attempts`, paired poison facts) returned by
-  `Docket.Storage.Runs.inspect_run`, documenting the `inspect_run` contract
+  `Docket.Backend.RunStore.inspect_run`, documenting the `inspect_run` contract
   and the poisoned `await_run` typed operational halt (DCKT-31, #17).
 - `Docket.Run.durable_statuses/0`, `durable_status?/1`, and
   `valid_transition?/2`: the five durable graph statuses and the locked

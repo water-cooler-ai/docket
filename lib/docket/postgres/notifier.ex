@@ -33,7 +33,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @type option ::
             {:name, GenServer.name()}
-            | {:context, Storage.ctx()}
+            | {:context, Docket.Backend.ctx()}
             | {:dispatcher, GenServer.server()}
             | {:connection, keyword()}
 

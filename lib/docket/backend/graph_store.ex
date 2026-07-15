@@ -1,4 +1,4 @@
-defmodule Docket.Storage.Graphs do
+defmodule Docket.Backend.GraphStore do
   @moduledoc """
   Persistence contract for tenant-owned effective graph versions.
 
@@ -18,8 +18,8 @@ defmodule Docket.Storage.Graphs do
   transactions never publish graph documents.
   """
 
-  @type ctx :: Docket.Storage.ctx()
-  @type owner_scope :: Docket.Storage.owner_scope()
+  @type ctx :: Docket.Backend.ctx()
+  @type owner_scope :: Docket.Backend.owner_scope()
 
   @typedoc "Stable newest-first graph-version cursor: `{published_at, graph_hash}`."
   @type list_cursor :: Docket.GraphVersionPage.cursor()

@@ -37,7 +37,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                          |> Enum.map_join(", ", &"'#{&1}'")
 
     @retained_graph_revisions 10
-    @type ctx :: Storage.ctx()
+    @type ctx :: Docket.Backend.ctx()
     @type policy :: %{
             required(:now) => DateTime.t() | :database,
             required(:event_retention_ms) => non_neg_integer(),

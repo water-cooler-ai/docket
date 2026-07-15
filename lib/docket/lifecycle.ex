@@ -5,17 +5,16 @@ defmodule Docket.Lifecycle do
 
   alias Docket.Runtime.Moment
 
-  @type backend :: {module(), Docket.Storage.ctx()}
+  @type backend :: {module(), Docket.Backend.ctx()}
 
-  @spec start(backend(), Docket.Storage.owner_scope(), Moment.t()) ::
+  @spec start(backend(), Docket.Backend.owner_scope(), Moment.t()) ::
           {:ok, Moment.t()} | {:error, term()}
   def start({backend, context}, scope, %Moment{} = moment) do
-    storage = backend.storage()
     runs = backend.runs()
     events = backend.events()
 
     Docket.Telemetry.lifecycle_span(:start, fn ->
-      storage.transaction(context, fn tx ->
+      backend.transaction(context, fn tx ->
         with {:ok, _run} <-
                store_span(:run_insert, fn ->
                  runs.insert_run(
@@ -41,10 +40,10 @@ defmodule Docket.Lifecycle do
 
   @spec commit_moment(
           backend(),
-          Docket.Storage.scope(),
+          Docket.Backend.scope(),
           Moment.t(),
           non_neg_integer(),
-          Docket.Storage.Runs.claim_token()
+          Docket.Backend.RunStore.claim_token()
         ) :: {:ok, Moment.t()} | {:error, term()}
   def commit_moment(
         {backend, context},
@@ -53,7 +52,6 @@ defmodule Docket.Lifecycle do
         expected_checkpoint_seq,
         claim_token
       ) do
-    storage = backend.storage()
     runs = backend.runs()
     events = backend.events()
 
@@ -66,7 +64,7 @@ defmodule Docket.Lifecycle do
     }
 
     Docket.Telemetry.lifecycle_span(:moment, fn ->
-      storage.transaction(context, fn tx ->
+      backend.transaction(context, fn tx ->
         with {:ok, _run} <- store_span(:run_commit, fn -> runs.commit(tx, scope, proposal) end),
              :ok <-
                store_span(
@@ -83,18 +81,17 @@ defmodule Docket.Lifecycle do
 
   @spec signal(
           backend(),
-          Docket.Storage.scope(),
+          Docket.Backend.scope(),
           String.t(),
           (Docket.Run.t() ->
              {:ok, Moment.t()} | {:unchanged, Docket.Run.t()} | {:error, term()})
         ) :: {:ok, Moment.t() | Docket.Run.t()} | {:error, term()}
   def signal({backend, context}, scope, run_id, mutation) when is_function(mutation, 1) do
-    storage = backend.storage()
     runs = backend.runs()
     events = backend.events()
 
     Docket.Telemetry.lifecycle_span(:signal, fn ->
-      storage.transaction(context, fn tx ->
+      backend.transaction(context, fn tx ->
         case store_span(:run_mutation, fn ->
                runs.mutate_run(tx, scope, run_id, fn run ->
                  mutation_decision(mutation.(run))
@@ -122,7 +119,8 @@ defmodule Docket.Lifecycle do
   end
 
   @doc false
-  @spec schedule(Moment.disposition(), :claimed | :unclaimed) :: Docket.Storage.Runs.schedule()
+  @spec schedule(Moment.disposition(), :claimed | :unclaimed) ::
+          Docket.Backend.RunStore.schedule()
   def schedule(:continue, :claimed), do: :retain_claim
   def schedule(:continue, :unclaimed), do: {:release_claim, :immediate}
   def schedule({:park, :immediate, _reason}, _claim), do: {:release_claim, :immediate}

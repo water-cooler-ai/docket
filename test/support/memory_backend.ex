@@ -9,15 +9,14 @@ defmodule Docket.Test.MemoryBackend do
   """
 
   @behaviour Docket.Backend
-  @behaviour Docket.Storage
-  @behaviour Docket.Storage.Graphs
-  @behaviour Docket.Storage.Runs
-  @behaviour Docket.Storage.Events
+  @behaviour Docket.Backend.GraphStore
+  @behaviour Docket.Backend.RunStore
+  @behaviour Docket.Backend.EventStore
 
   defmodule Transaction do
     @moduledoc false
-    @enforce_keys [:root, :agent]
-    defstruct [:root, :agent]
+    @enforce_keys [:root, :agent, :rollback]
+    defstruct [:root, :agent, :rollback]
   end
 
   @type scope :: :system | :tenantless | {:tenant, String.t()}
@@ -26,9 +25,6 @@ defmodule Docket.Test.MemoryBackend do
             graphs: %{},
             clock: nil,
             token_generator: nil
-
-  @impl Docket.Backend
-  def storage, do: __MODULE__
 
   @impl Docket.Backend
   def graphs, do: __MODULE__
@@ -61,25 +57,50 @@ defmodule Docket.Test.MemoryBackend do
     )
   end
 
-  @impl Docket.Storage
-  def transaction(%Transaction{} = transaction, fun) when is_function(fun, 1) do
-    validate_transaction_result(fun.(transaction))
+  @impl Docket.Backend
+  def transaction(%Transaction{rollback: rollback} = transaction, fun)
+      when is_function(fun, 1) do
+    try do
+      case validate_transaction_result(fun.(transaction)) do
+        {:ok, _value} = result ->
+          result
+
+        {:error, _reason} = error ->
+          mark_rollback_only(rollback)
+          error
+      end
+    catch
+      kind, reason ->
+        mark_rollback_only(rollback)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
   end
 
   def transaction(backend, fun) when is_function(fun, 1) do
     with_root_lock(backend, fn ->
       snapshot = Agent.get(backend, & &1)
       {:ok, transaction_agent} = Agent.start_link(fn -> snapshot end)
-      transaction = %Transaction{root: backend, agent: transaction_agent}
+      {:ok, rollback_agent} = Agent.start_link(fn -> false end)
+
+      transaction = %Transaction{
+        root: backend,
+        agent: transaction_agent,
+        rollback: rollback_agent
+      }
+
       process_key = transaction_process_key(backend)
       previous = Process.put(process_key, true)
 
       try do
         case validate_transaction_result(fun.(transaction)) do
           {:ok, _value} = result ->
-            committed = Agent.get(transaction_agent, & &1)
-            Agent.update(backend, fn _state -> committed end)
-            result
+            if Agent.get(rollback_agent, & &1) do
+              {:error, :rollback}
+            else
+              committed = Agent.get(transaction_agent, & &1)
+              Agent.update(backend, fn _state -> committed end)
+              result
+            end
 
           {:error, _reason} = error ->
             error
@@ -90,11 +111,15 @@ defmodule Docket.Test.MemoryBackend do
         if Process.alive?(transaction_agent) do
           Agent.stop(transaction_agent)
         end
+
+        if Process.alive?(rollback_agent) do
+          Agent.stop(rollback_agent)
+        end
       end
     end)
   end
 
-  @impl Docket.Storage.Graphs
+  @impl Docket.Backend.GraphStore
   def save_graph(
         backend,
         owner_scope,
@@ -134,7 +159,7 @@ defmodule Docket.Test.MemoryBackend do
   def save_graph(_backend, _owner_scope, _graph_id, _graph_hash, _graph),
     do: {:error, :invalid_graph_document}
 
-  @impl Docket.Storage.Graphs
+  @impl Docket.Backend.GraphStore
   def fetch_graph(backend, owner_scope, graph_id, graph_hash) do
     validate_owner_scope!(owner_scope)
 
@@ -146,7 +171,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Graphs
+  @impl Docket.Backend.GraphStore
   def fetch_latest_graph_ref(backend, owner_scope, graph_id) do
     validate_owner_scope!(owner_scope)
 
@@ -161,7 +186,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Graphs
+  @impl Docket.Backend.GraphStore
   def list_graph_versions(backend, owner_scope, graph_id, %{limit: limit, before: before}) do
     validate_owner_scope!(owner_scope)
 
@@ -188,7 +213,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Runs
+  @impl Docket.Backend.RunStore
   def insert_run(backend, owner_scope, run, checkpoint_type, wake_at) do
     tenant_id = owner_tenant_id!(owner_scope)
 
@@ -210,7 +235,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Runs
+  @impl Docket.Backend.RunStore
   def fetch_run(backend, scope, run_id) do
     validate_scope!(scope)
 
@@ -221,7 +246,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Runs
+  @impl Docket.Backend.RunStore
   def inspect_run(backend, scope, run_id) do
     validate_scope!(scope)
 
@@ -232,7 +257,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Runs
+  @impl Docket.Backend.RunStore
   def list_runs(
         backend,
         scope,
@@ -265,7 +290,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Runs
+  @impl Docket.Backend.RunStore
   def claim_due(backend, :system, policy) do
     validate_claim_policy!(policy)
 
@@ -279,7 +304,7 @@ defmodule Docket.Test.MemoryBackend do
     raise ArgumentError, "claim_due scope must be :system, got: #{inspect(scope)}"
   end
 
-  @impl Docket.Storage.Runs
+  @impl Docket.Backend.RunStore
   def refresh_claim(backend, :system, run_id, claim_token, now) do
     state_get_and_update(backend, fn state ->
       case fetch_record(state, run_id) do
@@ -304,7 +329,7 @@ defmodule Docket.Test.MemoryBackend do
 
   defp latest(_stored, now), do: now
 
-  @impl Docket.Storage.Runs
+  @impl Docket.Backend.RunStore
   def release_claim(backend, :system, run_id, claim_token, now) do
     state_update(backend, fn state ->
       case fetch_record(state, run_id) do
@@ -325,7 +350,7 @@ defmodule Docket.Test.MemoryBackend do
     raise ArgumentError, "release_claim scope must be :system, got: #{inspect(scope)}"
   end
 
-  @impl Docket.Storage.Runs
+  @impl Docket.Backend.RunStore
   def abandon_claim(backend, :system, run_id, claim_token, policy) do
     validate_abandon_policy!(policy)
 
@@ -345,7 +370,7 @@ defmodule Docket.Test.MemoryBackend do
     raise ArgumentError, "abandon_claim scope must be :system, got: #{inspect(scope)}"
   end
 
-  @impl Docket.Storage.Runs
+  @impl Docket.Backend.RunStore
   def commit(backend, scope, proposal) do
     validate_scope!(scope)
 
@@ -371,7 +396,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Runs
+  @impl Docket.Backend.RunStore
   def mutate_run(backend, scope, run_id, mutation) when is_function(mutation, 1) do
     validate_scope!(scope)
 
@@ -383,7 +408,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Runs
+  @impl Docket.Backend.RunStore
   def retry_poisoned_run(backend, scope, run_id, now) do
     validate_scope!(scope)
 
@@ -415,7 +440,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Events
+  @impl Docket.Backend.EventStore
   def append_events(_backend, scope, _run_id, []) do
     validate_scope!(scope)
     :ok
@@ -435,7 +460,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Events
+  @impl Docket.Backend.EventStore
   def fetch_event(backend, scope, run_id, seq) do
     validate_scope!(scope)
 
@@ -453,7 +478,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Events
+  @impl Docket.Backend.EventStore
   def fetch_latest_event(backend, scope, run_id) do
     validate_scope!(scope)
 
@@ -470,7 +495,7 @@ defmodule Docket.Test.MemoryBackend do
     end)
   end
 
-  @impl Docket.Storage.Events
+  @impl Docket.Backend.EventStore
   def list_events(backend, scope, run_id, %{after_seq: after_seq, limit: limit}) do
     validate_scope!(scope)
 
@@ -1090,8 +1115,10 @@ defmodule Docket.Test.MemoryBackend do
 
   defp validate_transaction_result(other) do
     raise ArgumentError,
-          "storage transaction must return {:ok, value} or {:error, reason}, got: #{inspect(other)}"
+          "backend transaction must return {:ok, value} or {:error, reason}, got: #{inspect(other)}"
   end
+
+  defp mark_rollback_only(agent), do: Agent.update(agent, fn _rollback_only? -> true end)
 
   defp state_get(%Transaction{agent: agent}, fun), do: Agent.get(agent, fun)
 

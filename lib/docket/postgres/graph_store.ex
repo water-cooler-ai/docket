@@ -2,7 +2,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.GraphStore do
     @moduledoc "Postgres storage for immutable, content-addressed durable graphs."
 
-    @behaviour Docket.Storage.Graphs
+    @behaviour Docket.Backend.GraphStore
 
     import Ecto.Query
 
@@ -10,7 +10,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Schemas.GraphVersion, as: GraphVersionSchema
     alias Docket.Postgres.Storage
 
-    @impl Docket.Storage.Graphs
+    @impl Docket.Backend.GraphStore
     def save_graph(
           ctx,
           owner_scope,
@@ -36,7 +36,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def save_graph(_ctx, _owner_scope, _graph_id, _graph_hash, _graph),
       do: {:error, :invalid_graph_document}
 
-    @impl Docket.Storage.Graphs
+    @impl Docket.Backend.GraphStore
     def fetch_graph(ctx, owner_scope, graph_id, graph_hash) do
       started = System.monotonic_time()
 
@@ -54,7 +54,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       result
     end
 
-    @impl Docket.Storage.Graphs
+    @impl Docket.Backend.GraphStore
     def fetch_latest_graph_ref(ctx, owner_scope, graph_id) do
       started = System.monotonic_time()
 
@@ -67,7 +67,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       result
     end
 
-    @impl Docket.Storage.Graphs
+    @impl Docket.Backend.GraphStore
     def list_graph_versions(ctx, owner_scope, graph_id, query) do
       started = System.monotonic_time()
 

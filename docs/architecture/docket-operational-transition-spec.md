@@ -170,7 +170,7 @@ effective graph and compiles it against the node modules installed on that
 node. During a rolling deployment a node can therefore hold a valid claim on
 a run whose graph it cannot compile. That is a deployment-compatibility
 condition, not node execution failure, and it gets its own disposition:
-`Docket.Storage.Runs.abandon_claim/5`.
+`Docket.Backend.RunStore.abandon_claim/5`.
 
 An ordinary release would mishandle this. Claim acquisition already
 incremented `claim_attempts`, and `release_claim` records an immediate wake —
@@ -298,8 +298,8 @@ end
 ```
 
 The migration records its installed version in a comment on `docket_runs` and
-applies only missing steps. `Docket.Postgres.Storage` accepts either a Repo or
-`%{repo: MyApp.Repo, prefix: "automation"}` as its context.
+applies only missing steps. `Docket.Postgres` resolves the configured Repo and
+optional prefix into the opaque backend context used by its stores.
 
 ## Operational inspection
 

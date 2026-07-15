@@ -125,7 +125,8 @@ defmodule Docket.MemoryBackendTest do
   end
 
   test "backend is one bundle for compatible capabilities", %{backend: backend} do
-    assert MemoryBackend.storage() == MemoryBackend
+    assert function_exported?(MemoryBackend, :transaction, 2)
+    refute function_exported?(MemoryBackend, :storage, 0)
     assert MemoryBackend.graphs() == MemoryBackend
     assert MemoryBackend.runs() == MemoryBackend
     assert MemoryBackend.events() == MemoryBackend
@@ -352,6 +353,41 @@ defmodule Docket.MemoryBackendTest do
 
     assert {:ok, %Run{id: "outer"}} = MemoryBackend.fetch_run(b, :system, "outer")
     assert {:ok, %Run{id: "inner"}} = MemoryBackend.fetch_run(b, :system, "inner")
+  end
+
+  test "a swallowed nested rollback makes the outer transaction rollback-only", %{backend: b} do
+    publish_default!(b)
+
+    assert {:error, :rollback} =
+             MemoryBackend.transaction(b, fn tx ->
+               assert {:ok, _} =
+                        MemoryBackend.insert_run(
+                          tx,
+                          :tenantless,
+                          run("outer-rollback"),
+                          :run_initialized,
+                          @initial_wake
+                        )
+
+               assert {:error, :inner_stop} =
+                        MemoryBackend.transaction(tx, fn nested ->
+                          assert {:ok, _} =
+                                   MemoryBackend.insert_run(
+                                     nested,
+                                     :tenantless,
+                                     run("inner-rollback"),
+                                     :run_initialized,
+                                     @initial_wake
+                                   )
+
+                          {:error, :inner_stop}
+                        end)
+
+               {:ok, :attempted_swallow}
+             end)
+
+    assert {:error, :not_found} = MemoryBackend.fetch_run(b, :system, "outer-rollback")
+    assert {:error, :not_found} = MemoryBackend.fetch_run(b, :system, "inner-rollback")
   end
 
   test "overlapping transactions cannot erase each other's commits", %{backend: b} do

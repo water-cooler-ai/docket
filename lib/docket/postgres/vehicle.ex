@@ -52,7 +52,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           ]
 
     @type option ::
-            {:backend, {module(), Docket.Storage.ctx()}}
+            {:backend, {module(), Docket.Backend.ctx()}}
             | {:task_supervisor, Supervisor.supervisor()}
             | {:clock, (-> DateTime.t())}
             | {:monotonic_clock, (-> integer())}
@@ -102,7 +102,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     `launch: Docket.Postgres.Vehicle.launcher(opts)`.
     """
     @spec launcher([option()]) ::
-            (Docket.Storage.Runs.claim_lease() -> {:ok, pid()} | {:error, term()})
+            (Docket.Backend.RunStore.claim_lease() -> {:ok, pid()} | {:error, term()})
     def launcher(opts) do
       _drain_budget = drain_budget!(opts)
       _monotonic_clock = monotonic_clock!(opts)
@@ -121,7 +121,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     `launch: &Docket.Postgres.Vehicle.launch(&1, opts)`. Prefer `launcher/1`,
     which validates the options once at assembly time.
     """
-    @spec launch(Docket.Storage.Runs.claim_lease(), [option()]) ::
+    @spec launch(Docket.Backend.RunStore.claim_lease(), [option()]) ::
             {:ok, pid()} | {:error, term()}
     def launch(lease, opts) do
       Task.Supervisor.start_child(Keyword.fetch!(opts, :task_supervisor), fn ->
@@ -132,7 +132,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc """
     Synchronously drains one claim lease to its next park or stop.
     """
-    @spec drain(Docket.Storage.Runs.claim_lease(), [option()]) :: outcome()
+    @spec drain(Docket.Backend.RunStore.claim_lease(), [option()]) :: outcome()
     def drain(lease, opts) do
       try do
         Docket.Telemetry.span([:docket, :postgres, :vehicle], %{}, fn ->

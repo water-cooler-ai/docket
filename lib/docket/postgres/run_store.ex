@@ -56,7 +56,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     import Ecto.Query
 
-    @behaviour Docket.Storage.Runs
+    @behaviour Docket.Backend.RunStore
 
     alias Docket.Postgres.{RunCodec, Storage}
     alias Docket.Postgres.Schemas.Run
@@ -80,7 +80,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @impl true
     @spec insert_run(
             ctx(),
-            Docket.Storage.owner_scope(),
+            Docket.Backend.owner_scope(),
             Docket.Run.t(),
             Docket.Checkpoint.type(),
             DateTime.t()
@@ -132,7 +132,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Fetches the last committed run under an explicit SQL-enforced scope.
     """
     @impl true
-    @spec fetch_run(ctx(), Docket.Storage.scope(), String.t()) ::
+    @spec fetch_run(ctx(), Docket.Backend.scope(), String.t()) ::
             {:ok, Docket.Run.t()} | {:error, :not_found}
     def fetch_run(ctx, scope, run_id) do
       store_operation(:run_fetch, fn ->
@@ -151,8 +151,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     limit, and uses the immutable `(started_at, run_id)` key for stable
     newest-first pagination.
     """
-    @impl Docket.Storage.Runs
-    @spec list_runs(ctx(), Docket.Storage.scope(), Docket.Storage.Runs.list_query()) ::
+    @impl Docket.Backend.RunStore
+    @spec list_runs(ctx(), Docket.Backend.scope(), Docket.Backend.RunStore.list_query()) ::
             {:ok, Docket.RunPage.t()}
     def list_runs(ctx, scope, query) do
       store_operation(:run_list, fn ->
@@ -192,7 +192,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Fetches the committed run plus token-free backend operational state.
     """
     @impl true
-    @spec inspect_run(ctx(), Docket.Storage.scope(), String.t()) ::
+    @spec inspect_run(ctx(), Docket.Backend.scope(), String.t()) ::
             {:ok, Docket.RunInfo.t()} | {:error, :not_found}
     def inspect_run(ctx, scope, run_id) do
       store_operation(:run_inspect, fn ->
@@ -228,8 +228,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     and is never returned as a lease.
     """
     @impl true
-    @spec claim_due(ctx(), :system, Docket.Storage.Runs.claim_policy()) ::
-            {:ok, Docket.Storage.Runs.claim_batch()} | {:error, term()}
+    @spec claim_due(ctx(), :system, Docket.Backend.RunStore.claim_policy()) ::
+            {:ok, Docket.Backend.RunStore.claim_batch()} | {:error, term()}
     def claim_due(ctx, :system, policy) do
       started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)
@@ -274,7 +274,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             ctx(),
             :system,
             String.t(),
-            Docket.Storage.Runs.claim_token(),
+            Docket.Backend.RunStore.claim_token(),
             DateTime.t()
           ) ::
             :ok | {:error, :claim_lost}
@@ -321,7 +321,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             ctx(),
             :system,
             String.t(),
-            Docket.Storage.Runs.claim_token(),
+            Docket.Backend.RunStore.claim_token(),
             DateTime.t()
           ) ::
             :ok
@@ -371,9 +371,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             ctx(),
             :system,
             String.t(),
-            Docket.Storage.Runs.claim_token(),
-            Docket.Storage.Runs.abandon_policy()
-          ) :: Docket.Storage.Runs.abandon_result()
+            Docket.Backend.RunStore.claim_token(),
+            Docket.Backend.RunStore.abandon_policy()
+          ) :: Docket.Backend.RunStore.abandon_result()
     def abandon_claim(ctx, :system, run_id, claim_token, policy) do
       started = System.monotonic_time()
 
@@ -520,7 +520,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @doc "Commits an exact-next run document under the current claim fence."
     @impl true
-    @spec commit(ctx(), Docket.Storage.scope(), Docket.Storage.Runs.commit_proposal()) ::
+    @spec commit(ctx(), Docket.Backend.scope(), Docket.Backend.RunStore.commit_proposal()) ::
             {:ok, Docket.Run.t()} | {:error, :stale_fence | :invalid_commit | :not_found}
     def commit(ctx, scope, proposal) do
       {repo, prefix} = Storage.context!(ctx)
@@ -558,8 +558,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @doc "Serializes and applies one pure run mutation without requiring a claim fence."
     @impl true
-    @spec mutate_run(ctx(), Docket.Storage.scope(), String.t(), Docket.Storage.Runs.mutation()) ::
-            Docket.Storage.Runs.mutation_result()
+    @spec mutate_run(
+            ctx(),
+            Docket.Backend.scope(),
+            String.t(),
+            Docket.Backend.RunStore.mutation()
+          ) ::
+            Docket.Backend.RunStore.mutation_result()
     def mutate_run(ctx, scope, run_id, mutation) when is_function(mutation, 1) do
       {repo, prefix} = Storage.context!(ctx)
       validate_scope!(scope)
@@ -583,7 +588,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @impl true
     @spec retry_poisoned_run(
             ctx(),
-            Docket.Storage.scope(),
+            Docket.Backend.scope(),
             String.t(),
             DateTime.t()
           ) :: {:ok, Docket.Run.t()} | {:error, :not_found | :inactive_run}
@@ -643,7 +648,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @doc false
-    @spec current_claim(String.t(), Docket.Storage.Runs.claim_token()) ::
+    @spec current_claim(String.t(), Docket.Backend.RunStore.claim_token()) ::
             Ecto.Query.dynamic_expr()
     def current_claim(run_id, claim_token)
         when is_binary(run_id) and byte_size(run_id) > 0 and is_binary(claim_token) and

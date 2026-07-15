@@ -57,19 +57,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule FailingBackend do
-      def storage, do: Docket.Postgres.Storage
+      defdelegate transaction(ctx, fun), to: Docket.Postgres
       def runs, do: Docket.Postgres.RunStore
       def events, do: Docket.Postgres.LifecycleStorageTest.FailingEvents
     end
 
     defmodule NoopBackend do
-      def storage, do: Docket.Postgres.Storage
+      defdelegate transaction(ctx, fun), to: Docket.Postgres
       def runs, do: Docket.Postgres.RunStore
       def events, do: Docket.Postgres.LifecycleStorageTest.NoopEvents
     end
 
     defmodule RealBackend do
-      def storage, do: Docket.Postgres.Storage
+      defdelegate transaction(ctx, fun), to: Docket.Postgres
       def runs, do: Docket.Postgres.RunStore
       def events, do: Docket.Postgres.EventStore
     end
