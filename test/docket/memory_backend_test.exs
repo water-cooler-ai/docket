@@ -268,128 +268,6 @@ defmodule Docket.MemoryBackendTest do
     assert {:error, :not_found} = MemoryBackend.fetch_run(b, :system, "r1")
   end
 
-  test "transaction errors, exceptions, and throws roll back and propagate", %{backend: b} do
-    publish_default!(b)
-
-    assert {:error, :stop} =
-             MemoryBackend.transaction(b, fn tx ->
-               assert {:ok, _} =
-                        MemoryBackend.insert_run(
-                          tx,
-                          :tenantless,
-                          run("error"),
-                          :run_initialized,
-                          @initial_wake
-                        )
-
-               {:error, :stop}
-             end)
-
-    assert_raise RuntimeError, "boom", fn ->
-      MemoryBackend.transaction(b, fn tx ->
-        assert {:ok, _} =
-                 MemoryBackend.insert_run(
-                   tx,
-                   :tenantless,
-                   run("raise"),
-                   :run_initialized,
-                   @initial_wake
-                 )
-
-        raise "boom"
-      end)
-    end
-
-    assert catch_throw(
-             MemoryBackend.transaction(b, fn tx ->
-               assert {:ok, _} =
-                        MemoryBackend.insert_run(
-                          tx,
-                          :tenantless,
-                          run("throw"),
-                          :run_initialized,
-                          @initial_wake
-                        )
-
-               throw(:boom)
-             end)
-           ) == :boom
-
-    for id <- ~w(error raise throw) do
-      assert {:error, :not_found} = MemoryBackend.fetch_run(b, :system, id)
-    end
-  end
-
-  test "nested transactions join the outer transaction", %{backend: b} do
-    publish_default!(b)
-
-    assert {:ok, :outer} =
-             MemoryBackend.transaction(b, fn tx ->
-               assert {:ok, _} =
-                        MemoryBackend.insert_run(
-                          tx,
-                          :tenantless,
-                          run("outer"),
-                          :run_initialized,
-                          @initial_wake
-                        )
-
-               assert {:ok, :inner} =
-                        MemoryBackend.transaction(tx, fn nested ->
-                          assert {:ok, _} =
-                                   MemoryBackend.insert_run(
-                                     nested,
-                                     :tenantless,
-                                     run("inner"),
-                                     :run_initialized,
-                                     @initial_wake
-                                   )
-
-                          {:ok, :inner}
-                        end)
-
-               {:ok, :outer}
-             end)
-
-    assert {:ok, %Run{id: "outer"}} = MemoryBackend.fetch_run(b, :system, "outer")
-    assert {:ok, %Run{id: "inner"}} = MemoryBackend.fetch_run(b, :system, "inner")
-  end
-
-  test "a swallowed nested rollback makes the outer transaction rollback-only", %{backend: b} do
-    publish_default!(b)
-
-    assert {:error, :rollback} =
-             MemoryBackend.transaction(b, fn tx ->
-               assert {:ok, _} =
-                        MemoryBackend.insert_run(
-                          tx,
-                          :tenantless,
-                          run("outer-rollback"),
-                          :run_initialized,
-                          @initial_wake
-                        )
-
-               assert {:error, :inner_stop} =
-                        MemoryBackend.transaction(tx, fn nested ->
-                          assert {:ok, _} =
-                                   MemoryBackend.insert_run(
-                                     nested,
-                                     :tenantless,
-                                     run("inner-rollback"),
-                                     :run_initialized,
-                                     @initial_wake
-                                   )
-
-                          {:error, :inner_stop}
-                        end)
-
-               {:ok, :attempted_swallow}
-             end)
-
-    assert {:error, :not_found} = MemoryBackend.fetch_run(b, :system, "outer-rollback")
-    assert {:error, :not_found} = MemoryBackend.fetch_run(b, :system, "inner-rollback")
-  end
-
   test "overlapping transactions cannot erase each other's commits", %{backend: b} do
     publish_default!(b)
     parent = self()
@@ -564,22 +442,6 @@ defmodule Docket.MemoryBackendTest do
              MemoryBackend.fetch_run(b, :system, "transaction")
 
     assert {:ok, %Run{id: "direct"}} = MemoryBackend.fetch_run(b, :system, "direct")
-  end
-
-  test "scope is explicit and cannot fail open", %{backend: b} do
-    assert {:ok, _} = initialize(b, run("tenantless"))
-    assert {:ok, _} = initialize(b, run("tenant"), scope: {:tenant, "t1"})
-
-    assert {:ok, _} = MemoryBackend.fetch_run(b, :system, "tenantless")
-    assert {:ok, _} = MemoryBackend.fetch_run(b, :system, "tenant")
-    assert {:ok, _} = MemoryBackend.fetch_run(b, :tenantless, "tenantless")
-    assert {:error, :not_found} = MemoryBackend.fetch_run(b, :tenantless, "tenant")
-    assert {:ok, _} = MemoryBackend.fetch_run(b, {:tenant, "t1"}, "tenant")
-    assert {:error, :not_found} = MemoryBackend.fetch_run(b, {:tenant, "t2"}, "tenant")
-
-    assert_raise ArgumentError, ~r/scope must be/, fn ->
-      MemoryBackend.fetch_run(b, nil, "tenant")
-    end
   end
 
   test "inspect_run exposes operational state but never the claim token", %{backend: b} do
@@ -1011,30 +873,6 @@ defmodule Docket.MemoryBackendTest do
     assert MemoryBackend.claim(b, "r1") == lease.claim_token
   end
 
-  test "two commits under the same fence produce one durable winner", %{backend: b} do
-    assert {:ok, _} = initialize(b, run("r1"))
-    lease = claim_one(b, @now)
-
-    results =
-      [10, 20]
-      |> Task.async_stream(
-        fn seq ->
-          next = %{run("r1", checkpoint_seq: 2) | metadata: %{"winner" => seq}}
-
-          commit(b, next, lease.claim_token, {:release_claim, :immediate},
-            events: [event("r1", seq)]
-          )
-        end,
-        ordered: false,
-        max_concurrency: 2
-      )
-      |> Enum.map(fn {:ok, result} -> result end)
-
-    assert Enum.count(results, &match?({:ok, _}, &1)) == 1
-    assert Enum.count(results, &match?({:error, :stale_fence}, &1)) == 1
-    assert [_winner] = MemoryBackend.events(b, :system, "r1")
-  end
-
   test "commit schedule effects retain, wake, and park without ambiguity", %{backend: _} do
     {:ok, b} = MemoryBackend.start_link(clock: fn -> @commit_now end)
 
@@ -1202,20 +1040,6 @@ defmodule Docket.MemoryBackendTest do
              end)
 
     assert MemoryBackend.record(b, "r1") == before
-  end
-
-  test "serialized mutation checks scope before invoking the callback", %{backend: b} do
-    assert {:ok, _} = initialize(b, run("r1"), scope: {:tenant, "t1"})
-
-    assert {:error, :not_found} =
-             MemoryBackend.mutate_run(b, {:tenant, "t2"}, "r1", fn _ ->
-               flunk("mutation must not run outside scope")
-             end)
-
-    assert {:error, :invalid_signal} =
-             MemoryBackend.mutate_run(b, {:tenant, "t1"}, "r1", fn _ ->
-               {:error, :invalid_signal}
-             end)
   end
 
   test "retry_poisoned_run is terminal-first and fully resets non-terminal poison", %{backend: b} do

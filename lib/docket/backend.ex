@@ -39,7 +39,16 @@ defmodule Docket.Backend do
 
   Exceptions and throws also roll back, then propagate unchanged. A backend
   joins a transaction already represented by `ctx` rather than opening an
-  invalid nested transaction.
+  invalid nested transaction. Returning any other shape raises
+  `ArgumentError` and rolls back. If a nested callback fails and its result or
+  raised value is swallowed, the containing transaction is rollback-only and
+  returns `{:error, :rollback}` instead of publishing partial work.
+
+  Transaction-scoped describes participation, not value lifetime or identity.
+  A backend may yield an ephemeral transaction object or reuse a normalized
+  root-context representation whose active transaction is owned by the
+  process, connection, or substrate. Callers must use the yielded value
+  unchanged inside the callback and must not rely on its behavior afterward.
 
   Publication must be concurrency safe. An implementation may serialize
   transactions or compare-and-swap their publication, but it must never take

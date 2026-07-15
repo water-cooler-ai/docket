@@ -16,6 +16,13 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- `Docket.BackendTests`, a source-owned shared ExUnit suite under
+  `test/support`. One explicit backend matrix generates identical black-box
+  cases for the memory and PostgreSQL bundles; external backend projects can
+  load the same files from a Docket checkout pinned to their supported release.
+  The suite covers callback completeness, transaction and cross-store
+  atomicity, scopes, graph/event identity and reads, claim fencing and
+  recovery, checkpoint sequencing, and serialized mutation safety (DCKT-52).
 - A canonical delivery and execution guarantee matrix documenting the exact
   PostgreSQL transaction boundary, replayable node attempts, external-effect
   idempotency requirements, retained-event export boundary, best-effort
@@ -132,7 +139,7 @@ entries below reflect what has landed so far.
   cached graph never crosses an incompatible local generation and cache loss
   only affects latency. Known-incompatible versions are negative-cached, with
   a bounded TTL when the stored document could not even be decoded (DCKT-20).
-- `Docket.Backend.RunStore.abandon_claim/5` and its Postgres and conformance
+- `Docket.Backend.RunStore.abandon_claim/5` and its Postgres and shared-test
   implementations: the token-and-sequence fenced, non-poisoning disposition
   for a claimed run whose graph the executing node cannot compile
   (deployment incompatibility). A matched abandon hands the acquisition
@@ -159,7 +166,7 @@ entries below reflect what has landed so far.
 - Explicit owner scope on graph operations and
   `:system | :tenantless | {:tenant, id}` scope on run/event operations;
   missing tenant input never implies privileged access (DCKT-8, #12).
-- In-memory conformance backend exercising the full bundle contract,
+- In-memory shared-test backend exercising the full bundle contract,
   including overlapping-transaction publication (test support) (DCKT-8, #12).
 - Postgres substrate scaffold behind optional dependencies: versioned
   migrations (`Docket.Postgres.Migration`, v01), `docket_graph_versions` /
@@ -202,7 +209,7 @@ entries below reflect what has landed so far.
 - `Docket.Run.Failure`: durable, JSON-safe terminal failure payload
   (`code`, `message`, optional `node_id`/`details`), present exactly when a
   run is `:failed` (`Run.validate_failure/1`, enforced at the wire boundary
-  and conformance commits) and populated by every runtime terminal-failure
+  and shared backend commits) and populated by every runtime terminal-failure
   path, so a failed run retains its cause with event persistence off
   (DCKT-31, #17).
 - `Docket.RunInfo`: token-free operational projection (`run`, `wake_at`,
