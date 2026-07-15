@@ -136,6 +136,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         notifier: :none
     end
 
+    defmodule AlternatePolicyManualHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        testing: :manual,
+        notifier: :none,
+        claim_policy: [
+          implementation: Docket.Test.AlternateClaimPolicy,
+          marker: :manual_runtime
+        ]
+    end
+
     defmodule SandboxInlineHost do
       use Docket,
         backend: Docket.Postgres,
@@ -261,6 +273,37 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, %{drained: 0, poisoned: [], outcomes: [], limit_reached: false}} =
                ManualHost.drain_runs(max_runs: 10)
+    end
+
+    test "manual drain uses the instance-selected ClaimPolicy and ignores per-call switches" do
+      start_supervised!(AlternatePolicyManualHost)
+      assert {:ok, reference} = AlternatePolicyManualHost.save_graph(Graphs.minimal_linear())
+
+      assert {:ok, %{status: :running}} =
+               AlternatePolicyManualHost.start_run(reference, %{"value" => "alternate"})
+
+      handler = "alternate-manual-policy-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:docket, :postgres, :claim_policy, :admission],
+        &Docket.Test.TelemetryRelay.raw/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert {:ok, %{drained: 1}} =
+               AlternatePolicyManualHost.drain_runs(
+                 max_runs: 1,
+                 claim_policy: [implementation: Docket.Postgres.ClaimPolicy.Legacy]
+               )
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission], %{demand: 1},
+                      %{
+                        implementation: Docket.Test.AlternateClaimPolicy,
+                        result: :ok
+                      }}
     end
 
     test "manual drains preserve retry attempt state across separate claims" do

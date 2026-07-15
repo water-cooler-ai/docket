@@ -109,3 +109,13 @@ them. Examples include:
 Portable omissions should be promoted into `Docket.BackendTests` so every
 backend receives the same assertion. Substrate mechanics should remain in
 backend-specific suites.
+
+## PostgreSQL ClaimPolicy implementations
+
+ClaimPolicy is a PostgreSQL-backend extension seam rather than a portable
+`Docket.Backend` capability. Its source-owned reusable cases live in
+`test/support/claim_policy_tests.ex`, with the implementation matrix in
+`test/docket/postgres/claim_policy_test.exs`. Every implementation must run
+that matrix in addition to the shared backend suite and PostgreSQL run-store
+claim, fencing, poison, and contention tests. These test modules remain source
+support and are not part of the Hex runtime API.

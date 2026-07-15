@@ -39,9 +39,12 @@ when you want to understand *why* the contracts are shaped the way they are.
 9. `docket-tenant-claim-fairness-design.md`
    - Proposed database-wide tenant claim caps, dynamic tier policy, fair
      partition selection, weighted service, borrowing, telemetry, and rollout.
-10. `docket-runtime-design.md`
-   - Historical 0.0.1 runtime research and background: goals, alternatives
-     considered (Pregel, LangGraph, Temporal), and future design space.
+10. `docket-claim-policy.md`
+    - Implemented phase-0 ClaimPolicy extension contract, atomicity rule,
+      instance-level rollout switch, conformance tests, and legacy rollback.
+11. `docket-runtime-design.md`
+    - Historical 0.0.1 runtime research and background: goals, alternatives
+      considered (Pregel, LangGraph, Temporal), and future design space.
 
 ## Release-Line Boundary
 

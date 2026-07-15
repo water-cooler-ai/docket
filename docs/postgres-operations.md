@@ -277,6 +277,7 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `backend:` | required | Use the complete `Docket.Postgres` bundle. |
 | `prefix:` | `public` | Must match both directions of the generated migration. |
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
+| `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` | Internal instance-level admission rollout switch. Implementations are validated before startup and cannot be selected per call. |
 | `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
 | `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
 | `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
@@ -313,6 +314,10 @@ retry policy defaults `max_attempts` to `1` and `backoff_ms` to `0`; raise the
 attempt count and choose a positive backoff to enable durable retry parking.
 Testing modes start no dispatcher, notifier, vehicle supervisor, or pruner;
 their caller-owned drain still uses the production lifecycle transactions.
+Manual and inline drains also use the instance-resolved ClaimPolicy; a
+`drain_runs/1` call cannot override the selected admission implementation. See
+the [ClaimPolicy boundary](architecture/docket-claim-policy.md) for its internal
+contract, atomicity requirement, and rollout procedure.
 
 ## Checkpoints, events, and notifications
 

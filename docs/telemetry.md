@@ -16,11 +16,12 @@ labels. Claim tokens are never emitted.
 | `[:docket, :checkpoint, :observer, :stop]` | `duration` | `checkpoint_type`, `result`, `durable_success` |
 | `[:docket, :checkpoint, :observer, :failure]` | `count` | `checkpoint_type`, `result`, `durable_success` |
 | `[:docket, :postgres, :dispatcher, :state]` | `concurrency`, `demand`, `in_flight`, `poll_active`, `poll_pending` | none |
-| `[:docket, :postgres, :dispatcher, :poll]` | `duration`, `demand`, `concurrency`, `in_flight`, `leases`, `poisoned` | `result`, `source` |
+| `[:docket, :postgres, :dispatcher, :poll]` | `duration`, `demand`, `concurrency`, `in_flight`, `leases`, `poisoned` | `claim_policy`, `result`, `source` |
 | `[:docket, :postgres, :dispatcher, :launch]` | `duration` | `result` |
 | `[:docket, :postgres, :dispatcher, :shutdown]` | `duration`, `vehicles_remaining` | `result` |
 | `[:docket, :postgres, :notification]` | `count` | `result` |
 | `[:docket, :postgres, :run_store, :claim]` | duration, candidate/selection ages and counts, `demand`, `leases`, `poisoned`, `steals`, `claim_attempts` | `preference`, `fallback`, `result` |
+| `[:docket, :postgres, :claim_policy, :admission]` | `duration`, `demand`, `leases`, `poisoned` | `implementation`, `result` |
 | `[:docket, :postgres, :claim, :attempt]` | `count`, `claim_attempts` | `result` |
 | `[:docket, :postgres, :claim, :poisoned]` | `count` | `reason` |
 | `[:docket, :postgres, :claim, :operation]` | `duration`, optionally `matched` | `operation`, `result` |
