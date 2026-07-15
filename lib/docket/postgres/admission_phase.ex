@@ -1,6 +1,49 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.AdmissionPhase do
-    @moduledoc false
+    @moduledoc """
+    Coordinates the admission preference shared by one PostgreSQL backend instance.
+
+    The legacy claim policy gives single-run claims (`demand == 1`) a choice between
+    ready work and expired leases. To prevent one class from being preferred
+    indefinitely, successful single-run attempts alternate their first choice:
+    `:ready`, then `:expired`, then `:ready` again. Here, successful means any
+    `{:ok, _}` result, including an empty or poison-only batch; it does not mean that
+    a lease was returned. A query may also fall through to the non-preferred class,
+    so this alternates the first choice rather than guaranteeing alternating result
+    classes.
+
+    Every admission receives the current preference. The legacy policy ignores it
+    for multi-run ordering because that query already makes progress across both
+    classes, and multi-run attempts do not advance the phase. Other policy
+    implementations remain free to interpret the supplied value.
+
+    This process owns exactly three pieces of transient, instance-local state:
+
+      * `preference` — the next first-choice class, initially `:ready`;
+      * `owner` — the current attempt's token, demand, and caller monitor;
+      * `queue` — callers waiting in FIFO order for the current owner to finish.
+
+    `run/3` executes the callback in the calling process while holding exclusive
+    ownership, supplies it with the current preference, and advances the preference
+    only after a successful single-run attempt. Error results, exceptions, caller
+    exits, and multi-run attempts release ownership without advancing it. Caller
+    monitoring ensures a process that exits cannot strand the queue.
+
+    Checkout and completion intentionally have no timeout: claim serialization must
+    outlive ordinary call timeouts. Consequently, a live callback that never returns
+    blocks the queue, and a callback must not call `run/3` recursively for the same
+    phase. The owning claim path is responsible for bounding its database operation;
+    process death is the phase's recovery boundary.
+
+    Production dispatcher mode and synchronous testing/drain mode both use this
+    abstraction, with one phase process for the active mode of each backend instance.
+    Keeping the phase here, rather than in a caller or per-call options, gives that
+    mode one serialized ordering history. In production it belongs to the Runner's
+    `:one_for_all` accounting unit alongside the dispatcher and vehicle supervisor;
+    restarting that unit resets the phase to `:ready`. In testing mode it is the
+    backend's standalone child. The state is scheduling coordination only and is
+    deliberately not durable.
+    """
 
     use GenServer
 
