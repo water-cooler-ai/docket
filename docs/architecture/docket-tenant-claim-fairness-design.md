@@ -163,7 +163,7 @@ supervised dispatcher:
 - `Docket.Postgres.@dispatcher_keys` and nested validation;
 - `Docket.Postgres.Dispatcher.init/1` state;
 - one shared claim-policy constructor used by dispatcher polling;
-- `Docket.Postgres.drain_runs/1`, which currently constructs its own policy;
+- `Docket.Postgres.drain_runs/2`, which receives the resolved backend context;
 - testing/manual runtime configuration and validation;
 - storage behavior types and test doubles.
 
@@ -699,7 +699,7 @@ threat model, even if hierarchical scheduling ships later.
 
 ## Manual and inline testing modes
 
-`Docket.Postgres.drain_runs/1` must use the same effective tenant policy as the
+`Docket.Postgres.drain_runs/2` must use the same effective tenant policy as the
 supervised dispatcher. It may claim one run per loop for deterministic tests,
 but it must not bypass a tenant cap or reset fairness state. A test-only bypass
 would make production behavior impossible to reproduce.

@@ -6,7 +6,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
-    alias Docket.Postgres.{Dispatcher, Notifier, RunStore, Storage}
+    alias Docket.Postgres.{AdmissionPhase, Dispatcher, Notifier, RunStore, Storage}
     alias Docket.Postgres.NotifierTestRepo, as: TestRepo
     alias Docket.Postgres.Schemas.{GraphVersion, Run}
 
@@ -317,7 +317,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         dispatcher =
           start_supervised!(
             {Dispatcher,
-             context: TestRepo,
+             context: dispatcher_context(),
              concurrency: 1,
              poll_interval_ms: 60_000,
              orphan_ttl_ms: 60_000,
@@ -358,7 +358,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         start_supervised!(
           {Dispatcher,
-           context: TestRepo,
+           context: dispatcher_context(),
            concurrency: 1,
            poll_interval_ms: 100,
            orphan_ttl_ms: 60_000,
@@ -440,7 +440,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, future())
 
       {:ok, %{leases: leases, poisoned: []}} =
-        RunStore.claim_due(TestRepo, :system, %{
+        RunStore.claim_due(Docket.Postgres.TestAdmissionContext.resolve(TestRepo), :system, %{
           now: DateTime.add(DateTime.utc_now(), 7_200, :second),
           limit: 10,
           orphan_ttl_ms: 3_600_000,
@@ -450,6 +450,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       lease = Enum.find(leases, &(&1.run_id == run.id))
       assert lease, "expected a lease for #{run.id}"
       {run, lease}
+    end
+
+    defp dispatcher_context do
+      phase = start_supervised!(AdmissionPhase)
+
+      Docket.Postgres.TestAdmissionContext.resolve(TestRepo, %{admission_phase: phase})
     end
 
     defp commit_proposal(run, lease, schedule, status \\ :running) do

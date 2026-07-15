@@ -14,6 +14,8 @@ defmodule Docket.Runtime.SupervisorConfigTest do
     def runs, do: Docket.Test.MemoryBackend
     def events, do: Docket.Test.MemoryBackend
 
+    def drain_runs(_context, _opts), do: {:error, :unsupported}
+
     def child_spec(_opts, _context),
       do: %{id: __MODULE__, start: {Task, :start_link, [fn -> :ok end]}}
   end
@@ -24,6 +26,7 @@ defmodule Docket.Runtime.SupervisorConfigTest do
     def runs, do: Docket.Test.MemoryBackend
     def events, do: Docket.Test.MemoryBackend
     def context(opts), do: Keyword.fetch!(opts, :name)
+    def drain_runs(_context, _opts), do: {:error, :unsupported}
   end
 
   defmodule StrictBackend do
@@ -42,6 +45,9 @@ defmodule Docket.Runtime.SupervisorConfigTest do
 
     @impl true
     def events, do: Docket.Test.MemoryBackend
+
+    @impl true
+    def drain_runs(_context, _opts), do: {:error, :unsupported}
 
     @impl true
     def context(opts) do

@@ -487,11 +487,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "returns an empty typed batch when no work is eligible" do
       assert {:ok, %{leases: [], poisoned: []}} = claim_due(@now)
 
-      assert {:ok, %{leases: [], poisoned: []}} =
-               RunStore.claim_due(%{repo: TestRepo}, :system, policy(@now))
+      assert_raise ArgumentError, ~r/requires a resolved ClaimPolicy/, fn ->
+        RunStore.claim_due(%{repo: TestRepo}, :system, policy(@now))
+      end
 
       assert_raise ArgumentError, fn ->
-        RunStore.claim_due(TestRepo, :tenantless, policy(@now))
+        RunStore.claim_due(admission_context(), :tenantless, policy(@now))
       end
 
       for invalid <- [
@@ -499,7 +500,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             %{policy(@now) | orphan_ttl_ms: -1},
             %{policy(@now) | max_claim_attempts: 0}
           ] do
-        assert_raise ArgumentError, fn -> RunStore.claim_due(TestRepo, :system, invalid) end
+        assert_raise ArgumentError, fn ->
+          RunStore.claim_due(admission_context(), :system, invalid)
+        end
       end
     end
 
@@ -551,7 +554,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       on_exit(fn -> :telemetry.detach(handler) end)
 
       assert {:ok, %{leases: [%{run_id: "legacy-one-query"}], poisoned: []}} =
-               RunStore.claim_due(TestRepo, :system, policy(@now))
+               RunStore.claim_due(admission_context(), :system, policy(@now))
 
       assert_receive {[:docket, :postgres, :run_store_test_repo, :query], _measurements,
                       %{query: query}}
@@ -747,7 +750,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert claim_one(@now, limit: 1, preference: :expired).run_id == "ready-only"
 
       assert_raise ArgumentError, fn ->
-        RunStore.claim_due(TestRepo, :system, policy(@now, preference: :sideways))
+        RunStore.claim_due(admission_context(), :system, policy(@now, preference: :sideways))
       end
     end
 
@@ -995,7 +998,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:error, %Postgrex.Error{}} =
                RunStore.claim_due(
-                 %{repo: TestRepo, prefix: "missing_claim_schema"},
+                 admission_context(%{repo: TestRepo, prefix: "missing_claim_schema"}),
                  :system,
                  policy(@now)
                )
@@ -1521,7 +1524,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
       end
 
-      claim_policy = ClaimPolicy.resolve(TestRepo)
+      claim_policy = ClaimPolicy.resolve(admission_context())
 
       admission_plan =
         ClaimPolicy.build_plan(
@@ -1580,7 +1583,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                )
 
       insert_graph!("docket_private")
-      ctx = %{repo: TestRepo, prefix: "docket_private"}
+      ctx = admission_context(%{repo: TestRepo, prefix: "docket_private"})
       run = initialized_run("prefixed")
 
       assert {:ok, ^run} =
@@ -1777,8 +1780,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp claim_due(now, overrides \\ []) do
-      RunStore.claim_due(TestRepo, :system, policy(now, overrides))
+      RunStore.claim_due(admission_context(), :system, policy(now, overrides))
     end
+
+    defp admission_context(context \\ TestRepo),
+      do: Docket.Postgres.TestAdmissionContext.resolve(context)
 
     defp claim_one(now, overrides \\ []) do
       assert {:ok, %{leases: [lease], poisoned: []}} = claim_due(now, overrides)

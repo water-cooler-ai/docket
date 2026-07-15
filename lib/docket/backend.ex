@@ -13,6 +13,11 @@ defmodule Docket.Backend do
   opaque context as separate arguments. It returns the single child
   specification the host places in its supervision tree. Keeping the context
   separate prevents core from injecting private keys into backend-owned options.
+
+  Testing execution is also explicit. `drain_runs/2` receives the same resolved
+  context separately; `:manual` instances invoke it only through the public
+  drain operation, while `:inline` instances invoke it after committed work is
+  scheduled. Backends return a summary containing `:limit_reached`.
   """
 
   @typedoc "A module implementing one of Docket's focused store contracts."
@@ -29,6 +34,10 @@ defmodule Docket.Backend do
 
   @type transaction_result :: {:ok, term()} | {:error, term()}
   @type transaction_fun :: (ctx() -> transaction_result())
+  @type drain_summary :: %{
+          required(:limit_reached) => boolean(),
+          optional(atom()) => term()
+        }
 
   @doc """
   Runs `fun` in one backend transaction.
@@ -72,4 +81,8 @@ defmodule Docket.Backend do
 
   @doc "Resolves the opaque root context passed to the backend transaction boundary."
   @callback context(opts :: keyword()) :: ctx()
+
+  @doc "Synchronously claims and drains due runs using the resolved backend context."
+  @callback drain_runs(ctx(), opts :: keyword()) ::
+              {:ok, drain_summary()} | {:error, term()}
 end

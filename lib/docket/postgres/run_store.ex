@@ -199,9 +199,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc """
     Executes one admission plan from the ClaimPolicy selected by `ctx`.
 
-    A bare Repo or otherwise unconfigured direct context selects the Legacy
-    policy for source compatibility. Configured root and transaction contexts
-    carry one already-resolved policy value.
+    Admission requires a configured root or transaction context carrying one
+    already-resolved policy value. Bare Repo contexts remain valid for
+    non-admission storage operations but are rejected here.
     """
     @impl true
     @spec claim_due(ctx(), :system, Docket.Backend.RunStore.claim_policy()) ::

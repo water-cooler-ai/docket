@@ -18,13 +18,13 @@ dispatcher or synchronous drain
             -> unchanged {:ok, claim_batch} | {:error, reason}
 ```
 
-Direct calls with a bare Repo or `%{repo: repo}` have no backend instance from
-which to resolve configuration, so they select `ClaimPolicy.Legacy`. A runtime
-instance constructs its configured policy once. The root context, dispatcher,
-manual/inline drain, and every transaction-scoped context reuse that exact
-resolved value; per-call options cannot replace it. Runtime startup passes the
-resolved root context separately to `Docket.Backend.child_spec/2`; it is never
-injected into the backend's option keyword list.
+Admission rejects a bare Repo or `%{repo: repo}` because neither identifies a
+configured backend instance. A runtime instance constructs its configured
+policy once. The root context, dispatcher, manual/inline drain, and every
+transaction-scoped context reuse that exact resolved value; per-call options
+cannot replace it. Runtime startup passes the resolved root context separately
+to `Docket.Backend.child_spec/2`; it is never injected into the backend's
+option keyword list.
 
 RunStore owns only policy-neutral context resolution, one query execution, and
 generic result plumbing. It does not contain candidate SQL, ordering, caps,

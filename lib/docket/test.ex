@@ -34,7 +34,7 @@ defmodule Docket.Test do
   """
 
   alias Docket.{Error, Run}
-  alias Docket.Runtime.{Config, Dispatcher, Loop}
+  alias Docket.Runtime.{Config, Loop, Moment, RunMutation}
 
   @doc """
   Compiles (when given a `Docket.Graph`), builds a fresh run from `input`,
@@ -85,9 +85,13 @@ defmodule Docket.Test do
     with {:ok, rtg} <- graph_from_opts(opts) do
       cond do
         run.status == :created ->
-          case Loop.init(rtg, run, opts) do
-            {:ok, run, effects} -> {:ok, run, deliver(effects, opts)}
-            {:error, error} -> {:error, error, []}
+          case Loop.propose_init(rtg, run, opts) do
+            {:ok, moment} ->
+              {run, checkpoints} = accept_moment(moment)
+              {:ok, run, checkpoints}
+
+            {:error, error} ->
+              {:error, error, []}
           end
 
         Run.terminal?(run) ->
@@ -123,9 +127,15 @@ defmodule Docket.Test do
     opts = normalize_opts(opts)
 
     with {:ok, rtg} <- graph_from_opts(opts) do
-      case Loop.resolve_interrupt(rtg, run, interrupt_id, value, opts) do
-        {:ok, run, effects} -> drive(rtg, run, opts, deliver(effects, opts), 0)
-        {:error, error} -> {:error, error, []}
+      config = Config.resolve(opts)
+
+      case RunMutation.resolve_interrupt(rtg, run, interrupt_id, value, config.clock.()) do
+        {:ok, moment} ->
+          {run, checkpoints} = accept_moment(moment)
+          drive(rtg, run, opts, checkpoints, 0)
+
+        {:error, error} ->
+          {:error, error, []}
       end
     else
       {:error, %Error{} = error} -> {:error, error, []}
@@ -137,9 +147,16 @@ defmodule Docket.Test do
   # ---------------------------------------------------------------------------
 
   defp start(rtg, run, opts) do
-    case Loop.init(rtg, run, opts) do
-      {:ok, run, effects} -> drive(rtg, run, opts, deliver(effects, opts), 0)
-      {:error, error} -> {:error, error, []}
+    case Loop.propose_init(rtg, run, opts) do
+      {:ok, moment} ->
+        {run, checkpoints} = accept_moment(moment)
+        drive(rtg, run, opts, checkpoints, 0)
+
+      {:terminal, run} ->
+        {:ok, run, []}
+
+      {:error, error} ->
+        {:error, error, []}
     end
   end
 
@@ -181,17 +198,27 @@ defmodule Docket.Test do
     config = Config.resolve(opts)
     opts = put_resume_floor(opts, resume_floor)
 
-    case Loop.plan(rtg, run, opts) do
-      {:execute, run, activations} ->
-        results = Dispatcher.dispatch(activations, rtg, run, config)
+    case Loop.propose_advance(rtg, run, opts) do
+      {:ok, %Moment{} = moment} ->
+        {run, checkpoints} = accept_moment(moment)
 
-        case Loop.apply_results(rtg, run, activations, results, opts) do
-          {:ok, run, effects} ->
-            {:continue, run, deliver(effects, opts)}
+        case moment.disposition do
+          :continue ->
+            {:continue, run, checkpoints}
 
-          {:park, run, park, effects} ->
-            config.sleeper.(park.wait_ms)
-            {:continue_at, run, park.resume_at, deliver(effects, opts)}
+          {:park, :immediate, _reason} ->
+            {:continue, run, checkpoints}
+
+          {:park, {:at, resume_at}, _reason} ->
+            wait_ms = max(DateTime.diff(resume_at, moment.run.updated_at, :millisecond), 0)
+            config.sleeper.(wait_ms)
+            {:continue_at, run, resume_at, checkpoints}
+
+          {:park, :external, _reason} ->
+            {:stop, run, checkpoints}
+
+          {:park, :terminal, _reason} ->
+            {:stop, run, checkpoints}
         end
 
       # An uncommitted retry wait: nothing durable changed, the sleeper just
@@ -203,8 +230,8 @@ defmodule Docket.Test do
       {:wait, run, _interrupt_ids} ->
         {:stop, run, []}
 
-      {:terminal, run, effects} ->
-        {:stop, run, deliver(effects, opts)}
+      {:terminal, run} ->
+        {:stop, run, []}
 
       {:error, error} ->
         {:error, error, []}
@@ -214,12 +241,11 @@ defmodule Docket.Test do
   defp put_resume_floor(opts, nil), do: Keyword.delete(opts, :resume_floor)
   defp put_resume_floor(opts, %DateTime{} = floor), do: Keyword.put(opts, :resume_floor, floor)
 
-  # Processless checkpoint values are accumulated in transition order.
-  defp deliver(effects, _opts) do
-    Enum.flat_map(effects, fn
-      {:checkpoint, checkpoint} ->
-        [checkpoint]
-    end)
+  # Processless drivers accept the same pre-commit moment shape as durable
+  # drivers, then expose its checkpoint as a read-only assertion value.
+  defp accept_moment(%Moment{} = moment) do
+    Docket.Telemetry.emit_events(moment.run, moment.events)
+    {moment.run, [Moment.checkpoint(moment)]}
   end
 
   # ---------------------------------------------------------------------------

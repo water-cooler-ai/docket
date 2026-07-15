@@ -14,7 +14,8 @@ defmodule Docket.Runtime.Supervisor do
 
   `:name` is required and becomes the runtime identity passed to
   durable facade functions. All other options are stored as the instance's
-  default run options and merged under per-call options. A configured
+  instance configuration. Execution policy is resolved once at startup and
+  cannot be replaced by per-call options. A configured
   `backend: BackendModule` contributes its own supervised child and is the
   only public durable backend substitution point; individual stores cannot be mixed.
 
@@ -55,6 +56,7 @@ defmodule Docket.Runtime.Supervisor do
 
   defp backend_children(name, defaults) do
     reject_component_configuration!(defaults)
+    Docket.Runtime.Config.validate_instance!(defaults)
 
     case Keyword.get(defaults, :backend) do
       nil ->
@@ -108,7 +110,8 @@ defmodule Docket.Runtime.Supervisor do
             runs: 0,
             events: 0,
             context: 1,
-            child_spec: 2
+            child_spec: 2,
+            drain_runs: 2
           ],
           not function_exported?(backend, name, arity),
           do: "#{name}/#{arity}"

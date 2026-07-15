@@ -47,6 +47,14 @@ defmodule Docket.Test.MemoryBackend do
     }
   end
 
+  @impl Docket.Backend
+  def drain_runs(context, opts) do
+    if pid = opts[:drain_probe], do: send(pid, {:memory_backend_drain, context, opts})
+
+    {:error,
+     Docket.Error.new(:unsupported_operation, "configured backend does not support drain_runs")}
+  end
+
   def start_link(opts \\ []) do
     clock = Keyword.get(opts, :clock, &DateTime.utc_now/0)
     token_generator = Keyword.get(opts, :token_generator, &generate_claim_token/0)

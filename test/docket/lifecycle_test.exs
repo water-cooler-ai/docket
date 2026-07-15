@@ -76,6 +76,7 @@ defmodule Docket.LifecycleTest do
   defmodule Host do
     use Docket,
       backend: Docket.Test.MemoryBackend,
+      context: %{notify: :docket_lifecycle_relay},
       checkpoint_observers: [FailingObserver, RecordingObserver]
   end
 
@@ -88,10 +89,22 @@ defmodule Docket.LifecycleTest do
   defmodule BlockingHost do
     use Docket,
       backend: Docket.Test.MemoryBackend,
+      context: %{notify: :docket_lifecycle_relay},
       checkpoint_observers: [BlockingObserver]
   end
 
+  defmodule DrainProbeHost do
+    use Docket, backend: Docket.Test.MemoryBackend
+  end
+
   setup do
+    Process.register(self(), :docket_lifecycle_relay)
+
+    on_exit(fn ->
+      if Process.whereis(:docket_lifecycle_relay),
+        do: Process.unregister(:docket_lifecycle_relay)
+    end)
+
     start_supervised!(Host)
     start_supervised!(TenantHost)
     start_supervised!(BlockingHost)
@@ -102,7 +115,9 @@ defmodule Docket.LifecycleTest do
     assert {:ok, reference} = Host.save_graph(Graphs.minimal_linear())
 
     assert {:ok, started} =
-             Host.start_run(reference, %{"value" => "hello"}, context: %{notify: self()})
+             Host.start_run(reference, %{"value" => "hello"},
+               context: %{notify: :ignored_per_call_context}
+             )
 
     assert started.status == :running
     assert {:ok, ^started} = Host.fetch_run(started.id)
@@ -113,7 +128,7 @@ defmodule Docket.LifecycleTest do
     assert_receive {:observed, %Docket.Checkpoint{type: :run_initialized}}
     assert_receive :failing_observer_called
 
-    assert {:ok, cancelled} = Host.cancel_run(started.id, context: %{notify: self()})
+    assert {:ok, cancelled} = Host.cancel_run(started.id)
 
     assert cancelled.status == :cancelled
     assert {:ok, ^cancelled} = Host.await_run(started.id, timeout: 0)
@@ -315,11 +330,26 @@ defmodule Docket.LifecycleTest do
     refute function_exported?(Host, :run, 2)
   end
 
+  test "drain receives the resolved context separately and ignores per-call instance policy" do
+    start_supervised!({DrainProbeHost, drain_probe: self()})
+    {_backend, context} = backend_ref(DrainProbeHost)
+
+    assert {:error, %Docket.Error{type: :unsupported_operation}} =
+             DrainProbeHost.drain_runs(
+               backend_context: :spoofed,
+               executor: __MODULE__.NotAnExecutor
+             )
+
+    assert_receive {:memory_backend_drain, ^context, opts}
+    refute Keyword.has_key?(opts, :backend_context)
+    refute Keyword.has_key?(opts, :executor)
+  end
+
   test "a blocking observer cannot delay a committed API result" do
     assert {:ok, reference} = BlockingHost.save_graph(Graphs.minimal_linear())
 
     assert {:ok, run} =
-             BlockingHost.start_run(reference, %{"value" => "x"}, context: %{notify: self()})
+             BlockingHost.start_run(reference, %{"value" => "x"})
 
     assert run.status == :running
     assert_receive {:blocking_observer_started, observer}

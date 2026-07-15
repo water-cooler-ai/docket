@@ -101,16 +101,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "rejects incomplete implementations and invalid implementation configuration" do
+      context = %{repo: __MODULE__.Repo, prefix: nil}
+
       assert_raise ArgumentError, ~r/missing init\/2, build_plan\/3, decode\/3, observe\/5/, fn ->
-        ClaimPolicy.new(implementation: MissingCallbacks)
+        ClaimPolicy.new([implementation: MissingCallbacks], context)
       end
 
       assert_raise ArgumentError, ~r/rejected its configuration: :invalid_rollout/, fn ->
-        ClaimPolicy.new(implementation: RejectingImplementation)
+        ClaimPolicy.new([implementation: RejectingImplementation], context)
       end
 
       assert_raise ArgumentError, ~r/:claim_policy must be a keyword list/, fn ->
-        ClaimPolicy.new(:legacy)
+        ClaimPolicy.new(:legacy, context)
       end
     end
 
@@ -166,12 +168,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       refute_receive {:alternate_claim_policy, :init, :init_contract, _}
     end
 
-    test "bare contexts default to Legacy while malformed configured values fail" do
-      assert ClaimPolicy.resolve(__MODULE__.Repo) |> ClaimPolicy.implementation() ==
-               ClaimPolicy.Legacy
+    test "admission rejects unresolved and malformed contexts" do
+      assert_raise ArgumentError, ~r/requires a resolved ClaimPolicy/, fn ->
+        ClaimPolicy.resolve(__MODULE__.Repo)
+      end
 
-      assert ClaimPolicy.resolve(%{repo: __MODULE__.Repo}) |> ClaimPolicy.implementation() ==
-               ClaimPolicy.Legacy
+      assert_raise ArgumentError, ~r/requires a resolved ClaimPolicy/, fn ->
+        ClaimPolicy.resolve(%{repo: __MODULE__.Repo})
+      end
 
       assert_raise ArgumentError, ~r/invalid resolved ClaimPolicy/, fn ->
         ClaimPolicy.resolve(%{repo: __MODULE__.Repo, claim_policy: :legacy})

@@ -217,6 +217,36 @@ defmodule Docket.Runtime.FailureRetryTest do
       refute_received {:slept, _}
     end
 
+    test "retry sleep uses the timer origin when the injected clock advances between reads" do
+      test_pid = self()
+      {:ok, clock_state} = Agent.start_link(fn -> 0 end)
+      base = ~U[2026-07-15 12:00:00.000000Z]
+
+      clock = fn ->
+        Agent.get_and_update(clock_state, fn tick ->
+          {DateTime.add(base, tick * 10, :millisecond), tick + 1}
+        end)
+      end
+
+      sleeper = fn ms ->
+        send(test_pid, {:advancing_clock_slept, ms})
+        :ok
+      end
+
+      graph =
+        Graphs.retry_then_continue()
+        |> Graph.update_node!("flaky",
+          policies: %{"retry" => %{"max_attempts" => 3, "backoff_ms" => 100}}
+        )
+
+      assert {:ok, %{status: :done}, _} =
+               Docket.Test.run_inline(graph, %{}, clock: clock, sleeper: sleeper)
+
+      assert_received {:advancing_clock_slept, 100}
+      assert_received {:advancing_clock_slept, 100}
+      refute_received {:advancing_clock_slept, _}
+    end
+
     # The compiler rejects invalid node policies at verify time; these two
     # tests bypass it with a mutated precompiled runtime graph to prove the
     # plan-time defense holds for hand-built or stale runtime graphs.

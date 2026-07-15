@@ -12,7 +12,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @type option ::
             {:name, GenServer.name()}
             | {:context, Docket.Backend.ctx()}
-            | {:claim_policy_implementation, module()}
             | {:run_store, module()}
             | {:concurrency, pos_integer()}
             | {:poll_interval_ms, pos_integer()}
@@ -50,10 +49,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def init(opts) do
       Process.flag(:trap_exit, true)
       context = Keyword.fetch!(opts, :context)
+      claim_policy = ClaimPolicy.resolve(context)
 
       state = %{
         context: context,
-        claim_policy_implementation: claim_policy_implementation(context, opts),
+        admission_phase: Map.fetch!(context, :admission_phase),
+        claim_policy: ClaimPolicy.implementation(claim_policy),
         run_store: Keyword.get(opts, :run_store, Docket.Postgres.RunStore),
         concurrency: positive!(opts, :concurrency),
         poll_interval_ms: positive!(opts, :poll_interval_ms, @default_poll_interval_ms),
@@ -68,7 +69,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         poll_pending?: false,
         poll_pending_source: nil,
         poll_timer: nil,
-        preference: :ready,
         vehicles: %{}
       }
 
@@ -95,7 +95,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ) do
       emit_poll(state, demand, started, source, result)
       state = finish_poll(state)
-      state = alternate_preference(result, demand, state)
       state = consume_claim_result(result, state)
       {:noreply, resume_polling(state)}
     end
@@ -168,14 +167,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       else
         parent = self()
         request_ref = make_ref()
-        runtime_input = claim_policy_input(state, demand)
 
         {pid, monitor} =
-          spawn_monitor(fn ->
-            result = state.run_store.claim_due(state.context, :system, runtime_input)
+          :erlang.spawn_opt(
+            fn ->
+              result =
+                Docket.Postgres.AdmissionPhase.run(state.admission_phase, demand, fn preference ->
+                  runtime_input = claim_policy_input(state, demand, preference)
+                  state.run_store.claim_due(state.context, :system, runtime_input)
+                end)
 
-            send(parent, {:claim_result, request_ref, result})
-          end)
+              send(parent, {:claim_result, request_ref, result})
+            end,
+            [:link, :monitor]
+          )
 
         next = %{
           state
@@ -193,18 +198,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       emit_state(next, demand)
       next
     end
-
-    # Demand-1 polls alternate the preferred candidate class across
-    # consecutive successful polls so neither continuously eligible class
-    # starves at concurrency one. The phase is process-local and resets on
-    # restart.
-    defp alternate_preference({:ok, _batch}, 1, %{preference: :ready} = state),
-      do: %{state | preference: :expired}
-
-    defp alternate_preference({:ok, _batch}, 1, %{preference: :expired} = state),
-      do: %{state | preference: :ready}
-
-    defp alternate_preference(_result, _demand, state), do: state
 
     defp consume_claim_result({:ok, %{leases: leases, poisoned: poisoned}}, state)
          when is_list(leases) and is_list(poisoned) do
@@ -307,7 +300,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           poisoned: poisoned
         },
         %{
-          claim_policy: state.claim_policy_implementation,
+          claim_policy: state.claim_policy,
           result: Docket.Telemetry.result_kind(result),
           source: source
         }
@@ -336,21 +329,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
     end
 
-    defp claim_policy_input(state, demand) do
+    defp claim_policy_input(state, demand, preference) do
       %{
         now: state.clock.(),
         limit: demand,
         orphan_ttl_ms: state.orphan_ttl_ms,
         max_claim_attempts: state.max_claim_attempts,
-        preference: state.preference
+        preference: preference
       }
-    end
-
-    defp claim_policy_implementation(%{claim_policy: %ClaimPolicy{} = policy}, _opts),
-      do: ClaimPolicy.implementation(policy)
-
-    defp claim_policy_implementation(_context, opts) do
-      Keyword.get(opts, :claim_policy_implementation, Docket.Postgres.ClaimPolicy.Legacy)
     end
 
     defp schedule_poll(%{poll_timer: nil} = state) do

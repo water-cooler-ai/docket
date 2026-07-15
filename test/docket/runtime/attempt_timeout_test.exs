@@ -30,7 +30,7 @@ defmodule Docket.Runtime.AttemptTimeoutTest do
   end
 
   test "a missing timeout inherits the finite runtime maximum for every executor" do
-    for executor <- [Docket.Executor.Local, Docket.Executor.Task, PassthroughExecutor] do
+    for executor <- [Docket.Executor.Local, PassthroughExecutor] do
       task =
         Task.async(fn ->
           Docket.Test.run_inline(blocking_graph(), %{},

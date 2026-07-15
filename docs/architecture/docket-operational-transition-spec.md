@@ -330,9 +330,10 @@ capabilities and focused backend-development test surfaces.
 The bundle requires `repo:` and an explicit `pruner:` policy containing
 `interval_ms`, `event_retention_ms`, `run_retention_ms`, and `batch_size`.
 Event retention cannot exceed run retention. `notifier: :none` omits the
-LISTEN connection for poll-only deployments. Dispatcher and vehicle policies
-may be supplied through `dispatcher:` and `vehicle:` keyword lists; the store
-capabilities themselves are fixed and cannot be mixed independently.
+LISTEN connection for poll-only deployments. Shared execution policy is
+configured once through top-level runtime options. Dispatcher mechanics and
+vehicle drain/abandon mechanics use their respective nested keyword lists; the
+store capabilities themselves are fixed and cannot be mixed independently.
 
 The old host-owned supervised `run`/`resume`/`get_run` path is absent in
 v0.1.0. A configured backend is the only supervised production lifecycle.

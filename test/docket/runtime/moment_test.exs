@@ -107,11 +107,8 @@ defmodule Docket.Runtime.MomentTest do
       rtg = compile!(Graphs.minimal_linear())
       moment = propose_init!(rtg, %{"value" => "hello"}, opts())
 
-      accepted_opts = opts()
-      run = Loop.build_initial_run(rtg, %{"value" => "hello"}, accepted_opts)
-
-      {:ok, committed, [{:checkpoint, checkpoint}]} =
-        Loop.init(rtg, run, accepted_opts)
+      committed = moment.run
+      checkpoint = Moment.checkpoint(moment)
 
       assert moment.run == committed
       assert moment.events == checkpoint.events

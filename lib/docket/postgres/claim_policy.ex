@@ -79,8 +79,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               ) :: :ok
 
     @doc false
-    @spec new(keyword(), Docket.Backend.ctx() | nil) :: t()
-    def new(config \\ [], context \\ nil) do
+    @spec new(keyword(), Docket.Backend.ctx()) :: t()
+    def new(config, context) do
       unless Keyword.keyword?(config) do
         raise ArgumentError, ":claim_policy must be a keyword list, got: #{inspect(config)}"
       end
@@ -124,10 +124,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def resolve(context) do
       _ = Storage.context!(context)
 
-      %__MODULE__{
-        implementation: @default_implementation,
-        implementation_state: nil
-      }
+      raise ArgumentError,
+            "Postgres claim admission requires a resolved ClaimPolicy; " <>
+              "build the context with Docket.Postgres.context/1"
     end
 
     @doc false
@@ -248,8 +247,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {_repo, prefix} = Storage.context!(context)
       policy_context(prefix)
     end
-
-    defp init_context!(nil), do: policy_context(nil)
 
     defp init_context!(context) do
       {_repo, prefix} = Storage.context!(context)

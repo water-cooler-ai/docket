@@ -571,7 +571,7 @@ run is the execution state document.
 passed to `run`, `resume`, or `retry`. `Docket.Run` is the durable document that
 is advanced through checkpoint emissions. A new public `run` call first builds a
 fresh `Docket.Run` from input; resume passes the durable run loaded by the host.
-`Docket.Runtime.Loop.init/3` inspects the supplied run to decide whether to
+`Docket.Runtime.Loop.propose_init/3` inspects the supplied run to decide whether to
 initialize a fresh run or continue a saved run.
 
 `Docket.Run` should be a real struct with nested structs for channel, task,
@@ -1006,16 +1006,13 @@ deliveries.
 Run initialization follows the same rule. `Docket.run/4` builds a fresh
 `Docket.Run` document from input and launches the Runtime with that run.
 `Docket.resume/4` launches the Runtime with a durable `Docket.Run` supplied by
-the host. Both paths call `Docket.Runtime.Loop.init/3`, and the loop infers the
+the host. Both paths call `Docket.Runtime.Loop.propose_init/3`, and the loop infers the
 path from the supplied run document rather than an explicit mode.
 
-For any non-terminal run it is going to execute, `Loop.init/3` produces an
-initialized public run document and emits a required `:run_initialized`
-checkpoint before any node execution, event publication, interrupt, timer, or
-later step checkpoint can occur. The checkpoint handler upserts by
-`Docket.Run.id`: a new run creates the host row, and a resumed run updates the
-existing host row. If the initialization checkpoint fails, execution has not
-started and callers receive a checkpoint error.
+For any non-terminal run it is going to execute, `Loop.propose_init/3` produces
+one `:run_initialized` moment before any node execution, event publication,
+interrupt, timer, or later checkpoint can occur. The durable driver commits
+that moment atomically; `Docket.Test` accepts the same shape directly.
 
 Starting a Runtime process is not graph progress by itself. `Docket.Run.status`
 describes graph execution state, not process liveness, so resume must not
@@ -1356,7 +1353,7 @@ If the Runtime crashes:
 2. Host loads the latest saved `Docket.Run` document and matching
    `Docket.Graph` document.
 3. Host calls `Docket.resume/4` or `MyApp.Docket.resume/3`.
-4. Runtime calls `Docket.Runtime.Loop.init/3` with the saved run.
+4. Runtime calls `Docket.Runtime.Loop.propose_init/3` with the saved run.
 5. Runtime reconciles active tasks.
 6. Completed effects are reused from event history if the host saved it.
 7. Lost in-flight effects are retried or marked unknown according to executor
@@ -1545,11 +1542,9 @@ Docket.Test.step_inline(run, opts \\ [])
 - verify and compile a supplied `Docket.Graph`, or accept a precompiled
   `Docket.Runtime.Graph`
 - create the initial `Docket.Run`
-- initialize execution through `Docket.Runtime.Loop.init/3`, letting the loop
+- initialize execution through `Docket.Runtime.Loop.propose_init/3`, letting the loop
   infer fresh versus saved execution from the run document
-- rely on `Loop.init/3` to synchronously emit the required
-  `:run_initialized` checkpoint to the configured test checkpoint sink before
-  any node execution it schedules
+- accept the returned `:run_initialized` moment before any node execution
 - execute graph transitions in the calling process until the run reaches
   `:done`, `:failed`, `:waiting`, or a configured max step limit
 - return only after sync checkpoints caused by those transitions have been
@@ -1620,7 +1615,6 @@ treats it as a permanent node failure.
 Built-in executors:
 
 - `Docket.Executor.Local`: direct function call.
-- `Docket.Executor.Task`: supervised task with timeout.
 - `Docket.Executor.Queue`: durable task queue.
 - `Docket.Executor.Remote`: application-defined remote call.
 
@@ -1993,7 +1987,7 @@ Included in v1:
 7. One Runtime process per active run plus a shared execution loop used by the
    supervised Runtime and `Docket.Test`.
 8. Plan -> Execution -> Update supersteps with barrier visibility.
-9. `Docket.Executor.Local` and `Docket.Executor.Task`.
+9. `Docket.Executor.Local`.
 10. `Docket.Checkpoint` callback behaviour with both `:sync` and `:async`
     delivery modes.
 11. `Docket.Run` document emission for persist/resume.
