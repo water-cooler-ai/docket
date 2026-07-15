@@ -16,8 +16,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     alias Docket.Postgres.ClaimPolicy
     alias Docket.Postgres.ClaimPolicy.Plan
+    alias Docket.Postgres.ClaimPolicy.TenantFair.Config
 
     @now ~U[2026-07-15 12:00:00.000000Z]
+    @maximum_integer 2_147_483_647
+    @tenant_fair_options [
+      partition_by: :tenant_id,
+      default_preferred_active: 2,
+      default_max_active: 4,
+      default_weight: 1
+    ]
 
     defmodule MissingCallbacks do
     end
@@ -111,6 +119,162 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert_raise ArgumentError, ~r/:claim_policy must be a keyword list/, fn ->
         ClaimPolicy.new(:legacy, context)
       end
+
+      assert_raise ArgumentError, ~r/duplicate keys: \[:implementation\]/, fn ->
+        ClaimPolicy.new(
+          [implementation: RejectingImplementation, implementation: MissingCallbacks],
+          context
+        )
+      end
+    end
+
+    test "normalizes the future TenantFair configuration into one bounded data-only value" do
+      assert {:ok,
+              %Config{
+                partition_by: :tenant_id,
+                default_preferred_active: 2,
+                default_max_active: 4,
+                default_weight: 1,
+                borrowing: false
+              } = expected} = Config.new(@tenant_fair_options)
+
+      context = %{repo: __MODULE__.Repo, prefix: "tenant_fair_config"}
+
+      claim_policy =
+        ClaimPolicy.new(
+          [implementation: Docket.Test.TenantFairConfigClaimPolicy] ++ @tenant_fair_options,
+          context
+        )
+
+      assert_receive {:tenant_fair_config_claim_policy, :init, ^expected,
+                      %{
+                        prefix: "tenant_fair_config",
+                        identifiers: %{runs: ~s("tenant_fair_config"."docket_runs")}
+                      }}
+
+      resolved = Map.put(context, :claim_policy, claim_policy)
+      assert ClaimPolicy.resolve(resolved) === claim_policy
+      refute_receive {:tenant_fair_config_claim_policy, :init, _, _}
+
+      assert {:ok,
+              %Config{
+                default_preferred_active: @maximum_integer,
+                default_max_active: @maximum_integer,
+                default_weight: @maximum_integer,
+                borrowing: true
+              }} =
+               Config.new(
+                 partition_by: :tenant_id,
+                 default_preferred_active: @maximum_integer,
+                 default_max_active: @maximum_integer,
+                 default_weight: @maximum_integer,
+                 borrowing: true
+               )
+    end
+
+    test "rejects malformed TenantFair configuration with ClaimPolicy context" do
+      invalid = [
+        {Keyword.put(@tenant_fair_options, :partition_by, :scope_key), ":partition_by"},
+        {Keyword.put(@tenant_fair_options, :default_preferred_active, -1),
+         ":default_preferred_active"},
+        {Keyword.put(@tenant_fair_options, :default_preferred_active, 1.0),
+         ":default_preferred_active"},
+        {Keyword.put(@tenant_fair_options, :default_preferred_active, true),
+         ":default_preferred_active"},
+        {Keyword.put(@tenant_fair_options, :default_max_active, @maximum_integer + 1),
+         ":default_max_active"},
+        {Keyword.put(@tenant_fair_options, :default_max_active, nil), ":default_max_active"},
+        {Keyword.put(@tenant_fair_options, :default_weight, 0), ":default_weight"},
+        {Keyword.put(@tenant_fair_options, :default_weight, @maximum_integer + 1),
+         ":default_weight"},
+        {Keyword.put(@tenant_fair_options, :default_weight, 1.5), ":default_weight"},
+        {Keyword.put(@tenant_fair_options, :borrowing, :yes), ":borrowing"},
+        {Keyword.put(@tenant_fair_options, :default_preferred_active, 5),
+         ":invalid_relationship"},
+        {@tenant_fair_options ++ [unexpected: :value], ":unknown_options"}
+      ]
+
+      for {options, fragment} <- invalid do
+        error =
+          assert_raise ArgumentError, fn ->
+            ClaimPolicy.new(
+              [implementation: Docket.Test.TenantFairConfigClaimPolicy] ++ options,
+              %{repo: __MODULE__.Repo, prefix: nil}
+            )
+          end
+
+        assert Exception.message(error) =~ fragment
+        assert Exception.message(error) =~ "rejected its configuration"
+      end
+
+      for missing <- [
+            :partition_by,
+            :default_preferred_active,
+            :default_max_active,
+            :default_weight
+          ] do
+        error =
+          assert_raise ArgumentError, fn ->
+            ClaimPolicy.new(
+              [implementation: Docket.Test.TenantFairConfigClaimPolicy] ++
+                Keyword.delete(@tenant_fair_options, missing),
+              %{repo: __MODULE__.Repo, prefix: nil}
+            )
+          end
+
+        assert Exception.message(error) =~ ":missing_options"
+        assert Exception.message(error) =~ inspect(missing)
+      end
+
+      duplicate_error =
+        assert_raise ArgumentError, fn ->
+          ClaimPolicy.new(
+            [implementation: Docket.Test.TenantFairConfigClaimPolicy] ++
+              @tenant_fair_options ++ [default_weight: 2],
+            %{repo: __MODULE__.Repo, prefix: nil}
+          )
+        end
+
+      assert Exception.message(duplicate_error) =~ "rejected its configuration"
+      assert Exception.message(duplicate_error) =~ ":duplicate_options"
+      assert Exception.message(duplicate_error) =~ ":default_weight"
+
+      assert {:error, {:duplicate_options, [:default_weight]}} =
+               Config.new(@tenant_fair_options ++ [default_weight: 2])
+
+      assert {:error, {:expected_keyword_list, %{partition_by: :tenant_id}}} =
+               Config.new(%{partition_by: :tenant_id})
+    end
+
+    test "keeps dormant maximum capacity valid when borrowing is disabled" do
+      assert {:ok,
+              %Config{
+                default_preferred_active: 0,
+                default_max_active: 0,
+                default_weight: 1,
+                borrowing: false
+              }} =
+               Config.new(
+                 partition_by: :tenant_id,
+                 default_preferred_active: 0,
+                 default_max_active: 0,
+                 default_weight: 1
+               )
+
+      assert {:ok,
+              %Config{
+                default_preferred_active: 0,
+                default_max_active: 4,
+                default_weight: 1,
+                borrowing: false
+              }} =
+               Config.new(
+                 partition_by: :tenant_id,
+                 default_preferred_active: 0,
+                 default_max_active: 4,
+                 default_weight: 1,
+                 borrowing: false
+               )
     end
 
     test "validates neutral runtime input before any plan is built" do
@@ -368,6 +532,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       for source <- implementation_sources do
         refute File.read!(source) =~ "RunStore.claim_due("
       end
+
+      refute Code.ensure_loaded?(Docket.Postgres.ClaimPolicy.TenantFair)
     end
 
     defp effective_policy do

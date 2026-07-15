@@ -191,12 +191,17 @@ that caps, fair rotation, weights, or borrowing are active.
 
 Initial validation rules:
 
-- `partition_by` must be `:tenant_id`.
-- preferred and maximum values are non-negative bounded integers.
+- `partition_by` is required and must be `:tenant_id`.
+- `default_preferred_active`, `default_max_active`, and `default_weight` are
+  required. Their example values are not library defaults.
+- preferred and maximum values are integers in `0..2_147_483_647`, matching
+  the future PostgreSQL signed `integer` columns.
 - `preferred_active <= max_active`.
-- `weight` is a positive bounded integer. Integer weights avoid inconsistent
-  floating-point ordering between SQL and application code.
+- `weight` is an integer in `1..2_147_483_647`. Integer weights avoid
+  inconsistent floating-point ordering between SQL and application code.
 - `borrowing` is boolean and defaults to `false`.
+- `max_active > preferred_active` remains valid when borrowing is disabled;
+  the excess capacity is dormant until borrowing is enabled.
 - Fairness may be enabled in `tenant_mode: :none`; all tenantless runs then
   form one partition. It is useful mainly so one configuration shape can be
   tested in tenantless deployments.

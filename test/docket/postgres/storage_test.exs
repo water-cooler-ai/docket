@@ -70,7 +70,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       claim_policy =
         ClaimPolicy.new(
-          [implementation: Docket.Test.AlternateClaimPolicy, marker: :transaction_identity],
+          [
+            implementation: Docket.Test.TenantFairConfigClaimPolicy,
+            partition_by: :tenant_id,
+            default_preferred_active: 2,
+            default_max_active: 4,
+            default_weight: 1
+          ],
           root
         )
 

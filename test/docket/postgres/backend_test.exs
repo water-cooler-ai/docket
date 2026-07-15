@@ -160,7 +160,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ]
     end
 
-    defmodule AlternatePolicySupervisedHost do
+    defmodule TenantFairConfigManualHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        testing: :manual,
+        notifier: :none,
+        claim_policy: [
+          implementation: Docket.Test.TenantFairConfigClaimPolicy,
+          partition_by: :tenant_id,
+          default_preferred_active: 2,
+          default_max_active: 4,
+          default_weight: 1
+        ]
+    end
+
+    defmodule TenantFairConfigSupervisedHost do
       @pruner [
         interval_ms: :timer.hours(1),
         event_retention_ms: :timer.hours(24 * 30),
@@ -175,8 +190,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         dispatcher: [concurrency: 1, poll_interval_ms: 10],
         pruner: @pruner,
         claim_policy: [
-          implementation: Docket.Test.AlternateClaimPolicy,
-          marker: :supervised_runtime
+          implementation: Docket.Test.TenantFairConfigClaimPolicy,
+          partition_by: :tenant_id,
+          default_preferred_active: 2,
+          default_max_active: 4,
+          default_weight: 1
         ]
     end
 
@@ -220,7 +238,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       stop_host(ManualHost)
       stop_host(ClockedManualHost)
       stop_host(AlternatePolicyManualHost)
-      stop_host(AlternatePolicySupervisedHost)
+      stop_host(TenantFairConfigManualHost)
+      stop_host(TenantFairConfigSupervisedHost)
       stop_host(SandboxInlineHost)
       stop_host(ObserverInlineHost)
 
@@ -376,7 +395,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       refute_receive {:alternate_claim_policy, :init, :manual_runtime, _context}
     end
 
-    test "supervised dispatch initializes once and executes the independent selected engine" do
+    test "manual drain preserves the one normalized TenantFair configuration value" do
       Process.register(self(), :docket_claim_policy_relay)
 
       on_exit(fn ->
@@ -384,22 +403,68 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           do: Process.unregister(:docket_claim_policy_relay)
       end)
 
-      start_supervised!(AlternatePolicySupervisedHost)
+      expected = %Docket.Postgres.ClaimPolicy.TenantFair.Config{
+        partition_by: :tenant_id,
+        default_preferred_active: 2,
+        default_max_active: 4,
+        default_weight: 1,
+        borrowing: false
+      }
 
-      assert_receive {:alternate_claim_policy, :init, :supervised_runtime,
+      start_supervised!(TenantFairConfigManualHost)
+
+      assert_receive {:tenant_fair_config_claim_policy, :init, ^expected,
                       %{prefix: nil, identifiers: %{runs: ~s("docket_runs")}}}
 
-      assert {:ok, reference} = AlternatePolicySupervisedHost.save_graph(Graphs.minimal_linear())
+      assert {:ok, reference} = TenantFairConfigManualHost.save_graph(Graphs.minimal_linear())
+
+      assert {:ok, %{status: :running}} =
+               TenantFairConfigManualHost.start_run(reference, %{"value" => "config"})
+
+      assert {:ok, %{drained: 1}} =
+               TenantFairConfigManualHost.drain_runs(
+                 max_runs: 1,
+                 claim_policy: [implementation: Docket.Postgres.ClaimPolicy.Legacy]
+               )
+
+      assert_receive {:tenant_fair_config_claim_policy, :build_plan, ^expected, _pid}
+      assert_receive {:tenant_fair_config_claim_policy, :decode, ^expected, _pid}
+      refute_receive {:tenant_fair_config_claim_policy, :init, _, _}
+    end
+
+    test "supervised dispatch preserves the one normalized TenantFair configuration value" do
+      Process.register(self(), :docket_claim_policy_relay)
+
+      on_exit(fn ->
+        if Process.whereis(:docket_claim_policy_relay),
+          do: Process.unregister(:docket_claim_policy_relay)
+      end)
+
+      expected = %Docket.Postgres.ClaimPolicy.TenantFair.Config{
+        partition_by: :tenant_id,
+        default_preferred_active: 2,
+        default_max_active: 4,
+        default_weight: 1,
+        borrowing: false
+      }
+
+      start_supervised!(TenantFairConfigSupervisedHost)
+
+      assert_receive {:tenant_fair_config_claim_policy, :init, ^expected,
+                      %{prefix: nil, identifiers: %{runs: ~s("docket_runs")}}}
+
+      assert {:ok, reference} =
+               TenantFairConfigSupervisedHost.save_graph(Graphs.minimal_linear())
 
       assert {:ok, started} =
-               AlternatePolicySupervisedHost.start_run(reference, %{"value" => "alternate"})
+               TenantFairConfigSupervisedHost.start_run(reference, %{"value" => "config"})
 
       assert {:ok, %Docket.Run{status: :done}} =
-               AlternatePolicySupervisedHost.await_run(started.id, timeout: 5_000)
+               TenantFairConfigSupervisedHost.await_run(started.id, timeout: 5_000)
 
-      assert_receive {:alternate_claim_policy, :build_plan, :supervised_runtime, _pid}
-      assert_receive {:alternate_claim_policy, :decode, :supervised_runtime, _pid}
-      refute_receive {:alternate_claim_policy, :init, :supervised_runtime, _context}
+      assert_receive {:tenant_fair_config_claim_policy, :build_plan, ^expected, _pid}
+      assert_receive {:tenant_fair_config_claim_policy, :decode, ^expected, _pid}
+      refute_receive {:tenant_fair_config_claim_policy, :init, _, _}
     end
 
     test "manual drains preserve retry attempt state across separate claims" do
