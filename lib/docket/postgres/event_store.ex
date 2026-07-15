@@ -7,7 +7,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.{RunCodec, Storage}
     alias Docket.Postgres.Schemas.{Event, Run}
 
-    @behaviour Docket.Storage.Events
+    @behaviour Docket.Backend.EventStore
 
     @impl true
     def append_events(_ctx, scope, _run_id, []) do
@@ -47,7 +47,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {:error, :invalid_events}
     end
 
-    @impl Docket.Storage.Events
+    @impl Docket.Backend.EventStore
     def fetch_event(ctx, scope, run_id, seq) when is_integer(seq) and seq > 0 do
       started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)
@@ -71,7 +71,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       raise ArgumentError, "event sequence must be a positive integer"
     end
 
-    @impl Docket.Storage.Events
+    @impl Docket.Backend.EventStore
     def fetch_latest_event(ctx, scope, run_id) do
       started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)

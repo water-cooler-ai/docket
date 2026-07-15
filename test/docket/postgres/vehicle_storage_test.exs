@@ -23,7 +23,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule Backend do
-      def storage, do: Docket.Postgres.Storage
+      defdelegate transaction(ctx, fun), to: Docket.Postgres
       def graphs, do: Docket.Postgres.GraphStore
       def runs, do: Docket.Postgres.RunStore
       def events, do: Docket.Postgres.EventStore
@@ -35,7 +35,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule FailingEventsBackend do
-      def storage, do: Docket.Postgres.Storage
+      defdelegate transaction(ctx, fun), to: Docket.Postgres
       def graphs, do: Docket.Postgres.GraphStore
       def runs, do: Docket.Postgres.RunStore
       def events, do: Docket.Postgres.VehicleStorageTest.FailingEvents
@@ -61,7 +61,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule RelayBackend do
-      def storage, do: Docket.Postgres.Storage
+      defdelegate transaction(ctx, fun), to: Docket.Postgres
       def graphs, do: Docket.Postgres.GraphStore
       def runs, do: Docket.Postgres.VehicleStorageTest.RelayRuns
       def events, do: Docket.Postgres.EventStore

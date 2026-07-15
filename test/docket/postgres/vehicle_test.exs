@@ -38,7 +38,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule StaleCommitBackend do
-      def storage, do: Docket.Test.MemoryBackend
+      defdelegate transaction(ctx, fun), to: Docket.Test.MemoryBackend
       def graphs, do: Docket.Test.MemoryBackend
       def events, do: Docket.Test.MemoryBackend
       def runs, do: __MODULE__.Runs
@@ -59,7 +59,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule FailingEventsBackend do
-      def storage, do: Docket.Test.MemoryBackend
+      defdelegate transaction(ctx, fun), to: Docket.Test.MemoryBackend
       def graphs, do: Docket.Test.MemoryBackend
       def runs, do: Docket.Test.MemoryBackend
       def events, do: __MODULE__.Events
@@ -71,7 +71,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule DoneRunBackend do
-      def storage, do: Docket.Test.MemoryBackend
+      defdelegate transaction(ctx, fun), to: Docket.Test.MemoryBackend
       def graphs, do: Docket.Test.MemoryBackend
       def events, do: Docket.Test.MemoryBackend
       def runs, do: __MODULE__.Runs
@@ -85,7 +85,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule MissingRunBackend do
-      def storage, do: Docket.Test.MemoryBackend
+      defdelegate transaction(ctx, fun), to: Docket.Test.MemoryBackend
       def graphs, do: Docket.Test.MemoryBackend
       def events, do: Docket.Test.MemoryBackend
       def runs, do: __MODULE__.Runs

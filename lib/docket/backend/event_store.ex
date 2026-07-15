@@ -1,4 +1,4 @@
-defmodule Docket.Storage.Events do
+defmodule Docket.Backend.EventStore do
   @moduledoc """
   Persistence contract for append-only run events.
 
@@ -7,8 +7,8 @@ defmodule Docket.Storage.Events do
   insert or commit so durable state and its retained facts cannot diverge.
   """
 
-  @type ctx :: Docket.Storage.ctx()
-  @type scope :: Docket.Storage.scope()
+  @type ctx :: Docket.Backend.ctx()
+  @type scope :: Docket.Backend.scope()
 
   @doc """
   Appends retained events for `run_id` in sequence order.

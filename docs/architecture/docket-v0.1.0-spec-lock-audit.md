@@ -60,7 +60,7 @@ testable without pretending arbitrary stores can be safely mixed.
 
 ### A run row is one durable aggregate
 
-`Docket.Storage.Runs` owns every operation that changes the scheduling or
+`Docket.Backend.RunStore` owns every operation that changes the scheduling or
 commit-authority tuple. PostgreSQL may split schemas and codecs internally,
 but claim and graph-state fencing update the same row.
 
@@ -162,7 +162,7 @@ fencing, or persistence codecs changes; ETF persistence is unchanged.
 
 `Docket.list_events/3` (and the generated `list_events/2` host wrapper) reads a
 tenant-scoped, keyset page of retained durable events for a run, backed by the
-new `Docket.Storage.Events.list_events/4` backend callback with memory and
+new `Docket.Backend.EventStore.list_events/4` backend callback with memory and
 Postgres implementations. The final contract:
 
 - Events return in ascending sequence order, restricted to sequences greater

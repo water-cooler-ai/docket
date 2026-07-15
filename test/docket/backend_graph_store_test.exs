@@ -1,8 +1,8 @@
-defmodule Docket.Storage.GraphsTest do
+defmodule Docket.Backend.GraphStoreTest do
   use ExUnit.Case, async: true
 
   test "the graph capability exposes scoped publication and version reads" do
-    assert Docket.Storage.Graphs.behaviour_info(:callbacks) |> Enum.sort() ==
+    assert Docket.Backend.GraphStore.behaviour_info(:callbacks) |> Enum.sort() ==
              [
                fetch_graph: 4,
                fetch_latest_graph_ref: 3,

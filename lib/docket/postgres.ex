@@ -81,7 +81,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @testing_modes [:inline, :manual]
 
     @impl Docket.Backend
-    def storage, do: Storage
+    defdelegate transaction(ctx, fun), to: Storage
 
     @impl Docket.Backend
     def graphs, do: GraphStore

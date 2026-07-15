@@ -59,7 +59,7 @@ defmodule Docket.Runtime.SupervisorConfigTest do
       Docket.Runtime.Supervisor.init({@runtime, backend: __MODULE__.MissingBackend})
     end
 
-    assert_raise ArgumentError, ~r/does not implement Docket.Backend.*storage\/0/, fn ->
+    assert_raise ArgumentError, ~r/does not implement Docket.Backend.*transaction\/2/, fn ->
       Docket.Runtime.Supervisor.init({@runtime, backend: IncompleteBackend})
     end
   end
