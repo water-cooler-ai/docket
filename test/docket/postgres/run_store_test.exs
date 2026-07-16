@@ -12,6 +12,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Schemas.GraphVersion
     alias Docket.Postgres.Schemas.Run
     alias Docket.Run.ChannelState
+    alias Docket.Test.ConcurrentAdmissionHarness
 
     @now ~U[2026-07-10 12:00:00.000000Z]
     @committed_at ~U[2026-07-10 11:59:58.123456Z]
@@ -1502,6 +1503,205 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       for lease <- leases do
         assert row!(lease.run_id).claim_token == lease.claim_token
       end
+    end
+
+    test "known-bad rank-then-lock policy deterministically under-claims a locked first page" do
+      insert_run!("ranked-t1",
+        tenant_id: "t1",
+        wake_at: DateTime.add(@now, -30, :second)
+      )
+
+      insert_run!("ranked-t2",
+        tenant_id: "t2",
+        wake_at: DateTime.add(@now, -20, :second)
+      )
+
+      insert_run!("later-tenantless", wake_at: DateTime.add(@now, -10, :second))
+
+      result =
+        ConcurrentAdmissionHarness.reproduce_known_bad_underclaim!(TestRepo,
+          now: @now,
+          demand: 2,
+          pollers: 2
+        )
+
+      assert result.locked == [
+               %{run_id: "ranked-t1", scope_key: "t1"},
+               %{run_id: "ranked-t2", scope_key: "t2"}
+             ]
+
+      assert result.control.rows == [["later-tenantless", ""]]
+      assert result.control.backend_pid != result.blocker_backend_pid
+
+      poller_backends = Enum.map(result.pollers, & &1.backend_pid)
+      assert length(Enum.uniq(poller_backends)) == 2
+      refute result.blocker_backend_pid in poller_backends
+
+      Enum.each(result.pollers, fn %{result: claim_result} ->
+        assert {:ok, batch} = claim_result
+        assert ConcurrentAdmissionHarness.outcome_count(batch) == 0
+
+        assert_raise RuntimeError, ~r/admission under-claimed/, fn ->
+          ConcurrentAdmissionHarness.assert_full_demand!(batch, result.demand)
+        end
+      end)
+
+      assert row!("later-tenantless").claim_token == nil
+    end
+
+    test "concurrent harness preserves mixed ready, steal, and poison accounting" do
+      ready_one =
+        insert_run!("ready-t1",
+          tenant_id: "t1",
+          wake_at: DateTime.add(@now, -20, :second)
+        )
+
+      ready_two =
+        insert_run!("ready-t2",
+          tenant_id: "t2",
+          wake_at: DateTime.add(@now, -10, :second)
+        )
+
+      old_token = Ecto.UUID.generate()
+
+      expired =
+        insert_run!("expired-tenantless",
+          wake_at: nil,
+          claim_token: old_token,
+          claimed_at: DateTime.add(@now, -120, :second),
+          claim_attempts: 1
+        )
+
+      poison_token = Ecto.UUID.generate()
+
+      poison =
+        insert_run!("expired-poison",
+          tenant_id: "tenant",
+          wake_at: nil,
+          claim_token: poison_token,
+          claimed_at: DateTime.add(@now, -180, :second),
+          claim_attempts: 3
+        )
+
+      context = admission_context()
+      policy = policy(@now, limit: 2, orphan_ttl_ms: 60_000, max_claim_attempts: 3)
+
+      drain = fn drain ->
+        case RunStore.claim_due(context, :system, policy) do
+          {:ok, %{leases: [], poisoned: []}} -> []
+          {:ok, batch} -> [batch | drain.(drain)]
+        end
+      end
+
+      results =
+        ConcurrentAdmissionHarness.run_callers!(TestRepo, [
+          {:poller_one, fn -> drain.(drain) end},
+          {:poller_two, fn -> drain.(drain) end}
+        ])
+
+      assert results |> Enum.map(& &1.backend_pid) |> Enum.uniq() |> length() == 2
+
+      batches = Enum.flat_map(results, & &1.result)
+      leases = Enum.flat_map(batches, & &1.leases)
+      poisoned = Enum.flat_map(batches, & &1.poisoned)
+
+      assert Enum.sort(Enum.map(leases, & &1.run_id)) ==
+               Enum.sort([ready_one.run_id, ready_two.run_id, expired.run_id])
+
+      assert Enum.map(poisoned, & &1.run_id) == [poison.run_id]
+
+      stolen = Enum.find(leases, &(&1.run_id == expired.run_id))
+      assert stolen.claim_token != old_token
+      assert stolen.claim_attempt == 2
+      assert row!(expired.run_id).claim_token == stolen.claim_token
+
+      poisoned_row = row!(poison.run_id)
+      assert poisoned_row.claim_token == nil
+      assert poisoned_row.poisoned_at == @now
+
+      assert :ok =
+               ConcurrentAdmissionHarness.assert_active_claims!(TestRepo, %{
+                 "" => 1,
+                 "t1" => 1,
+                 "t2" => 1
+               })
+    end
+
+    test "concurrent harness fills ready-only and expired-only demand" do
+      context = admission_context()
+      policy = policy(@now, limit: 2, orphan_ttl_ms: 60_000)
+
+      for index <- 1..4 do
+        insert_run!("ready-only-#{index}",
+          tenant_id: if(rem(index, 2) == 0, do: "t2", else: "t1"),
+          wake_at: DateTime.add(@now, -index, :second)
+        )
+      end
+
+      ready_results =
+        ConcurrentAdmissionHarness.run_callers!(TestRepo, [
+          {:ready_one, fn -> RunStore.claim_due(context, :system, policy) end},
+          {:ready_two, fn -> RunStore.claim_due(context, :system, policy) end}
+        ])
+
+      Enum.each(ready_results, fn %{result: claim_result} ->
+        assert {:ok, batch} = claim_result
+        assert :ok = ConcurrentAdmissionHarness.assert_full_demand!(batch, 2)
+        assert batch.poisoned == []
+      end)
+
+      assert :ok =
+               ConcurrentAdmissionHarness.assert_active_claims!(TestRepo, %{
+                 "t1" => 2,
+                 "t2" => 2
+               })
+
+      TestRepo.delete_all(Run)
+
+      for index <- 1..4 do
+        insert_run!("expired-only-#{index}",
+          tenant_id: if(rem(index, 2) == 0, do: "t2", else: "t1"),
+          wake_at: nil,
+          claim_token: Ecto.UUID.generate(),
+          claimed_at: DateTime.add(@now, -(index + 100), :second),
+          claim_attempts: 1
+        )
+      end
+
+      expired_results =
+        ConcurrentAdmissionHarness.run_callers!(TestRepo, [
+          {:expired_one, fn -> RunStore.claim_due(context, :system, policy) end},
+          {:expired_two, fn -> RunStore.claim_due(context, :system, policy) end}
+        ])
+
+      Enum.each(expired_results, fn %{result: claim_result} ->
+        assert {:ok, batch} = claim_result
+        assert :ok = ConcurrentAdmissionHarness.assert_full_demand!(batch, 2)
+        assert batch.poisoned == []
+        assert Enum.all?(batch.leases, &(&1.claim_attempt == 2))
+      end)
+
+      assert :ok =
+               ConcurrentAdmissionHarness.assert_active_claims!(TestRepo, %{
+                 "t1" => 2,
+                 "t2" => 2
+               })
+    end
+
+    @tag capture_log: true
+    test "concurrent harness timeout reports phase and PostgreSQL diagnostics" do
+      assert_raise RuntimeError,
+                   ~r/concurrent admission timeout.*phase: \{:caller_finished, :stuck\}.*postgres:/s,
+                   fn ->
+                     ConcurrentAdmissionHarness.run_callers!(
+                       TestRepo,
+                       [stuck: fn -> receive(do: (:never -> :ok)) end],
+                       timeout: 100
+                     )
+                   end
+
+      assert %{rows: [[backend_pid]]} = TestRepo.query!("SELECT pg_backend_pid()")
+      assert is_integer(backend_pid)
     end
 
     test "the plan fences both limited index scans before the bounded update" do

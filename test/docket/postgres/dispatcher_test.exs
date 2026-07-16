@@ -98,6 +98,57 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert length(policies(agent)) == 2
     end
 
+    test "separately supervised dispatchers enter admission from distinct claim workers", %{
+      agent: first_agent
+    } do
+      parent = self()
+      barrier = make_ref()
+
+      blocker = fn policy ->
+        send(parent, {:claim_worker_checked_in, self(), policy})
+
+        receive do
+          {:release_claim_worker, ^barrier} -> batch()
+        end
+      end
+
+      set_claims(first_agent, [blocker])
+
+      second_phase =
+        start_supervised!(%{
+          id: make_ref(),
+          start: {AdmissionPhase, :start_link, [[]]}
+        })
+
+      second_agent =
+        start_supervised!(%{
+          id: make_ref(),
+          start:
+            {Agent, :start_link,
+             [fn -> %{claims: [blocker], policies: [], releases: [], phase: second_phase} end]}
+        })
+
+      _first =
+        start_dispatcher!(first_agent,
+          name: Module.concat(__MODULE__, FirstConcurrentDispatcher)
+        )
+
+      _second =
+        start_dispatcher!(second_agent,
+          name: Module.concat(__MODULE__, SecondConcurrentDispatcher)
+        )
+
+      assert_receive {:claim_worker_checked_in, first_worker, %{limit: 1}}, 1_000
+      assert_receive {:claim_worker_checked_in, second_worker, %{limit: 1}}, 1_000
+      assert first_worker != second_worker
+
+      send(first_worker, {:release_claim_worker, barrier})
+      send(second_worker, {:release_claim_worker, barrier})
+
+      assert eventually(fn -> length(policies(first_agent)) == 1 end)
+      assert eventually(fn -> length(policies(second_agent)) == 1 end)
+    end
+
     test "a hard dispatcher exit kills its in-flight claim worker", %{agent: agent} do
       parent = self()
 
