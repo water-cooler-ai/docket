@@ -691,13 +691,18 @@ assumption:
 
 ```text
 reclamation delay <= maximum residual slice duration
-                   + claim poll delay
-                   + admission transaction delay
+                   + bounded preferred rounds
+                     * (partition lock/discovery bound
+                        + claim poll delay
+                        + admission transaction delay)
 ```
 
-Without it, the public promise is weaker: eventual preference at the next
-actual release, not bounded capacity return. Finite attempt and drain settings
-must have documented numeric bounds before they support a reclamation SLO.
+The exact population and formula are `RECLAIM-1` below. Without every term and
+the database-authored preferred-epoch sequence, there is no numeric or eventual
+liveness guarantee: the policy merely prefers eligible work at future
+qualifying admissions after actual capacity release. Finite attempt and drain
+settings must have documented numeric bounds before they support a reclamation
+SLO.
 
 Borrowing is a global scheduling mode plus a per-tenant permission to exceed
 `preferred_active`; unused preferred capacity is not owned or reserved, so
@@ -879,6 +884,364 @@ immutable claim-start fact; residency requires future durable token-install/end
 evidence. The two signals are never combined implicitly, and zero denominators
 are undefined rather than coerced to zero.
 
+## Fairness SLO and regression-budget contract
+
+This section is the normative DCKT-60 reporting contract. It publishes targets
+without pretending that the unimplemented TenantFair engine already emits
+production evidence. A target marked **activation-gated** is a release
+qualification target: a report must return `not_qualified` until every named
+signal and bound exists. Missing input, an unavailable observation, a zero
+denominator, or a right-censored episode is never converted to zero or silently
+excluded.
+
+### Domain, populations, and windows
+
+One contention domain is one physical PostgreSQL database plus resolved Docket
+table schema. `prefix: nil` must be resolved before reporting. Domains, schemas,
+engine versions, policy versions, or service signals are never combined in one
+denominator.
+
+For partition `i` at time `t`, reports distinguish these populations:
+
+- **ready-admissible** means administrative state `running`, at least one
+  non-poisoned ready row is globally eligible, and authoritative live claims
+  are below `max_active`. A transiently held partition/run lock does not remove
+  it from this global population;
+- **preferred-eligible** means ready-admissible and live claims are below
+  `preferred_active`;
+- **immediately lockable** means the bounded control can acquire the required
+  partition/run locks at that instant. It is reported separately from global
+  eligibility so persistent lock contention cannot hide a starving partition;
+- **expired-recoverable** means an expired authoritative claim can be replaced;
+  it is not additive ready capacity;
+- **considered**, **locked**, and **skipped** describe only the bounded plan
+  represented by the same-named TenantFair v1 measurements. In particular,
+  `eligible_partitions` means considered candidates, not every globally
+  eligible partition;
+- **weighted active set** means the complete fixed set of every partition in
+  the fully covered domain that is continuously service-demanding during the
+  complete post-warmup window: each remains administrative `running` and
+  continuously has ready backlog or an authoritative claim consuming the named
+  service. Reaching `max_active` while being served does not remove it from this
+  set. Omitting any partition satisfying the predicate invalidates the report;
+  and
+- **physically executing** means runtime activations or executor tasks still
+  running. This is not the authoritative-claim population.
+
+A **qualifying preferred epoch** is a future database-authored, domain-wide,
+monotonic sequence value attached to one completed, successful, observation-
+available admission decision. It qualifies only when the trusted inspection
+proves at least `preferred_slot_floor > 0` distinct preferred-ready partition
+slots remained after expired/poison outcomes, capacity constraints, and lock
+races. Partial/no-op decisions that do not prove that floor do not advance the
+qualified sequence and instead remain coverage/lock evidence. An episode
+starting between epochs uses the first one at or after its database-authored
+start time. The current runtime has no such sequence or proof, so epoch targets
+are activation-gated rather than inferred from telemetry arrival order.
+
+A **low-volume episode** begins when a previously non-eligible partition becomes
+preferred-eligible with ready depth in `1..low_volume_ready_limit` (the
+qualification default is `1`). It ends at its first preferred admission, loss
+of eligibility, or policy/admin-state change. The latter two endings are
+right-censored and remain explicit report counts. A partition lock that remains
+held does not end the episode: it creates an unresolved lock-skip episode and
+eventually a breach. If no qualifying capacity/admission opportunity occurs,
+the episode remains visible but is not eligible for a quanta target; its wall
+age and capacity-starved status are still reported.
+
+Production rollups use half-open 15-minute episode-start windows `[start, end)`
+and retain a separate daily compliance rollup. Episodes starting in a window
+are followed beyond `end` until resolution or their target deadline; a report
+generated before that deadline marks them `pending`, never successful. Data
+loss, loss of eligibility, or policy/admin changes before resolution are
+right-censored and make coverage ineligible rather than improving the result.
+Qualification and benchmark windows are one complete controlled run, excluding
+declared warmup, and must contain at least 1,000 committed measured
+transactions for percentile or skew decisions. Smoke profiles verify shape
+only. Administrative `hold_new`/`drain` intervals, unavailable/error
+observations, database failover/migration intervals, and mixed engine/policy
+versions are reported as exclusions with counts and durations. They are not in
+successful SLO denominators.
+
+### Required report input
+
+Default telemetry stays identity-free. A cardinality-bounded trusted collector
+therefore supplies a versioned `tenant_fair_report_input/v1` record for each
+authorized domain/window. It contains only the partitions admitted by the
+collector's access and pagination policy and names that coverage explicitly:
+
+```text
+header:
+  domain_database, domain_schema, window_start, window_end
+  coverage_complete, partitions_covered, coverage_limit, coverage_truncated
+  implementation, engine_version, policy_version, service_signal
+  observation_successes, observation_errors, observation_unavailable
+  exclusions_by_reason[{reason, count, duration_ms}]
+
+admission_decisions[] keyed by (decision_sequence, transaction_id, partition):
+  optional preferred_epoch, preferred_slot_floor
+  preferred_eligible_partition_count
+  policy_version, effective_preferred_active, effective_max_active
+  effective_weight, admin_state
+  ready_admission_permitted_before_cap
+  authoritative_live_before, non_additive_claim_clears
+  replacement_steals, authoritative_live_at_ready_decision
+  additive_ready_admissions, authoritative_live_after
+  cap_denial_decision, immediately_lockable_control_rows
+
+low_volume_episodes[] keyed by episode_id:
+  partition, started_at, episode_start_epoch, preferred_admission_at
+  preferred_admission_epoch, ready_depth, preferred_slot_floor
+  eligible_partition_peak, deadline_epoch, optional deadline_at
+  resolution, censor_reason
+  capacity_starved, immediately_lockable_at_start
+low_volume_lag_epoch_histogram, low_volume_pending_count
+low_volume_normalized_lag_histogram
+low_volume_censored_count, low_volume_capacity_starved_count
+
+lock_skip_episodes[] keyed by episode_id:
+  partition, first_consecutive_skip_at, start_epoch, skip_resolved_at
+  resolution_epoch, preferred_slot_floor, eligible_partition_peak
+  deadline_epoch, optional deadline_at, resolution, censor_reason
+lock_skip_epoch_histogram, unresolved_skip_count, censored_skip_count
+lock_normalized_skip_histogram
+
+service_window:
+  fixed_active_set, fixed_active_set_complete
+  active_claim_intervals, domain_active_claim_intervals
+  partitions[{partition, partition_service_us, active_weight_intervals}]
+  active_set_service_us, peak_service_concurrency
+  max_batch_outcomes, enforced_max_service_quantum_us
+  max_service_quantum_enforcement_mechanism
+
+wait_window:
+  covered_ready_claim_wait_ms_count, covered_ready_claim_wait_ms_sum
+  covered_ready_claim_wait_ms_max, ready_claim_wait_histogram_ms
+  candidate_coverage_complete, candidate_observation_errors
+  candidate_observation_unavailable
+  ready_claim_wait_reference_histogram_ms, reference_count
+  reference_coverage_complete, reference_observation_errors
+  reference_observation_unavailable
+  candidate_workload_policy_fingerprint, reference_workload_policy_fingerprint
+  wait_reference_artifact_id, wait_reference_approved
+  expired_recovery_wait_histogram_ms
+
+reclaim_episodes[] keyed by episode_id:
+  partition, borrowed_capacity_at_start, below_preferred_eligible_at
+  episode_start_epoch, preferred_admission_at, preferred_admission_epoch
+  preferred_slot_floor, eligible_partition_peak, deadline_epoch
+  optional deadline_at
+  resolution, censor_reason
+reclaim_episode_count, reclaim_unresolved_count, reclaim_censored_count
+
+enforced_bounds:
+  partition_lock_hold{H_ms, enforcement_mechanism}
+  residual_service_quantum{R_ms, enforcement_mechanism}
+  poll_delay{P_ms, enforcement_mechanism}
+  admission_transaction{T_ms, enforcement_mechanism}
+
+stale_owner_episodes[] keyed by (run, stolen_token, replacement_token):
+  steal_at, stale_owner_stopped_at, overlap_ms
+
+benchmark_comparison:
+  benchmark_candidate, benchmark_profile, normalized_workload_fingerprint
+  benchmark_environment_id, benchmark_postgres_fingerprint
+  reference_runtime_fingerprint, candidate_runtime_fingerprint
+  reference_source_sha256, candidate_source_sha256
+  reference_query_sha256, candidate_query_sha256
+  reference_ddl_sha256, candidate_ddl_sha256
+  reference_runtime_parity, candidate_runtime_parity
+  reference_status, candidate_status
+  typed_hash_transition_approvals[{kind: query|ddl,
+    reference_sha256, candidate_sha256, approved}]
+  query_reference_artifact, query_candidate_artifact, reference_approved
+```
+
+An SLO decision requires `coverage_complete = true` for the globally eligible
+population within the declared bounded scan/pagination limit. A truncated or
+access-subset report remains useful diagnostics but cannot pass a fairness SLO,
+because an omitted starving partition could otherwise improve every result.
+Each percentile requires at least 1,000 values in its own named population, not
+merely 1,000 unrelated admission transactions; smaller sets are
+`insufficient_population`. The cap audit records the policy version read inside
+the serialized transaction.
+The lockability control used to classify a false denial is executed inside the
+bounded correctness harness. A false cap denial is a decision labeled cap-
+denied even though `L_decision_i < M_i`, administrative/policy state permits
+ready admission (`ready_admission_permitted_before_cap = true`), and the control
+proves at least one ready row is immediately lockable. Service intervals are
+clipped to the window.
+Claim residency requires immutable token-install/end evidence; mutable
+`claimed_at` is not sufficient. Histogram bucket boundaries and counts are
+part of the input and their totals must equal the corresponding TenantFair v1
+wait counts for the same covered population. A histogram percentile is the
+least bucket upper bound whose cumulative count reaches `ceil(q * count)`; it
+is a conservative bucket bound, not a reconstructed raw-sample value. Epoch
+histograms use this same nearest-rank bucket rule. Bounds are usable only when
+the report also names the enforcing configuration or mechanism; a configured
+timeout that does not cover the whole interval is not an enforced bound.
+
+`stale_owner_episodes[].overlap_ms` is measured per stale owner from the
+replacement steal until that owner acknowledges stop. Aggregate stale-owner
+milliseconds sum per-owner durations and therefore preserve multiplicity. An
+absent stop acknowledgement is unresolved, not zero. Executor-task skew
+qualification requires these episodes to be absent or included in the measured
+service and `peak_service_concurrency`.
+
+The collector rejects internally inconsistent input: decision keys are unique;
+episode histogram totals equal the matching resolved array classifications;
+pending/censored/starved/unresolved counters equal their array states;
+`reclaim_episode_count` equals the reclaim array length;
+`active_set_service_us = sum(partitions[].partition_service_us)`; and the fixed
+active-set keys equal the partition keys exactly. Current/reference wait
+histogram totals equal their recorded counts. Benchmark selection uses the same
+`benchmark_candidate` row in both summaries, and all selected measurements,
+eligibility checks, query hashes, samples, and `plan_path` come from that row.
+Zero audited cap decisions or zero reclaim episodes is `no_population`, not a
+vacuous pass. FAIR/LOCK epoch finalization sets
+`deadline_epoch_i = start_epoch_i + 2 * round_budget_epochs_i`. For reclaim,
+when every bound exists,
+`deadline_at_i = below_preferred_eligible_at_i + budget_ms_i`; otherwise it has
+no numeric deadline or guarantee and its epoch deadline is diagnostic only.
+Every unequal query or DDL hash pair requires exactly one matching approved
+typed transition entry; equal pairs require none.
+
+### Published targets
+
+Let `A_i` be additive ready admissions for partition `i`, `L_decision_i` its
+authoritative live claims after any claim-clearing/replacement outcomes and at
+the serialized ready-capacity decision, and `M_i` the effective `max_active`
+read in that transaction. The audit requires
+`L_decision_i = L_before_i - non_additive_claim_clears_i` and
+`L_after_i = L_decision_i + A_i`; every replacement steal has zero net effect
+and therefore appears only in `replacement_steals_i`. This transition
+reconciliation prevents a mislabeled steal from hiding additive authority.
+Let `E_peak` be the maximum globally preferred-eligible partition count during
+an episode, `S_floor` the minimum proven `preferred_slot_floor` across its
+qualifying epochs, and:
+
+```text
+round_budget_epochs = ceil(E_peak / S_floor) + 1
+```
+
+The extra epoch is the explicit indivisible-batch/lock-race allowance. It is
+not a promise of strict per-poll rotation. Budgets are computed per episode;
+population percentiles use `normalized_lag_i = lag_epochs_i /
+round_budget_epochs_i`, so episodes with different active sets and slot floors
+are never compared to one unindexed budget. In `FAIR-2`, `C_service_max` is
+`service_window.peak_service_concurrency`, `B_max` is
+`service_window.max_batch_outcomes`, and `Q_max_us` is
+`service_window.enforced_max_service_quantum_us`; its enforcement evidence is
+`max_service_quantum_enforcement_mechanism`. `H_ms`, `R_ms`, `P_ms`, and
+`T_ms` come from their like-named `enforced_bounds` objects and are unusable
+without the adjacent enforcement mechanism.
+
+| ID and class | Formula and unit | Window and population | Published target | Required signal and current status |
+| --- | --- | --- | --- | --- |
+| `CAP-1` safety invariant | `violations = count(A_i > max(M_i - L_decision_i, 0) or L_decision_i != L_before_i - non_additive_claim_clears_i or L_after_i != L_decision_i + A_i)`; committed decisions | Every serialized ready-capacity decision. Replacement steals are zero-net and excluded from `A_i`; an already-over-cap downgrade cannot add ready authority. | `violations = 0`. This is exact correctness, not a percentile. | Trusted serialized transition audit plus concurrent correctness harness. TenantFair engine activation-gated. |
+| `CAP-2` cap-denial correctness | `false_denial_rate = count(cap_denial and L_decision_i < M_i and ready_admission_permitted_before_cap and immediately_lockable_control_rows > 0) / count(cap_denial)`; ratio | Every bounded audited cap-denial decision; zero decisions is `no_population`. | Numerator `= 0`. | `cap_denied_partitions` supplies descriptive volume only; exact numerator comes from the decision/control audit. Activation-gated. |
+| `FAIR-1` low-volume service lag | `lag_epochs_i = preferred_admission_epoch_i - episode_start_epoch_i`; `normalized_lag_i = lag_epochs_i / round_budget_epochs_i`; epochs and ratio. Also report wall age/censor reason. | 15-minute episode-start and daily windows; >=1,000 low-volume episodes, including pending/censored/capacity-starved counts. | p99 normalized lag `<= 1`, maximum `<= 2`; pending, censored, and capacity-starved counts must all be zero for a final pass. | Database-authored epoch/episode history. No current production numeric claim. |
+| `FAIR-2` bounded service skew | `skew_i_pp = 100 * (partition_service_us / active_set_service_us - windowed_entitlement_i)`; percentage points. `B_pp = 100 * ((C_service_max + B_max) * Q_max_us / active_set_service_us)`. `Q_max_us` is an enforced maximum accounting quantum for the named signal; `C_service_max` measures that signal's actual concurrency. | One complete >=15-minute fixed-signal window; the complete fixed continuously service-demanding weighted active set; numerator and denominator include only that set. | `max_i(abs(skew_i_pp)) <= B_pp` and `fixed_active_set_complete = true`. For claim residency, token-residency charges must be durably split at `Q_max_us`; for executor task time, stale work must be included and physically bounded. | Trusted complete-coverage service/weight intervals. Currently `not_qualified`. |
+| `LOCK-1` preferred-partition lock-skip delay | `skip_delay_ms_i = skip_resolved_at_i - first_consecutive_skip_at_i`; `skip_epochs_i = resolution_epoch_i - start_epoch_i`; normalize by that episode's round budget. | 15-minute episode-start and daily windows; >=1,000 preferred-eligible skip episodes, including unresolved/censored episodes. | p99 normalized skip epochs `<= 1`, maximum `<= 2`, unresolved/censored counts `= 0`. With per-epoch enforced `H_ms`, `P_ms`, `T_ms`: each episode's millisecond budget is `round_budget_epochs_i * (H_ms + P_ms + T_ms)`; p99 normalized milliseconds `<= 1`, maximum `<= 2`. | DB-authored skip/epoch history. `skipped_partitions` alone is incidence, not duration. No current numeric lock-delay SLO. |
+| `WAIT-1` ready claim wait | `mean_ms = covered_ready_claim_wait_ms_sum / covered_ready_claim_wait_ms_count`; p95/p99 from matching histograms; milliseconds. | One complete controlled >=1,000-ready-lease candidate compared with an immutable approved complete >=1,000-sample reference; identical buckets and workload/policy fingerprints. | Candidate/reference p95 ratio `<= 1.20`, p99 ratio `<= 1.30`; both coverage-complete with zero error or unavailable observations. This is a qualification regression budget, not a universal wake-to-claim bound. | Trusted current/reference artifact IDs, coverage/errors, counts, fingerprints, and histograms; reconcile candidate with TenantFair totals when whole-domain. |
+| `QUERY-1` claim-query latency | For the named `benchmark_candidate`, `p95_ratio = candidate.query_us.p95 / reference.query_us.p95`, likewise p99; ratio and microseconds. | Approved prior artifact for the same candidate, normalized workload fingerprint, PostgreSQL fingerprint, and environment ID; both non-smoke, correctness-eligible, zero-error, and independently >=1,000 samples. Query/DDL hashes match or have an approved transition. | p95 ratio `<= 1.20`, p99 ratio `<= 1.30`. Benchmark regression budget only. | Complete benchmark artifact sets. Current `runtime_parity: false` permits prototype-to-prototype evidence only. |
+| `RECLAIM-1` authoritative preferred-admission reclaim lag | Per episode `reclaim_lag_ms_i = preferred_admission_at_i - below_preferred_eligible_at_i`; `budget_ms_i = R_ms + round_budget_epochs_i * (H_ms + P_ms + T_ms)`. | Every borrowed-capacity-at-start episode in 15-minute episode-start and daily windows, including unresolved/censored episodes. | Only if every bound, epoch, and timestamp exists: `count(reclaim_lag_ms_i > budget_ms_i) = 0` and unresolved/censored counts `= 0`. Otherwise `no_numeric_guarantee`; preference is conditional on an actual release and no finite liveness promise is made. | Trusted borrowed-capacity crossing/epoch/admission history. This targets authoritative admission only; borrowing/current runtime is not qualified. |
+
+`CAP-1` limits net additive authoritative claim count, not the creation of a
+replacement token and not physical execution. A successful steal replaces one
+authority, but the stale owner can overlap the replacement
+until it stops or reaches another fence; repeated steals can multiply that
+physical overlap. `stale_owner_overlap_*` is therefore a separate report-only
+inspection signal with no current target. CPU, executor tasks, downstream calls,
+and external effects are never CAP-1 numerators.
+
+`RECLAIM-1` likewise ends at a new authoritative preferred admission; it does
+not claim that a stale borrowed executor, process, CPU slot, or downstream call
+has stopped. A physical-capacity reclaim objective would additionally require
+stop acknowledgement for every implicated `stale_owner_episode` and has no
+current target.
+
+### Worked report
+
+This illustrative report uses only the fields above, the TenantFair v1 event,
+and the complete benchmark v1 artifact sets (`summary.json`, `manifest.json`,
+samples, and plans). It demonstrates unavailable handling; it is not evidence
+from a shipped TenantFair engine.
+
+```text
+domain/window: docket_prod_1/public, [12:00, 12:15)
+coverage: complete=true, partitions=20/limit=1000, truncated=false
+          observation_successes=600, errors=0, unavailable=0
+          exclusions_by_reason=[]
+
+CAP-1: 40 additive decisions have (L_before,M,clears,A,L_after)=(1,2,0,1,2)
+       12 denied decisions have (2,2,0,0,2); all 52 share policy_version=7
+       capacity/transition violations=0                          PASS
+CAP-2: all 12 denied decisions have L_decision=2,M=2
+       cap_denial_decisions=12, false_cap_denial_decisions=0
+       false_denial_rate=0/12=0                                 PASS
+
+FAIR-1: all 1000 episodes have E_peak=20, S_floor=5
+        per-episode round_budget=ceil(20/5)+1=5
+        lag_epoch_histogram={1:200,2:400,3:300,4:99,7:1}
+        normalized p99=4/5=.8, max=7/5=1.4
+        count=1000, pending/censored/starved=0                   PASS
+LOCK-1: skip_epoch_histogram={1:500,2:300,3:199,8:1}
+        normalized p99=3/5=.6, max=8/5=1.6
+        count=1000, unresolved/censored=0                       PASS
+        H_ms/P_ms/T_ms not all present; millisecond target       NOT_QUALIFIED
+
+WAIT-1: ready count=1000, sum=1200000 ms, max=3900 ms
+        reference_artifact_id=wait-ref-2026-07-01-approved
+        shared bucket bounds=[1000,1800,2000,2500,3000,3500,3900]
+        candidate counts=[600,0,350,0,40,0,10]
+        reference counts=[700,250,0,40,0,10,0]
+        candidate/reference count=1000/1000, coverage=true/true
+        errors=0/0, unavailable=0/0, workload_policy_fingerprint=7c31/7c31
+        p95/p99 candidate=2000/3000, reference=1800/2500 ms
+        exact ratios=2000/1800 and 3000/2500 (gate before rounding) PASS
+
+FAIR-2: service_signal=claim_residency, active_set_service=100000000 us
+        C_service_max=10, B_max=5, Q_max absent                  NOT_QUALIFIED
+RECLAIM-1: episodes=8, unresolved=0, censored=0
+           R_ms/H_ms/T_ms absent; numeric target                 NO_NUMERIC_GUARANTEE
+
+QUERY-1: candidate=hint_cursor, profile=scale
+         candidate_artifact=/evidence/current/summary.json
+         reference_artifact=/evidence/reference/summary.json
+         artifact_set_complete=true/true
+         candidate/reference samples=1600/1600
+         candidate/reference eligible=true/true, errors=0/0
+         normalized_workload_fingerprint=19af, environment_id=pg-scale-a
+         postgres_fingerprint=pg16/settings-7c31, reference_approved=true
+         runtime/source/query/DDL fingerprints match
+         status=exploratory_pre_runtime_prototype/
+                exploratory_pre_runtime_prototype, runtime_parity=false/false
+         approved reference p95/p99=80000/120000 us
+         candidate p95/p99=92000/150000 us
+         ratios=1.15/1.25                                       PASS (prototype only)
+```
+
+The event reconciliation checks for this report are also explicit: because the
+illustrated histogram covers the whole successful-ready population, its count
+equals `sum(ready_claim_wait_ms_count) = 1000`; a collector covering only an
+authorized subset instead reports both covered and event-total counts and does
+not claim equality. Cap-denial volume equals the covered sum of
+`cap_denied_partitions = 12`, and excluded/unavailable observations are stated
+in the header. The per-partition cap and fairness numerators come only from the
+bounded trusted input, never from identity-free aggregate events.
+
+### DCKT-50 traceability
+
+| DCKT-50 acceptance criterion | Contract or evidence |
+| --- | --- |
+| Tenant identity cannot be selected from untrusted run payload data. | [Trusted partition identity](#trusted-partition-identity) and persisted generated `scope_key`. |
+| All policy concepts have precise operational definitions and units. | [Fairness vocabulary](#fairness-vocabulary), population definitions above, and TenantFair v1 measurements in [`../telemetry.md`](../telemetry.md). |
+| Configuration uses the closed whitelist and fails clearly when invalid. | [Instance configuration contract](#instance-configuration-contract) and `Docket.Postgres.ClaimPolicy.TenantFair.Config`. |
+| Benchmarks cover queued-row/tenant cardinality, dormant tenants, and hot contention. | Benchmark `manifest.json.config`, deterministic seed manifest, contention, hot-contention, reconciliation, and cap audits documented in [`../postgres-operations.md`](../postgres-operations.md). |
+| SLOs can be computed from emitted aggregate telemetry plus documented bounded trusted inspection inputs. | TenantFair v1 event inputs plus the explicitly bounded `tenant_fair_report_input/v1` crosswalk above. Identity-bearing per-partition values never become default metric labels; unavailable activation gates remain visible. |
+| The harness reproduces ranking-CTE plus `SKIP LOCKED` under-claim. | `Docket.Test.ConcurrentAdmissionHarness.reproduce_known_bad_underclaim!/2` in `test/support/postgres/concurrent_admission_harness.ex`, invoked from `test/docket/postgres/run_store_test.exs`, plus benchmark `contention`, `control_lockable_rows`, `avoidable_underclaim_transactions`, and `performance_eligibility` outputs. |
+
 Operational dashboards should compare:
 
 - total versus quiet-tenant queue age;
@@ -890,20 +1253,6 @@ Operational dashboards should compare:
   from benchmark `EXPLAIN` output;
 - vehicle utilization;
 - execution-time share versus claim-count share.
-
-Fairness objectives for production rollout are:
-
-- zero authoritative hard-cap admission violations;
-- quiet-tenant eligible-to-claim p95/p99 during contention;
-- maximum admission lag in completed drain quanta;
-- consecutive partition skips and oldest skipped age;
-- stale-owner physical overlap after steal;
-- tenant reactivation latency;
-- weighted normalized-service error over fixed contention windows, once
-  weighting exists;
-- borrowed-capacity reclamation p95/p99, only after a numeric slice bound
-  exists;
-- queue growth rate and projected storage exhaustion time.
 
 Aggregate tier metrics can hide one starving tenant. Use bounded top-K or
 sampled tenant diagnostics in the trusted inspection plane rather than tenant

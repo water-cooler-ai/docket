@@ -473,6 +473,56 @@ under-claim. The check intentionally has no p95/p99, latency,
 throughput, exact cost, or planner-node-count gate; shared-runner timing and
 minor PostgreSQL planner changes are not release regressions by themselves.
 
+### DCKT-60 query regression budget
+
+The published `QUERY-1` budget compares a candidate with an approved prior
+artifact for the same candidate and only when both non-smoke artifacts have
+the same `normalized_workload_fingerprint`, PostgreSQL major/settings
+fingerprint, and an operator-assigned `benchmark_environment_id` identifying
+the same machine class. The comparison record also fingerprints both
+artifacts' `runtime`, `postgres`, and `config` objects. The normalized workload is the complete
+resolved `config` after removing only artifact/control keys `output`, `check`,
+and `keep_schema`; both normalized objects must be byte-identical. Query and
+DDL hashes must match, or that
+record must name and approve the intentional hash transition. A result is
+comparable only when both artifacts independently have
+the same named `benchmark_candidate`, that candidate's
+`performance_eligibility.eligible = true`, `measurements.error_count = 0`, and
+at least 1,000 samples. Select exactly one row where
+`candidates[].candidate == benchmark_candidate`, then read:
+
+```text
+candidates[].measurements.query_us.p95
+candidates[].measurements.query_us.p99
+candidates[].measurements.sample_count
+candidates[].performance_eligibility.eligible
+candidates[].performance_eligibility.checks
+candidates[].query_sha256
+candidates[].plan_path
+samples_path
+manifest_path
+```
+
+from `summary.json`, and read `source.sha256` and `provisional_ddl_sha256` from
+`manifest.json`. `benchmark_environment_id`, the two artifact paths, reference
+approval, fingerprints, and any approved hash transition are the bounded
+`tenant_fair_report_input/v1` comparison fields; the runner does not infer
+hardware equivalence. Each artifact path names an exact immutable artifact root
+or `summary.json`, whose relative manifest, samples, and selected plan files
+must all exist. The target is candidate/reference p95 `<= 1.20` and p99
+`<= 1.30`. Checkout and commit distributions remain separately named; plan
+execution milliseconds are one rolled-back `EXPLAIN ANALYZE` sample and are not
+substituted for the query distribution. A failed correctness audit makes the latency comparison
+ineligible rather than fast.
+
+The current manifest says `runtime_parity: false` and
+`exploratory_pre_runtime_prototype`; consequently this budget supports only
+prototype-to-prototype candidate regression decisions. It becomes runtime
+qualification evidence only after exact runtime query/DDL hashes replace the
+prototype hashes. It never becomes a production latency SLO without a separate
+production event population and target. See the full
+[fairness SLO and regression-budget contract](architecture/docket-tenant-claim-fairness-design.md#fairness-slo-and-regression-budget-contract).
+
 ## Migration from 0.0.1
 
 Nodes, graphs, schemas, reducers, interrupts, executors, and processless inline
