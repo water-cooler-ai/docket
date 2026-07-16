@@ -19,7 +19,7 @@ defmodule Docket.Bench.Scorecard.Config do
       scenarios: %{
         "throughput" => %{n: 300, concurrency: 8, target_runs_per_sec: 50},
         "concurrency" => %{levels: [2, 8], per_slot: 25},
-        "claim_ceiling" => %{n: 1_000, workers: 4, target_claims_per_sec: 500},
+        "claim_ceiling" => %{n: 1_000, workers: 4, batch: 50, target_claims_per_sec: 500},
         "tenant_fairness" => %{tenants: 6, hot_fraction: 0.6, n: 300, concurrency: 8},
         "fast_slow" => %{
           concurrency: 8,
@@ -37,7 +37,7 @@ defmodule Docket.Bench.Scorecard.Config do
       scenarios: %{
         "throughput" => %{n: 2_000, concurrency: 32, target_runs_per_sec: 300},
         "concurrency" => %{levels: [4, 16, 64], per_slot: 60},
-        "claim_ceiling" => %{n: 20_000, workers: 8, target_claims_per_sec: 3_000},
+        "claim_ceiling" => %{n: 20_000, workers: 8, batch: 50, target_claims_per_sec: 3_000},
         "tenant_fairness" => %{tenants: 10, hot_fraction: 0.6, n: 1_500, concurrency: 16},
         "fast_slow" => %{
           concurrency: 16,
@@ -55,7 +55,7 @@ defmodule Docket.Bench.Scorecard.Config do
       scenarios: %{
         "throughput" => %{n: 10_000, concurrency: 64, target_runs_per_sec: 500},
         "concurrency" => %{levels: [8, 32, 128], per_slot: 100},
-        "claim_ceiling" => %{n: 100_000, workers: 16, target_claims_per_sec: 5_000},
+        "claim_ceiling" => %{n: 100_000, workers: 16, batch: 50, target_claims_per_sec: 5_000},
         "tenant_fairness" => %{tenants: 20, hot_fraction: 0.6, n: 6_000, concurrency: 32},
         "fast_slow" => %{
           concurrency: 32,

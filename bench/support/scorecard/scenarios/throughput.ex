@@ -33,7 +33,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.Throughput do
 
     latencies_ms =
       Enum.map(trial.finished, fn %{run_id: run_id, finished_at: finished_at} ->
-        DateTime.diff(finished_at, trial.seed[run_id].due_at, :millisecond)
+        Stats.wait_ms(finished_at, trial.seed[run_id].due_at, trial.started_at)
       end)
 
     latency = Stats.percentiles(latencies_ms)
@@ -47,7 +47,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.Throughput do
       elapsed_s: elapsed_s,
       completed: length(trial.finished),
       latency_ms: latency,
-      timing_scope: "staged due-time to terminal finished_at (queue plus service)"
+      timing_scope: "max(due-time, runtime start) to terminal finished_at (queue plus service)"
     }
 
     evidence = "#{round(runs_per_sec)} r/s (target #{target}), p95 #{format_ms(latency.p95)}"

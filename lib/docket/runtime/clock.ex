@@ -25,7 +25,8 @@ defmodule Docket.Runtime.Clock do
         |> DateTime.to_unix(:microsecond)
         |> DateTime.from_unix!(:microsecond)
 
-      other -> raise ArgumentError, "expected a DateTime to normalize, got: #{inspect(other)}"
+      other ->
+        raise ArgumentError, "expected a DateTime to normalize, got: #{inspect(other)}"
     end
   end
 end

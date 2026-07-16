@@ -1,5 +1,10 @@
 defmodule Docket.Bench.Scorecard.Stats do
-  @moduledoc "Nearest-rank percentiles, mean, clamp, and Jain's fairness index."
+  @moduledoc "Nearest-rank percentiles, mean, clamp, wait anchoring, and Jain's fairness index."
+
+  def wait_ms(finished_at, due_at, started_at) do
+    anchor = if DateTime.compare(due_at, started_at) == :gt, do: due_at, else: started_at
+    DateTime.diff(finished_at, anchor, :millisecond)
+  end
 
   def percentiles([]), do: %{p50: nil, p95: nil, p99: nil, min: nil, max: nil}
 
