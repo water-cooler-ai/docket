@@ -22,6 +22,7 @@ labels. Claim tokens are never emitted.
 | `[:docket, :postgres, :notification]` | `count` | `result` |
 | `[:docket, :postgres, :run_store, :claim]` | duration, candidate/selection ages and counts, `demand`, `leases`, `poisoned`, `steals`, `claim_attempts` | `preference`, `fallback`, `result` |
 | `[:docket, :postgres, :claim_policy, :admission]` | `duration`, `demand`, `leases`, `poisoned` | `implementation`, `result` |
+| `[:docket, :postgres, :claim_policy, :admission, :observation]` | TenantFair v1 aggregate partition, policy, outcome, and wait measurements described below | `implementation`, `schema`, `result`, `observation_status`, `admission_class`, `work_class`, `batch_shape`, `policy_source`, `admin_state` |
 | `[:docket, :postgres, :claim, :attempt]` | `count`, `claim_attempts` | `result` |
 | `[:docket, :postgres, :claim, :poisoned]` | `count` | `reason` |
 | `[:docket, :postgres, :claim, :operation]` | `duration`, optionally `matched` | `operation`, `result` |
@@ -60,11 +61,86 @@ effects require their own stable idempotency scheme.
 
 The DCKT-58 contract defines tenant fairness over the persisted PostgreSQL
 `scope_key`, but raw `scope_key` and `tenant_id` are forbidden as ordinary
-telemetry metadata and metric labels. Run ID, graph ID/hash, claim token, tier,
-and host account identity are forbidden for the same reason. The current
-generic ClaimPolicy event remains bounded by implementation and result; DCKT-59
-adds TenantFair aggregate measurements after the engine observation shape is
-available.
+admission telemetry metadata and metric labels. Run ID, graph ID/hash, claim
+token, tier, host account identity, policy version, and arbitrary error text are
+forbidden for the same reason. This admission restriction does not remove
+identity from durable domain events, whose raw metadata contract is separate.
+
+The generic `[:docket, :postgres, :claim_policy, :admission]` event remains
+exactly four measurements and two metadata keys for every implementation.
+Legacy emits no TenantFair observation event and retains all of its existing
+events unchanged.
+
+### TenantFair v1 admission observation
+
+A future TenantFair plan opts into the source-owned `:tenant_fair_v1` schema.
+Every successful decode, including a no-op, must return one complete aggregate
+summary. The ClaimPolicy facade validates that summary against the portable
+lease/poison batch and emits
+`[:docket, :postgres, :claim_policy, :admission, :observation]`. Implementation
+private observation fields are not copied. All event metadata is derived by the
+facade from fixed numeric fields, and
+`Docket.Telemetry.metric_metadata/2` rejects both unknown keys and values
+outside the fixed enums.
+
+The event's direct measurements are:
+
+| Measurement | Meaning and unit |
+| --- | --- |
+| `duration` | Whole ClaimPolicy admission operation in native monotonic units, matching the generic event. It is not PostgreSQL lock wait or pool checkout time. |
+| `demand`, `leases`, `poisoned`, `outcomes`, `unfilled_demand`, `steals` | Counts. An outcome is one returned lease or poison; an expired lease is a token-replacing steal. `unfilled_demand` is descriptive and does not by itself prove avoidable under-claim. |
+| `eligible_partitions`, `locked_partitions`, `skipped_partitions` | Distinct partition counts considered, successfully locked, and skipped by the bounded plan. |
+| `cap_denied_partitions` | Count of distinct locked, eligible partitions denied additive ready admission because authoritative live claims reached `max_active`; it is not denied backlog rows or a cap-violation count. |
+| `below_preferred_partitions` | Count of locked eligible partitions below `preferred_active`. |
+| `default_policy_partitions`, `override_policy_partitions` | Counts of locked partitions consulting each policy source. |
+| `running_partitions`, `hold_new_partitions`, `drain_partitions` | Counts of locked partitions in each administrative state. |
+| `preferred_admissions`, `borrowed_admissions` | Counts of additive ready leases by admission class. Expired replacement steals are neither. |
+| `ready_leases`, `ready_poisoned`, `expired_leases`, `expired_poisoned` | Outcome counts by work class and disposition. |
+| `candidate_rows_examined` | Logical candidate rows materialized/considered by the bounded TenantFair plan. It is not PostgreSQL physical rows scanned; physical work and buffers belong to benchmark `EXPLAIN` output. |
+| `under_claimed` | `0` or `1`. It is `1` only when a bounded, trusted audit proves that eligible lockable work was avoidably left unserved. Ordinary `outcomes < demand` remains a partial result, not automatically under-claim. |
+| `ready_claim_wait_ms_count|sum|max` | Ready-lease wait samples in integer milliseconds. Each sample is database `claimed_at - wake_at`; the count equals `ready_leases`. |
+| `expired_recovery_wait_ms_count|sum|max` | Expired outcome recovery samples in integer milliseconds from the prior claim's expiry boundary to its lease/poison resolution. These are never mixed with ready wait. |
+| optional `partition_lock_skip_delay_ms_count|sum|max` | Integer milliseconds from a proven database-authored first consecutive skip to observation. The fields are absent unless that history exists; they are never fabricated as zero or inferred from query duration. |
+
+`count/sum/max` supports a count, mean, and maximum. It cannot reconstruct a
+claim-level percentile. A percentile SLO must use fixed histogram buckets or a
+documented bounded inspection histogram with the same population and window.
+
+True row-lock blocking time is not a direct TenantFair v1 signal:
+`FOR ... SKIP LOCKED` deliberately skips instead of waiting, and Ecto query or
+checkout duration includes unrelated work. Until a later database-authored
+contention history exists, partition-lock delay is owned by the bounded
+concurrency harness/inspection plane; default telemetry directly owns the
+`skipped_partitions` count only.
+
+Metadata vocabularies are fixed:
+
+- `schema`: `:tenant_fair_v1`;
+- `result`: `:ok | :error`;
+- `observation_status`: `:available | :unavailable`;
+- `admission_class`: `:none | :preferred | :borrowed | :mixed`;
+- `work_class`: `:none | :ready | :expired | :mixed`;
+- `batch_shape`: `:error | :no_op | :full | :partial | :under_claim`;
+- `policy_source`: `:none | :default | :override | :mixed`; and
+- `admin_state`: `:none | :running | :hold_new | :drain | :mixed`.
+
+An opted-in SQL, decoder, or observation-contract error emits the detail event
+with only `duration` and `demand`, `result: :error`, and
+`observation_status: :unavailable`; database-derived fields are absent rather
+than falsely zero. The generic error event is still emitted. Observation
+callback failures cannot suppress either facade-owned event.
+
+The path shapes intentionally allow poison and steal to overlap other paths:
+
+| Path | Available observation shape |
+| --- | --- |
+| full success | `batch_shape: :full`; `outcomes == demand` |
+| no-op | `batch_shape: :no_op`; zero outcomes, while discovery/cap/skip counts may be non-zero |
+| legitimate partial result | `batch_shape: :partial`; `unfilled_demand > 0`, `under_claimed == 0` |
+| proven avoidable under-claim | `batch_shape: :under_claim`; `under_claimed == 1` |
+| poison | `ready_poisoned + expired_poisoned > 0`; may still fill demand |
+| steal | `steals == expired_leases > 0`; replacement does not add concurrency |
+| error | `batch_shape: :error`, `observation_status: :unavailable`; DB aggregates absent |
 
 Fairness reports use the following locked meanings:
 
@@ -80,11 +156,50 @@ Fairness reports use the following locked meanings:
   weight entitlement, reported in percentage points.
 
 Those per-partition values belong to a trusted, cardinality-bounded inspection
-or offline aggregation plane, not default metrics. Ordinary TenantFair events
-emit only aggregate counts/durations and bounded enums needed to detect cap
-denial, partition-lock contention, under-claim, and query delay. A host may join
-trusted inspection output to its own tenant/account model under its own access,
-retention, and cardinality controls.
+or offline aggregation plane, not default metrics. A report must name one
+physical database/schema fairness domain, one partition population, and one
+window. For partition `i`, the required bounded inputs and derivations are:
+
+```text
+instant concurrency share_i
+  = active_claims_i / domain_active_claims
+
+windowed concurrency share_i
+  = (1 / window_duration_ms)
+    * integral over the window of (active_claims_i(t) / domain_active_claims(t)) dt
+
+processing-time share_i,signal
+  = partition_service_time_i,signal / domain_service_time_signal
+
+entitlement_i
+  = active_weight_i / sum(active_set_weights)
+
+windowed entitlement_i
+  = time average of entitlement_i over the named window
+
+service skew_i_pp
+  = 100 * (processing-time share_i,signal - windowed entitlement_i)
+```
+
+Concurrency and processing shares are ratios in `[0, 1]`; service skew is in
+percentage points. Windowed concurrency therefore requires time-aligned
+partition and domain active-claim samples/intervals; a ratio of their separate
+time integrals is not equivalent when domain concurrency changes. The bounded
+inspection row also supplies effective weight and active-set weight sum, named
+window boundaries, and service-time numerator/denominator for one named signal.
+`:claim_residency` uses database-authored integer microseconds;
+`:executor_task` converts native monotonic duration to integer microseconds
+before window aggregation. They are separate signals and are never combined
+implicitly. The current mutable `claimed_at` freshness timestamp is not an
+immutable claim-start fact, so residency inspection requires future durable
+token-install/end evidence rather than deriving a false duration from the
+current row. Zero denominators produce an undefined/no-population result, not a
+numeric zero.
+
+Ordinary TenantFair events emit only aggregate counts/durations and bounded
+enums needed to detect cap denial, skipped partitions, under-claim, and query
+delay. A host may join trusted inspection output to its own tenant/account
+model under its own access, pagination, retention, and cardinality controls.
 
 Preferred-capacity reclaim lag is measured from an eligible partition crossing
 below `preferred_active` until its next preferred admission. It is not assigned

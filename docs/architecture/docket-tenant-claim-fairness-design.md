@@ -1,8 +1,9 @@
 # Docket Tenant Claim Fairness
 
 Status: implementation design for the PostgreSQL durable runtime after `0.1.0`;
-the identity, vocabulary, and instance-configuration contract is locked by
-DCKT-58, while the TenantFair engine and its schema remain unimplemented.
+the identity, vocabulary, instance-configuration, and bounded observation
+contracts are locked by DCKT-58/DCKT-59, while the TenantFair engine and its
+schema remain unimplemented.
 
 This document turns the tenant-fairness roadmap item into an implementation
 plan. The migration version and later query-tuning values remain provisional.
@@ -810,24 +811,73 @@ Useful controls include:
 
 ## Telemetry
 
-Extend claim telemetry with aggregate measurements only:
+TenantFair uses the facade-owned
+`[:docket, :postgres, :claim_policy, :admission, :observation]` event. A plan
+declares the closed `:tenant_fair_v1` schema and a successful decoder returns
+one complete summary, including for a no-op. Legacy does not opt in, the
+existing generic admission event remains exact, and no implementation-supplied
+metadata is copied to the new event.
+
+Emit aggregate measurements only:
 
 - eligible partition candidates;
 - partition rows locked and skipped;
 - partitions capped at `max_active`;
 - partitions below preferred;
-- default versus override policies consulted;
-- effective policy version;
+- policy-source and administrative-state counts (policy versions remain
+  numeric inspection/audit inputs, not labels);
 - preferred and borrowed admission decisions;
 - ready and expired outcomes;
-- rows scanned and selected;
-- oldest selected eligibility age;
-- claim query and pool checkout duration;
-- false-admission and false-rejection audit results in stress tests.
+- logical candidate rows examined and selected outcomes;
+- ready claim-wait and expired recovery-wait count/sum/max in integer
+  milliseconds.
 
-Do not emit tenant ID, run ID, claim token, graph ID, or raw `scope_key` as a
-telemetry label. A host that needs tenant-level audit information can use
-trusted logs or the bounded inspection API with its own cardinality controls.
+The concurrency harness separately owns false-admission and false-rejection
+audit results; they are not inferred from an ordinary claim event.
+
+The full measurement names, units, invariants, metadata enums, error
+availability shape, and success/no-op/partial/under-claim/poison/steal matrix
+are normative in [`../telemetry.md`](../telemetry.md). `under_claimed` is set
+only by a bounded trusted audit; `outcomes < demand` alone is ordinary partial
+fulfillment. A returned CTE count is `candidate_rows_examined`, not physical
+PostgreSQL rows scanned. Physical rows/buffers belong to benchmark `EXPLAIN`
+output.
+
+Do not emit tenant ID, run ID, claim token, graph ID/hash, raw `scope_key`,
+tier, host account identity, policy version, or arbitrary error text as an
+admission telemetry label. A host that needs tenant-level audit information
+can use trusted logs or the bounded inspection API with its own access,
+pagination, retention, and cardinality controls.
+
+`FOR ... SKIP LOCKED` deliberately does not wait for a row lock, and Ecto query
+or pool-checkout duration is not a substitute for lock wait. The direct event
+owns `skipped_partitions`. A lock-skip delay duration remains a bounded
+harness/inspection input unless a later schema provides a database-authored
+first-consecutive-skip timestamp; absent history is omitted, never emitted as
+zero.
+
+Identity-free aggregates cannot produce per-partition fairness shares. For one
+named database/schema domain and window, trusted bounded inspection owns:
+
+```text
+instant_concurrency_share_i(t) = active_claims_i(t) / domain_active_claims(t)
+windowed_concurrency_share_i = time average of instant_concurrency_share_i(t)
+processing_share_i,signal = service_time_i,signal / domain_service_time_signal
+entitlement_i = active_weight_i / sum(active_set_weights)
+windowed_entitlement_i = time average of entitlement_i over the named window
+service_skew_i_pp = 100 * (processing_share_i,signal - windowed_entitlement_i)
+```
+
+Windowed concurrency requires time-aligned partition and domain active-claim
+samples/intervals; a ratio of their separate time integrals is not equivalent
+when total domain concurrency changes. Shares are ratios in `[0, 1]`; skew is
+percentage points. Every report names the population, window, and one service
+signal. Claim residency uses database-authored integer microseconds;
+executor-task native duration is converted to integer microseconds before
+aggregation. The current mutable `claimed_at` freshness timestamp is not an
+immutable claim-start fact; residency requires future durable token-install/end
+evidence. The two signals are never combined implicitly, and zero denominators
+are undefined rather than coerced to zero.
 
 Operational dashboards should compare:
 
@@ -836,7 +886,8 @@ Operational dashboards should compare:
 - capped partition count;
 - borrowed capacity and reclamation delay;
 - claim throughput and p95/p99 claim latency;
-- rows scanned per lease;
+- logical candidate rows examined per lease, with physical scan work taken
+  from benchmark `EXPLAIN` output;
 - vehicle utilization;
 - execution-time share versus claim-count share.
 

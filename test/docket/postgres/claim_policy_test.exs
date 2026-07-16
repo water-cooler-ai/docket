@@ -17,6 +17,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.ClaimPolicy
     alias Docket.Postgres.ClaimPolicy.Plan
     alias Docket.Postgres.ClaimPolicy.TenantFair.Config
+    alias Docket.Postgres.ClaimPolicy.TenantFair.Observation
 
     @now ~U[2026-07-15 12:00:00.000000Z]
     @maximum_integer 2_147_483_647
@@ -463,6 +464,296 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                       %{implementation: FailingCallbackImplementation, result: :ok}}
     end
 
+    test "emits a closed TenantFair observation for mixed success despite observer failure" do
+      batch = %{leases: [%{kind: :ready}, %{kind: :expired}], poisoned: [%{kind: :ready}]}
+
+      observation =
+        Observation.new!(
+          eligible_partitions: 3,
+          locked_partitions: 2,
+          skipped_partitions: 1,
+          below_preferred_partitions: 2,
+          default_policy_partitions: 1,
+          override_policy_partitions: 1,
+          running_partitions: 2,
+          preferred_admissions: 1,
+          ready_leases: 1,
+          ready_poisoned: 1,
+          expired_leases: 1,
+          candidate_rows_examined: 3,
+          ready_claim_wait_ms_count: 1,
+          ready_claim_wait_ms_sum: 20,
+          ready_claim_wait_ms_max: 20,
+          expired_recovery_wait_ms_count: 1,
+          expired_recovery_wait_ms_sum: 30,
+          expired_recovery_wait_ms_max: 30
+        )
+
+      {claim_policy, plan} =
+        observed_policy(batch, observation, 3, observe: :raise)
+
+      assert {:ok, ^batch, decoded} = ClaimPolicy.decode(claim_policy, plan, [])
+      attach_admission_events()
+
+      assert :ok =
+               ClaimPolicy.observe(
+                 claim_policy,
+                 plan,
+                 decoded,
+                 {:ok, batch},
+                 System.monotonic_time()
+               )
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission, :observation], measurements,
+                      %{
+                        implementation: Docket.Test.ObservedClaimPolicy,
+                        schema: :tenant_fair_v1,
+                        result: :ok,
+                        observation_status: :available,
+                        admission_class: :preferred,
+                        work_class: :mixed,
+                        batch_shape: :full,
+                        policy_source: :mixed,
+                        admin_state: :running
+                      } = metadata}
+
+      assert map_size(metadata) == 9
+      assert measurements.demand == 3
+      assert measurements.leases == 2
+      assert measurements.poisoned == 1
+      assert measurements.outcomes == 3
+      assert measurements.unfilled_demand == 0
+      assert measurements.steals == 1
+      assert measurements.cap_denied_partitions == 0
+      assert measurements.ready_claim_wait_ms_max == 20
+      assert measurements.expired_recovery_wait_ms_max == 30
+      refute Map.has_key?(measurements, :partition_lock_skip_delay_ms_count)
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission],
+                      %{demand: 3, leases: 2, poisoned: 1} = generic_measurements,
+                      %{implementation: Docket.Test.ObservedClaimPolicy, result: :ok} =
+                        generic_metadata}
+
+      assert map_size(generic_measurements) == 4
+      assert map_size(generic_metadata) == 2
+    end
+
+    test "distinguishes an observed no-op from a proven avoidable under-claim" do
+      attach_admission_events()
+
+      empty_batch = %{leases: [], poisoned: []}
+
+      capped_no_op =
+        Observation.new!(
+          eligible_partitions: 2,
+          locked_partitions: 1,
+          skipped_partitions: 1,
+          cap_denied_partitions: 1,
+          default_policy_partitions: 1,
+          running_partitions: 1,
+          partition_lock_skip_delay_ms_count: 1,
+          partition_lock_skip_delay_ms_sum: 40,
+          partition_lock_skip_delay_ms_max: 40
+        )
+
+      {empty_policy, empty_plan} = observed_policy(empty_batch, capped_no_op, 2)
+      assert {:ok, ^empty_batch, empty_decoded} = ClaimPolicy.decode(empty_policy, empty_plan, [])
+
+      assert :ok =
+               ClaimPolicy.observe(
+                 empty_policy,
+                 empty_plan,
+                 empty_decoded,
+                 {:ok, empty_batch},
+                 System.monotonic_time()
+               )
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission, :observation],
+                      %{
+                        outcomes: 0,
+                        unfilled_demand: 2,
+                        cap_denied_partitions: 1,
+                        partition_lock_skip_delay_ms_max: 40
+                      },
+                      %{
+                        batch_shape: :no_op,
+                        observation_status: :available,
+                        policy_source: :default,
+                        admin_state: :running
+                      }}
+
+      partial_batch = %{leases: [%{kind: :ready}], poisoned: []}
+
+      borrowed_partial =
+        Observation.new!(
+          eligible_partitions: 1,
+          locked_partitions: 1,
+          default_policy_partitions: 1,
+          running_partitions: 1,
+          borrowed_admissions: 1,
+          ready_leases: 1,
+          candidate_rows_examined: 1,
+          ready_claim_wait_ms_count: 1,
+          ready_claim_wait_ms_sum: 3,
+          ready_claim_wait_ms_max: 3
+        )
+
+      {partial_policy, partial_plan} = observed_policy(partial_batch, borrowed_partial, 2)
+
+      assert {:ok, ^partial_batch, partial_decoded} =
+               ClaimPolicy.decode(partial_policy, partial_plan, [])
+
+      assert :ok =
+               ClaimPolicy.observe(
+                 partial_policy,
+                 partial_plan,
+                 partial_decoded,
+                 {:ok, partial_batch},
+                 System.monotonic_time()
+               )
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission, :observation],
+                      %{under_claimed: 0, outcomes: 1, unfilled_demand: 1},
+                      %{batch_shape: :partial, admission_class: :borrowed}}
+
+      under_claimed_batch = %{leases: [%{kind: :ready}], poisoned: []}
+
+      under_claimed =
+        Observation.new!(
+          eligible_partitions: 2,
+          locked_partitions: 2,
+          below_preferred_partitions: 2,
+          default_policy_partitions: 2,
+          running_partitions: 2,
+          preferred_admissions: 1,
+          ready_leases: 1,
+          candidate_rows_examined: 1,
+          under_claimed: 1,
+          ready_claim_wait_ms_count: 1,
+          ready_claim_wait_ms_sum: 5,
+          ready_claim_wait_ms_max: 5
+        )
+
+      {under_policy, under_plan} = observed_policy(under_claimed_batch, under_claimed, 2)
+
+      assert {:ok, ^under_claimed_batch, under_decoded} =
+               ClaimPolicy.decode(under_policy, under_plan, [])
+
+      assert :ok =
+               ClaimPolicy.observe(
+                 under_policy,
+                 under_plan,
+                 under_decoded,
+                 {:ok, under_claimed_batch},
+                 System.monotonic_time()
+               )
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission, :observation],
+                      %{under_claimed: 1, outcomes: 1, unfilled_demand: 1},
+                      %{batch_shape: :under_claim, work_class: :ready}}
+
+      expired_poison_batch = %{leases: [], poisoned: [%{kind: :expired}]}
+
+      expired_poison =
+        Observation.new!(
+          eligible_partitions: 1,
+          locked_partitions: 1,
+          default_policy_partitions: 1,
+          running_partitions: 1,
+          expired_poisoned: 1,
+          candidate_rows_examined: 1,
+          expired_recovery_wait_ms_count: 1,
+          expired_recovery_wait_ms_sum: 9,
+          expired_recovery_wait_ms_max: 9
+        )
+
+      {poison_policy, poison_plan} = observed_policy(expired_poison_batch, expired_poison, 1)
+
+      assert {:ok, ^expired_poison_batch, poison_decoded} =
+               ClaimPolicy.decode(poison_policy, poison_plan, [])
+
+      assert :ok =
+               ClaimPolicy.observe(
+                 poison_policy,
+                 poison_plan,
+                 poison_decoded,
+                 {:ok, expired_poison_batch},
+                 System.monotonic_time()
+               )
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission, :observation],
+                      %{expired_poisoned: 1, steals: 0, poisoned: 1},
+                      %{batch_shape: :full, work_class: :expired, admission_class: :none}}
+    end
+
+    test "invalid or missing TenantFair decoded summaries fail closed and emit unavailable detail" do
+      invalid = %Observation{ready_leases: 1}
+      batch = %{leases: [], poisoned: []}
+      {claim_policy, plan} = observed_policy(batch, invalid, 1)
+
+      assert {:error, {:claim_policy_decode_failed, {:raised, %ArgumentError{}, _stacktrace}}} =
+               ClaimPolicy.decode(claim_policy, plan, [])
+
+      attach_admission_events()
+
+      assert :ok =
+               ClaimPolicy.observe(
+                 claim_policy,
+                 plan,
+                 nil,
+                 {:error, :invalid_observation},
+                 System.monotonic_time()
+               )
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission, :observation],
+                      %{duration: duration, demand: 1} = unavailable_measurements,
+                      %{
+                        result: :error,
+                        observation_status: :unavailable,
+                        admission_class: :none,
+                        work_class: :none,
+                        batch_shape: :error,
+                        policy_source: :none,
+                        admin_state: :none
+                      }}
+
+      assert is_integer(duration) and duration >= 0
+      assert map_size(unavailable_measurements) == 2
+
+      for options <- [[decode?: false], [declare?: false]] do
+        {policy, mismatch_plan} = observed_policy(batch, Observation.new!(), 1, options)
+
+        assert {:error, {:claim_policy_decode_failed, {:raised, %ArgumentError{}, _stacktrace}}} =
+                 ClaimPolicy.decode(policy, mismatch_plan, [])
+      end
+    end
+
+    test "TenantFair observations reject unknown identity fields and invalid aggregates" do
+      assert_raise ArgumentError, ~r/unknown fields: \[:tenant_id\]/, fn ->
+        Observation.new!(tenant_id: "tenant-secret")
+      end
+
+      assert_raise ArgumentError, ~r/eligible_partitions must be a non-negative integer/, fn ->
+        Observation.new!(eligible_partitions: -1)
+      end
+
+      assert_raise ArgumentError, ~r/count\/sum\/max must be all set or all nil/, fn ->
+        Observation.new!(partition_lock_skip_delay_ms_count: 1)
+      end
+
+      assert_raise ArgumentError, ~r/sum cannot exceed.*count.*max/, fn ->
+        Observation.new!(
+          ready_claim_wait_ms_count: 1,
+          ready_claim_wait_ms_sum: 100,
+          ready_claim_wait_ms_max: 1
+        )
+      end
+
+      assert_raise ArgumentError, ~r/policy-source partition counts must equal/, fn ->
+        Observation.new!(locked_partitions: 1, eligible_partitions: 1)
+      end
+    end
+
     test "the built Hex artifact excludes ClaimPolicy test support" do
       output =
         Path.join(
@@ -536,14 +827,45 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       refute Code.ensure_loaded?(Docket.Postgres.ClaimPolicy.TenantFair)
     end
 
-    defp effective_policy do
+    defp effective_policy(limit \\ 1) do
       ClaimPolicy.effective_policy!(%{
         now: @now,
-        limit: 1,
+        limit: limit,
         orphan_ttl_ms: 1_000,
         max_claim_attempts: 3,
         preference: :ready
       })
+    end
+
+    defp observed_policy(batch, observation, demand, options \\ []) do
+      context = %{repo: __MODULE__.Repo, prefix: nil}
+
+      config =
+        [
+          implementation: Docket.Test.ObservedClaimPolicy,
+          batch: batch,
+          observation: observation
+        ] ++ options
+
+      claim_policy = ClaimPolicy.new(config, context)
+      plan = ClaimPolicy.build_plan(claim_policy, context, effective_policy(demand))
+      {claim_policy, plan}
+    end
+
+    defp attach_admission_events do
+      handler = "tenant-fair-observation-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach_many(
+        handler,
+        [
+          [:docket, :postgres, :claim_policy, :admission],
+          [:docket, :postgres, :claim_policy, :admission, :observation]
+        ],
+        &Docket.Test.TelemetryRelay.raw/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
     end
 
     defp build_plan_from(implementation) do
