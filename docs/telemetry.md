@@ -59,7 +59,7 @@ effects require their own stable idempotency scheme.
 
 ## Tenant fairness telemetry boundary
 
-The DCKT-58 contract defines tenant fairness over the persisted PostgreSQL
+The tenant-fairness contract defines fairness over the persisted PostgreSQL
 `scope_key`, but raw `scope_key` and `tenant_id` are forbidden as ordinary
 admission telemetry metadata and metric labels. Run ID, graph ID/hash, claim
 token, tier, host account identity, policy version, and arbitrary error text are
@@ -203,10 +203,28 @@ model under its own access, pagination, retention, and cardinality controls.
 
 Preferred-capacity reclaim lag is measured from an eligible partition crossing
 below `preferred_active` until its next preferred admission. It is not assigned
-a numeric SLO unless maximum residual slice duration, poll delay, and admission
-transaction delay all have enforceable numeric bounds. The full operational
-vocabulary and formulas live in
+a numeric SLO unless the maximum residual service quantum, database-authored
+preferred-epoch/slot-floor contract, repeated partition lock/discovery delay,
+poll delay, and whole-admission transaction delay all have enforceable numeric
+bounds. The full operational vocabulary and conditional formula live in
 [`architecture/docket-tenant-claim-fairness-design.md`](architecture/docket-tenant-claim-fairness-design.md).
+
+The normative target matrix, bounded `tenant_fair_report_input/v1` inspection
+schema, unavailable/right-censored rules, worked report, and acceptance
+traceability live in that document's
+[fairness SLO and regression-budget contract](architecture/docket-tenant-claim-fairness-design.md#fairness-slo-and-regression-budget-contract).
+Default telemetry supplies aggregate volume and wait totals; trusted inspection
+supplies identity-bearing episode, cap-audit, aligned interval, histogram, and
+bound inputs; the benchmark supplies only correctness-gated prototype query
+regression evidence. These sources are reconciled by window and count, never
+silently substituted for one another. In particular:
+
+- `cap_denied_partitions` is not a cap violation or false-denial count;
+- `eligible_partitions` is bounded-plan candidate volume, not a global tenant
+  population;
+- wait count/sum/max cannot yield p95/p99 without a matching histogram;
+- query or checkout duration is not partition lock wait; and
+- a missing optional duration or bound produces `not_qualified`, not zero.
 
 ## Benchmark derivations
 
