@@ -27,10 +27,10 @@ defmodule Docket.Bench.TenantFairClaim.Config do
   @profiles %{
     "smoke" => %{
       queued_rows: 160,
-      tenants: 24,
+      tenants: 64,
       dormant_tenants: 120,
       hot_rows: 80,
-      one_row_tenants: 16,
+      one_row_tenants: 48,
       capped_tenants: 4,
       active_per_capped_tenant: 2,
       expired_percent: 25,
@@ -2198,6 +2198,14 @@ defmodule Docket.Bench.TenantFairClaim do
                performance_eligibility.eligible ==
                  Enum.all?(Map.values(performance_eligibility.checks)) do
         raise "#{candidate} performance-eligibility classification is inconsistent"
+      end
+
+      unless performance_eligibility.checks.measured_underclaim do
+        raise "#{candidate} recorded #{measurements.avoidable_underclaim_transactions} avoidable measured under-claim transactions"
+      end
+
+      unless performance_eligibility.eligible do
+        raise "#{candidate} is ineligible for performance comparison: #{inspect(performance_eligibility.checks)}"
       end
 
       unless envelope.outcomes == envelope.requested do
