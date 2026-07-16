@@ -499,6 +499,101 @@ delete_legal_hold(context, hold_id, opts)
 prune_events(context, opts)
 ```
 
+### DCKT-66 Admin option and result freeze
+
+The following details are normative for the DCKT-66 surface. They close option,
+pagination, and external-export questions that the function list alone does not
+answer.
+
+- A valid Admin context is the resolved map returned by
+  `Docket.Postgres.context/1`, including its Postgres-bundle marker, physical
+  prefix, Repo, resolved ClaimPolicy, and factory-minted provenance bound to
+  that exact Repo, physical prefix, resolved identifier set, and per-policy
+  configuration. `ClaimPolicy.new/2` does not accept or copy provenance supplied
+  by its input context, and there is no public provenance binding function. A
+  bare Repo, a map assembled through documented public constructors from a
+  Repo/raw prefix or arbitrary value, or a map containing a ClaimPolicy built
+  separately through `ClaimPolicy.new/2` is not an Admin context.
+  Copying an already valid resolved context remains valid. This in-VM provenance
+  is structural misuse hardening, not an authentication or unforgeability
+  boundary: arbitrary host code that can inspect a valid context can copy its
+  opaque terms or reconstruct equivalent data. Before any mutator SQL, Admin also checks both the
+  transaction-context marker and `Repo.in_transaction?/0`; either condition
+  returns `{:error, :transaction_context_forbidden}`. Inspection reads accept
+  the resolved transaction context.
+- Policy and change maps have exactly the documented atom keys; unknown,
+  string, duplicate keyword, and partial fields are rejected. Admin uses the
+  same non-empty canonical owner-scope normalization as the existing stores;
+  this ticket does not add an Admin-only tenant-length rule. Versions are PostgreSQL signed
+  bigint values. A mutation requires `0 <= expected_version < 2^63 - 1` so its
+  exact `N + 1` is representable. Source, event ID, actor, and legal-hold reason
+  are non-empty valid UTF-8, reject NUL, and use UTF-8 byte limits matching the
+  numeric schema widths (deliberately stricter than PostgreSQL's character-counting
+  `varchar(n)`). Admin uses a
+  fixed one-second `lock_timeout` and five-second `statement_timeout`; callers
+  cannot weaken or expand them through options.
+- Every event-bearing operation uses a versioned, length-delimited canonical
+  request encoding. Version 1 covers operation, binary-ascending normalized
+  targets (Elixir binary byte order, independent of database collation), every
+  expected version, complete payload, source, and event ID. Actor is required,
+  bounded, and audited but deliberately excluded from replay identity, as
+  frozen above; retrying an identical event with a different actor returns the
+  original receipt. The SHA-256
+  digest of that encoding is the request fingerprint. Target fingerprints use
+  a domain-separated version of the same encoding. A receipt is checked before
+  authority acquisition and rechecked after every lock or uniqueness wait. If
+  an audit/receipt uniqueness insert nevertheless loses, the whole transaction
+  is rolled back and the request is classified once from a fresh transaction;
+  no partially applied mutation can survive.
+- `get_default/1` returns the complete tuple plus `version`, `initialized_at`,
+  and `updated_at`, or `{:error, :not_initialized}`. `get_effective/2` has the
+  exact fields stated below plus `readiness_epoch` and `admission_epoch` and is
+  evaluated in one read-only `READ COMMITTED` transaction using one SQL
+  statement. `get_prefix_state/1` returns the rollout columns, initialized
+  default tuple/version/fingerprint, gate columns, live/total capability
+  counts, audit/export watermarks, and dormant-partition count. It never claims
+  readiness from those observations.
+- `list_events/2` accepts only `after_audit_id` (default zero) and `limit`
+  (default 100, maximum 500). It returns ascending immutable event maps and a
+  `next_after_audit_id` cursor. Before/after JSON is decoded to maps/lists; raw
+  scope keys occur only in this trusted audit surface.
+- External export is deliberately two-step. The host first keyset-reads and
+  durably writes audit through an ID, then calls `export_events/2` with
+  `through_audit_id`, a 32-byte `location_fingerprint`, and actor/source/event.
+  The call does not perform external I/O and does not return audit contents; it
+  records the host's explicit completion attestation. A new watermark cannot
+  move backward or exceed the current audit high watermark. The first
+  attestation asserts complete external coverage from prefix history start
+  through its ID; later attestations assert complete continuation through the
+  new ID. The applied result contains `export_id`, `through_audit_id`, and its
+  audit ID. Exact replay reconstructs that result from the lifetime receipt.
+- `put_legal_hold/2` requires `first_audit_id`, `last_audit_id`, and `reason`.
+  Its deterministic receipt-derived UUID makes replay reconstructable without
+  storing raw targets in the receipt. Ranges must be positive, ordered, and no
+  later than the current audit high watermark. Overlap is allowed and means
+  union protection. `delete_legal_hold/3` requires that exact UUID; deleting
+  one overlapping range does not weaken another.
+- `prune_events/2` requires `cutoff: DateTime.t()`, actor/source/event, and a
+  limit defaulting to 100 and capped at 500. It selects ascending IDs strictly
+  older than the cutoff and no later than the contiguous export watermark,
+  skips the union of legal holds, deletes that keyset only, then appends a new
+  audit event outside the selected set. Its result contains `deleted_count`,
+  `last_deleted_audit_id`, and the new audit ID. Receipts, export attestations,
+  holds, and every live policy/gate/rollout/partition row are outside the delete
+  statement and cannot be mutated by pruning.
+
+Fresh default and partition CAS results and replays retain the exact shapes
+already specified below. Fresh audit-control results use `outcome: :applied`;
+matching replays use `outcome: :replayed` with the original result under
+`original`. Invalid option/map input returns a bounded operation-family error
+(`:invalid_admin_options`, `:invalid_policy`, `:invalid_target`, or
+`:invalid_audit_options`) and never includes database text or another target.
+Malformed bulk containers, entries, and duplicate normalized targets return
+`:invalid_partition_changes`, `:invalid_partition_change`, and
+`:duplicate_partition_target`, respectively. A database statement canceled by
+the fixed five-second bound returns `{:error, :admin_timeout}` and is never
+misreported as a row-lock timeout.
+
 Every mutator requires bounded `source`, `event_id`, and `actor`. Every CAS
 also requires `expected_version`. Bootstrap requires `expected_version: 0` and
 is the only operation that can initialize the singleton. `ClaimPolicy.init/2`
@@ -617,7 +712,8 @@ Host authentication, authorization, billing-to-policy mapping, and actor
 identity are application responsibilities. Docket validates the configured
 administrative context, target form, bounded fields, tuple constraints, CAS,
 and replay identity; it does not add a capability token that could be mistaken
-for host authorization.
+for host authorization. The host must restrict access to the Admin API and to
+resolved backend contexts from code that is not authorized to administer policy.
 
 `get_effective/2` returns the complete effective tuple, `policy_source`,
 default and partition versions, `partition_present`, state, live count, debt
@@ -700,6 +796,11 @@ Exact non-CAS failures are:
 | installed/caller function contract differs from gate | `{:error, {:claim_policy_unavailable, :function_contract_mismatch}}` |
 | admission after readiness drift demotion | `{:error, {:claim_policy_unavailable, :not_ready}}` |
 | readiness verification failure | `{:error, {:not_ready, sorted_reason_atoms}}` |
+| malformed legal-hold UUID | `{:error, :invalid_hold_id}` |
+| legal-hold UUID is well formed but absent | `{:error, :legal_hold_not_found}` |
+| legal-hold range exceeds current committed audit high watermark | `{:error, :invalid_audit_range}` |
+| export completion moves backward or exceeds committed audit high watermark | `{:error, :invalid_export_watermark}` |
+| pruning has no completed export watermark | `{:error, :audit_export_required}` |
 
 These errors create no receipt or audit event. CAS conflict/replay errors remain
 the exact tuples defined above. `sorted_reason_atoms` is the lexical-order
@@ -708,6 +809,11 @@ subset of `[:backfill_incomplete, :default_fingerprint_changed,
 :gate_contract_invalid, :live_index_invalid, :missing_partitions,
 :ready_index_invalid, :schema_generation]`; arbitrary database text is never
 returned.
+
+Audit-control failure precedence is bounded input/UUID validation, lifetime
+receipt replay/conflict, rollout lock, post-lock replay/conflict, then the
+range/watermark/existence predicate. Every failure in the table leaves policy,
+partition, gate, rollout, audit, receipt, hold, and export state unchanged.
 
 ## Audit retention and privacy
 
@@ -718,6 +824,17 @@ most 500. It keysets by `audit_id`, skips legal-held events, deletes no receipt,
 and cannot update policy, partition, rollout, or mode state. Legal holds are
 separate append/delete control-plane facts with their own actor/source/event
 receipts. Automatic age-based pruning is forbidden.
+
+Every transaction that allocates a claim-policy `audit_id` takes the rollout
+singleton `FOR UPDATE` before its policy/default/partition authority and before
+identity allocation. This is the prefix-local audit commit-order barrier:
+while one event-producing Admin transaction is open, no later allocator can
+publish or attest a higher audit ID. Export completion and pruning take the
+same barrier, so a visible high watermark cannot omit an in-flight lower event.
+Future assertion, readiness, activation, or other control-plane writers that
+allocate from this audit identity must participate in the same barrier in the
+global gate -> rollout -> default -> partition order. Capability heartbeats and
+other operations that allocate no audit ID remain lock-free under this rule.
 
 Raw tenant IDs in partition rows and target-specific audit events can be
 personal or confidential data. They never appear in metrics, logs, receipt
@@ -746,13 +863,15 @@ so no earlier data-plane lock can precede this order.
 | --- | --- | --- | --- | --- | --- | --- |
 | activation-aware Legacy admission | `FOR SHARE SKIP LOCKED` | none | none | none | existing `FOR UPDATE SKIP LOCKED` | held gate or all run rows skipped: prompt unavailable error |
 | TenantFair admission | `FOR SHARE SKIP LOCKED` | none | `FOR SHARE SKIP LOCKED` | `FOR NO KEY UPDATE SKIP LOCKED`, ascending | `FOR UPDATE SKIP LOCKED`, ascending | gate/default/all-authority skip: prompt unavailable; partial locks: bounded partial batch |
-| bootstrap/default CAS | `FOR SHARE NOWAIT` | none | `FOR UPDATE` | none | none | bounded lock timeout, no mutation |
-| partition/reset/state/bulk CAS | `FOR SHARE NOWAIT` | none | `FOR SHARE NOWAIT` | `FOR NO KEY UPDATE`, ascending | none | bounded lock timeout, no mutation |
+| bootstrap/default CAS | `FOR SHARE NOWAIT` | `FOR UPDATE` | `FOR UPDATE` | none | none | bounded lock timeout, no mutation; rollout serializes audit allocation/commit order |
+| partition/reset/state/bulk CAS | `FOR SHARE NOWAIT` | `FOR UPDATE` | `FOR SHARE NOWAIT` | `FOR NO KEY UPDATE`, ascending | none | bounded lock timeout, no mutation; rollout serializes audit allocation/commit order |
 | dual-write attestation | none | `FOR UPDATE` | none | none | none | exact rollout timeout; assertion/receipt atomic with ledger link |
 | backfill batch/final reconciliation | `FOR SHARE NOWAIT` | `FOR UPDATE` under one advisory runner | none | insert-only `ON CONFLICT DO NOTHING` | read-only keyset | activation excludes new batch; bounded batch/statement timeout |
 | readiness promote or drift demote | `FOR UPDATE` | `FOR UPDATE` | `FOR SHARE` | read-only reconciliation | read-only verification | waits out admission with bounded timeout; gate change and evidence commit atomically |
 | activate/deactivate | `FOR UPDATE` | `FOR SHARE` | `FOR SHARE` | none | none | waits out admission and rollout writer with bounded timeout; commits mode atomically |
-| old-binary assertion/capability heartbeat | none | none | none | none | none | insert/upsert only; never authority by itself |
+| old-binary assertion | none | `FOR UPDATE` | none | none | none | audit-producing assertion participates in commit-order serialization |
+| capability heartbeat | none | none | none | none | none | insert/upsert only; allocates no audit ID and is never authority by itself |
+| audit export completion, legal-hold add/delete, audit pruning | none | `FOR UPDATE` | none | none | none | bounded rollout timeout; replay rechecked after the lock; policy/gate/partition state is never touched |
 | run creation | none | none | none | plain MVCC existence read; only absent/invisible rows use unique `INSERT ... ON CONFLICT DO NOTHING`; mandatory FK takes `KEY SHARE` | insert | committed row: no partition-row wait; competing first writer: uniqueness may wait within configured timeout |
 | refresh/release/commit/abandon/retry-poison | none | none | none | none | existing fenced run update | never introduces run-then-partition order |
 

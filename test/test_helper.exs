@@ -4,6 +4,8 @@ generated_database_repos =
       {Docket.Postgres.TestRepo, "DOCKET_TEST_DATABASE_URL", "docket_migration_test", 2},
       {Docket.Postgres.RunStoreTestRepo, "DOCKET_RUN_STORE_TEST_DATABASE_URL",
        "docket_run_store_test", 10},
+      {Docket.Postgres.ClaimPolicyAdminTestRepo, "DOCKET_CLAIM_POLICY_ADMIN_TEST_DATABASE_URL",
+       "docket_claim_policy_admin_test", 10},
       {Docket.Postgres.StorageTestRepo, "DOCKET_STORAGE_TEST_DATABASE_URL", "docket_storage_test",
        10},
       {Docket.Postgres.GraphStoreTestRepo, "DOCKET_GRAPH_STORE_TEST_DATABASE_URL",

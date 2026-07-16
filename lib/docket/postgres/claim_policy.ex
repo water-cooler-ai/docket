@@ -89,10 +89,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @opaque t :: %__MODULE__{
               implementation: module(),
               implementation_state: term(),
-              policy_context: plan_context()
+              policy_context: plan_context(),
+              admin_repo: module() | nil,
+              admin_identity: term()
             }
 
-    @enforce_keys [:implementation, :implementation_state, :policy_context]
+    @enforce_keys [
+      :implementation,
+      :implementation_state,
+      :policy_context,
+      :admin_repo,
+      :admin_identity
+    ]
     defstruct @enforce_keys
 
     @callback init(keyword(), init_context()) :: {:ok, state :: term()} | {:error, term()}
@@ -126,6 +134,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       validate_implementation!(implementation)
 
       policy_context = init_context!(context)
+      {_repo, _prefix} = Storage.context!(context)
 
       implementation_state =
         case implementation.init(implementation_opts, policy_context) do
@@ -146,7 +155,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       %__MODULE__{
         implementation: implementation,
         implementation_state: implementation_state,
-        policy_context: policy_context
+        policy_context: policy_context,
+        admin_repo: nil,
+        admin_identity: nil
       }
     end
 
@@ -170,6 +181,51 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc false
     @spec implementation(t()) :: module()
     def implementation(%__MODULE__{implementation: implementation}), do: implementation
+
+    @doc false
+    @spec admin_context?(t(), term(), module(), String.t(), identifiers()) :: boolean()
+    def admin_context?(
+          %__MODULE__{
+            admin_repo: repo,
+            admin_identity: identity,
+            policy_context: %{prefix: prefix, identifiers: identifiers} = policy_context,
+            implementation: implementation,
+            implementation_state: implementation_state
+          },
+          identity,
+          repo,
+          prefix,
+          identifiers
+        ) do
+      valid_factory_identity?(
+        identity,
+        repo,
+        prefix,
+        identifiers,
+        {implementation, implementation_state, policy_context}
+      )
+    end
+
+    def admin_context?(%__MODULE__{}, _identity, _repo, _prefix, _identifiers), do: false
+
+    defp valid_factory_identity?(identity, repo, prefix, identifiers, policy_binding)
+         when is_function(identity, 0) do
+      with {:module, Docket.Postgres} <- :erlang.fun_info(identity, :module),
+           {:arity, 0} <- :erlang.fun_info(identity, :arity),
+           {:docket_postgres_admin_v1, nonce, ^repo, ^prefix, ^identifiers, ^policy_binding}
+           when is_binary(nonce) and byte_size(nonce) == 32 <- identity.() do
+        true
+      else
+        _ -> false
+      end
+    rescue
+      _ -> false
+    catch
+      _, _ -> false
+    end
+
+    defp valid_factory_identity?(_identity, _repo, _prefix, _identifiers, _policy_binding),
+      do: false
 
     @doc false
     @spec effective_policy!(runtime_input()) :: runtime_input()

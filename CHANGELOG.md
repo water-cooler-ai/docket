@@ -16,6 +16,14 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- `Docket.Postgres.ClaimPolicy.Admin`, the prefix-local dynamic exact-cap
+  control plane. It provides explicit one-time default bootstrap, versioned
+  default and atomic partition CAS, complete-tuple override/reset/state and
+  effective reads, lifetime source-event replay receipts, immutable audit,
+  host-attested export watermarks, legal holds, and bounded keyset pruning.
+  Mutations use the frozen gate/rollout/default/partition lock order and an
+  audit commit-order barrier; host authorization remains outside Docket, and
+  readiness, activation, and TenantFair admission remain disabled.
 - PostgreSQL run creation now atomically materializes the canonical
   owner-derived claim partition with inherited, running, version-zero defaults.
   Concurrent first inserts use `ON CONFLICT DO NOTHING`, preserving Admin-owned
