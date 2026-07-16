@@ -273,6 +273,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           :ok
 
         Enum.all?(values, &(is_integer(&1) and &1 >= 0)) ->
+          if Map.fetch!(observation, count_field) == 0 do
+            invalid!(
+              "#{count_field} must be positive when the optional wait is present",
+              observation
+            )
+          end
+
           validate_wait!(observation, count_field, sum_field, max_field)
 
           if Map.fetch!(observation, count_field) > observation.skipped_partitions do

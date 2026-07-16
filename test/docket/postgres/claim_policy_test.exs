@@ -741,6 +741,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         Observation.new!(partition_lock_skip_delay_ms_count: 1)
       end
 
+      assert_raise ArgumentError,
+                   ~r/count must be positive when the optional wait is present/,
+                   fn ->
+                     Observation.new!(
+                       partition_lock_skip_delay_ms_count: 0,
+                       partition_lock_skip_delay_ms_sum: 0,
+                       partition_lock_skip_delay_ms_max: 0
+                     )
+                   end
+
       assert_raise ArgumentError, ~r/sum cannot exceed.*count.*max/, fn ->
         Observation.new!(
           ready_claim_wait_ms_count: 1,
