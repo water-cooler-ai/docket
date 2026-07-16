@@ -6,8 +6,7 @@ rationale moved to `docs/architecture/docket-reducers-design.md`; API truth
 lives in module docs. Themes 6 (graph module DSL) and 7 (subgraph
 composition) remain open design space, recorded below. Theme 9 records the
 tenant-claim fairness follow-up targeted at v0.1.1. Theme 10 records the
-`{:await}` late-completion protocol (DCKT-40), sized during the DCKT-22
-claim-freshness review.
+`{:await}` late-completion protocol, sized during the claim-freshness review.
 
 The v1.1 theme: **make building graphs feel natural without adding a second
 canonical model.** Every proposal below is sugar or extension over the existing
@@ -328,7 +327,7 @@ claim_policy: [
 ]
 ```
 
-These names are locked by the DCKT-58 contract. The TenantFair module and its
+These names are locked by the tenant-fairness contract. The TenantFair module and its
 schema are later delivery slices; this example does not describe currently
 available behavior. The intended behavior is:
 
@@ -400,19 +399,18 @@ more parallel node work than another.
 
 ---
 
-## Theme 10 — `{:await}` late-completion protocol (detached execution, DCKT-40)
+## Theme 10 — `{:await}` late-completion protocol for detached execution
 
-v0.1.0 gives blocking node work two freshness strategies (DCKT-22): keep each
-between-commit stretch under the orphan TTL (strict alignment — commits are
-the finite runtime-owned attempt deadline. Work an external system
+v0.1.0 gives blocking node work two freshness strategies: keep each
+between-commit stretch under the orphan TTL, or refresh the claim while work
+runs under the finite runtime-owned attempt deadline. Work an external system
 durably owns parks as an external wait instead. The remaining shape is work a
 node started **in-process** but wants to hand back to the runtime — stop
 holding a vehicle slot and claim while it finishes. The execution contract
 reserves `{:await, term()}` for exactly this; v1 rejects it as permanent
 failure. This theme promotes it to a specified protocol.
 
-Design skeleton (established adversarially during DCKT-22; see the epic for
-the full constraint list):
+Design skeleton, established during the adversarial claim-freshness review:
 
 - Detachment is voluntary. The runtime can never extract an await from opaque
   blocking code — any TTL-fired takeover is a timeout in disguise. The
@@ -440,8 +438,8 @@ the full constraint list):
 Epic-sized (~15+ files: executor behaviour and both executors, runtime
 dispatcher, TaskResult/TaskState/Moment, Loop/Algorithm, RunMutation,
 Lifecycle, RunStore schedule + sweeper, Postgres dispatcher/vehicle, a holder
-module, MemoryBackend, both contract docs). Tracked as DCKT-40; targets v1.1
-after the v0.1.0 line ships.
+module, MemoryBackend, and both contract docs). This targets v1.1 after the
+v0.1.0 line ships.
 
 ---
 
@@ -464,8 +462,8 @@ value-per-risk:
    limits, fair partition selection, optional spare-capacity bursting, and
    contention/pool benchmarks (Theme 9; v0.1.1 operational follow-up).
 7. **await-protocol** — `{:await, term()}` late-completion protocol for
-   detached node execution (Theme 10; epic DCKT-40, after the v0.1.0 line
-   ships — breaks down into its own slices when scheduled).
+   detached node execution (Theme 10, after the v0.1.0 line ships; it breaks
+   down into its own slices when scheduled).
 
 ## Open questions (need a call before their slice starts)
 

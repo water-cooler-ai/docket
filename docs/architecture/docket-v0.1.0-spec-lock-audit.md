@@ -2,12 +2,12 @@
 
 Date: 2026-07-11
 
-Status: historical pre-cutover snapshot. DCKT-37 superseded its lifecycle and
-testing-gap findings after the assembled backend and deterministic modes
-landed. See the module docs, PostgreSQL guide, and migration guide for the
-current v0.1.0 production boundary.
+Status: historical pre-cutover snapshot. Later lifecycle and deterministic
+testing work superseded its gap findings after the assembled backend landed.
+See the module docs, PostgreSQL guide, and migration guide for the current
+v0.1.0 production boundary.
 
-This audit compared the pre-DCKT-37 `v0.1.0` branch with the architecture
+This audit compared the pre-cutover `v0.1.0` branch with the architecture
 previously described by the operational transition spec. Its tables record
 repository state on 2026-07-11 and are intentionally not current. The code and
 module documentation remain authoritative.
@@ -26,8 +26,8 @@ backend boundary.
 ## State by area
 
 > **Historical snapshot:** every state in this table is the state observed
-> before DCKT-24 and DCKT-37 landed. “Missing” and “Not done” below are not
-> claims about the released v0.1.0 code.
+> before deterministic test mode and lifecycle cutover work landed. “Missing”
+> and “Not done” below are not claims about the released v0.1.0 code.
 
 | Area | State in pre-cutover snapshot | Evidence |
 | --- | --- | --- |
@@ -42,9 +42,9 @@ backend boundary.
 | Dispatcher | Implemented | Demand-bounded, jittered polling and lease launch/release behavior exist. |
 | Execution vehicle | Implemented | `Docket.Postgres.Vehicle` fetches and compiles the graph for a lease (with an optional generation-checked cache), validates it against the host attempt maximum, and drains fenced moments. Runtime-owned finite deadlines bound executor callbacks; orphan TTL and fencing recover crashed or stolen claims. |
 | Backend supervision assembly | Implemented | A one-for-all execution subtree couples dispatcher accounting to its vehicle supervisor; notifier and pruner are isolated siblings. |
-| Deterministic backend test mode | Missing at snapshot; implemented by DCKT-24 | The snapshot had no public PostgreSQL drain/manual testing API. |
+| Deterministic backend test mode | Missing at snapshot; implemented later | The snapshot had no public PostgreSQL drain/manual testing API. |
 | Pruning/retention | Implemented | `Docket.Postgres.Pruner` performs locked, bounded cleanup under the bundle's required explicit policy. |
-| Legacy production API removal | Not done at snapshot; completed by DCKT-37 | The snapshot still exposed `run`, `resume`, `get_run`, and `checkpoint:`. |
+| Legacy production API removal | Not done at snapshot; completed at lifecycle cutover | The snapshot still exposed `run`, `resume`, `get_run`, and `checkpoint:`. |
 
 ## Decisions verified in code
 
@@ -126,21 +126,21 @@ checkpoint committer and resident per-run processes. Durable APIs coexisted
 with `run`, `resume`, and `get_run`; documentation therefore had to call this
 transitional compatibility, not a completed single-lifecycle release.
 
-This finding was resolved by DCKT-37. The released v0.1.0 boundary has no
+This finding was resolved at lifecycle cutover. The released v0.1.0 boundary has no
 legacy production lifecycle.
 
 ### Historical finding: some operational promises remained design work
 
 At the time of this snapshot, notification-assisted wakes, pruning, bounded
 drains, and production assembly had landed, while deterministic manual/drain
-test modes remained separate product work. DCKT-24 subsequently implemented
-the deterministic backend test modes.
+test modes remained separate product work. Later work implemented the
+deterministic backend test modes.
 
 ## Release gate
 
 The remaining release work is downstream hardening and cutover: broader
 release-gate invariants and telemetry, documented deterministic test modes,
-and the deliberate DCKT-37 removal of the transitional legacy facade.
+and the deliberate removal of the transitional legacy facade.
 
 ## Verification performed
 
@@ -152,9 +152,9 @@ and the deliberate DCKT-37 removal of the transitional legacy facade.
 - Repository inspection confirms that every PostgreSQL module is conditionally
   compiled behind optional `ecto_sql` and `postgrex` dependencies.
 
-## DCKT-43 lock reopening (2026-07-12)
+## Spec-lock reopening (2026-07-12)
 
-The DCKT-1 spec lock reopens narrowly to add two public read/interchange
+The spec lock reopens narrowly to add two public read/interchange
 surfaces. Nothing in the durable data model, transaction boundaries, claim
 fencing, or persistence codecs changes; ETF persistence is unchanged.
 

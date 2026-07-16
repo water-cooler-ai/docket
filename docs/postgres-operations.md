@@ -369,6 +369,160 @@ private `state`, `payload`, or `metadata` columns. Application-facing tools
 should remain on the scoped facade so tenantless or tenant access can never
 become system access.
 
+## Tenant-fair claim benchmark
+
+The repository includes a source-checkout-only PostgreSQL benchmark for the
+tenant-fair candidate-discovery work. It compares the known ranking-window and
+`DISTINCT ON` failure baselines with bounded partition-hint/cursor and recursive
+loose-scan reconciliation candidates. This is an exploratory query and plan
+suite, not a public API or a selectable ClaimPolicy implementation.
+
+The runner requires PostgreSQL 13 or newer. CI exercises PostgreSQL 13 as the
+minimum and PostgreSQL 17 as the reference version. Supply an explicitly owned
+benchmark database URL and invoke the bounded profile with:
+
+```sh
+DOCKET_BENCH_DATABASE_URL=postgres://localhost/docket_bench \
+  mix run bench/postgres/tenant_fair_claim.exs -- --profile smoke --check
+```
+
+The runner creates and owns a scratch schema in that database. Inside it, the
+fixture installs Docket's real migration tables and provisional benchmark-only
+policy, partition-hint, and tenant-leading index DDL. It never modifies the
+runtime hot path, but the database role must still be allowed to create and
+drop the scratch schema. Do not point the benchmark at a database unless that
+scratch-schema lifecycle and its seeded data are safe. The provisional objects
+are query prototypes only; future runtime migrations and TenantFair SQL remain
+the authority, and candidates promoted to runtime must be rechecked for exact
+ClaimPolicy, cap, locking, decoding, and telemetry parity.
+
+### Profiles and repeatability
+
+`smoke` is deliberately small and exists for deterministic result, artifact,
+and broad plan-shape regression checks. Larger profiles exercise independently
+configurable queued-row, queued-tenant, dormant-tenant, hot-tenant, capped-
+tenant, and ready/expired cardinalities. Each candidate run records its resolved
+page size, oversampling factor, and reconciliation work budget. Run an explicit
+matrix of those options when selecting thresholds; one run is evidence for only
+the values in its manifest. The reconciliation budget must be an exact multiple
+of page size times oversampling, so the runner never rounds a requested budget
+up to a larger page.
+
+Each candidate/profile combination uses a fixed timestamp and integer seed,
+seeds and analyzes the resolved fixture, completes its configured warmup, then
+reseeds the same fixture for measurement. Saved `EXPLAIN` operations are rolled
+back so data-modifying plans do not consume the measured claim fixture. Use the
+same PostgreSQL major version, resolved scenario, seed, database settings, and
+machine class when comparing runs. Cache state, autovacuum, concurrent database
+traffic, and storage still affect timings even when fixture contents are
+deterministic.
+
+Artifacts default to:
+
+```text
+tmp/bench/postgres/tenant_fair_claim/<run-id>/
+```
+
+The versioned machine-readable artifact set records the resolved scenarios and
+candidate thresholds, seed and fixed time, git/runtime/database versions,
+relevant database settings, aggregate measurements, and relative paths to raw
+samples and saved `EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON)`
+plans. Environment and source identity live in the manifest; aggregates live in
+the summary. Preserve the whole run directory when comparing or publishing
+results; a summary without its raw samples and plans is incomplete evidence.
+
+### Metric interpretation
+
+- Checkout time is measured from the caller's checkout request until it owns a
+  connection. Ecto query `queue_time` may be absent for queries executed on an
+  already checked-out connection and is not substituted for this measurement.
+- Query time is caller-observed bounded claim-path time on an owned connection;
+  the cursor candidate may execute multiple recorded page statements inside one
+  transaction, while the recursive candidate spends its full work budget in one
+  loose scan. Commit throughput counts completed claim
+  commits over the measured wall-clock window; rollback warmup and plan capture
+  are excluded. Sustainable claim/requeue-cycle throughput, when present, is
+  labeled separately.
+- p50, p95, and p99 use the artifact's documented quantile method and sample
+  population. A percentile from the smoke profile is a serialization and
+  plumbing check, not statistically useful performance evidence.
+- Physical scan work is derived from base-relation and bitmap-index scan nodes
+  in the saved plan and is kept separate from any future runtime logical
+  candidate counters. Rows scanned per lease is undefined when the statement
+  returns no outcome and must not be coerced to zero.
+- Root plan buffer counters are the statement totals. Summing parent and child
+  buffer counters double-counts work. `EXPLAIN ANALYZE` executes data-modifying
+  CTEs, so the runner always captures plans inside an explicit rollback.
+- `SKIP LOCKED` normally skips rather than waits. Skipped partitions and the
+  benchmark's explicit blocker/control audit are the contention evidence. A
+  separate audit holds the deep hot tenant's partition lock and requires full
+  progress from other tenants; the recursive candidate also has to progress
+  beyond a fully locked first scan slice. Checkout or whole-query duration is
+  not a row-lock wait measurement.
+- Fewer outcomes than demand is a partial batch, not automatically an
+  avoidable under-claim. The under-claim flag requires the bounded control
+  audit to prove that eligible, lockable work remained. A candidate that fails
+  that correctness audit is ineligible for latency or throughput comparisons,
+  even if returning less work makes it appear faster.
+
+CI runs only `--profile smoke --check`. The check may assert bounded work,
+deterministic under-claim controls, concurrent cap safety, required artifact
+fields, and coarse plan structure. Measured partial batches are audited against
+the same cap-aware eligibility policy before they are classified as avoidable
+under-claim. The check intentionally has no p95/p99, latency,
+throughput, exact cost, or planner-node-count gate; shared-runner timing and
+minor PostgreSQL planner changes are not release regressions by themselves.
+
+### TenantFair query regression budget
+
+The published `QUERY-1` budget compares a candidate with an approved prior
+artifact for the same candidate and only when both non-smoke artifacts have
+the same `normalized_workload_fingerprint`, PostgreSQL major/settings
+fingerprint, and an operator-assigned `benchmark_environment_id` identifying
+the same machine class. The comparison record also fingerprints both
+artifacts' `runtime`, `postgres`, and `config` objects. The normalized workload is the complete
+resolved `config` after removing only artifact/control keys `output`, `check`,
+and `keep_schema`; both normalized objects must be byte-identical. Query and
+DDL hashes must match, or that
+record must name and approve the intentional hash transition. A result is
+comparable only when both artifacts independently have
+the same named `benchmark_candidate`, that candidate's
+`performance_eligibility.eligible = true`, `measurements.error_count = 0`, and
+at least 1,000 samples. Select exactly one row where
+`candidates[].candidate == benchmark_candidate`, then read:
+
+```text
+candidates[].measurements.query_us.p95
+candidates[].measurements.query_us.p99
+candidates[].measurements.sample_count
+candidates[].performance_eligibility.eligible
+candidates[].performance_eligibility.checks
+candidates[].query_sha256
+candidates[].plan_path
+samples_path
+manifest_path
+```
+
+from `summary.json`, and read `source.sha256` and `provisional_ddl_sha256` from
+`manifest.json`. `benchmark_environment_id`, the two artifact paths, reference
+approval, fingerprints, and any approved hash transition are the bounded
+`tenant_fair_report_input/v1` comparison fields; the runner does not infer
+hardware equivalence. Each artifact path names an exact immutable artifact root
+or `summary.json`, whose relative manifest, samples, and selected plan files
+must all exist. The target is candidate/reference p95 `<= 1.20` and p99
+`<= 1.30`. Checkout and commit distributions remain separately named; plan
+execution milliseconds are one rolled-back `EXPLAIN ANALYZE` sample and are not
+substituted for the query distribution. A failed correctness audit makes the latency comparison
+ineligible rather than fast.
+
+The current manifest says `runtime_parity: false` and
+`exploratory_pre_runtime_prototype`; consequently this budget supports only
+prototype-to-prototype candidate regression decisions. It becomes runtime
+qualification evidence only after exact runtime query/DDL hashes replace the
+prototype hashes. It never becomes a production latency SLO without a separate
+production event population and target. See the full
+[fairness SLO and regression-budget contract](architecture/docket-tenant-claim-fairness-design.md#fairness-slo-and-regression-budget-contract).
+
 ## Migration from 0.0.1
 
 Nodes, graphs, schemas, reducers, interrupts, executors, and processless inline
