@@ -8,7 +8,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     alias Docket.Postgres.{AdmissionPhase, Dispatcher, Notifier, RunStore, Storage}
     alias Docket.Postgres.NotifierTestRepo, as: TestRepo
-    alias Docket.Postgres.Schemas.{GraphVersion, Run}
+    alias Docket.Postgres.Schemas.{ClaimPartition, GraphVersion, Run}
 
     @migration_version 20_260_711_000_025
     @prefixed_migration_version 20_260_711_000_026
@@ -58,8 +58,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     setup do
       TestRepo.delete_all(Run)
+      TestRepo.delete_all(ClaimPartition)
       TestRepo.delete_all(GraphVersion)
       TestRepo.delete_all(Run, prefix: "docket_private")
+      TestRepo.delete_all(ClaimPartition, prefix: "docket_private")
       TestRepo.delete_all(GraphVersion, prefix: "docket_private")
       :ok
     end
@@ -80,6 +82,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  end)
 
         assert_receive {:notification, _, _, @channel, ""}
+        assert TestRepo.aggregate(ClaimPartition, :count, :scope_key) == 1
       end
 
       test "a rolled-back start announces nothing" do
@@ -97,6 +100,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         refute_receive {:notification, _, _, @channel, _}, 300
         assert {:error, :not_found} = RunStore.fetch_run(TestRepo, :system, run.id)
+        assert TestRepo.aggregate(ClaimPartition, :count, :scope_key) == 0
       end
 
       test "a wake that became due after the transaction began still announces" do
@@ -139,6 +143,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  RunStore.insert_run(ctx, :tenantless, run, :run_initialized, past())
 
         assert_receive {:notification, _, _, @channel, "docket_private"}
+
+        assert TestRepo.aggregate(ClaimPartition, :count, :scope_key, prefix: "docket_private") ==
+                 1
+
+        assert TestRepo.aggregate(ClaimPartition, :count, :scope_key) == 0
       end
 
       test "commit announces an immediate release and a due {:at, _} release" do

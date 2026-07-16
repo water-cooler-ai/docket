@@ -7,10 +7,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduletag :postgres
 
     alias Docket.DurableCodec
-    alias Docket.Postgres.{ClaimPolicy, RunCodec, RunStore}
+    alias Docket.Postgres.{ClaimPolicy, RunCodec, RunStore, Storage}
     alias Docket.Postgres.RunStoreTestRepo, as: TestRepo
-    alias Docket.Postgres.Schemas.GraphVersion
-    alias Docket.Postgres.Schemas.Run
+    alias Docket.Postgres.Schemas.{ClaimPartition, GraphVersion, Run}
     alias Docket.Run.ChannelState
     alias Docket.Test.ConcurrentAdmissionHarness
 
@@ -99,6 +98,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert row.latest_checkpoint_type == :run_initialized
       assert row.updated_at == @committed_at
 
+      assert %ClaimPartition{
+               scope_key: "",
+               preferred_active: nil,
+               max_active: nil,
+               weight: nil,
+               borrowing: nil,
+               admin_state: :running,
+               partition_version: 0,
+               admission_epoch: 0
+             } = claim_partition!("")
+
       assert {:error, :already_exists} =
                RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
     end
@@ -134,7 +144,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         row = row!(run_id)
         assert row.tenant_id == tenant_id
         assert row.scope_key == scope_key
+        assert claim_partition!(scope_key).scope_key == scope_key
       end
+
+      refute claim_partition("payload-tenant")
+      refute claim_partition("payload-scope")
+      refute claim_partition("nested-payload-tenant")
 
       assert {:ok, %{leases: leases, poisoned: []}} =
                claim_due(@now, limit: length(expected))
@@ -143,6 +158,295 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                "trusted-tenant" => {:tenant, "tenant"},
                "trusted-tenantless" => :tenantless
              }
+    end
+
+    test "committed-row fast path preserves every Admin-owned field" do
+      admin_partition =
+        TestRepo.insert!(%ClaimPartition{
+          scope_key: "tenant",
+          preferred_active: 2,
+          max_active: 5,
+          weight: 3,
+          borrowing: true,
+          admin_state: :drain,
+          partition_version: 7,
+          admission_epoch: 11
+        })
+
+      run = initialized_run("admin-owned-partition")
+
+      assert {:ok, ^run} =
+               RunStore.insert_run(TestRepo, {:tenant, "tenant"}, run, :run_initialized, @now)
+
+      persisted = claim_partition!("tenant")
+
+      assert Map.take(persisted, claim_partition_fields()) ==
+               Map.take(admin_partition, claim_partition_fields())
+    end
+
+    test "a committed partition remains unchanged after its last run is deleted" do
+      run = initialized_run("dormant-partition")
+
+      assert {:ok, ^run} =
+               RunStore.insert_run(
+                 TestRepo,
+                 {:tenant, "tenant"},
+                 run,
+                 :run_initialized,
+                 @now
+               )
+
+      partition = claim_partition!("tenant")
+      assert {1, nil} = TestRepo.delete_all(from(stored in Run, where: stored.run_id == ^run.id))
+      assert claim_partition!("tenant") == partition
+    end
+
+    test "concurrent first inserts create one inherited partition and every run" do
+      runs = for index <- 1..8, do: initialized_run("concurrent-first-#{index}")
+
+      callers =
+        Enum.with_index(runs, 1)
+        |> Enum.map(fn {run, index} ->
+          {{:insert, index},
+           fn ->
+             RunStore.insert_run(
+               TestRepo,
+               {:tenant, "tenant"},
+               run,
+               :run_initialized,
+               @now
+             )
+           end}
+        end)
+
+      outcomes = ConcurrentAdmissionHarness.run_callers!(TestRepo, callers)
+
+      assert Enum.map(outcomes, & &1.result) == Enum.map(runs, &{:ok, &1})
+      assert TestRepo.aggregate(Run, :count) == length(runs)
+      assert claim_partition_count("tenant") == 1
+
+      assert %ClaimPartition{
+               admin_state: :running,
+               partition_version: 0,
+               admission_epoch: 0
+             } = claim_partition!("tenant")
+    end
+
+    test "invalid, duplicate, and graph-FK failures roll back their partition insert" do
+      invalid = initialized_run("invalid", status: :waiting)
+
+      assert {:error, :invalid_run} =
+               RunStore.insert_run(
+                 TestRepo,
+                 {:tenant, "invalid-partition"},
+                 invalid,
+                 :run_initialized,
+                 @now
+               )
+
+      refute claim_partition("invalid-partition")
+
+      non_durable = initialized_run("non-durable", input: %{"owner" => self()})
+
+      assert {:error, :invalid_run} =
+               RunStore.insert_run(
+                 TestRepo,
+                 {:tenant, "codec-partition"},
+                 non_durable,
+                 :run_initialized,
+                 @now
+               )
+
+      refute claim_partition("codec-partition")
+
+      missing_graph = initialized_run("missing-graph", graph_hash: "not-published")
+
+      assert {:error, :not_found} =
+               RunStore.insert_run(
+                 TestRepo,
+                 {:tenant, "fk-partition"},
+                 missing_graph,
+                 :run_initialized,
+                 @now
+               )
+
+      refute claim_partition("fk-partition")
+
+      original = initialized_run("duplicate-across-partitions")
+
+      assert {:ok, ^original} =
+               RunStore.insert_run(TestRepo, :tenantless, original, :run_initialized, @now)
+
+      assert {:error, :already_exists} =
+               RunStore.insert_run(
+                 TestRepo,
+                 {:tenant, "x"},
+                 original,
+                 :run_initialized,
+                 @now
+               )
+
+      assert claim_partition!("").scope_key == ""
+      refute claim_partition("x")
+      assert TestRepo.aggregate(Run, :count) == 1
+    end
+
+    test "an outer transaction rollback removes the run and its first partition" do
+      run = initialized_run("outer-rollback")
+
+      assert {:error, :forced_outer_rollback} =
+               Storage.transaction(TestRepo, fn tx ->
+                 assert {:ok, ^run} =
+                          RunStore.insert_run(
+                            tx,
+                            {:tenant, "tenant"},
+                            run,
+                            :run_initialized,
+                            @now
+                          )
+
+                 assert row!(run.id)
+                 assert claim_partition!("tenant")
+                 {:error, :forced_outer_rollback}
+               end)
+
+      refute TestRepo.get_by(Run, run_id: run.id)
+      refute claim_partition("tenant")
+    end
+
+    test "an uncommitted admission epoch update and run lock do not block another insert" do
+      existing = initialized_run("locked-existing")
+
+      assert {:ok, ^existing} =
+               RunStore.insert_run(
+                 TestRepo,
+                 {:tenant, "tenant"},
+                 existing,
+                 :run_initialized,
+                 @now
+               )
+
+      parent = self()
+      ref = make_ref()
+
+      blocker =
+        Task.async(fn ->
+          TestRepo.transaction(fn ->
+            TestRepo.query!(
+              """
+              UPDATE docket_claim_partitions
+              SET admission_epoch = admission_epoch + 1
+              WHERE scope_key = $1
+              RETURNING admission_epoch
+              """,
+              ["tenant"]
+            )
+
+            TestRepo.query!("SELECT id FROM docket_runs WHERE run_id = $1 FOR UPDATE", [
+              existing.id
+            ])
+
+            send(parent, {ref, :locked})
+
+            receive do
+              {^ref, :release} -> :released
+            after
+              5_000 -> raise "lock blocker was not released"
+            end
+          end)
+        end)
+
+      assert_receive {^ref, :locked}, 2_000
+      inserted = initialized_run("not-blocked")
+
+      inserter =
+        Task.async(fn ->
+          RunStore.insert_run(
+            TestRepo,
+            {:tenant, "tenant"},
+            inserted,
+            :run_initialized,
+            @now
+          )
+        end)
+
+      insert_result =
+        try do
+          Task.yield(inserter, 1_000)
+        after
+          send(blocker.pid, {ref, :release})
+        end
+
+      assert insert_result == {:ok, {:ok, inserted}}
+      assert Task.await(blocker, 2_000) == {:ok, :released}
+      assert claim_partition_count("tenant") == 1
+      assert claim_partition!("tenant").admission_epoch == 1
+    end
+
+    test "an uncommitted Admin first insert wins permitted uniqueness arbitration unchanged" do
+      parent = self()
+      ref = make_ref()
+
+      admin_writer =
+        Task.async(fn ->
+          TestRepo.transaction(fn ->
+            partition =
+              TestRepo.insert!(%ClaimPartition{
+                scope_key: "x",
+                preferred_active: 4,
+                max_active: 9,
+                weight: 2,
+                borrowing: false,
+                admin_state: :hold_new,
+                partition_version: 12,
+                admission_epoch: 17
+              })
+
+            send(parent, {ref, :admin_inserted})
+
+            receive do
+              {^ref, :commit} -> partition
+            after
+              5_000 -> raise "Admin insert was not released"
+            end
+          end)
+        end)
+
+      assert_receive {^ref, :admin_inserted}, 2_000
+      run = initialized_run("admin-first-race")
+
+      lifecycle_writer =
+        Task.async(fn ->
+          TestRepo.checkout(fn ->
+            [[backend_pid]] = TestRepo.query!("SELECT pg_backend_pid()").rows
+            send(parent, {ref, :lifecycle_checked_out, backend_pid})
+
+            receive do
+              {^ref, :start_lifecycle} ->
+                RunStore.insert_run(TestRepo, {:tenant, "x"}, run, :run_initialized, @now)
+            after
+              5_000 -> raise "lifecycle insert was not started"
+            end
+          end)
+        end)
+
+      assert_receive {^ref, :lifecycle_checked_out, lifecycle_backend_pid}, 2_000
+      send(lifecycle_writer.pid, {ref, :start_lifecycle})
+
+      try do
+        assert_backend_lock_wait!(lifecycle_backend_pid)
+        assert Task.yield(lifecycle_writer, 0) == nil
+      after
+        send(admin_writer.pid, {ref, :commit})
+      end
+
+      assert {:ok, admin_partition} = Task.await(admin_writer, 2_000)
+      assert {:ok, ^run} = Task.await(lifecycle_writer, 2_000)
+
+      persisted = claim_partition!("x")
+
+      assert Map.take(persisted, claim_partition_fields()) ==
+               Map.take(admin_partition, claim_partition_fields())
     end
 
     test "run listing applies graph and status filters in SQL without decoding state" do
@@ -1792,6 +2096,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, %Docket.RunInfo{run: ^run, wake_at: @now}} =
                RunStore.inspect_run(ctx, {:tenant, "prefix-tenant"}, run.id)
 
+      assert claim_partition!("prefix-tenant", "docket_private").scope_key == "prefix-tenant"
+      refute claim_partition("prefix-tenant")
+
       assert {:ok, %{leases: [lease], poisoned: []}} =
                RunStore.claim_due(ctx, :system, policy(@now))
 
@@ -1812,6 +2119,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert row!("prefixed", "docket_private").wake_at == released_at
       assert {:ok, ^run} = RunStore.fetch_run(ctx, :system, run.id)
+    end
+
+    test "bare Repo inserts keep both writes in the transaction-local search path" do
+      assert :ok =
+               Ecto.Migrator.up(
+                 TestRepo,
+                 @prefixed_migration_version,
+                 InstallDocketPrefixed,
+                 log: false
+               )
+
+      insert_graph!("docket_private")
+      run = initialized_run("search-path-prefixed")
+
+      assert {:ok, :inserted} =
+               Storage.transaction(TestRepo, fn _tx ->
+                 TestRepo.query!("SET LOCAL search_path TO docket_private, public")
+
+                 assert {:ok, ^run} =
+                          RunStore.insert_run(
+                            TestRepo,
+                            {:tenant, "prefix-tenant"},
+                            run,
+                            :run_initialized,
+                            @now
+                          )
+
+                 {:ok, :inserted}
+               end)
+
+      assert row!(run.id, "docket_private").scope_key == "prefix-tenant"
+      assert claim_partition!("prefix-tenant", "docket_private").scope_key == "prefix-tenant"
+      refute TestRepo.get_by(Run, run_id: run.id)
+      refute claim_partition("prefix-tenant")
     end
 
     defp policy(now, overrides \\ []) do
@@ -2048,6 +2389,85 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
 
       TestRepo.one!(query)
+    end
+
+    defp claim_partition(scope_key, prefix \\ nil) do
+      query =
+        from(partition in ClaimPartition, where: partition.scope_key == ^scope_key)
+        |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
+
+      TestRepo.one(query)
+    end
+
+    defp claim_partition_fields do
+      [
+        :scope_key,
+        :preferred_active,
+        :max_active,
+        :weight,
+        :borrowing,
+        :admin_state,
+        :partition_version,
+        :admission_epoch,
+        :inserted_at,
+        :updated_at
+      ]
+    end
+
+    defp assert_backend_lock_wait!(backend_pid) do
+      assert_backend_lock_wait!(backend_pid, 200)
+    end
+
+    defp assert_backend_lock_wait!(backend_pid, attempts) when attempts > 0 do
+      case TestRepo.query!(
+             """
+             SELECT EXISTS (
+               SELECT 1
+               FROM pg_locks
+               WHERE pid = $1
+                 AND locktype = 'transactionid'
+                 AND mode = 'ShareLock'
+                 AND granted = false
+             )
+             """,
+             [backend_pid]
+           ).rows do
+        [[true]] ->
+          :ok
+
+        [[false]] ->
+          Process.sleep(10)
+          assert_backend_lock_wait!(backend_pid, attempts - 1)
+      end
+    end
+
+    defp assert_backend_lock_wait!(backend_pid, 0) do
+      activity =
+        TestRepo.query!(
+          "SELECT state, wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1",
+          [backend_pid]
+        ).rows
+
+      flunk(
+        "expected backend #{backend_pid} to reach uniqueness arbitration; activity: " <>
+          inspect(activity)
+      )
+    end
+
+    defp claim_partition!(scope_key, prefix \\ nil) do
+      claim_partition(scope_key, prefix) ||
+        flunk("expected claim partition #{inspect(scope_key)} in prefix #{inspect(prefix)}")
+    end
+
+    defp claim_partition_count(scope_key, prefix \\ nil) do
+      query =
+        from(partition in ClaimPartition,
+          where: partition.scope_key == ^scope_key,
+          select: count(partition.scope_key)
+        )
+        |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
+
+      TestRepo.one(query)
     end
   end
 end

@@ -16,6 +16,15 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- PostgreSQL run creation now atomically materializes the canonical
+  owner-derived claim partition with inherited, running, version-zero defaults.
+  Concurrent first inserts use `ON CONFLICT DO NOTHING`, preserving Admin-owned
+  state and versions. A non-locking existence read keeps established
+  partitions off that uniqueness path, so run creation does not wait behind an
+  admission epoch update. Failed or outer-rolled-back run creation leaves no
+  new partition or wake notification. Dormant partition rows are retained
+  after their last run disappears and are never selected from serialized
+  payload identity.
 - PostgreSQL schema version 2: prefix-local exact-cap policy, partition,
   durable receipt/audit, rollout, admission-gate, assertion, and capability
   tables with an explicitly uninitialized default. ClaimPolicy implementations

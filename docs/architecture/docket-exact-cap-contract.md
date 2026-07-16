@@ -387,15 +387,31 @@ receipt uniqueness, immutable audit IDs, and export/prune checks.
 
 ### Run relationship and indexes
 
-DCKT-65 makes partition upsert and run insert one transaction for every
-`RunStore.insert_run/5` path. A failed or rolled-back run insert leaves no
-partition row from that transaction. Concurrent first inserts use
-`INSERT ... ON CONFLICT DO NOTHING`; harmless uniqueness waiting is allowed,
-but the path never takes the admission lock. Its insert supplies only the
-canonical new-row values: null overrides, `admin_state = 'running'`,
-`partition_version = 0`, and `admission_epoch = 0`. On conflict it updates
-nothing, so it can never erase an Admin-created override/state, lower a control
-version, or reset an admission epoch.
+DCKT-65 makes partition assurance and run insertion one transaction for every
+`RunStore.insert_run/5` path. After validating and serializing the run, lifecycle
+creation performs one plain, non-locking MVCC partition-existence read:
+
+- If the partition is already committed and visible, the writer skips the
+  partition insert. It therefore does not wait behind an admission
+  transaction's uncommitted `admission_epoch` update.
+- If the partition is absent or a concurrent first writer's row is not yet
+  visible, the lifecycle writer executes `INSERT ... ON CONFLICT DO NOTHING`.
+  Concurrent first lifecycle/Admin inserts may wait only for ordinary
+  uniqueness arbitration. The insert supplies only the canonical new-row
+  values: null overrides, `admin_state = 'running'`, `partition_version = 0`,
+  and `admission_epoch = 0`. On conflict it updates nothing, so an Admin-created
+  row, control version, and admission epoch remain unchanged.
+
+A failed or rolled-back run insert removes a partition newly inserted by that
+transaction. A previously committed partition is never mutated by this path.
+
+One `insert_run/5` call materializes at most one partition and therefore needs
+no multi-partition ordering. A caller that deliberately starts runs for several
+previously unseen scopes inside one outer transaction owns the ordinary
+PostgreSQL uniqueness-ordering risk: acquire those scopes in ascending
+canonical `scope_key` order or retry a detected deadlock. The lifecycle writer
+does not reorder a caller's outer transaction, and this contract does not claim
+global deadlock freedom for arbitrary multi-scope transactions.
 
 DCKT-72 owns these exact tenant-leading partial indexes:
 
@@ -737,7 +753,7 @@ so no earlier data-plane lock can precede this order.
 | readiness promote or drift demote | `FOR UPDATE` | `FOR UPDATE` | `FOR SHARE` | read-only reconciliation | read-only verification | waits out admission with bounded timeout; gate change and evidence commit atomically |
 | activate/deactivate | `FOR UPDATE` | `FOR SHARE` | `FOR SHARE` | none | none | waits out admission and rollout writer with bounded timeout; commits mode atomically |
 | old-binary assertion/capability heartbeat | none | none | none | none | none | insert/upsert only; never authority by itself |
-| run creation | none | none | none | unique insert; mandatory FK takes `KEY SHARE` | insert | uniqueness may wait within configured timeout |
+| run creation | none | none | none | plain MVCC existence read; only absent/invisible rows use unique `INSERT ... ON CONFLICT DO NOTHING`; mandatory FK takes `KEY SHARE` | insert | committed row: no partition-row wait; competing first writer: uniqueness may wait within configured timeout |
 | refresh/release/commit/abandon/retry-poison | none | none | none | none | existing fenced run update | never introduces run-then-partition order |
 
 `FOR SHARE` conflicts with a default or gate update while allowing concurrent

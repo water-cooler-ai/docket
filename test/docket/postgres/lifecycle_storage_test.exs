@@ -8,7 +8,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     alias Docket.Postgres.{EventStore, GraphStore, RunCodec, RunStore, Storage}
     alias Docket.Postgres.LifecycleStorageTestRepo, as: TestRepo
-    alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}
+    alias Docket.Postgres.Schemas.{ClaimPartition, Event, GraphVersion, Run}
     alias Docket.Runtime.Moment
 
     @migration_version 20_260_710_000_023
@@ -96,11 +96,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     setup do
       TestRepo.delete_all(Event)
       TestRepo.delete_all(Run)
+      TestRepo.delete_all(ClaimPartition)
       TestRepo.delete_all(GraphVersion)
       :ok
     end
 
-    test "a later Events-capability failure rolls back run, wake, and partial event only" do
+    test "a later Events-capability failure rolls back run, partition, wake, and partial event" do
       {graph_id, graph_hash, document} = publish_graph!("rollback-graph")
       moment = initialization_moment("rollback-run", graph_id, graph_hash)
       backend = {FailingBackend, %{repo: TestRepo}}
@@ -110,6 +111,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:error, :not_found} = RunStore.fetch_run(TestRepo, :system, moment.run.id)
       assert TestRepo.aggregate(Run, :count) == 0
+      assert TestRepo.aggregate(ClaimPartition, :count, :scope_key) == 0
       assert TestRepo.aggregate(Event, :count) == 0
 
       assert {:ok, ^document} =
@@ -131,6 +133,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                RunStore.inspect_run(TestRepo, :tenantless, moment.run.id)
 
       assert run == moment.run
+      assert TestRepo.aggregate(ClaimPartition, :count, :scope_key) == 1
       assert TestRepo.aggregate(Event, :count) == 0
     end
 

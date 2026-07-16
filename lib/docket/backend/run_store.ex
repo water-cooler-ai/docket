@@ -160,9 +160,12 @@ defmodule Docket.Backend.RunStore do
   That type becomes the latest checkpoint metadata, and `wake_at` is the
   run's first explicit schedule.
 
-  This callback writes only the run aggregate. Lifecycle orchestration appends
-  assigned initialization events in the same outer transaction; it never
-  publishes the already-saved graph version.
+  This callback owns the run aggregate and may atomically materialize
+  backend-specific supporting authority needed for that run. Supporting
+  identity must come only from `owner_scope`; serialized run or payload fields
+  cannot select it. Lifecycle orchestration appends assigned initialization
+  events in the same outer transaction, while graph publication remains a
+  separate, earlier operation.
   """
   @callback insert_run(
               ctx(),
