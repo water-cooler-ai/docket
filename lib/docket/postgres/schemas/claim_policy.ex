@@ -55,6 +55,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       field(:previous_versions, {:array, :integer})
       field(:versions, {:array, :integer})
       field(:audit_id, :integer)
+      field(:result_value, :map, default: %{})
       field(:created_at, :utc_datetime_usec, read_after_writes: true)
     end
   end
@@ -156,8 +157,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       field(:backfill_retries, :integer, default: 0)
       field(:backfill_completed_at, :utc_datetime_usec)
       field(:backfill_last_error, :string)
+      field(:online_phase, Ecto.Enum, values: Types.online_phases(), default: :not_started)
+      field(:online_attempts, :integer, default: 0)
+      field(:online_last_error, :string)
+      field(:online_started_at, :utc_datetime_usec)
+      field(:online_completed_at, :utc_datetime_usec)
       field(:ready_index_valid, :boolean, default: false)
       field(:live_index_valid, :boolean, default: false)
+      field(:ready_index_ddl_sha256, :binary, redact: true)
+      field(:live_index_ddl_sha256, :binary, redact: true)
       field(:fk_disposition, Ecto.Enum, values: Types.fk_dispositions(), default: :absent)
       field(:missing_partition_count, :integer)
       field(:verified_default_fingerprint, :binary, redact: true)

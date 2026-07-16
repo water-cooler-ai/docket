@@ -492,13 +492,184 @@ GC. Deletion requires a
 separately reviewed proof that no run references the key; this backfill never
 deletes a partition.
 
+### Online indexes, foreign key, and readiness
+
+The online artifact is deliberately separate from the transactional V02
+migration. The Repo must use PostgreSQL advisory migration locking so the lock
+covers the gap between autocommit DDL and Ecto's `schema_migrations` record:
+
+```elixir
+config :my_app, MyApp.Repo, migration_lock: :pg_advisory_lock
+```
+
+Generate and commit one prefix-explicit artifact. Never paste these operations
+into the transactional schema migration:
+
+```sh
+mix docket.gen.migration --online --prefix YOUR_PREFIX -r MyApp.Repo
+```
+
+The generated module has `@disable_ddl_transaction true`. Docket also takes a
+prefix session advisory runner across all autocommit phases. Readiness
+verification takes the same authority transactionally, so a first promotion
+cannot race online down; DCKT-71 activation must participate in the same
+authority. Calls from an outer transaction and repos using table migration
+locks are refused.
+
+Run only after the dual-write assertion is current and backfill shows
+`complete` with zero missing partitions. The helper performs these restartable
+checkpoints:
+
+1. create/repair the tenant-leading ready index concurrently;
+2. create/repair the tenant-leading live/expired index concurrently;
+3. recount current runs, then install the exact FK as `NOT VALID`; and
+4. validate the FK separately and mark the online checkpoint `complete`.
+
+`NOT VALID` avoids a historical validation scan during installation, but it
+immediately enforces new writes. A returned old writer that omits partition
+dual-write can therefore fail run insertion; stop and drain it rather than
+removing the constraint. Validation is separately retryable. A canceled
+`CREATE INDEX CONCURRENTLY` can leave a same-name invalid artifact. On restart,
+Docket proves that object's table OID, keys, include count, access method,
+nonconstraint/nonprimary/nonexclusion status, immediate semantics, default
+opclasses/collations/order, and exact predicate before dropping and rebuilding
+it concurrently. A foreign-definition object—valid or invalid—is
+never dropped automatically. Repair is refused while the prefix is ready. A
+drift-demoted TenantFair-selected prefix is not ready and may be repaired;
+repair never changes admission mode.
+
+Inspect durable progress separately from schema generation:
+
+```sql
+SELECT schema_generation, online_phase, online_attempts, online_last_error,
+       online_started_at, online_completed_at,
+       ready_index_valid, encode(ready_index_ddl_sha256, 'hex') AS ready_hash,
+       live_index_valid, encode(live_index_ddl_sha256, 'hex') AS live_hash,
+       fk_disposition, missing_partition_count,
+       encode(verified_default_fingerprint, 'hex') AS default_hash,
+       verified_at
+FROM "YOUR_PREFIX".docket_claim_rollout
+WHERE id = 1;
+
+SELECT gate.readiness, gate.readiness_epoch, gate.admission_mode,
+       gate.mode_epoch, gate.required_function_contract
+FROM "YOUR_PREFIX".docket_claim_admission_gate AS gate
+WHERE gate.id = 1;
+
+SELECT index_relid::regclass, phase, lockers_total, lockers_done,
+       blocks_total, blocks_done, tuples_total, tuples_done
+FROM pg_stat_progress_create_index
+WHERE relid = '"YOUR_PREFIX".docket_runs'::regclass;
+
+SELECT conname, convalidated, confmatchtype, condeferrable, condeferred,
+       confupdtype, confdeltype
+FROM pg_constraint
+WHERE conrelid = '"YOUR_PREFIX".docket_runs'::regclass
+  AND conname = 'docket_runs_scope_key_claim_partition_fkey';
+```
+
+Before every invocation, record free tablespace/disk headroom, current WAL LSN,
+replica retained bytes/time, and the number of long transactions. Concurrent
+index creation can temporarily require roughly another index-sized allocation;
+do not begin without the host's measured headroom. Use these observations:
+
+```sql
+SELECT pg_size_pretty(pg_table_size('"YOUR_PREFIX".docket_runs'::regclass)),
+       pg_size_pretty(pg_indexes_size('"YOUR_PREFIX".docket_runs'::regclass)),
+       pg_current_wal_lsn();
+
+SELECT pid, application_name, state, sync_state,
+       pg_wal_lsn_diff(pg_current_wal_lsn(),
+         COALESCE(replay_lsn, flush_lsn, write_lsn))::bigint AS lag_bytes
+FROM pg_stat_replication
+ORDER BY application_name;
+
+SELECT pid, now() - xact_start AS transaction_age, state, query
+FROM pg_stat_activity
+WHERE datname = current_database() AND xact_start IS NOT NULL
+ORDER BY xact_start;
+```
+
+The helper uses a lock timeout no greater than one second and a bounded server
+statement timeout (at least one second, five minutes by default, and at most one
+hour). Its client query deadline is longer than the server deadline. On normal
+and handled-error exits, checked cleanup first disables that deadline, proves
+the advisory unlock, and restores prior session settings. A cleanup-query or
+unlock mismatch raises instead of reporting success; a disconnected PostgreSQL
+session releases its lock. To cancel, use the deployment job's normal
+cancellation first; a database operator may use `pg_cancel_backend(pid)` only
+after matching the exact prefix DDL in `pg_stat_activity`. Never use
+`pg_terminate_backend` as a routine throttle. After cancellation, wait for
+cleanup, inspect
+`pg_stat_progress_create_index`, `pg_index.indisvalid`, the FK catalog, and the
+ledger, then rerun the same generated migration. Do not issue hand-written
+`DROP INDEX`, mark ledger flags manually, or use `IF NOT EXISTS` as proof.
+
+Pause retries when free disk falls below the host threshold, WAL growth exceeds
+budget, any required replica exceeds the approved byte/time lag, a long
+transaction prevents an old snapshot from clearing, or cancellation remains
+in progress. The library never queries replicas or sleeps while holding its
+runner. Resume only after the external condition clears. Attempts/errors are
+closed ledger codes; database and tenant text is intentionally absent.
+
+After online completion and explicit default bootstrap, compute the approved
+prefix-neutral hashes from `Docket.Postgres.ClaimPolicy.OnlineDDL` and verify:
+
+```elixir
+alias Docket.Postgres.ClaimPolicy.{OnlineDDL, Readiness}
+
+hashes = OnlineDDL.index_fingerprints(context.prefix)
+
+Readiness.verify(context,
+  expected_readiness_epoch: current_epoch,
+  ready_index_ddl_sha256: hashes.ready,
+  live_index_ddl_sha256: hashes.live,
+  actor: "rollout-operator",
+  source: "deployment",
+  event_id: "online-ready-2026-07-16"
+)
+```
+
+Verification rechecks the complete table/catalog set, current zero-missing
+count, dual-write/backfill facts, exact indexes/FK, function-contract metadata,
+and initialized default under gate -> rollout -> default locks. A wrong supplied
+hash deliberately fails closed. A changed default or later index/FK/partition
+drift demotes a ready prefix and increments its readiness epoch. After repair,
+a fresh event at the new epoch records the current default fingerprint and may
+re-promote. A successful unchanged verification leaves the epoch and gate state
+alone but refreshes rollout `verified_at`/`updated_at`, so `verified_at` is the
+latest successful or demoting proof time. Demotion receipts retain their exact
+sorted reasons after audit pruning.
+
+Readiness does not activate anything. DCKT-72 leaves `admission_mode = legacy`,
+does not install/select the TenantFair engine or claim function, and does not
+change mode/epoch. DCKT-71 owns activation. Ordinary online down is allowed
+only before any readiness or activation history and while the prefix is
+not-ready/Legacy; otherwise use the explicit stopped-fleet destructive teardown
+contract. The intermediate DCKT-64..67 generation-2 schemas were never
+released: recreate those developer databases or apply the reviewed stacked
+branch patch manually. The online runner does not alter a prior draft V02.
+
+Rehearse on a production-shaped copy with populated v1 tenantless and tenant
+runs, current concurrent dual-writing inserts, default and every custom prefix,
+and replicas attached. Inject interruption after each committed checkpoint,
+cancel both concurrent index creation and FK validation, hold conflicting table
+locks to prove bounded timeout, and verify a rerun preserves already-correct
+object OIDs while repairing only exact invalid artifacts. Record server major,
+settings, DDL fingerprints, ledger transitions, WAL/disk/lag observations, and
+the final zero/count/catalog queries. PostgreSQL 13 and 17 both remain required
+release gates.
+
 ## Tenant-fair claim benchmark
 
 The repository includes a source-checkout-only PostgreSQL benchmark for the
 tenant-fair candidate-discovery work. It compares the known ranking-window and
 `DISTINCT ON` failure baselines with bounded partition-hint/cursor and recursive
 loose-scan reconciliation candidates. This is an exploratory query and plan
-suite, not a public API or a selectable ClaimPolicy implementation.
+benchmark suite, not a public API or a selectable ClaimPolicy implementation.
+DCKT-72 makes its ready/live predicates and prefix-neutral index DDL hashes
+identical to the online migration, but `runtime_query_parity` remains false;
+DCKT-68 owns the eventual admission SQL/function fingerprint.
 
 The runner requires PostgreSQL 13 or newer. CI exercises PostgreSQL 13 as the
 minimum and PostgreSQL 17 as the reference version. Supply an explicitly owned

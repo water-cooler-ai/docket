@@ -7,6 +7,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @outcomes [:applied, :unchanged, :demoted]
     @assertion_kinds [:dual_write, :old_binaries_absent]
     @backfill_phases [:not_started, :running, :reconciling, :complete]
+    @online_phases [:not_started, :ready_index, :live_index, :fk_not_valid, :complete]
     @fk_dispositions [:absent, :not_valid, :validated]
     @readiness_states [:not_ready, :ready]
     @admission_modes [:legacy, :tenant_fair]
@@ -16,6 +17,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def outcomes, do: @outcomes
     def assertion_kinds, do: @assertion_kinds
     def backfill_phases, do: @backfill_phases
+    def online_phases, do: @online_phases
     def fk_dispositions, do: @fk_dispositions
     def readiness_states, do: @readiness_states
     def admission_modes, do: @admission_modes

@@ -5,6 +5,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
+    alias Docket.Postgres.ClaimPolicy.OnlineDDL
     alias Docket.Postgres.TestRepo
 
     defmodule InstallDocket do
@@ -168,6 +169,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {"previous_versions", "bigint[]", true, nil, nil},
         {"versions", "bigint[]", true, nil, nil},
         {"audit_id", "bigint", true, nil, nil},
+        {"result_value", "jsonb", true, "'{}'::jsonb", nil},
         {"created_at", "timestamp with time zone", true, "CURRENT_TIMESTAMP", nil}
       ],
       "docket_claim_policy_events" => [
@@ -228,8 +230,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {"backfill_retries", "bigint", true, "0", nil},
         {"backfill_completed_at", "timestamp with time zone", false, nil, nil},
         {"backfill_last_error", "character varying(512)", false, nil, nil},
+        {"online_phase", "character varying(24)", true, "'not_started'", nil},
+        {"online_attempts", "bigint", true, "0", nil},
+        {"online_last_error", "character varying(64)", false, nil, nil},
+        {"online_started_at", "timestamp with time zone", false, nil, nil},
+        {"online_completed_at", "timestamp with time zone", false, nil, nil},
         {"ready_index_valid", "boolean", true, "false", nil},
         {"live_index_valid", "boolean", true, "false", nil},
+        {"ready_index_ddl_sha256", "bytea", false, nil, nil},
+        {"live_index_ddl_sha256", "bytea", false, nil, nil},
         {"fk_disposition", "character varying(16)", true, "'absent'", nil},
         {"missing_partition_count", "bigint", false, nil, nil},
         {"verified_default_fingerprint", "bytea", false, nil, nil},
@@ -1065,6 +1074,50 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    test "destructive V02 teardown removes orphan online DDL from retained v1 tables" do
+      assert :ok =
+               Ecto.Migrator.up(TestRepo, @v1_migration_version, InstallDocketV1, log: false)
+
+      assert :ok =
+               Ecto.Migrator.up(
+                 TestRepo,
+                 @v2_upgrade_migration_version,
+                 UpgradeDocketV2,
+                 log: false
+               )
+
+      TestRepo.query!(OnlineDDL.create_index_sql("public", :ready))
+      TestRepo.query!(OnlineDDL.create_index_sql("public", :live))
+      TestRepo.query!(OnlineDDL.add_foreign_key_sql("public"))
+      TestRepo.query!(OnlineDDL.validate_foreign_key_sql("public"))
+
+      assert Map.has_key?(indexes("docket_runs"), OnlineDDL.index_name(:ready))
+      assert Map.has_key?(indexes("docket_runs"), OnlineDDL.index_name(:live))
+
+      assert TestRepo.query!("""
+             SELECT convalidated
+             FROM pg_constraint
+             WHERE conname = '#{OnlineDDL.foreign_key_name()}'
+             """).rows == [[true]]
+
+      assert :ok =
+               Ecto.Migrator.down(
+                 TestRepo,
+                 @v2_upgrade_migration_version,
+                 DestructiveUpgradeDocketV2,
+                 log: false
+               )
+
+      assert tables("public") == @v1_tables
+      refute Map.has_key?(indexes("docket_runs"), OnlineDDL.index_name(:ready))
+      refute Map.has_key?(indexes("docket_runs"), OnlineDDL.index_name(:live))
+
+      assert TestRepo.query!("""
+             SELECT 1 FROM pg_constraint
+             WHERE conname = '#{OnlineDDL.foreign_key_name()}'
+             """).rows == []
+    end
+
     test "destructive teardown requires a completed export covering retained audit" do
       install!()
       fingerprint = :binary.copy(<<8>>, 32)
@@ -1436,8 +1489,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              SELECT id, schema_generation, dual_write_assertion_id, backfill_phase,
                     backfill_target_id, backfill_cursor, backfill_batches, backfill_rows,
                     backfill_retries,
-                    backfill_completed_at, backfill_last_error, ready_index_valid,
-                    live_index_valid, fk_disposition, missing_partition_count,
+                    backfill_completed_at, backfill_last_error,
+                    online_phase, online_attempts, online_last_error,
+                    online_started_at, online_completed_at,
+                    ready_index_valid, live_index_valid,
+                    ready_index_ddl_sha256, live_index_ddl_sha256,
+                    fk_disposition, missing_partition_count,
                     verified_default_fingerprint, verified_at
              FROM #{quoted}.docket_claim_rollout
              """).rows == [
@@ -1453,8 +1510,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  0,
                  nil,
                  nil,
+                 "not_started",
+                 0,
+                 nil,
+                 nil,
+                 nil,
                  false,
                  false,
+                 nil,
+                 nil,
                  "absent",
                  nil,
                  nil,

@@ -268,6 +268,8 @@ end
 defmodule Docket.Bench.TenantFairClaim.SQL do
   @moduledoc false
 
+  alias Docket.Postgres.ClaimPolicy.OnlineDDL
+
   @candidates [:ranking_window, :distinct_on, :hint_cursor, :recursive_loose_scan]
   def candidates, do: @candidates
   def role(candidate) when candidate in [:ranking_window, :distinct_on], do: "failure_baseline"
@@ -383,7 +385,6 @@ defmodule Docket.Bench.TenantFairClaim.SQL do
   end
 
   def provisional_ddl(prefix) do
-    runs = table(prefix, "docket_runs")
     partitions = table(prefix, "docket_bench_claim_partitions")
 
     [
@@ -404,17 +405,8 @@ defmodule Docket.Bench.TenantFairClaim.SQL do
       ON #{partitions} (scope_key)
       WHERE next_ready_at_hint IS NOT NULL OR next_expired_at_hint IS NOT NULL
       """,
-      """
-      CREATE INDEX docket_bench_runs_ready_tenant_index
-      ON #{runs} (scope_key, wake_at, id)
-      WHERE status = 'running' AND poisoned_at IS NULL
-        AND claim_token IS NULL AND wake_at IS NOT NULL
-      """,
-      """
-      CREATE INDEX docket_bench_runs_claimed_tenant_index
-      ON #{runs} (scope_key, claimed_at, id)
-      WHERE status = 'running' AND poisoned_at IS NULL AND claim_token IS NOT NULL
-      """
+      OnlineDDL.create_index_sql(prefix, :ready),
+      OnlineDDL.create_index_sql(prefix, :live)
     ]
   end
 
@@ -2116,6 +2108,20 @@ defmodule Docket.Bench.TenantFairClaim do
             "false for baselines and whenever any deterministic contention/cap audit, measured under-claim audit, or post-measurement cap audit fails"
         },
         provisional_ddl_sha256: SQL.ddl_hash("docket_bench_schema"),
+        runtime_index_ddl_sha256: %{
+          ready:
+            Docket.Postgres.ClaimPolicy.OnlineDDL.index_fingerprint_hex(
+              "docket_bench_schema",
+              :ready
+            ),
+          live:
+            Docket.Postgres.ClaimPolicy.OnlineDDL.index_fingerprint_hex(
+              "docket_bench_schema",
+              :live
+            )
+        },
+        runtime_query_parity: false,
+        runtime_query_parity_owner: "DCKT-68",
         candidate_order: candidate_order,
         artifact_root: artifacts.root
       }

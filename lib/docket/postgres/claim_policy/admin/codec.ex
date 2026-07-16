@@ -5,6 +5,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def request_fingerprint(request), do: :crypto.hash(:sha256, canonical(request))
     def target_fingerprint(target), do: :crypto.hash(:sha256, canonical({:v1_target, target}))
 
+    def default_fingerprint(%{
+          preferred_active: preferred_active,
+          max_active: max_active,
+          weight: weight,
+          borrowing: borrowing
+        }) do
+      request_fingerprint(%{
+        preferred_active: preferred_active,
+        max_active: max_active,
+        weight: weight,
+        borrowing: borrowing
+      })
+    end
+
     def deterministic_uuid(fingerprint) do
       <<a::binary-size(4), b::binary-size(2), c0::16, d0::16, e::binary-size(6), _::binary>> =
         fingerprint

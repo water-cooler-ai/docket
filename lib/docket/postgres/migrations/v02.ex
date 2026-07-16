@@ -4,6 +4,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     use Ecto.Migration
 
+    alias Docket.Postgres.ClaimPolicy.OnlineDDL
     alias Docket.Postgres.Storage
 
     @tables [
@@ -126,6 +127,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         previous_versions bigint[] NOT NULL,
         versions bigint[] NOT NULL,
         audit_id bigint NOT NULL,
+        result_value jsonb NOT NULL DEFAULT '{}'::jsonb,
         created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (source, event_id),
         CONSTRAINT docket_claim_policy_receipts_request_fingerprint_check
@@ -221,8 +223,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         backfill_retries bigint NOT NULL DEFAULT 0,
         backfill_completed_at timestamptz NULL,
         backfill_last_error varchar(512) NULL,
+        online_phase varchar(24) NOT NULL DEFAULT 'not_started',
+        online_attempts bigint NOT NULL DEFAULT 0,
+        online_last_error varchar(64) NULL,
+        online_started_at timestamptz NULL,
+        online_completed_at timestamptz NULL,
         ready_index_valid boolean NOT NULL DEFAULT false,
         live_index_valid boolean NOT NULL DEFAULT false,
+        ready_index_ddl_sha256 bytea NULL,
+        live_index_ddl_sha256 bytea NULL,
         fk_disposition varchar(16) NOT NULL DEFAULT 'absent',
         missing_partition_count bigint NULL,
         verified_default_fingerprint bytea NULL,
@@ -252,6 +261,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           CHECK (backfill_cursor IS NULL OR backfill_cursor >= 0),
         CONSTRAINT docket_claim_rollout_counts_check
           CHECK (backfill_batches >= 0 AND backfill_rows >= 0 AND backfill_retries >= 0),
+        CONSTRAINT docket_claim_rollout_online_phase_check CHECK (
+          online_phase IN ('not_started', 'ready_index', 'live_index', 'fk_not_valid', 'complete') AND
+          online_attempts >= 0 AND
+          (
+            (online_phase = 'not_started' AND online_completed_at IS NULL) OR
+            (online_phase = 'ready_index' AND ready_index_valid AND online_completed_at IS NULL) OR
+            (online_phase = 'live_index' AND ready_index_valid AND live_index_valid AND
+              online_completed_at IS NULL) OR
+            (online_phase = 'fk_not_valid' AND ready_index_valid AND live_index_valid AND
+              fk_disposition = 'not_valid' AND online_completed_at IS NULL) OR
+            (online_phase = 'complete' AND ready_index_valid AND live_index_valid AND
+              fk_disposition = 'validated' AND online_completed_at IS NOT NULL)
+          )
+        ),
+        CONSTRAINT docket_claim_rollout_online_fingerprints_check CHECK (
+          (ready_index_ddl_sha256 IS NULL OR octet_length(ready_index_ddl_sha256) = 32) AND
+          (live_index_ddl_sha256 IS NULL OR octet_length(live_index_ddl_sha256) = 32) AND
+          (NOT ready_index_valid OR ready_index_ddl_sha256 IS NOT NULL) AND
+          (NOT live_index_valid OR live_index_ddl_sha256 IS NOT NULL)
+        ),
         CONSTRAINT docket_claim_rollout_fk_disposition_check
           CHECK (fk_disposition IN ('absent', 'not_valid', 'validated')),
         CONSTRAINT docket_claim_rollout_missing_count_check
@@ -367,6 +396,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       END
       $docket_v02_down$
       """)
+
+      # DCKT-72 installs this relationship after V02. Drop it explicitly while
+      # the teardown transaction still holds the run/partition table locks so
+      # the owned partition table can be removed without CASCADE.
+      execute("""
+      ALTER TABLE #{runs}
+      DROP CONSTRAINT IF EXISTS docket_runs_scope_key_claim_partition_fkey
+      """)
+
+      # A nontransactional online migration can commit either index before its
+      # schema_migrations row or rollout checkpoint is durable. V02 teardown
+      # owns these names and must remove that orphan DDL while its existing
+      # ACCESS EXCLUSIVE lock on docket_runs prevents concurrent users.
+      for kind <- [:live, :ready] do
+        execute("DROP INDEX IF EXISTS #{qualified_table(prefix, OnlineDDL.index_name(kind))}")
+      end
 
       Enum.each(@tables, fn name ->
         execute("DROP TABLE IF EXISTS #{qualified_table(prefix, name)}")

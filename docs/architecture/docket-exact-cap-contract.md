@@ -270,6 +270,9 @@ docket_claim_policy_receipts
   previous_versions               bigint[] not null
   versions                        bigint[] not null
   audit_id                        bigint not null
+  result_value                    jsonb not null default '{}'
+                                  redacted exact replay payload; readiness
+                                  demotion stores its sorted reason atoms
   created_at                      timestamptz not null default CURRENT_TIMESTAMP
   primary key (source, event_id)
   check equal nonzero cardinality of target_fingerprints/previous_versions/versions
@@ -343,14 +346,29 @@ docket_claim_rollout
   backfill_retries                bigint not null default 0, check >= 0
   backfill_completed_at           timestamptz null
   backfill_last_error             varchar(512) null
+  online_phase                    varchar(24) not null default 'not_started'
+                                  check in ('not_started', 'ready_index',
+                                            'live_index', 'fk_not_valid',
+                                            'complete')
+  online_attempts                 bigint not null default 0, check >= 0
+  online_last_error               varchar(64) null
+  online_started_at               timestamptz null
+  online_completed_at             timestamptz null
   ready_index_valid               boolean not null default false
   live_index_valid                boolean not null default false
+  ready_index_ddl_sha256          bytea(32) null
+  live_index_ddl_sha256           bytea(32) null
   fk_disposition                  varchar(16) not null default 'absent'
                                   check in ('absent', 'not_valid', 'validated')
   missing_partition_count         bigint null check is null or >= 0
   verified_default_fingerprint    bytea(32) null
   verified_at                     timestamptz null
   updated_at                      timestamptz not null default CURRENT_TIMESTAMP
+
+`verified_at` is the database time of the latest successful promotion,
+successful unchanged verification, or drift demotion proof. An unchanged
+verification refreshes it and `updated_at` without incrementing the readiness
+epoch or rewriting gate state.
 
 docket_claim_admission_gate
   id                              smallint primary key default 1, check id = 1
@@ -380,6 +398,72 @@ permits a positive count in `complete` so DCKT-72 can persist later drift
 evidence after demoting readiness. That handoff may update only the missing
 evidence (and its readiness-owned state), not DCKT-67's phase, target, cursor,
 work counters, or completion time.
+
+### DCKT-72 online/readiness delivery freeze
+
+DCKT-72 extends the still-unreleased generation-2 ledger in place. Fresh and
+v1-to-v2 installs receive these fields from V02. Databases created from an
+intermediate unmerged DCKT-64..67 stack commit are developer artifacts, not a
+supported migration source: recreate them or apply the reviewed branch patch
+manually before running the online artifact. The online runner deliberately
+does not improvise transactional schema repair. Released generation-2 schemas
+do not exist at this point; after release, an in-place V02 rewrite is forbidden
+and would require a new schema generation.
+
+`online_phase` is the last committed checkpoint: `not_started`, ready index,
+live index, installed `NOT VALID` FK, then `complete` after validation. Attempts
+increment before each autocommit phase. Errors are closed codes, never server
+text. `complete` requires both exact index fingerprints/validity, a validated
+FK, and completion database time. Drift demotion rewrites the online tuple to
+the highest constraint-consistent observed checkpoint and clears completion
+time without changing any DCKT-67 backfill target/cursor/counter/completion
+field.
+
+The generated online host migration sets `@disable_ddl_transaction true`,
+passes an explicit prefix, and refuses to run unless the Repo uses Ecto's
+`migration_lock: :pg_advisory_lock`. That migration lock spans DDL through the
+host `schema_migrations` record; a separate prefix session advisory lock
+excludes online helpers for the same prefix. Checked cleanup disables Docket's
+server deadline, proves advisory unlock, and restores captured session timeout
+values after configuration, lock-acquisition, cancellation, or DDL failure. A
+cleanup-query or unlock mismatch raises instead of reporting migration success;
+a disconnected PostgreSQL session releases its session lock. PostgreSQL owns
+the bounded statement deadline and the client query timeout is longer than it.
+
+The two canonical index fingerprints hash a versioned, prefix-neutral DDL
+encoding (object role, exact key/order/opclass/collation/include shape, and
+predicate), not rendered prefix-qualified SQL. The benchmark imports the same
+definitions and records those hashes; this proves DDL/predicate identity only,
+not DCKT-68 runtime-query parity. Catalog proof binds each index to the expected
+prefix-local `docket_runs` OID and verifies live/ready/valid state, btree,
+nonunique/nonprimary/nonexclusion immediate semantics, absence of constraint
+ownership or dependency, exact keys with no INCLUDE columns, default order/
+opclasses/collations, and the exact PostgreSQL predicate tree. A valid same-name
+mismatch is never replaced automatically. An invalid interrupted same-name index is
+dropped/rebuilt concurrently only while the gate is not-ready. This includes a
+post-activation TenantFair selection that is fail-closed after drift: repair
+does not change mode, and only a later successful verification reopens it.
+
+The FK proof includes the same-name object kind, both relation OIDs, exact
+columns, `MATCH SIMPLE`, nondeferrable/immediate enforcement, `RESTRICT` update
+and delete actions, and validation state. Installation is allowed only after a
+current dual-write assertion, DCKT-67 complete/zero evidence, and a fresh
+zero-missing recount. `NOT VALID` skips the historical table scan but enforces
+new writes immediately; therefore an old non-dual-writing writer deployed
+after installation can fail run inserts and violates the rollout contract.
+Validation is a separate retryable checkpoint.
+
+`Readiness.verify/2` accepts exactly `expected_readiness_epoch`, the two
+32-byte canonical index fingerprints, and bounded `source`, `event_id`, and
+`actor`. The expected epoch is a nonnegative signed-64-bit value below its
+maximum, leaving room for a promotion or demotion increment. Verification
+locks gate -> rollout -> initialized default, rechecks every expected table and
+catalog predicate plus the current zero-missing count, and is the only path to
+promotion/demotion. A caller-supplied wrong approved hash deliberately
+fail-closes (and demotes a ready prefix). A changed initialized default demotes
+on the next verification; a fresh event at the new epoch can then verify and
+record the new fingerprint to re-promote. Readiness receipts store the exact
+redacted sorted demotion reasons so replay remains exact after audit pruning.
 
 A fresh install and a v1 upgrade both contain exactly three singleton facts:
 the uninitialized policy row `(version 0, all policy fields null)`, the rollout

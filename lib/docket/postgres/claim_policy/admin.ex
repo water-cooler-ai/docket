@@ -1203,7 +1203,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  rollout.backfill_batches, rollout.backfill_rows, rollout.backfill_retries,
                  rollout.backfill_completed_at,
                  rollout.backfill_last_error, rollout.updated_at,
+                 rollout.online_phase, rollout.online_attempts, rollout.online_last_error,
+                 rollout.online_started_at, rollout.online_completed_at,
                  rollout.ready_index_valid, rollout.live_index_valid, rollout.fk_disposition,
+                 encode(rollout.ready_index_ddl_sha256, 'hex'),
+                 encode(rollout.live_index_ddl_sha256, 'hex'),
                  rollout.missing_partition_count,
                  encode(rollout.verified_default_fingerprint, 'hex'), rollout.verified_at,
                  gate.readiness, gate.readiness_epoch, gate.admission_mode, gate.mode_epoch,
@@ -1244,9 +1248,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             completed_at,
             backfill_last_error,
             rollout_updated_at,
+            online_phase,
+            online_attempts,
+            online_last_error,
+            online_started_at,
+            online_completed_at,
             ready_index,
             live_index,
             fk,
+            ready_index_ddl_sha256,
+            live_index_ddl_sha256,
             missing_count,
             verified_fingerprint,
             verified_at,
@@ -1292,8 +1303,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              backfill_completed_at: completed_at,
              backfill_last_error: backfill_last_error,
              rollout_updated_at: rollout_updated_at,
+             online_phase: decode_online_phase(online_phase),
+             online_attempts: online_attempts,
+             online_last_error: online_last_error,
+             online_started_at: online_started_at,
+             online_completed_at: online_completed_at,
              ready_index_valid: ready_index,
              live_index_valid: live_index,
+             ready_index_ddl_sha256: ready_index_ddl_sha256,
+             live_index_ddl_sha256: live_index_ddl_sha256,
              fk_disposition: decode_fk_disposition(fk),
              missing_partition_count: missing_count,
              verified_default_fingerprint: verified_fingerprint,
@@ -1301,7 +1319,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              default: default,
              default_version: default_version,
              default_fingerprint:
-               if(default, do: Base.encode16(request_fingerprint(default), case: :lower)),
+               if(default,
+                 do: Base.encode16(Codec.default_fingerprint(default), case: :lower)
+               ),
              readiness: decode_readiness(readiness),
              readiness_epoch: readiness_epoch,
              mode: decode_mode(mode),
@@ -1976,6 +1996,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp decode_backfill_phase("running"), do: :running
     defp decode_backfill_phase("reconciling"), do: :reconciling
     defp decode_backfill_phase("complete"), do: :complete
+
+    defp decode_online_phase("not_started"), do: :not_started
+    defp decode_online_phase("ready_index"), do: :ready_index
+    defp decode_online_phase("live_index"), do: :live_index
+    defp decode_online_phase("fk_not_valid"), do: :fk_not_valid
+    defp decode_online_phase("complete"), do: :complete
 
     defp decode_fk_disposition("absent"), do: :absent
     defp decode_fk_disposition("not_valid"), do: :not_valid

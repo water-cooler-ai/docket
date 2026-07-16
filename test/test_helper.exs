@@ -36,6 +36,7 @@ generated_database_repos =
       Application.put_env(:docket, repo,
         url: url,
         pool_size: pool_size,
+        migration_lock: :pg_advisory_lock,
         log: false
       )
 

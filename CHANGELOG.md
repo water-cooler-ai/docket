@@ -16,6 +16,15 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- Resumable PostgreSQL v2 online-readiness DDL and verification: generated
+  nontransactional host migrations build the two exact tenant-leading indexes
+  concurrently, install and validate the partition foreign key in separate
+  restartable phases, and persist prefix-local evidence. Catalog proof rejects
+  foreign, constraint-owned, or shape-mismatched objects; interrupted exact
+  indexes can be repaired only while fail-closed. Replayable readiness checks
+  promote or demote the gate from live schema/default/backfill evidence without
+  activating TenantFair admission, which remains owned by the later activation
+  rollout.
 - `Docket.Postgres.ClaimPolicy.Readiness.attest_dual_write/2` and
   `Docket.Postgres.ClaimPolicy.Backfill.advance/2` for the prefix-local v2
   partition rollout. The audited, replayable fleet assertion gates a finite,
