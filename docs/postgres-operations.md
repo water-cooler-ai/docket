@@ -437,8 +437,9 @@ results; a summary without its raw samples and plans is incomplete evidence.
   connection. Ecto query `queue_time` may be absent for queries executed on an
   already checked-out connection and is not substituted for this measurement.
 - Query time is caller-observed bounded claim-path time on an owned connection;
-  cursor and reconciliation candidates may execute multiple recorded page
-  statements inside one transaction. Commit throughput counts completed claim
+  the cursor candidate may execute multiple recorded page statements inside one
+  transaction, while the recursive candidate spends its full work budget in one
+  loose scan. Commit throughput counts completed claim
   commits over the measured wall-clock window; rollback warmup and plan capture
   are excluded. Sustainable claim/requeue-cycle throughput, when present, is
   labeled separately.
@@ -455,8 +456,9 @@ results; a summary without its raw samples and plans is incomplete evidence.
 - `SKIP LOCKED` normally skips rather than waits. Skipped partitions and the
   benchmark's explicit blocker/control audit are the contention evidence. A
   separate audit holds the deep hot tenant's partition lock and requires full
-  progress from other tenants. Checkout or whole-query duration is not a
-  row-lock wait measurement.
+  progress from other tenants; the recursive candidate also has to progress
+  beyond a fully locked first scan slice. Checkout or whole-query duration is
+  not a row-lock wait measurement.
 - Fewer outcomes than demand is a partial batch, not automatically an
   avoidable under-claim. The under-claim flag requires the bounded control
   audit to prove that eligible, lockable work remained. A candidate that fails

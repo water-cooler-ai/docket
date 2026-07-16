@@ -575,7 +575,7 @@ defmodule Docket.Bench.TenantFairClaim.SQL do
       JOIN bounded_keys keys ON keys.scope_key = p.scope_key
       WHERE #{eligible_partition(runs, "p")}
       ORDER BY p.scope_key
-      LIMIT $3
+      LIMIT LEAST(($3::bigint * $6::bigint), $7::bigint)
       FOR NO KEY UPDATE OF p SKIP LOCKED
     ),
     candidate_heads AS MATERIALIZED (
@@ -1202,6 +1202,7 @@ defmodule Docket.Bench.TenantFairClaim.Runner do
     seed_manifest = Seed.reset!(prefix, config)
     envelope = contention_envelope!(candidate, prefix, config)
     hot_contention = hot_contention_audit!(candidate, prefix, config)
+    reconciliation_slice = reconciliation_slice_audit!(candidate, prefix, config)
     cap_safety = cap_safety_audit!(candidate, prefix, config)
     _ = Seed.reset!(prefix, config)
 
@@ -1212,6 +1213,22 @@ defmodule Docket.Bench.TenantFairClaim.Runner do
     _ = Seed.reset!(prefix, config)
     {samples, elapsed_us} = measured_samples!(candidate, prefix, config)
     policy_audit = policy_audit!(prefix)
+    measurements = Artifacts.summarize(samples, config.demand, elapsed_us)
+
+    eligibility_checks = %{
+      candidate_role: SQL.role(candidate) != "failure_baseline",
+      locked_page_fill: envelope.outcomes == envelope.requested,
+      hot_partition_progress:
+        hot_contention.audited and hot_contention.progressed_around_locked_hot_partition,
+      reconciliation_slice_progress:
+        candidate != :recursive_loose_scan or not reconciliation_slice_required?(config) or
+          (reconciliation_slice.audited and
+             reconciliation_slice.progressed_beyond_locked_slice),
+      concurrent_cap_safety:
+        config.capped_tenants == 0 or (cap_safety.audited and cap_safety.respected),
+      measured_underclaim: measurements.avoidable_underclaim_transactions == 0,
+      post_measurement_cap: policy_audit.respected
+    }
 
     %{
       candidate: candidate,
@@ -1220,13 +1237,134 @@ defmodule Docket.Bench.TenantFairClaim.Runner do
       seed: seed_manifest,
       contention: envelope,
       hot_contention: hot_contention,
+      reconciliation_slice: reconciliation_slice,
       cap_safety: cap_safety,
       post_measurement_policy: policy_audit,
       plan_path: plan_path,
       plan: Artifacts.plan_metrics(plan, plan_evidence),
-      measurements: Artifacts.summarize(samples, config.demand, elapsed_us),
+      measurements: measurements,
+      performance_eligibility: %{
+        eligible: Enum.all?(Map.values(eligibility_checks)),
+        checks: eligibility_checks
+      },
+      performance_eligible: Enum.all?(Map.values(eligibility_checks)),
       samples: samples
     }
+  end
+
+  defp reconciliation_slice_required?(config) do
+    config.tenants - config.capped_tenants - config.page_size * config.oversampling >=
+      config.demand
+  end
+
+  defp reconciliation_slice_audit!(candidate, _prefix, _config)
+       when candidate != :recursive_loose_scan do
+    %{audited: false, reason: "recursive loose-scan reconciliation only"}
+  end
+
+  defp reconciliation_slice_audit!(
+         :recursive_loose_scan,
+         _prefix,
+         %{
+           tenants: tenants,
+           capped_tenants: capped_tenants,
+           demand: demand,
+           page_size: page_size,
+           oversampling: oversampling
+         }
+       )
+       when tenants - capped_tenants - page_size * oversampling < demand do
+    %{
+      audited: false,
+      reason: "profile has too few non-capped partitions beyond one full reconciliation slice"
+    }
+  end
+
+  defp reconciliation_slice_audit!(:recursive_loose_scan, prefix, config) do
+    _ = Seed.reset!(prefix, config)
+    partitions = SQL.table(prefix, "docket_bench_claim_partitions")
+    parent = self()
+    barrier = make_ref()
+    slice_size = config.page_size * config.oversampling
+
+    blocker =
+      Task.async(fn ->
+        Repo.checkout(fn ->
+          Repo.query!("BEGIN")
+          [[backend_pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+
+          locked =
+            Repo.query!(
+              """
+              SELECT scope_key
+              FROM #{partitions}
+              WHERE scope_key LIKE 'tenant-%'
+              ORDER BY scope_key
+              LIMIT $1
+              FOR NO KEY UPDATE
+              """,
+              [slice_size]
+            ).rows
+
+          send(parent, {barrier, :slice_locked, backend_pid, locked})
+
+          receive do
+            {^barrier, :release_slice} -> Repo.query!("ROLLBACK")
+          after
+            config.statement_timeout_ms ->
+              Repo.query!("ROLLBACK")
+              raise "reconciliation-slice blocker timed out"
+          end
+        end)
+      end)
+
+    {blocker_pid, locked} =
+      receive do
+        {^barrier, :slice_locked, backend_pid, rows} -> {backend_pid, rows}
+      after
+        config.statement_timeout_ms -> raise "reconciliation slice was not locked"
+      end
+
+    locked_scopes = Enum.map(locked, &hd/1)
+    last_locked_scope = List.last(locked_scopes)
+
+    try do
+      {:error, subject} =
+        Repo.transaction(fn ->
+          [[subject_pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+          result = execute_claim!(:recursive_loose_scan, prefix, config, "")
+          outcomes = Enum.filter(result.rows, &(List.last(&1) in ["leased", "poisoned"]))
+
+          Repo.rollback(%{
+            backend_pid: subject_pid,
+            outcomes: length(outcomes),
+            outcome_scopes: Enum.map(outcomes, &Enum.at(&1, 2)),
+            pages: result.pages,
+            sql_statements: result.sql_statements,
+            work_budget_exhausted: result.work_budget_exhausted
+          })
+        end)
+
+      %{
+        audited: true,
+        blocker_backend_pid: blocker_pid,
+        subject_backend_pid: subject.backend_pid,
+        locked_partition_count: length(locked_scopes),
+        last_locked_scope: last_locked_scope,
+        requested: config.demand,
+        outcomes: subject.outcomes,
+        outcome_scopes: subject.outcome_scopes,
+        pages: subject.pages,
+        sql_statements: subject.sql_statements,
+        work_budget_exhausted: subject.work_budget_exhausted,
+        progressed_beyond_locked_slice:
+          subject.outcomes == config.demand and
+            Enum.all?(subject.outcome_scopes, &(&1 > last_locked_scope))
+      }
+    after
+      send(blocker.pid, {barrier, :release_slice})
+      _ = Task.await(blocker, config.statement_timeout_ms)
+    end
   end
 
   defp hot_contention_audit!(candidate, _prefix, _config)
@@ -1655,13 +1793,6 @@ defmodule Docket.Bench.TenantFairClaim.Runner do
     execute_hint_pages!(prefix, config, cursor, max_pages, 0, 0, [])
   end
 
-  defp execute_claim!(:recursive_loose_scan, prefix, config, _cursor) do
-    page_capacity = config.page_size * config.oversampling
-    max_pages = max(ceil(config.reconciliation_budget / page_capacity), 1)
-
-    execute_recursive_pages!(prefix, config, page_capacity, max_pages, 0, [])
-  end
-
   defp execute_claim!(candidate, prefix, config, _cursor) do
     result =
       Repo.query!(SQL.statement(candidate, prefix), SQL.params(candidate, config),
@@ -1675,47 +1806,6 @@ defmodule Docket.Bench.TenantFairClaim.Runner do
       sql_statements: 1,
       work_budget_exhausted: false
     }
-  end
-
-  defp execute_recursive_pages!(prefix, config, page_capacity, max_pages, pages, rows) do
-    remaining = config.demand - outcome_count(rows)
-
-    cond do
-      remaining <= 0 ->
-        %{
-          rows: rows,
-          cursor: "",
-          pages: pages,
-          sql_statements: pages,
-          work_budget_exhausted: false
-        }
-
-      pages >= max_pages ->
-        %{
-          rows: rows,
-          cursor: "",
-          pages: pages,
-          sql_statements: pages,
-          work_budget_exhausted: true
-        }
-
-      true ->
-        result =
-          Repo.query!(
-            SQL.statement(:recursive_loose_scan, prefix),
-            SQL.params(:recursive_loose_scan, config, "", remaining, page_capacity),
-            timeout: config.statement_timeout_ms
-          )
-
-        execute_recursive_pages!(
-          prefix,
-          config,
-          page_capacity,
-          max_pages,
-          pages + 1,
-          rows ++ result.rows
-        )
-    end
   end
 
   defp execute_hint_pages!(prefix, config, cursor, max_pages, pages, statements, rows) do
@@ -2021,7 +2111,9 @@ defmodule Docket.Bench.TenantFairClaim do
           partial_batch:
             "outcomes below demand; only avoidable when the cap-aware savepoint control finds lockable work",
           plan_denominator:
-            "leased outcomes from a rolled-back execution on the identical fixture; poison and metadata rows are excluded"
+            "leased outcomes from a rolled-back execution on the identical fixture; poison and metadata rows are excluded",
+          performance_eligibility:
+            "false for baselines and whenever any deterministic contention/cap audit, measured under-claim audit, or post-measurement cap audit fails"
         },
         provisional_ddl_sha256: SQL.ddl_hash("docket_bench_schema"),
         candidate_order: candidate_order,
@@ -2097,19 +2189,34 @@ defmodule Docket.Bench.TenantFairClaim do
       measurements = by_name[candidate].measurements
       cap_safety = by_name[candidate].cap_safety
       hot_contention = by_name[candidate].hot_contention
+      reconciliation_slice = by_name[candidate].reconciliation_slice
       post_measurement_policy = by_name[candidate].post_measurement_policy
+
+      performance_eligibility = by_name[candidate].performance_eligibility
+
+      unless by_name[candidate].performance_eligible == performance_eligibility.eligible and
+               performance_eligibility.eligible ==
+                 Enum.all?(Map.values(performance_eligibility.checks)) do
+        raise "#{candidate} performance-eligibility classification is inconsistent"
+      end
 
       unless envelope.outcomes == envelope.requested do
         raise "#{candidate} failed to fill demand past the locked first page: #{inspect(envelope)}"
       end
 
-      unless measurements.avoidable_underclaim_transactions == 0 do
-        raise "#{candidate} left audited lockable work after a measured partial transaction"
-      end
-
       unless hot_contention.audited and
                hot_contention.progressed_around_locked_hot_partition do
         raise "#{candidate} failed to progress around the locked hot tenant"
+      end
+
+      slice_audit_required =
+        summary.config.tenants - summary.config.capped_tenants -
+          summary.config.page_size * summary.config.oversampling >= summary.config.demand
+
+      if candidate == :recursive_loose_scan and slice_audit_required and
+           not (reconciliation_slice.audited and
+                  reconciliation_slice.progressed_beyond_locked_slice) do
+        raise "recursive_loose_scan failed to progress beyond a fully locked first slice"
       end
 
       unless (seed.ready_rows == 0 or measurements.ready_outcomes > 0) and
