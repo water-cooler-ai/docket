@@ -18,6 +18,12 @@ defmodule Docket.Bench.Scorecard.Probe do
     end
   end
 
+  def shutdown(pid) do
+    Process.unlink(pid)
+    Process.exit(pid, :kill)
+    :ok
+  end
+
   def sample(ctx, started) do
     runs = Db.table(ctx.prefix, "docket_runs")
 

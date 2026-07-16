@@ -51,6 +51,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.Surge do
         Process.sleep((@recovery_sustain_samples + 1) * @probe_interval_ms)
         Probe.stop(probe)
       after
+        Probe.shutdown(probe)
         Runtime.stop(runtime)
       end
 
