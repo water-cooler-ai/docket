@@ -1,17 +1,24 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Mix.Tasks.Docket.Gen.Migration do
-    @shortdoc "Generates the migration that installs Docket's Postgres tables"
+    @shortdoc "Generates a fresh install or v1-to-v2 Docket migration"
 
     @moduledoc """
-    Generates the host-application migration that installs (and can roll
-    back) Docket's Postgres tables via `Docket.Postgres.Migration`.
+    Generates a host-application migration that either installs Docket's
+    complete Postgres schema or upgrades an existing version-1 installation.
 
         $ mix docket.gen.migration
         $ mix docket.gen.migration -r MyApp.Repo
+        $ mix docket.gen.migration --upgrade-from-v1
 
-    The generated file pins the current installation schema. Commit it with
-    the host application and never edit it after it has been applied. Future
-    schema versions must be installed through a separate upgrade migration.
+    The default fresh-install artifact migrates from no Docket tables through
+    the current schema. `--upgrade-from-v1` instead emits the explicit v1-to-v2
+    step. Both generated `down/0` callbacks use the routine migration surface,
+    which deliberately refuses once v2 is installed. Destructive v2 teardown
+    is a separate operator action through
+    `Docket.Postgres.Migration.destructive_down/1`; it requires stopped-fleet,
+    audit-export, receipt-loss, and partition-loss acknowledgements plus live
+    database guards. Commit the chosen artifact with the host application and
+    never edit it after it has been applied.
 
     ## Options
 
@@ -19,6 +26,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         the repos configured under `:ecto_repos`.
       * `--migrations-path` — the directory to write the migration into.
         Defaults to the repo's `priv/.../migrations` directory.
+      * `--upgrade-from-v1` — generate the pinned v1-to-v2 upgrade artifact
+        instead of a fresh installation.
     """
 
     use Mix.Task
@@ -27,7 +36,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     import Mix.EctoSQL, only: [source_repo_priv: 1]
     import Mix.Generator, only: [create_directory: 1, create_file: 2]
 
-    @switches [migrations_path: :string, repo: [:string, :keep]]
+    @switches [migrations_path: :string, repo: [:string, :keep], upgrade_from_v1: :boolean]
     @aliases [r: :repo]
 
     @impl Mix.Task
@@ -40,10 +49,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         path =
           opts[:migrations_path] || Path.join(source_repo_priv(repo), "migrations")
 
-        file = Path.join(path, "#{timestamp()}_add_docket_tables.exs")
-        module = Module.concat([repo, Migrations, AddDocketTables])
-        version = Docket.Postgres.Migration.current_version()
-        initial_version = Docket.Postgres.Migration.initial_version()
+        {basename, migration_name, version, down_version} = generation(opts)
+        file = Path.join(path, "#{timestamp()}_#{basename}.exs")
+        module = Module.concat([repo, Migrations, migration_name])
 
         create_directory(path)
 
@@ -53,11 +61,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
           def up, do: Docket.Postgres.Migration.up(version: #{version})
 
-          def down, do: Docket.Postgres.Migration.down(version: #{initial_version})
+          def down, do: Docket.Postgres.Migration.down(version: #{down_version})
         end
         """)
 
         file
+      end
+    end
+
+    defp generation(opts) do
+      if Keyword.get(opts, :upgrade_from_v1, false) do
+        {"upgrade_docket_to_v2", UpgradeDocketToV2, 2, 2}
+      else
+        {"add_docket_tables", AddDocketTables, Docket.Postgres.Migration.current_version(),
+         Docket.Postgres.Migration.initial_version()}
       end
     end
 

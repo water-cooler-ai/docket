@@ -85,6 +85,47 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @doc false
+    @spec physical_prefix!(module(), String.t() | nil) :: String.t()
+    def physical_prefix!(_repo, prefix) when is_binary(prefix), do: prefix
+
+    def physical_prefix!(repo, nil) when is_atom(repo) do
+      query = """
+      SELECT namespace.nspname
+      FROM pg_class AS relation
+      JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+      WHERE relation.oid = to_regclass('docket_runs')
+      """
+
+      case repo.query(query, [], log: false) do
+        {:ok, %{rows: [[prefix]]}} when is_binary(prefix) ->
+          unless valid_prefix?(prefix) do
+            raise ArgumentError,
+                  "Postgres docket_runs schema must be a lowercase identifier up to 63 bytes, got: " <>
+                    inspect(prefix)
+          end
+
+          prefix
+
+        {:ok, %{rows: []}} ->
+          raise ArgumentError,
+                "Postgres search_path does not resolve an existing docket_runs relation"
+
+        {:ok, %{rows: rows}} ->
+          raise ArgumentError,
+                "Postgres docket_runs namespace resolution must return exactly one schema, got: " <>
+                  inspect(rows)
+
+        {:error, reason} ->
+          raise ArgumentError,
+                "Postgres docket_runs schema could not be resolved: #{inspect(reason)}"
+
+        other ->
+          raise ArgumentError,
+                "Postgres docket_runs schema query returned an invalid result: #{inspect(other)}"
+      end
+    end
+
+    @doc false
     @spec qualified_table(String.t() | nil, String.t()) :: String.t()
     def qualified_table(nil, table), do: quote_identifier(table)
 

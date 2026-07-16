@@ -574,7 +574,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       assert_receive {:alternate_claim_policy, :init, :transaction,
-                      %{prefix: nil, identifiers: %{runs: ~s("docket_runs")}}}
+                      %{prefix: "public", identifiers: %{runs: ~s("public"."docket_runs")}}}
 
       root = Map.put(root, :claim_policy, claim_policy)
 

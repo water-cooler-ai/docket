@@ -18,7 +18,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         defmodule MyApp.Repo.Migrations.AddDocketTables do
           use Ecto.Migration
 
-          def up, do: Docket.Postgres.Migration.up(version: 1)
+          def up, do: Docket.Postgres.Migration.up(version: 2)
           def down, do: Docket.Postgres.Migration.down(version: 1)
         end
 
@@ -39,11 +39,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     ## Tables
 
     Version 1 installs `docket_graph_versions`, `docket_runs`, and
-    `docket_events`, including tenant-scoped graph identity.
+    `docket_events`, including tenant-scoped graph identity. Version 2 adds
+    the transactional exact-cap policy, partition, audit, receipt, rollout,
+    readiness, activation-gate, and capability schema. It deliberately does
+    not backfill runs or make the new admission engine ready or active.
+
+    Once v2 is installed, ordinary `down/1` deliberately refuses to erase its
+    durable state. Operators must separately invoke `destructive_down/1` with
+    all documented acknowledgements after satisfying its database guards.
 
     The migrated version is recorded as a `COMMENT` on the `docket_runs`
     table, so `up/1` and `down/1` are idempotent and only apply the steps
-    the database is actually missing.
+    the database is actually missing. Version steps use collision-failing DDL:
+    a malformed partially created schema aborts transactionally instead of
+    being accepted and marked current.
     """
 
     use Ecto.Migration
@@ -51,8 +60,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Storage
 
     @initial_version 1
-    @current_version 1
+    @current_version 2
     @default_prefix "public"
+    @destructive_acknowledgements [
+      :stopped_fleet,
+      :audit_exported,
+      :acknowledge_receipt_loss,
+      :acknowledge_partition_loss
+    ]
 
     @doc """
     Migrates the Docket tables up to `:version` (defaults to the newest).
@@ -83,7 +98,55 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     """
     @spec down(keyword()) :: :ok
     def down(opts \\ []) when is_list(opts) do
+      if Keyword.has_key?(opts, :destructive) do
+        raise ArgumentError,
+              ":destructive is an internal migration marker; use destructive_down/1 " <>
+                "with every required acknowledgement"
+      end
+
       opts = with_defaults(opts, @initial_version)
+      initial = max(migrated_version(opts), @initial_version)
+
+      if initial >= opts.version do
+        change(initial..opts.version//-1, :down, opts)
+      end
+
+      :ok
+    end
+
+    @doc """
+    Explicitly destroys v2 claim-policy state after operator acknowledgements.
+
+    This is intentionally separate from `down/1`. The caller must affirm that
+    the fleet is stopped, retained audit has been exported, and receipt and
+    partition data loss are accepted:
+
+        Docket.Postgres.Migration.destructive_down(
+          stopped_fleet: true,
+          audit_exported: true,
+          acknowledge_receipt_loss: true,
+          acknowledge_partition_loss: true
+        )
+
+    PostgreSQL locks and guards still require Legacy mode, not-ready state,
+    zero retained receipts, no run referencing a claim partition, and a
+    completed export watermark covering every retained audit event.
+    Must be called from within a host `Ecto.Migration`.
+    """
+    @spec destructive_down(keyword()) :: :ok
+    def destructive_down(opts) when is_list(opts) do
+      missing =
+        Enum.reject(@destructive_acknowledgements, fn acknowledgement ->
+          Keyword.get(opts, acknowledgement) == true
+        end)
+
+      if missing != [] do
+        raise ArgumentError,
+              "destructive Docket v2 teardown requires explicit true acknowledgements: " <>
+                Enum.map_join(missing, ", ", &inspect/1)
+      end
+
+      opts = opts |> Keyword.put(:destructive, true) |> with_defaults(@initial_version)
       initial = max(migrated_version(opts), @initial_version)
 
       if initial >= opts.version do

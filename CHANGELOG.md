@@ -16,6 +16,11 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- PostgreSQL schema version 2: prefix-local exact-cap policy, partition,
+  durable receipt/audit, rollout, admission-gate, assertion, and capability
+  tables with an explicitly uninitialized default. ClaimPolicy implementations
+  now receive the additive quoted identifier context while Legacy behavior
+  remains selected and unchanged.
 - `Docket.BackendTests`, a source-owned shared ExUnit suite under
   `test/support`. One explicit backend matrix generates identical black-box
   cases for the memory and PostgreSQL bundles; external backend projects can

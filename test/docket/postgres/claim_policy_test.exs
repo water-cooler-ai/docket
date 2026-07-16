@@ -106,8 +106,41 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :ok
     end
 
+    test "expands the implementation-neutral context with every quoted v2 identifier" do
+      expected_tables = %{
+        runs: "docket_runs",
+        claim_policy: "docket_claim_policy",
+        claim_partitions: "docket_claim_partitions",
+        claim_policy_receipts: "docket_claim_policy_receipts",
+        claim_policy_events: "docket_claim_policy_events",
+        claim_policy_holds: "docket_claim_policy_holds",
+        claim_audit_exports: "docket_claim_audit_exports",
+        claim_assertions: "docket_claim_assertions",
+        claim_rollout: "docket_claim_rollout",
+        claim_admission_gate: "docket_claim_admission_gate",
+        claim_capabilities: "docket_claim_capabilities"
+      }
+
+      for {configured_prefix, expected_prefix} <- [
+            {"public", "public"},
+            {"claims", "claims"},
+            {"select", "select"}
+          ] do
+        assert %{prefix: ^expected_prefix, identifiers: identifiers} =
+                 ClaimPolicy.plan_context!(%{repo: __MODULE__.Repo, prefix: configured_prefix})
+
+        assert identifiers ==
+                 Map.new(expected_tables, fn {key, table} ->
+                   identifier =
+                     ~s("#{expected_prefix}"."#{table}")
+
+                   {key, identifier}
+                 end)
+      end
+    end
+
     test "rejects incomplete implementations and invalid implementation configuration" do
-      context = %{repo: __MODULE__.Repo, prefix: nil}
+      context = %{repo: __MODULE__.Repo, prefix: "public"}
 
       assert_raise ArgumentError, ~r/missing init\/2, build_plan\/3, decode\/3, observe\/5/, fn ->
         ClaimPolicy.new([implementation: MissingCallbacks], context)
@@ -200,7 +233,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           assert_raise ArgumentError, fn ->
             ClaimPolicy.new(
               [implementation: Docket.Test.TenantFairConfigClaimPolicy] ++ options,
-              %{repo: __MODULE__.Repo, prefix: nil}
+              %{repo: __MODULE__.Repo, prefix: "public"}
             )
           end
 
@@ -219,7 +252,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             ClaimPolicy.new(
               [implementation: Docket.Test.TenantFairConfigClaimPolicy] ++
                 Keyword.delete(@tenant_fair_options, missing),
-              %{repo: __MODULE__.Repo, prefix: nil}
+              %{repo: __MODULE__.Repo, prefix: "public"}
             )
           end
 
@@ -232,7 +265,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           ClaimPolicy.new(
             [implementation: Docket.Test.TenantFairConfigClaimPolicy] ++
               @tenant_fair_options ++ [default_weight: 2],
-            %{repo: __MODULE__.Repo, prefix: nil}
+            %{repo: __MODULE__.Repo, prefix: "public"}
           )
         end
 
@@ -295,7 +328,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "normalizes now before an independent implementation builds its plan" do
-      context = %{repo: __MODULE__.Repo, prefix: nil}
+      context = %{repo: __MODULE__.Repo, prefix: "public"}
 
       claim_policy =
         ClaimPolicy.new(
@@ -328,7 +361,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "rejects capability-bearing or multi-statement plans before execution" do
-      context = %{repo: __MODULE__.Repo, prefix: nil}
+      context = %{repo: __MODULE__.Repo, prefix: "public"}
       policy = ClaimPolicy.new([implementation: InvalidPlanImplementation], context)
 
       assert_raise ArgumentError, ~r/plan requires a non-empty SQL statement/, fn ->
@@ -378,7 +411,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "the selected implementation remains bound to plan decoding and generic telemetry" do
-      context = %{repo: __MODULE__.Repo, prefix: nil}
+      context = %{repo: __MODULE__.Repo, prefix: "public"}
 
       claim_policy =
         ClaimPolicy.new(
@@ -420,7 +453,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "decoder failures stay in the error contract and observation failures cannot hide results" do
-      context = %{repo: __MODULE__.Repo, prefix: nil}
+      context = %{repo: __MODULE__.Repo, prefix: "public"}
 
       decode_policy =
         ClaimPolicy.new(
@@ -848,7 +881,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp observed_policy(batch, observation, demand, options \\ []) do
-      context = %{repo: __MODULE__.Repo, prefix: nil}
+      context = %{repo: __MODULE__.Repo, prefix: "public"}
 
       config =
         [
@@ -879,7 +912,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp build_plan_from(implementation) do
-      context = %{repo: __MODULE__.Repo, prefix: nil}
+      context = %{repo: __MODULE__.Repo, prefix: "public"}
       policy = ClaimPolicy.new([implementation: implementation], context)
       ClaimPolicy.build_plan(policy, context, effective_policy())
     end

@@ -402,7 +402,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp dispatcher_opts(agent, overrides) do
-      base_context = %{repo: __MODULE__.Repo, prefix: nil}
+      base_context = %{repo: __MODULE__.Repo, prefix: "public"}
 
       context =
         Map.merge(base_context, %{

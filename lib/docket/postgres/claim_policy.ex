@@ -46,24 +46,53 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           }
 
     @type init_context :: %{
-            required(:prefix) => String.t() | nil,
-            required(:identifiers) => %{required(:runs) => String.t()}
+            required(:prefix) => String.t(),
+            required(:identifiers) => identifiers()
           }
 
     @type plan_context :: %{
-            required(:prefix) => String.t() | nil,
-            required(:identifiers) => %{required(:runs) => String.t()}
+            required(:prefix) => String.t(),
+            required(:identifiers) => identifiers()
           }
+
+    @type identifiers :: %{
+            required(:runs) => String.t(),
+            required(:claim_policy) => String.t(),
+            required(:claim_partitions) => String.t(),
+            required(:claim_policy_receipts) => String.t(),
+            required(:claim_policy_events) => String.t(),
+            required(:claim_policy_holds) => String.t(),
+            required(:claim_audit_exports) => String.t(),
+            required(:claim_assertions) => String.t(),
+            required(:claim_rollout) => String.t(),
+            required(:claim_admission_gate) => String.t(),
+            required(:claim_capabilities) => String.t()
+          }
+
+    @identifier_tables %{
+      runs: "docket_runs",
+      claim_policy: "docket_claim_policy",
+      claim_partitions: "docket_claim_partitions",
+      claim_policy_receipts: "docket_claim_policy_receipts",
+      claim_policy_events: "docket_claim_policy_events",
+      claim_policy_holds: "docket_claim_policy_holds",
+      claim_audit_exports: "docket_claim_audit_exports",
+      claim_assertions: "docket_claim_assertions",
+      claim_rollout: "docket_claim_rollout",
+      claim_admission_gate: "docket_claim_admission_gate",
+      claim_capabilities: "docket_claim_capabilities"
+    }
 
     @type claim_batch :: %{required(:leases) => [map()], required(:poisoned) => [map()]}
     @type claim_result :: {:ok, claim_batch()} | {:error, term()}
 
     @opaque t :: %__MODULE__{
               implementation: module(),
-              implementation_state: term()
+              implementation_state: term(),
+              policy_context: plan_context()
             }
 
-    @enforce_keys [:implementation, :implementation_state]
+    @enforce_keys [:implementation, :implementation_state, :policy_context]
     defstruct @enforce_keys
 
     @callback init(keyword(), init_context()) :: {:ok, state :: term()} | {:error, term()}
@@ -96,8 +125,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       validate_implementation!(implementation)
 
+      policy_context = init_context!(context)
+
       implementation_state =
-        case implementation.init(implementation_opts, init_context!(context)) do
+        case implementation.init(implementation_opts, policy_context) do
           {:ok, state} ->
             state
 
@@ -114,7 +145,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       %__MODULE__{
         implementation: implementation,
-        implementation_state: implementation_state
+        implementation_state: implementation_state,
+        policy_context: policy_context
       }
     end
 
@@ -179,9 +211,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc false
     @spec build_plan(t(), Docket.Backend.ctx(), runtime_input()) :: Plan.t()
     def build_plan(%__MODULE__{} = claim_policy, context, effective_policy) do
+      _ = Storage.context!(context)
+
       plan =
         claim_policy.implementation.build_plan(
-          plan_context!(context),
+          claim_policy.policy_context,
           effective_policy,
           claim_policy.implementation_state
         )
@@ -259,19 +293,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc false
     @spec plan_context!(Docket.Backend.ctx()) :: plan_context()
     def plan_context!(context) do
-      {_repo, prefix} = Storage.context!(context)
-      policy_context(prefix)
+      {repo, prefix} = Storage.context!(context)
+      policy_context(Storage.physical_prefix!(repo, prefix))
     end
 
     defp init_context!(context) do
-      {_repo, prefix} = Storage.context!(context)
-      policy_context(prefix)
+      {repo, prefix} = Storage.context!(context)
+      policy_context(Storage.physical_prefix!(repo, prefix))
     end
 
     defp policy_context(prefix) do
       %{
         prefix: prefix,
-        identifiers: %{runs: Storage.qualified_table(prefix, "docket_runs")}
+        identifiers:
+          Map.new(@identifier_tables, fn {key, table} ->
+            {key, Storage.qualified_table(prefix, table)}
+          end)
       }
     end
 

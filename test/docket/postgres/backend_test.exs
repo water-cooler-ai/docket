@@ -212,6 +212,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       use Docket,
         backend: Docket.Postgres,
         repo: SandboxRepo,
+        prefix: "public",
         testing: :inline,
         notifier: :none
     end
@@ -481,7 +482,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       start_supervised!(AlternatePolicyManualHost)
 
       assert_receive {:alternate_claim_policy, :init, :manual_runtime,
-                      %{prefix: nil, identifiers: %{runs: ~s("docket_runs")}}}
+                      %{prefix: "public", identifiers: %{runs: ~s("public"."docket_runs")}}}
 
       assert {:ok, reference} = AlternatePolicyManualHost.save_graph(Graphs.minimal_linear())
 
@@ -535,7 +536,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       start_supervised!(TenantFairConfigManualHost)
 
       assert_receive {:tenant_fair_config_claim_policy, :init, ^expected,
-                      %{prefix: nil, identifiers: %{runs: ~s("docket_runs")}}}
+                      %{prefix: "public", identifiers: %{runs: ~s("public"."docket_runs")}}}
 
       assert {:ok, reference} = TenantFairConfigManualHost.save_graph(Graphs.minimal_linear())
 
@@ -572,7 +573,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       start_supervised!(TenantFairConfigSupervisedHost)
 
       assert_receive {:tenant_fair_config_claim_policy, :init, ^expected,
-                      %{prefix: nil, identifiers: %{runs: ~s("docket_runs")}}}
+                      %{prefix: "public", identifiers: %{runs: ~s("public"."docket_runs")}}}
 
       assert {:ok, reference} =
                TenantFairConfigSupervisedHost.save_graph(Graphs.minimal_linear())
@@ -941,7 +942,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       Docket.Postgres.init({opts, Docket.Postgres.context(opts)})
     end
 
-    test "storage remains exactly the current three-table schema" do
+    test "storage remains exactly the current versioned schema" do
       tables =
         TestRepo.query!(
           "SELECT table_name FROM information_schema.tables " <>
@@ -952,7 +953,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ).rows
         |> List.flatten()
 
-      assert tables == ["docket_events", "docket_graph_versions", "docket_runs"]
+      assert tables ==
+               ~w(
+                 docket_claim_admission_gate
+                 docket_claim_assertions
+                 docket_claim_audit_exports
+                 docket_claim_capabilities
+                 docket_claim_partitions
+                 docket_claim_policy
+                 docket_claim_policy_events
+                 docket_claim_policy_holds
+                 docket_claim_policy_receipts
+                 docket_claim_rollout
+                 docket_events
+                 docket_graph_versions
+                 docket_runs
+               )
 
       assert %{rows: [[comment]]} =
                TestRepo.query!(
@@ -961,7 +977,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  log: false
                )
 
-      assert comment == "1"
+      assert comment == "2"
     end
 
     defp await_replacement(name, old_pid, attempts \\ 100)

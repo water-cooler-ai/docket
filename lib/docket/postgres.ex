@@ -100,7 +100,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       repo = Keyword.fetch!(opts, :repo)
       validate_repo!(repo)
       context = %{repo: repo, prefix: Keyword.get(opts, :prefix)}
-      {^repo, prefix} = Storage.context!(context)
+      {^repo, configured_prefix} = Storage.context!(context)
+      prefix = Storage.physical_prefix!(repo, configured_prefix)
       name = Keyword.get(opts, :name)
 
       resolved = %{
