@@ -49,11 +49,15 @@ jobs:
       - run: mix test
 
   postgres:
-    name: live Postgres release leg
+    name: live Postgres ${{ matrix.postgres }} release leg
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["13", "17"]
     services:
       postgres:
-        image: postgres:17
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: runner
           POSTGRES_HOST_AUTH_METHOD: trust
@@ -80,10 +84,11 @@ jobs:
           path: |
             deps
             _build
-          key: mix-postgres-${{ hashFiles('mix.lock') }}
+          key: mix-postgres-${{ matrix.postgres }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            mix-postgres-
+            mix-postgres-${{ matrix.postgres }}-
 
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix test --include postgres
+      - run: DOCKET_BENCH_DATABASE_URL=postgres://runner@localhost/postgres mix run bench/postgres/tenant_fair_claim.exs -- --profile smoke --check
