@@ -54,6 +54,17 @@ calibration knob in the profile.
 | Fast/slow fairness | fast cohort alone vs fast cohort behind a slow cohort | 100 at slowdown ≤ `good`, linear to 0 at ≥ `bad` |
 | Surge resilience | steady arrivals at 40% of measured capacity plus a mid-window burst | `100 · min(1, ideal_recovery / measured_recovery)` |
 
+### Claim-policy dimension
+
+The claim-sensitive rows — claim efficiency, tenant fairness, and fast/slow
+fairness — run once per entry in the `claim_policies` registry
+(`bench/support/scorecard/config.ex`) and carry the policy name in the
+scenario column, e.g. `60% hot tenant @16 [legacy]`. Each entry's config is
+passed straight through as the runtime's `claim_policy` backend option. The
+registry currently holds only the default legacy implementation; when the
+TenantFair engine ships, adding one entry produces side-by-side scored rows
+for both policies, turning the fairness rows into a direct policy comparison.
+
 Interpretation caveats:
 
 - **Throughput and claim-efficiency targets are machine-relative.** They exist

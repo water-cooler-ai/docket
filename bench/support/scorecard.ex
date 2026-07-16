@@ -44,7 +44,7 @@ defmodule Docket.Bench.Scorecard do
         artifacts_dir: artifacts_dir
       })
 
-      results = Enum.map(selected, fn name -> Scenario.run_one(name, ctx) end)
+      results = Enum.flat_map(selected, fn name -> Scenario.run_variants(name, ctx) end)
 
       Report.render(results, %{
         git: git,

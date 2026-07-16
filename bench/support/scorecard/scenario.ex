@@ -16,9 +16,23 @@ defmodule Docket.Bench.Scorecard.Scenario do
     {"surge", Docket.Bench.Scorecard.Scenarios.Surge}
   ]
 
+  @policy_sensitive ["claim_ceiling", "tenant_fairness", "fast_slow"]
+
   def registry, do: @registry
 
   def names, do: Enum.map(@registry, fn {name, _module} -> name end)
+
+  def policy_sensitive?(name), do: name in @policy_sensitive
+
+  def run_variants(name, ctx) do
+    if policy_sensitive?(name) do
+      Enum.map(ctx.config.claim_policies, fn policy ->
+        run_one(name, Map.put(ctx, :claim_policy, policy))
+      end)
+    else
+      [run_one(name, ctx)]
+    end
+  end
 
   def module(name) do
     case List.keyfind(@registry, name, 0) do
@@ -30,17 +44,25 @@ defmodule Docket.Bench.Scorecard.Scenario do
   def run_one(name, ctx) do
     module = module(name)
     profile = ctx.config.scenarios[name]
+    policy = policy_name(ctx)
 
     try do
       case module.run(profile, ctx) do
-        {:ok, result} -> normalize(module, result)
-        {:error, :not_implemented} -> not_implemented_result(module)
-        {:error, reason} -> error_result(module, reason)
+        {:ok, result} -> normalize(module, result, policy)
+        {:error, :not_implemented} -> not_implemented_result(module, policy)
+        {:error, reason} -> error_result(module, reason, policy)
       end
     rescue
-      error -> error_result(module, error)
+      error -> error_result(module, error, policy)
     catch
-      kind, reason -> error_result(module, {kind, reason})
+      kind, reason -> error_result(module, {kind, reason}, policy)
+    end
+  end
+
+  defp policy_name(ctx) do
+    case Map.get(ctx, :claim_policy) do
+      %{name: name} -> name
+      nil -> nil
     end
   end
 
@@ -74,23 +96,24 @@ defmodule Docket.Bench.Scorecard.Scenario do
     }
   end
 
-  def not_implemented_result(module) do
+  def not_implemented_result(module, policy \\ nil) do
     module
-    |> base_result()
+    |> base_result(policy)
     |> Map.merge(%{score: nil, passed: false, evidence: "not implemented"})
   end
 
-  def error_result(module, reason) do
+  def error_result(module, reason, policy \\ nil) do
     module
-    |> base_result()
+    |> base_result(policy)
     |> Map.merge(%{score: nil, passed: false, evidence: "error: #{describe(reason)}"})
   end
 
-  defp base_result(module) do
+  defp base_result(module, policy) do
     %{
       scenario: module.name(),
       metric: module.metric(),
       label: nil,
+      policy: policy,
       score: nil,
       passed: false,
       evidence: "",
@@ -99,7 +122,7 @@ defmodule Docket.Bench.Scorecard.Scenario do
     }
   end
 
-  defp normalize(module, result) do
+  defp normalize(module, result, policy) do
     invariants = Map.get(result, :invariants, [])
     invariant_failed = Enum.any?(invariants, &(not &1.pass))
 
@@ -107,6 +130,7 @@ defmodule Docket.Bench.Scorecard.Scenario do
       scenario: Map.get(result, :scenario, module.name()),
       metric: Map.get(result, :metric, module.metric()),
       label: Map.get(result, :label),
+      policy: policy,
       score: if(invariant_failed, do: nil, else: Map.get(result, :score)),
       passed: not invariant_failed and Map.get(result, :passed, false),
       evidence: Map.get(result, :evidence, ""),

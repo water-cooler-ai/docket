@@ -64,6 +64,7 @@ defmodule Docket.Bench.Scorecard.Runtime do
       prefix: ctx.prefix,
       tenant_mode: tenant_mode,
       notifier: :none,
+      claim_policy: Docket.Bench.Scorecard.Config.claim_policy_config(ctx),
       max_attempt_elapsed_ms: max_attempt_elapsed_ms,
       dispatcher: [
         concurrency: concurrency,

@@ -34,6 +34,7 @@ defmodule Docket.Bench.Scorecard.Seed do
       repo: ctx.repo,
       prefix: ctx.prefix,
       tenant_mode: tenant_mode,
+      claim_policy: Docket.Bench.Scorecard.Config.claim_policy_config(ctx),
       testing: :manual
     ]
   end

@@ -93,7 +93,14 @@ defmodule Docket.Bench.Scorecard.Report do
     end
   end
 
-  defp label(result), do: result.label || result.scenario
+  defp label(result) do
+    base = result.label || result.scenario
+
+    case Map.get(result, :policy) do
+      nil -> base
+      policy -> "#{base} [#{policy}]"
+    end
+  end
 
   defp score_str(nil), do: "-"
   defp score_str(score), do: Integer.to_string(score)

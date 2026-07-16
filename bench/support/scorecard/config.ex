@@ -3,6 +3,8 @@ defmodule Docket.Bench.Scorecard.Config do
 
   @default_seed 62_038
 
+  @claim_policies [%{name: "legacy", config: []}]
+
   @scenario_names [
     "throughput",
     "concurrency",
@@ -81,6 +83,13 @@ defmodule Docket.Bench.Scorecard.Config do
 
   def scenario_names, do: @scenario_names
 
+  def claim_policy_config(ctx) do
+    case Map.get(ctx, :claim_policy) do
+      %{config: config} -> config
+      nil -> []
+    end
+  end
+
   def parse!(argv) do
     {opts, positional} = OptionParser.parse!(argv, strict: @switches)
 
@@ -103,7 +112,8 @@ defmodule Docket.Bench.Scorecard.Config do
         only: parse_only(Keyword.get(opts, :only)),
         output: Keyword.get(opts, :output),
         check: Keyword.get(opts, :check, false),
-        keep_schema: Keyword.get(opts, :keep_schema, false)
+        keep_schema: Keyword.get(opts, :keep_schema, false),
+        claim_policies: @claim_policies
       })
 
     validate!(config)
@@ -191,7 +201,34 @@ defmodule Docket.Bench.Scorecard.Config do
       raise ArgumentError, "concurrency levels must be a non-empty list of positive integers"
     end
 
+    validate_claim_policies!(config.claim_policies)
+
     config
+  end
+
+  defp validate_claim_policies!(policies) do
+    if policies == [] do
+      raise ArgumentError, "claim_policies must name at least one policy"
+    end
+
+    names = Enum.map(policies, & &1.name)
+
+    if Enum.uniq(names) != names do
+      raise ArgumentError, "claim_policies names must be unique, got: #{inspect(names)}"
+    end
+
+    Enum.each(policies, fn %{name: name, config: config} ->
+      case Keyword.get(config, :implementation) do
+        nil ->
+          :ok
+
+        module ->
+          unless Code.ensure_loaded?(module) do
+            raise ArgumentError,
+                  "claim policy #{name} names implementation #{inspect(module)}, which is not available"
+          end
+      end
+    end)
   end
 
   defp validate_scenario!(knobs, keys) do

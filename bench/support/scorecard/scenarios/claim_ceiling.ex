@@ -2,7 +2,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.ClaimCeiling do
   @moduledoc "Direct claim throughput against a frozen backlog, bypassing the dispatcher to measure raw SQL claim contention."
   @behaviour Docket.Bench.Scorecard.Scenario
 
-  alias Docket.Bench.Scorecard.{Db, Seed, Stats}
+  alias Docket.Bench.Scorecard.{Config, Db, Seed, Stats}
   alias Docket.Bench.Scorecard.Nodes.NoopNode
 
   @batch 50
@@ -25,7 +25,13 @@ defmodule Docket.Bench.Scorecard.Scenarios.ClaimCeiling do
     batch = Map.get(profile, :batch, @batch)
 
     seed_backlog(ctx, n)
-    ctx_pg = Docket.Postgres.context(repo: Db.repo(), prefix: ctx.prefix)
+
+    ctx_pg =
+      Docket.Postgres.context(
+        repo: Db.repo(),
+        prefix: ctx.prefix,
+        claim_policy: Config.claim_policy_config(ctx)
+      )
 
     started = System.monotonic_time(:microsecond)
 
