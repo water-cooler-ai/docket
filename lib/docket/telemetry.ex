@@ -61,6 +61,17 @@ defmodule Docket.Telemetry do
     [:docket, :postgres, :notification] => [:result],
     [:docket, :postgres, :run_store, :claim] => [:preference, :fallback, :result],
     [:docket, :postgres, :claim_policy, :admission] => [:implementation, :result],
+    [:docket, :postgres, :claim_policy, :admission, :observation] => [
+      :implementation,
+      :schema,
+      :result,
+      :observation_status,
+      :admission_class,
+      :work_class,
+      :batch_shape,
+      :policy_source,
+      :admin_state
+    ],
     [:docket, :postgres, :claim, :operation] => [:operation, :result],
     [:docket, :postgres, :claim, :attempt] => [:result],
     [:docket, :postgres, :claim, :poisoned] => [:reason],
@@ -148,8 +159,67 @@ defmodule Docket.Telemetry do
   @doc "Returns the bounded metadata projection safe to use as metric labels."
   @spec metric_metadata([atom()], map()) :: map()
   def metric_metadata(event, metadata) do
-    Map.take(metadata, Map.get(@metric_metadata, event, []))
+    metadata
+    |> Map.take(Map.get(@metric_metadata, event, []))
+    |> Enum.filter(&bounded_metric_metadata_value?(event, &1))
+    |> Map.new()
   end
+
+  defp bounded_metric_metadata_value?(
+         [:docket, :postgres, :claim_policy, :admission, :observation],
+         {:implementation, value}
+       ),
+       do: is_atom(value)
+
+  defp bounded_metric_metadata_value?(
+         [:docket, :postgres, :claim_policy, :admission, :observation],
+         {:schema, value}
+       ),
+       do: value == :tenant_fair_v1
+
+  defp bounded_metric_metadata_value?(
+         [:docket, :postgres, :claim_policy, :admission, :observation],
+         {:result, value}
+       ),
+       do: value in [:ok, :error]
+
+  defp bounded_metric_metadata_value?(
+         [:docket, :postgres, :claim_policy, :admission, :observation],
+         {:observation_status, value}
+       ),
+       do: value in [:available, :unavailable]
+
+  defp bounded_metric_metadata_value?(
+         [:docket, :postgres, :claim_policy, :admission, :observation],
+         {:admission_class, value}
+       ),
+       do: value in [:none, :preferred, :borrowed, :mixed]
+
+  defp bounded_metric_metadata_value?(
+         [:docket, :postgres, :claim_policy, :admission, :observation],
+         {:work_class, value}
+       ),
+       do: value in [:none, :ready, :expired, :mixed]
+
+  defp bounded_metric_metadata_value?(
+         [:docket, :postgres, :claim_policy, :admission, :observation],
+         {:batch_shape, value}
+       ),
+       do: value in [:error, :no_op, :full, :partial, :under_claim]
+
+  defp bounded_metric_metadata_value?(
+         [:docket, :postgres, :claim_policy, :admission, :observation],
+         {:policy_source, value}
+       ),
+       do: value in [:none, :default, :override, :mixed]
+
+  defp bounded_metric_metadata_value?(
+         [:docket, :postgres, :claim_policy, :admission, :observation],
+         {:admin_state, value}
+       ),
+       do: value in [:none, :running, :hold_new, :drain, :mixed]
+
+  defp bounded_metric_metadata_value?(_event, _pair), do: true
 
   @doc false
   @spec result_kind(term()) :: atom()
