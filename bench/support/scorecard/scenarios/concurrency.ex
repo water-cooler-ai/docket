@@ -77,10 +77,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.Concurrency do
     plan = %{scenario: name(), tenant_mode: :none, graph: graph(), runs: runs}
     trial = Scenario.run_trial(ctx, plan, concurrency: level)
 
-    max_finished = max_datetime(Enum.map(trial.finished, & &1.finished_at))
-    elapsed_us = DateTime.diff(max_finished, trial.started_at, :microsecond)
-    elapsed_s = max(elapsed_us / 1_000_000, 0.000_001)
-    runs_per_sec = trial.expected / elapsed_s
+    runs_per_sec = completion_rate(trial)
 
     latencies_ms =
       Enum.map(trial.finished, fn %{run_id: run_id, finished_at: finished_at} ->
@@ -128,11 +125,32 @@ defmodule Docket.Bench.Scorecard.Scenarios.Concurrency do
     |> Docket.Graph.put_edge!("noop-finish", from: "noop", to: "$finish")
   end
 
+  defp completion_rate(trial) do
+    finished_ats = Enum.map(trial.finished, & &1.finished_at)
+    completed = length(trial.finished)
+
+    if completed < 2 do
+      elapsed_us = DateTime.diff(max_datetime(finished_ats), trial.started_at, :microsecond)
+      trial.expected / max(elapsed_us / 1_000_000, 1.0e-6)
+    else
+      span_us =
+        DateTime.diff(max_datetime(finished_ats), min_datetime(finished_ats), :microsecond)
+
+      (completed - 1) / max(span_us / 1_000_000, 1.0e-6)
+    end
+  end
+
   defp max_datetime([]), do: raise("concurrency trial completed no runs")
 
   defp max_datetime([first | rest]) do
     Enum.reduce(rest, first, fn candidate, acc ->
       if DateTime.compare(candidate, acc) == :gt, do: candidate, else: acc
+    end)
+  end
+
+  defp min_datetime([first | rest]) do
+    Enum.reduce(rest, first, fn candidate, acc ->
+      if DateTime.compare(candidate, acc) == :lt, do: candidate, else: acc
     end)
   end
 

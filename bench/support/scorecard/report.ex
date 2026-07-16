@@ -21,7 +21,10 @@ defmodule Docket.Bench.Scorecard.Report do
 
   defp build_lines(results, meta) do
     header = {"Metric", "Scenario", "Score", "Evidence"}
-    rows = Enum.map(results, fn r -> {r.metric, label(r), score_str(r.score), r.evidence} end)
+
+    rows =
+      Enum.map(results, fn r -> {r.metric, label(r), score_str(r.score), evidence(r)} end)
+
     all = [header | rows]
 
     w1 = width(all, fn {c, _, _, _} -> c end)
@@ -60,14 +63,18 @@ defmodule Docket.Bench.Scorecard.Report do
 
   defp invariant_line(results, {w1, w2, w3}) do
     total = Enum.sum(Enum.map(results, &length(&1.invariants)))
-    scenarios = Enum.count(results, &(&1.invariants != []))
-    all_pass = Enum.all?(results, fn r -> Enum.all?(r.invariants, & &1.pass) end)
-    status = if all_pass, do: "PASS", else: "FAIL"
+    scenarios = Enum.count(results, fn r -> r.invariants != [] or invariant_failed?(r) end)
+    status = if Enum.any?(results, &invariant_failed?/1), do: "FAIL", else: "PASS"
 
     String.pad_trailing("Invariants", w1) <>
       "  " <>
       String.pad_trailing("#{total} checks / #{scenarios} scenarios", w2) <>
       "  " <> String.pad_leading(status, w3)
+  end
+
+  defp invariant_failed?(result) do
+    Enum.any?(result.invariants, &(not &1.pass)) or
+      (result.passed == false and result.invariants == [])
   end
 
   defp overall_line(results, {w1, w2, w3}) do
@@ -76,20 +83,38 @@ defmodule Docket.Bench.Scorecard.Report do
   end
 
   defp overall(results) do
-    gated = Enum.find(results, fn r -> Enum.any?(r.invariants, &(not &1.pass)) end)
+    case Enum.find(results, &gated?/1) do
+      nil -> composite(results)
+      gated -> "GATED (#{gated.scenario})"
+    end
+  end
 
-    cond do
-      gated != nil ->
-        "GATED (#{gated.scenario})"
+  defp gated?(result), do: result.passed == false or is_nil(result.score)
 
-      true ->
-        scores = results |> Enum.map(& &1.score) |> Enum.reject(&is_nil/1)
+  defp composite(results) do
+    metric_scores =
+      results
+      |> Enum.group_by(& &1.metric)
+      |> Enum.map(fn {_metric, group} ->
+        group |> Enum.map(& &1.score) |> Enum.reject(&is_nil/1)
+      end)
+      |> Enum.reject(&(&1 == []))
+      |> Enum.map(fn scores -> Enum.sum(scores) / length(scores) end)
 
-        if scores == [] do
-          "-"
-        else
-          Integer.to_string(round(Enum.sum(scores) / length(scores)))
-        end
+    if metric_scores == [] do
+      "-"
+    else
+      Integer.to_string(round(Enum.sum(metric_scores) / length(metric_scores)))
+    end
+  end
+
+  defp evidence(result) do
+    text = result.evidence
+
+    if String.length(text) > 160 do
+      String.slice(text, 0, 157) <> "..."
+    else
+      text
     end
   end
 
@@ -125,7 +150,14 @@ defmodule Docket.Bench.Scorecard.Report do
     Map.new(map, fn {key, value} -> {to_string(key), json_safe(value)} end)
   end
 
-  def json_safe(list) when is_list(list), do: Enum.map(list, &json_safe/1)
+  def json_safe(list) when is_list(list) do
+    if list != [] and Keyword.keyword?(list) do
+      Map.new(list, fn {key, value} -> {to_string(key), json_safe(value)} end)
+    else
+      Enum.map(list, &json_safe/1)
+    end
+  end
+
   def json_safe(tuple) when is_tuple(tuple), do: tuple |> Tuple.to_list() |> json_safe()
 
   def json_safe(atom) when is_atom(atom) and atom not in [true, false, nil],

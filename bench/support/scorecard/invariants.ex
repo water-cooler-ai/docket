@@ -1,7 +1,19 @@
 defmodule Docket.Bench.Scorecard.Invariants do
-  @moduledoc "Locked-contract SQL invariant checks applied after every runtime trial."
+  @moduledoc """
+  Locked-contract SQL invariant checks applied after every runtime trial.
+
+  `no_active_claims`, `no_poisoned`, `no_stranded`, `dup_claim_tokens`, and
+  `event_seq_unique` are schema-regression guards after a successful drain: once
+  every run has reached a terminal status the database CHECK constraints make
+  those violating states impossible, so a failure here signals a schema
+  regression rather than a live fault. Live violations while runs are still in
+  flight surface through the drain-timeout diagnostics instead.
+  """
 
   alias Docket.Bench.Scorecard.Db
+
+  @terminal_statuses_sql Docket.Run.terminal_statuses()
+                         |> Enum.map_join(", ", &"'#{&1}'")
 
   def check(ctx, expected) do
     runs = Db.table(ctx.prefix, "docket_runs")
@@ -23,7 +35,7 @@ defmodule Docket.Bench.Scorecard.Invariants do
       ),
       check_zero(
         "no_stranded",
-        "SELECT count(*) FROM #{runs} WHERE status NOT IN ('done', 'failed', 'cancelled')"
+        "SELECT count(*) FROM #{runs} WHERE status NOT IN (#{@terminal_statuses_sql})"
       ),
       check_zero(
         "no_poisoned",

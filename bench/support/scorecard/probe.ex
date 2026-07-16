@@ -5,7 +5,7 @@ defmodule Docket.Bench.Scorecard.Probe do
 
   def start(ctx, interval_ms) do
     started = System.monotonic_time(:millisecond)
-    spawn_link(fn -> loop(ctx, interval_ms, started, []) end)
+    spawn(fn -> loop(ctx, interval_ms, started, []) end)
   end
 
   def stop(pid) do
@@ -27,24 +27,32 @@ defmodule Docket.Bench.Scorecard.Probe do
   def sample(ctx, started) do
     runs = Db.table(ctx.prefix, "docket_runs")
 
-    [[ready_backlog, in_flight, done]] =
-      Db.repo().query!(
-        "SELECT " <>
-          "count(*) FILTER (WHERE status = 'running' AND claim_token IS NULL AND wake_at <= now()), " <>
-          "count(*) FILTER (WHERE claim_token IS NOT NULL), " <>
-          "count(*) FILTER (WHERE finished_at IS NOT NULL) FROM #{runs}"
-      ).rows
+    query =
+      "SELECT " <>
+        "count(*) FILTER (WHERE status = 'running' AND claim_token IS NULL AND wake_at <= now()), " <>
+        "count(*) FILTER (WHERE claim_token IS NOT NULL), " <>
+        "count(*) FILTER (WHERE finished_at IS NOT NULL) FROM #{runs}"
 
-    %{
-      t_ms: System.monotonic_time(:millisecond) - started,
-      ready_backlog: ready_backlog,
-      in_flight: in_flight,
-      done: done
-    }
+    case Db.repo().query(query) do
+      {:ok, %{rows: [[ready_backlog, in_flight, done]]}} ->
+        %{
+          t_ms: System.monotonic_time(:millisecond) - started,
+          ready_backlog: ready_backlog,
+          in_flight: in_flight,
+          done: done
+        }
+
+      _ ->
+        nil
+    end
   end
 
   defp loop(ctx, interval_ms, started, samples) do
-    samples = [sample(ctx, started) | samples]
+    samples =
+      case sample(ctx, started) do
+        nil -> samples
+        sample -> [sample | samples]
+      end
 
     receive do
       {:stop, from} -> send(from, {:samples, Enum.reverse(samples)})

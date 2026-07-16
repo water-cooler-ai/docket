@@ -19,9 +19,9 @@ defmodule Docket.Bench.Scorecard.Config do
       poll_interval_ms: 50,
       drain_timeout_ms: 30_000,
       scenarios: %{
-        "throughput" => %{n: 300, concurrency: 8, target_runs_per_sec: 50},
-        "concurrency" => %{levels: [2, 8], per_slot: 25},
-        "claim_ceiling" => %{n: 1_000, workers: 4, batch: 50, target_claims_per_sec: 500},
+        "throughput" => %{n: 300, concurrency: 8, target_runs_per_sec: 400},
+        "concurrency" => %{levels: [2, 8], per_slot: 50},
+        "claim_ceiling" => %{n: 1_000, workers: 4, batch: 50, target_claims_per_sec: 5_000},
         "tenant_fairness" => %{tenants: 6, hot_fraction: 0.6, n: 300, concurrency: 8},
         "fast_slow" => %{
           concurrency: 8,
@@ -37,9 +37,9 @@ defmodule Docket.Bench.Scorecard.Config do
       poll_interval_ms: 50,
       drain_timeout_ms: 120_000,
       scenarios: %{
-        "throughput" => %{n: 2_000, concurrency: 32, target_runs_per_sec: 300},
+        "throughput" => %{n: 2_000, concurrency: 32, target_runs_per_sec: 1_500},
         "concurrency" => %{levels: [4, 16, 64], per_slot: 60},
-        "claim_ceiling" => %{n: 20_000, workers: 8, batch: 50, target_claims_per_sec: 3_000},
+        "claim_ceiling" => %{n: 20_000, workers: 8, batch: 50, target_claims_per_sec: 25_000},
         "tenant_fairness" => %{tenants: 10, hot_fraction: 0.6, n: 1_500, concurrency: 16},
         "fast_slow" => %{
           concurrency: 16,
@@ -55,9 +55,9 @@ defmodule Docket.Bench.Scorecard.Config do
       poll_interval_ms: 50,
       drain_timeout_ms: 600_000,
       scenarios: %{
-        "throughput" => %{n: 10_000, concurrency: 64, target_runs_per_sec: 500},
+        "throughput" => %{n: 10_000, concurrency: 64, target_runs_per_sec: 2_500},
         "concurrency" => %{levels: [8, 32, 128], per_slot: 100},
-        "claim_ceiling" => %{n: 100_000, workers: 16, batch: 50, target_claims_per_sec: 5_000},
+        "claim_ceiling" => %{n: 100_000, workers: 16, batch: 50, target_claims_per_sec: 40_000},
         "tenant_fairness" => %{tenants: 20, hot_fraction: 0.6, n: 6_000, concurrency: 32},
         "fast_slow" => %{
           concurrency: 32,
@@ -150,7 +150,8 @@ defmodule Docket.Bench.Scorecard.Config do
       --output PATH                 artifact directory (default under tmp/bench/postgres/scorecard)
       --check                       raise on any invariant violation (no timing gates)
       --keep-schema                 retain the generated scratch schema
-      --seed N                      deterministic seed (default: #{@default_seed})
+      --seed N                      recorded in manifests for provenance; execution is
+                                    deterministic by construction (default: #{@default_seed})
 
     Scenarios: #{Enum.join(@scenario_names, ", ")}
     """
@@ -163,6 +164,7 @@ defmodule Docket.Bench.Scorecard.Config do
       value
       |> String.split(",", trim: true)
       |> Enum.map(&String.trim/1)
+      |> Enum.uniq()
 
     unknown = Enum.reject(names, &(&1 in @scenario_names))
 
@@ -190,15 +192,37 @@ defmodule Docket.Bench.Scorecard.Config do
     end)
 
     validate_scenario!(config.scenarios["throughput"], [:n, :concurrency, :target_runs_per_sec])
-    validate_scenario!(config.scenarios["claim_ceiling"], [:n, :workers, :target_claims_per_sec])
+
+    validate_scenario!(config.scenarios["claim_ceiling"], [
+      :n,
+      :workers,
+      :batch,
+      :target_claims_per_sec
+    ])
+
     validate_scenario!(config.scenarios["tenant_fairness"], [:tenants, :n, :concurrency])
     validate_scenario!(config.scenarios["fast_slow"], [:concurrency, :n_fast, :hold_ms])
     validate_scenario!(config.scenarios["surge"], [:window_ms, :concurrency])
+    validate_scenario!(config.scenarios["concurrency"], [:per_slot])
 
     levels = config.scenarios["concurrency"].levels
 
     unless is_list(levels) and levels != [] and Enum.all?(levels, &(is_integer(&1) and &1 > 0)) do
       raise ArgumentError, "concurrency levels must be a non-empty list of positive integers"
+    end
+
+    hot_fraction = config.scenarios["tenant_fairness"].hot_fraction
+
+    unless is_float(hot_fraction) and hot_fraction > 0.0 and hot_fraction < 1.0 do
+      raise ArgumentError,
+            "hot_fraction must be a float strictly between 0.0 and 1.0, got: #{inspect(hot_fraction)}"
+    end
+
+    %{slowdown_good: good, slowdown_bad: bad} = config.scenarios["fast_slow"]
+
+    unless is_number(good) and is_number(bad) and good > 0 and bad > good do
+      raise ArgumentError,
+            "fast_slow requires slowdown_bad > slowdown_good > 0, got good=#{inspect(good)} bad=#{inspect(bad)}"
     end
 
     validate_claim_policies!(config.claim_policies)

@@ -22,7 +22,21 @@ defmodule Docket.Bench.Scorecard.Runtime do
   end
 
   def stop(runtime) do
-    if Process.alive?(runtime), do: Supervisor.stop(runtime, :normal, 5_000)
+    if Process.alive?(runtime) do
+      ref = Process.monitor(runtime)
+
+      try do
+        Supervisor.stop(runtime, :normal, 15_000)
+      catch
+        :exit, _ -> Process.exit(runtime, :kill)
+      end
+
+      receive do
+        {:DOWN, ^ref, :process, ^runtime, _reason} -> :ok
+      after
+        5_000 -> Process.demonitor(ref, [:flush])
+      end
+    end
   end
 
   def drain_wait(ctx, timeout_ms) do
@@ -38,7 +52,7 @@ defmodule Docket.Bench.Scorecard.Runtime do
         :ok
 
       System.monotonic_time(:millisecond) >= deadline ->
-        raise "scorecard drain timed out with #{remaining} runs not finished"
+        {:timeout, remaining}
 
       true ->
         Process.sleep(150)
@@ -71,7 +85,7 @@ defmodule Docket.Bench.Scorecard.Runtime do
         poll_interval_ms: ctx.config.poll_interval_ms,
         orphan_ttl_ms: orphan_ttl_ms,
         max_claim_attempts: 5,
-        drain_timeout_ms: 30_000
+        drain_timeout_ms: 5_000
       ],
       vehicle: [drain_budget: [max_moments: 100, max_elapsed_ms: drain_max_elapsed_ms]],
       pruner: @pruner

@@ -74,10 +74,15 @@ defmodule Docket.Bench.Scorecard.Seed do
     |> Enum.each(fn {due_at, group} ->
       ids = Enum.map(group, &run_id(plan.scenario, &1.idx))
 
-      Db.repo().query!(
-        "UPDATE #{runs} SET wake_at = $1 WHERE run_id = ANY($2) AND status = 'running' AND claim_token IS NULL AND poisoned_at IS NULL",
-        [due_at, ids]
-      )
+      result =
+        Db.repo().query!(
+          "UPDATE #{runs} SET wake_at = $1 WHERE run_id = ANY($2) AND status = 'running' AND claim_token IS NULL AND poisoned_at IS NULL",
+          [due_at, ids]
+        )
+
+      if result.num_rows != length(ids) do
+        raise "staging updated #{result.num_rows} of #{length(ids)} runs"
+      end
     end)
   end
 

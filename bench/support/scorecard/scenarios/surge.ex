@@ -47,13 +47,15 @@ defmodule Docket.Bench.Scorecard.Scenarios.Surge do
 
     samples =
       try do
-        Runtime.drain_wait(ctx, timeout_ms)
+        drained!(Runtime.drain_wait(ctx, timeout_ms), ctx, expected)
         Process.sleep((@recovery_sustain_samples + 1) * @probe_interval_ms)
         Probe.stop(probe)
       after
         Probe.shutdown(probe)
         Runtime.stop(runtime)
       end
+
+    if samples == [], do: raise("surge probe returned no samples")
 
     main_invariants = Invariants.check(ctx, expected)
 
@@ -72,7 +74,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.Surge do
     post_samples = Enum.filter(samples, fn sample -> sample.t_ms > burst_at_ms end)
     recovery_sample = find_recovery(post_samples, threshold)
 
-    ideal_recovery_s = burst / t_cal
+    ideal_recovery_s = burst / (t_cal * (1 - @steady_fraction))
 
     {score, recovery_time_s, recovered, evidence} =
       case recovery_sample do
@@ -135,18 +137,33 @@ defmodule Docket.Bench.Scorecard.Scenarios.Surge do
     plan = %{scenario: name(), tenant_mode: :none, graph: graph(), runs: runs}
     trial = Scenario.run_trial(ctx, plan, concurrency: concurrency)
 
-    max_finished = max_datetime(Enum.map(trial.finished, & &1.finished_at))
-
-    elapsed_s =
-      max(DateTime.diff(max_finished, trial.started_at, :microsecond) / 1_000_000, 0.000_001)
+    completed = length(trial.finished)
+    {runs_per_sec, elapsed_s} = completion_rate(trial)
 
     %{
       n: n,
-      completed: length(trial.finished),
+      completed: completed,
       elapsed_s: elapsed_s,
-      runs_per_sec: n / elapsed_s,
+      runs_per_sec: runs_per_sec,
       invariants: trial.invariants
     }
+  end
+
+  defp completion_rate(trial) do
+    finished_ats = Enum.map(trial.finished, & &1.finished_at)
+    completed = length(trial.finished)
+
+    if completed < 2 do
+      elapsed_us = DateTime.diff(max_datetime(finished_ats), trial.started_at, :microsecond)
+      elapsed_s = max(elapsed_us / 1_000_000, 1.0e-6)
+      {trial.expected / elapsed_s, elapsed_s}
+    else
+      span_us =
+        DateTime.diff(max_datetime(finished_ats), min_datetime(finished_ats), :microsecond)
+
+      elapsed_s = max(span_us / 1_000_000, 1.0e-6)
+      {(completed - 1) / elapsed_s, elapsed_s}
+    end
   end
 
   defp seed_main(ctx, expected) do
@@ -187,13 +204,38 @@ defmodule Docket.Bench.Scorecard.Scenarios.Surge do
     run_specs
     |> Enum.group_by(fn {_run_id, due_at} -> due_at end, fn {run_id, _due_at} -> run_id end)
     |> Enum.each(fn {due_at, ids} ->
-      Db.repo().query!(
-        "UPDATE #{runs} SET wake_at = $1 WHERE run_id = ANY($2) AND status = 'running' AND claim_token IS NULL AND poisoned_at IS NULL",
-        [due_at, ids]
-      )
+      result =
+        Db.repo().query!(
+          "UPDATE #{runs} SET wake_at = $1 WHERE run_id = ANY($2) AND status = 'running' AND claim_token IS NULL AND poisoned_at IS NULL",
+          [due_at, ids]
+        )
+
+      if result.num_rows != length(ids) do
+        raise "staging updated #{result.num_rows} of #{length(ids)} runs"
+      end
     end)
 
     :ok
+  end
+
+  defp drained!(:ok, _ctx, _expected), do: :ok
+
+  defp drained!({:timeout, remaining}, ctx, expected) do
+    summary =
+      ctx
+      |> Invariants.check(expected)
+      |> Enum.reject(& &1.pass)
+      |> case do
+        [] ->
+          "no invariant violations detected"
+
+        failing ->
+          Enum.map_join(failing, ", ", fn invariant ->
+            "#{invariant.name} expected=#{invariant.expected} actual=#{invariant.actual}"
+          end)
+      end
+
+    raise "scorecard drain timed out with #{remaining} runs not finished; " <> summary
   end
 
   defp find_recovery([], _threshold), do: nil
@@ -225,6 +267,12 @@ defmodule Docket.Bench.Scorecard.Scenarios.Surge do
   defp max_datetime([first | rest]) do
     Enum.reduce(rest, first, fn candidate, acc ->
       if DateTime.compare(candidate, acc) == :gt, do: candidate, else: acc
+    end)
+  end
+
+  defp min_datetime([first | rest]) do
+    Enum.reduce(rest, first, fn candidate, acc ->
+      if DateTime.compare(candidate, acc) == :lt, do: candidate, else: acc
     end)
   end
 

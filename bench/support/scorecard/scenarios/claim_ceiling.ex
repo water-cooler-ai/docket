@@ -7,7 +7,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.ClaimCeiling do
 
   @batch 50
   @empty_streak_limit 3
-  @orphan_ttl_ms 60_000
+  @orphan_ttl_ms 3_600_000
   @max_claim_attempts 5
   @note "concurrent direct claimers measure raw SQL claim contention; production serializes claims through one dispatcher per instance"
 
@@ -35,12 +35,19 @@ defmodule Docket.Bench.Scorecard.Scenarios.ClaimCeiling do
 
     started = System.monotonic_time(:microsecond)
 
-    results =
-      1..workers
-      |> Enum.map(fn _worker -> Task.async(fn -> drain_worker(ctx_pg, batch) end) end)
-      |> Task.await_many(:infinity)
+    tasks =
+      Enum.map(1..workers, fn _worker -> Task.async(fn -> drain_worker(ctx_pg, batch) end) end)
 
-    elapsed_us = System.monotonic_time(:microsecond) - started
+    results = await_workers(tasks, workers, ctx.config.drain_timeout_ms)
+
+    full_elapsed_us = System.monotonic_time(:microsecond) - started
+
+    elapsed_us =
+      case results |> Enum.map(& &1.last_lease_at) |> Enum.reject(&is_nil/1) do
+        [] -> full_elapsed_us
+        lease_ends -> Enum.max(lease_ends) - started
+      end
+
     elapsed_s = max(elapsed_us / 1_000_000, 0.000_001)
 
     total_leases = Enum.sum(Enum.map(results, & &1.leases))
@@ -99,14 +106,39 @@ defmodule Docket.Bench.Scorecard.Scenarios.ClaimCeiling do
     Seed.seed(ctx, plan)
   end
 
-  defp drain_worker(ctx_pg, batch), do: drain_loop(ctx_pg, batch, 0, [], 0, 0)
+  defp await_workers(tasks, workers, timeout_ms) do
+    outcomes =
+      tasks
+      |> Task.yield_many(timeout_ms)
+      |> Enum.map(fn {task, res} ->
+        case res || Task.shutdown(task, :brutal_kill) do
+          {:ok, value} -> {:ok, value}
+          _ -> :timeout
+        end
+      end)
 
-  defp drain_loop(_ctx_pg, _batch, streak, times, leases, poisoned)
-       when streak >= @empty_streak_limit do
-    %{leases: leases, poisoned: poisoned, call_times_us: Enum.reverse(times)}
+    timed_out = Enum.count(outcomes, &(&1 == :timeout))
+
+    if timed_out > 0 do
+      raise "claim_ceiling drain timed out with #{timed_out} of #{workers} workers unfinished"
+    end
+
+    Enum.map(outcomes, fn {:ok, value} -> value end)
   end
 
-  defp drain_loop(ctx_pg, batch, streak, times, leases, poisoned) do
+  defp drain_worker(ctx_pg, batch), do: drain_loop(ctx_pg, batch, 0, [], 0, 0, nil)
+
+  defp drain_loop(_ctx_pg, _batch, streak, times, leases, poisoned, last_lease_at)
+       when streak >= @empty_streak_limit do
+    %{
+      leases: leases,
+      poisoned: poisoned,
+      call_times_us: Enum.reverse(times),
+      last_lease_at: last_lease_at
+    }
+  end
+
+  defp drain_loop(ctx_pg, batch, streak, times, leases, poisoned, last_lease_at) do
     policy = %{
       now: DateTime.utc_now(),
       limit: batch,
@@ -117,22 +149,37 @@ defmodule Docket.Bench.Scorecard.Scenarios.ClaimCeiling do
 
     t0 = System.monotonic_time(:microsecond)
 
-    {:ok, %{leases: claimed, poisoned: poisoned_batch}} =
-      Docket.Postgres.RunStore.claim_due(ctx_pg, :system, policy)
+    {claimed, poisoned_batch} =
+      case Docket.Postgres.RunStore.claim_due(ctx_pg, :system, policy) do
+        {:ok, %{leases: claimed, poisoned: poisoned_batch}} -> {claimed, poisoned_batch}
+        {:error, reason} -> raise "claim_due failed: #{inspect(reason)}"
+      end
 
     t1 = System.monotonic_time(:microsecond)
 
     count = length(claimed)
-    next_streak = if count == 0, do: streak + 1, else: 0
 
-    drain_loop(
-      ctx_pg,
-      batch,
-      next_streak,
-      [t1 - t0 | times],
-      leases + count,
-      poisoned + length(poisoned_batch)
-    )
+    if count == 0 do
+      drain_loop(
+        ctx_pg,
+        batch,
+        streak + 1,
+        times,
+        leases,
+        poisoned + length(poisoned_batch),
+        last_lease_at
+      )
+    else
+      drain_loop(
+        ctx_pg,
+        batch,
+        0,
+        [t1 - t0 | times],
+        leases + count,
+        poisoned + length(poisoned_batch),
+        t1
+      )
+    end
   end
 
   defp invariants(ctx, n, total_leases) do

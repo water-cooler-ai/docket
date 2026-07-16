@@ -30,8 +30,13 @@ defmodule Docket.Bench.Scorecard.Db do
   def repo, do: Repo
 
   def database_url! do
-    System.get_env("DOCKET_BENCH_DATABASE_URL") ||
+    url = System.get_env("DOCKET_BENCH_DATABASE_URL")
+
+    if is_binary(url) and String.trim(url) != "" do
+      url
+    else
       raise "DOCKET_BENCH_DATABASE_URL must name a dedicated benchmark-capable database"
+    end
   end
 
   def start_repo!(url, pool_size) do
@@ -75,6 +80,31 @@ defmodule Docket.Bench.Scorecard.Db do
     validate_owned_prefix!(prefix)
     Repo.query!("DROP SCHEMA IF EXISTS #{quote_identifier(prefix)} CASCADE")
     :ok
+  end
+
+  def sweep_stale_schemas! do
+    Repo.query!(
+      "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname ~ '^docket_bench_[0-9]+_[0-9]+$'"
+    ).rows
+    |> Enum.each(fn [schema] ->
+      case Regex.run(~r/\Adocket_bench_(\d+)_\d+\z/, schema) do
+        [_, os_pid] ->
+          unless os_pid_alive?(os_pid) do
+            validate_owned_prefix!(schema)
+            Repo.query!("DROP SCHEMA IF EXISTS #{quote_identifier(schema)} CASCADE")
+          end
+
+        nil ->
+          :ok
+      end
+    end)
+
+    :ok
+  end
+
+  defp os_pid_alive?(os_pid) do
+    {_output, status} = System.cmd("kill", ["-0", os_pid], stderr_to_stdout: true)
+    status == 0
   end
 
   def truncate(ctx) do

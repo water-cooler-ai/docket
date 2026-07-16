@@ -26,6 +26,7 @@ defmodule Docket.Bench.Scorecard do
       postgres = Db.postgres_metadata!()
       Db.require_postgres_13!(postgres.server_version_num)
       Db.create_schema!(prefix)
+      Db.sweep_stale_schemas!()
 
       artifacts_dir = prepare_artifacts!(config, git)
       ctx = %{repo: Db.repo(), prefix: prefix, config: config, artifacts_dir: artifacts_dir}
@@ -71,6 +72,8 @@ defmodule Docket.Bench.Scorecard do
     after
       try do
         if not config.keep_schema, do: Db.drop_schema_if_exists!(prefix)
+      rescue
+        error -> IO.warn("scorecard schema cleanup failed: #{Exception.message(error)}", [])
       after
         Db.stop_repo()
       end

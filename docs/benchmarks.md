@@ -28,7 +28,7 @@ Options:
 | `--output PATH` | artifact directory (default `tmp/bench/postgres/scorecard/<run-id>/`) |
 | `--check` | raise on any invariant violation (CI mode; never gates on timing) |
 | `--keep-schema` | keep the scratch schema for inspection |
-| `--seed N` | deterministic interleave seed |
+| `--seed N` | recorded in manifests for provenance; execution is deterministic by construction |
 
 Each run creates an isolated scratch schema (`docket_bench_<pid>_<uniq>`),
 installs the production migration into it, runs the selected scenarios
@@ -52,7 +52,7 @@ calibration knob in the profile.
 | Claim efficiency | direct `claim_due` workers drain a frozen backlog (no runtime) | `100 · min(1, claims_per_sec / target_claims_per_sec)` |
 | Tenant fairness | one hot tenant seeds 60% of the backlog first; light tenants after | `100 · clamp(1 − light_p95_wait / drain_time)` |
 | Fast/slow fairness | fast cohort alone vs fast cohort behind a slow cohort | 100 at slowdown ≤ `good`, linear to 0 at ≥ `bad` |
-| Surge resilience | steady arrivals at 40% of measured capacity plus a mid-window burst | `100 · min(1, ideal_recovery / measured_recovery)` |
+| Surge resilience | steady arrivals at 40% of measured capacity plus a mid-window burst | `100 · min(1, ideal_recovery / measured_recovery)`, where `ideal_recovery = burst / (capacity · (1 − steady_fraction))` — arrivals continue during recovery, so a perfect system is reachable |
 
 ### Claim-policy dimension
 
@@ -64,6 +64,11 @@ passed straight through as the runtime's `claim_policy` backend option. The
 registry currently holds only the default legacy implementation; when the
 TenantFair engine ships, adding one entry produces side-by-side scored rows
 for both policies, turning the fairness rows into a direct policy comparison.
+
+The composite Overall averages per metric first and then across metrics, so
+registering additional claim policies adds comparison rows without
+re-weighting the claim-sensitive metrics: each metric contributes once to the
+Overall regardless of how many policies were run against it.
 
 Interpretation caveats:
 
@@ -90,8 +95,17 @@ duplicate active claim tokens, no active claims after drain, exact terminal
 accounting for all seeded runs, no stranded non-terminal runs, no poisoned
 runs, unique event sequence per run, and exactly one terminal event per run.
 Correctness gates are absolute: any violation forces the scenario's score to
-zero-out as `GATED` and `--check` raises. A fast result can never outrank a
-wrong one.
+zero-out as `GATED` and `--check` raises. A crashed or timed-out scenario
+gates the overall line and `--check` the same way — a missing score is a
+failure, never averaged away. A fast result can never outrank a wrong one.
+
+Several of these post-drain checks (no active claims, no poisoned or stranded
+runs, unique event sequence) are schema-regression guards: once every run has
+reached a terminal state the database's `CHECK` constraints make those states
+impossible, so a violation there means a schema regression rather than a live
+race. Live violations surface earlier, through the drain-timeout diagnostics
+that name each failing invariant when a trial fails to drain within its
+deadline.
 
 ### Profiles
 

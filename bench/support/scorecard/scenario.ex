@@ -46,18 +46,43 @@ defmodule Docket.Bench.Scorecard.Scenario do
     profile = ctx.config.scenarios[name]
     policy = policy_name(ctx)
 
-    try do
-      case module.run(profile, ctx) do
-        {:ok, result} -> normalize(module, result, policy)
-        {:error, :not_implemented} -> not_implemented_result(module, policy)
-        {:error, reason} -> error_result(module, reason, policy)
-      end
-    rescue
-      error -> error_result(module, error, policy)
-    catch
-      kind, reason -> error_result(module, {kind, reason}, policy)
+    {pid, ref} =
+      spawn_monitor(fn ->
+        marker =
+          try do
+            {:run, module.run(profile, ctx)}
+          rescue
+            error -> {:rescue, error}
+          catch
+            kind, reason -> {:catch, kind, reason}
+          end
+
+        exit({:scorecard_result, marker})
+      end)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, {:scorecard_result, marker}} ->
+        dispatch_marker(module, marker, policy)
+
+      {:DOWN, ^ref, :process, ^pid, reason} ->
+        error_result(module, {:exit, reason}, policy)
     end
   end
+
+  defp dispatch_marker(module, {:run, {:ok, result}}, policy),
+    do: normalize(module, result, policy)
+
+  defp dispatch_marker(module, {:run, {:error, :not_implemented}}, policy),
+    do: not_implemented_result(module, policy)
+
+  defp dispatch_marker(module, {:run, {:error, reason}}, policy),
+    do: error_result(module, reason, policy)
+
+  defp dispatch_marker(module, {:rescue, error}, policy),
+    do: error_result(module, error, policy)
+
+  defp dispatch_marker(module, {:catch, kind, reason}, policy),
+    do: error_result(module, {kind, reason}, policy)
 
   defp policy_name(ctx) do
     case Map.get(ctx, :claim_policy) do
@@ -76,16 +101,21 @@ defmodule Docket.Bench.Scorecard.Scenario do
         Keyword.get(opts, :runtime, [])
 
     timeout_ms = Keyword.get(opts, :drain_timeout_ms, ctx.config.drain_timeout_ms)
+    expected = length(plan.runs)
     started_at = DateTime.utc_now()
     runtime = Runtime.start(ctx, overrides)
 
-    try do
-      Runtime.drain_wait(ctx, timeout_ms)
-    after
-      Runtime.stop(runtime)
-    end
+    drain =
+      try do
+        Runtime.drain_wait(ctx, timeout_ms)
+      after
+        Runtime.stop(runtime)
+      end
 
-    expected = length(plan.runs)
+    case drain do
+      :ok -> :ok
+      {:timeout, remaining} -> raise drain_timeout_message(ctx, expected, remaining)
+    end
 
     %{
       seed: seed,
@@ -94,6 +124,23 @@ defmodule Docket.Bench.Scorecard.Scenario do
       finished: Db.finished_runs(ctx),
       invariants: Invariants.check(ctx, expected)
     }
+  end
+
+  defp drain_timeout_message(ctx, expected, remaining) do
+    summary = drain_invariant_summary(Invariants.check(ctx, expected))
+    "scorecard drain timed out with #{remaining} runs not finished; " <> summary
+  end
+
+  defp drain_invariant_summary(invariants) do
+    case Enum.filter(invariants, &(not &1.pass)) do
+      [] ->
+        "no invariant violations detected"
+
+      failing ->
+        Enum.map_join(failing, ", ", fn %{name: name, expected: expected, actual: actual} ->
+          "#{name} expected=#{expected} actual=#{actual}"
+        end)
+    end
   end
 
   def not_implemented_result(module, policy \\ nil) do

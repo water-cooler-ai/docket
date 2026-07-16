@@ -130,7 +130,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.FastSlow do
     runtime = Runtime.start(ctx, overrides)
 
     try do
-      Runtime.drain_wait(ctx, timeout_ms)
+      drained!(Runtime.drain_wait(ctx, timeout_ms), ctx, expected)
     after
       Runtime.stop(runtime)
     end
@@ -142,6 +142,26 @@ defmodule Docket.Bench.Scorecard.Scenarios.FastSlow do
       finished: Db.finished_runs(ctx),
       invariants: Invariants.check(ctx, expected)
     }
+  end
+
+  defp drained!(:ok, _ctx, _expected), do: :ok
+
+  defp drained!({:timeout, remaining}, ctx, expected) do
+    summary =
+      ctx
+      |> Invariants.check(expected)
+      |> Enum.reject(& &1.pass)
+      |> case do
+        [] ->
+          "no invariant violations detected"
+
+        failing ->
+          Enum.map_join(failing, ", ", fn invariant ->
+            "#{invariant.name} expected=#{invariant.expected} actual=#{invariant.actual}"
+          end)
+      end
+
+    raise "scorecard drain timed out with #{remaining} runs not finished; " <> summary
   end
 
   defp cohort_distributions(trial) do
