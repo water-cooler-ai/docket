@@ -40,14 +40,18 @@ when you want to understand *why* the contracts are shaped the way they are.
    - Locked tenant identity, vocabulary, and ClaimPolicy configuration contract,
      plus the proposed database-wide caps, dynamic policy, fair partition
      selection, weighted service, borrowing, telemetry, and rollout.
-10. `docket-exact-cap-delivery-plan.md`
+10. `docket-exact-cap-contract.md`
+    - Normative DCKT-47 schema, bootstrap, CAS/replay, readiness, activation,
+      lock, fresh-snapshot admission, decision-table, retention, and rollback
+      contract approved by DCKT-63.
+11. `docket-exact-cap-delivery-plan.md`
     - DCKT-47 delivery order, stacked pull-request topology, review gates,
       validation evidence, and DCKT-63 contract risks for the first exact-cap
       control-plane slice.
-11. `docket-claim-policy.md`
+12. `docket-claim-policy.md`
     - Implemented phase-0 RunStore-to-ClaimPolicy plan boundary, atomicity rule,
       instance-level rollout switch, conformance tests, and Legacy rollback.
-12. `docket-runtime-design.md`
+13. `docket-runtime-design.md`
     - Historical 0.0.1 runtime research and background: goals, alternatives
       considered (Pregel, LangGraph, Temporal), and future design space.
 

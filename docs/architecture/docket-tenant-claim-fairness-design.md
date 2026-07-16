@@ -7,6 +7,9 @@ unimplemented.
 
 This document turns the tenant-fairness roadmap item into an implementation
 plan. The migration version and later query-tuning values remain provisional.
+For the DCKT-47 slice, the schema, control plane, and serialization decisions
+in this file are reconciled to the normative
+[exact-cap contract](docket-exact-cap-contract.md).
 
 ## Summary
 
@@ -24,10 +27,10 @@ by treating each tenant as a scheduling partition. The scheduler will:
 - preserve the existing run-row queue, claim-token fence, orphan recovery,
   poison, and bounded-drain contracts.
 
-The first implementation should deliver strict dynamic claim caps and fair
-partition selection. Weighted service accounting and borrowing should follow
-as separately measured slices. This sequencing keeps exact safety enforcement
-small before adding work-conserving policy.
+The first implementation delivers strict dynamic claim caps with bounded,
+tenant-blind candidate discovery. DCKT-49 adds fair partition selection;
+weighted service and borrowing follow in DCKT-45 and DCKT-48. This sequencing
+keeps exact safety enforcement separate from service and liveness promises.
 
 ## Why claims are the fairness unit
 
@@ -188,7 +191,10 @@ This is the locked configuration shape, not a claim that TenantFair is already
 selectable. The source-owned configuration value is validated independently;
 the later hard-cap phase adds the selectable engine and schema. Merely accepting
 the configuration must not silently run Legacy under a TenantFair name or imply
-that caps, fair rotation, weights, or borrowing are active.
+that caps, fair rotation, weights, or borrowing are active. For DCKT-47 these
+`default_*` values are reviewed configuration inputs only: `init/2` performs no
+database I/O, they are never a claim-time fallback, and the host initializes
+the authoritative database tuple through the explicit control-plane bootstrap.
 
 Initial validation rules:
 
@@ -245,21 +251,21 @@ A migration adds library-owned policy and partition tables:
 
 ```text
 docket_claim_policy
-  id                    integer primary key, fixed value 1
-  preferred_active      integer not null
-  max_active            integer not null
-  weight                integer not null
-  borrowing             boolean not null
-  policy_version        bigint not null
+  id                    smallint primary key, fixed value 1
+  preferred_active      integer null
+  max_active            integer null
+  weight                integer null
+  borrowing             boolean null
+  policy_version        bigint not null, initially 0
+  initialized_at        timestamptz null
   updated_at            timestamptz not null
 ```
 
 This prefix-local singleton is the authoritative default policy for every
-dispatcher sharing the tables. Runtime configuration supplies the desired
-bootstrap policy, but a dispatcher must not silently substitute its own
-defaults after the database row exists. Startup should create or verify the
-row and reject a mismatched policy fingerprint/version rather than allowing
-mixed rolling-deploy semantics.
+dispatcher sharing the tables. The v2 migration creates it with all four policy
+fields null and version zero. Only the explicit, audited, version-zero CAS
+bootstrap initializes it; startup and first use never seed it from runtime
+configuration. Admission fails closed while it is uninitialized.
 
 ```text
 docket_claim_partitions
@@ -268,12 +274,9 @@ docket_claim_partitions
   max_active            integer null
   weight                integer null
   borrowing             boolean null
-  state                 text not null default 'running'
-  override_version      bigint not null default 0
-  last_claimed_at       timestamptz null
-  next_ready_at_hint    timestamptz null
-  next_expired_at_hint  timestamptz null
-  last_policy_event_id  text null
+  admin_state           text not null default 'running'
+  partition_version     bigint not null default 0
+  admission_epoch       bigint not null default 0
   inserted_at           timestamptz not null
   updated_at            timestamptz not null
 ```
@@ -283,13 +286,12 @@ the empty string represents tenantless ownership, and a non-empty tenant ID
 represents a tenant. Empty tenant IDs are already invalid, so the two forms do
 not collide.
 
-Nullable override columns mean "use the database default." This permits the
-host to reset an override without deleting scheduling history or racing a run
-insert. Effective policy is resolved inside the claim transaction with
-`COALESCE(partition_override, database_default)`. Resolving a nullable value
-against per-BEAM configuration is forbidden: two versions in a rolling deploy
-could otherwise enforce different ceilings despite correctly serialized row
-locks.
+Nullable override columns mean "use the complete database tuple." The four
+columns are database-constrained to be all null or all present. Claiming chooses
+the complete override when present and otherwise the complete default;
+per-column `COALESCE` is forbidden because it can construct a relationship that
+was never validated atomically. `admission_epoch` is a monotonic decision
+witness, not a live counter. DCKT-49, not DCKT-47, may later add hints/cursors.
 
 The table stores no tier or billing-plan name. Docket consumes only resolved
 execution policy. This prevents the runtime from becoming coupled to the
@@ -297,32 +299,42 @@ host's subscription model.
 
 ### Partition-row lifecycle
 
-- The migration backfills one row for every distinct run `scope_key`.
+- DCKT-67 backfills one row for every distinct run `scope_key` only after
+  DCKT-65 partition-upserting writers are fleet-wide; the transactional schema
+  migration performs no backfill.
 - Starting a run uses `INSERT ... ON CONFLICT DO NOTHING` to idempotently
   create its partition row before inserting the run, in the same outer
   transaction. Concurrent first runs may briefly contend on the unique insert
-  but do not take the long-lived admission lock path.
+  but do not take the long-lived admission lock path. The lifecycle insert
+  supplies only null overrides, `running`, control version zero, and admission
+  epoch zero; on conflict it updates nothing and therefore never overwrites an
+  Admin-created row.
 - An operator may create or update a policy before that tenant starts a run.
+  The exact-cap contract treats an absent target as a virtual inherited,
+  running version-zero row. Any first Admin mutation with expected version zero
+  materializes the canonical row and commits version one, including reset or a
+  request for `running`; all other expected versions conflict with actual zero.
 - Partition rows are not deleted through the normal policy API. Resetting all
   override columns to `NULL` returns a tenant to defaults while preserving its
-  scheduling cursor.
-- Ready/expired timestamps are recoverable liveness hints, not authority.
+  administrative state, admission epoch, and history.
+- When DCKT-49 adds ready/expired liveness hints, they remain non-authoritative.
   Insert and claim paths may update them synchronously when they already hold
   the partition-first lock order. Run-first commit/release/refresh paths emit
   an asynchronous repair signal and never acquire the partition row afterward.
   Periodic reconciliation repairs lost signals and stale hints.
-- A foreign key from `docket_runs.scope_key` to the partition table should use
-  `ON DELETE RESTRICT` if it can be introduced without weakening the existing
-  graph/run composite constraints.
-- The online migration order is: create tables, seed the database default,
-  backfill distinct scope keys, add the foreign key as `NOT VALID` where
-  appropriate, then validate it separately before enabling fair claims.
+- A foreign key from `docket_runs.scope_key` to the partition table uses
+  `ON UPDATE RESTRICT ON DELETE RESTRICT`. Readiness requires it validated;
+  there is no waiver path.
+- The rollout order is: create uninitialized tables, deploy dual-write,
+  explicitly bootstrap the reviewed default, backfill distinct scope keys,
+  build online indexes, add the foreign key as `NOT VALID`, and validate it
+  before readiness and activation.
 - Large installations batch the distinct-scope backfill and build new run
   indexes concurrently where PostgreSQL migration constraints permit.
-- `RunStore.insert_run/5` itself must make partition upsert and run insertion
-  atomic, including direct store calls outside the ordinary lifecycle. If a
-  nested transaction is not used, the weaker allowed outcome—harmless orphan
-  partition rows—must be explicit and tested.
+- `RunStore.insert_run/5` itself makes partition upsert and run insertion one
+  atomic transaction, including direct store calls outside the ordinary
+  lifecycle. Failed and outer-rolled-back run inserts leave neither write; the
+  formerly proposed harmless-orphan alternative is not allowed.
 
 Version 1 accepts dormant partition-row accumulation bounded by historical
 tenant cardinality; the existing pruner does not delete these rows. Inspection
@@ -353,24 +365,26 @@ of authoritative live claims for a tenant.
 
 ## Dynamic tenant policy
 
-The PostgreSQL backend should expose a trusted operator API conceptually like:
+The DCKT-47 control plane is the exact public
+`Docket.Postgres.ClaimPolicy.Admin` surface:
 
 ```elixir
-Docket.Postgres.put_tenant_claim_policy(context, tenant_id,
-  preferred_active: 5,
-  max_active: 10,
-  weight: 4,
-  borrowing: true,
+Docket.Postgres.ClaimPolicy.Admin.put_override(
+  context,
+  {:tenant, tenant_id},
+  %{preferred_active: 5, max_active: 10, weight: 4, borrowing: true},
   expected_version: 7,
-  event_id: "subscription-event-123"
+  source: "billing",
+  event_id: "subscription-event-123",
+  actor: "subscription-handler"
 )
-
-Docket.Postgres.reset_tenant_claim_policy(context, tenant_id)
 ```
 
-Exact placement and naming remain an implementation decision. This is an
-administrative control-plane operation, not a tenant-scoped data-plane call.
-The host must authorize it before invoking Docket.
+`bootstrap_default/3`, `put_default/3`, `put_override/4`,
+`reset_override/3`, `put_state/4`, and bounded bulk/read/audit operations are
+frozen in the exact-cap contract. These are administrative control-plane
+operations, not tenant-scoped data-plane calls. The host authorizes them before
+invoking Docket.
 
 A subscription handler can translate a plan change into a versioned,
 idempotent compare-and-swap:
@@ -385,11 +399,11 @@ separate BEAM nodes can observe different cached values, an external call
 would enter the claim hot path, and a callback cannot atomically coordinate
 concurrent claimers.
 
-The control plane must also record a monotonic version, source event ID,
-effective timestamp, and actor/source audit record; reject stale events; apply
-bounded safety rails; and offer a dry-run/effective-policy read. Policy
-transactions must remain short so `SKIP LOCKED` claimers do not repeatedly
-skip one tenant.
+The control plane records immutable audit events and separate lifetime replay
+receipts. Matching replay returns the original result after later updates or
+audit pruning; conflicting source/event reuse and stale CAS change nothing.
+`expected_version = N` commits exactly `N + 1`. Policy transactions remain
+bounded and use gate -> default -> ascending partition lock order.
 
 Policy changes use the same partition-row lock as claim admission:
 
@@ -411,9 +425,11 @@ Administrative state is separate from quota:
   and release through normal bounded runtime behavior. This is non-preemptive
   unless a later execution-control contract adds cooperative cancellation.
 
-State transitions do not replay, cancel, or mutate graph state. Their exact
-interaction with retained claims and manual drains must be covered by the
-storage contract before the operator API ships.
+State transitions do not replay, cancel, or mutate graph state. Ready and
+expired attempt-limit poison remains allowed in every state because it cannot
+increase live claims; `drain` alone forbids token-replacing steals. Manual and
+inline drains use the same table and report contention distinctly from an
+empty queue.
 
 The tenant partition key must be derived by the trusted host from an immutable
 account or billing principal, not accepted as an arbitrary caller-selected
@@ -427,32 +443,32 @@ Enforcement belongs in `RunStore.claim_due/3`. Dispatcher-local vehicle counts
 still determine how many leases that dispatcher can accept, but they cannot
 enforce a database-wide tenant cap.
 
-One claim statement or short transaction performs the following work:
+One RunStore-issued statement computes one bounded, non-authoritative candidate
+key array and calls the prefix-qualified
+`VOLATILE PARALLEL UNSAFE SECURITY INVOKER`
+`docket_tenant_fair_claim_v1(...)` function exactly once. The function performs
+ordered internal SQL commands:
 
 1. Determine dispatcher demand from the supplied `policy.limit`.
-2. Discover eligible tenant partitions without allowing the first tenant's
-   backlog to consume the entire candidate window.
-3. Rank a bounded set of partition keys by fairness state, then the
-   partition's oldest eligible row and stable scope key. This discovery is a
-   hint, not an authority decision.
-4. Re-sort the chosen keys by ascending `scope_key` and lock their partition
-   rows using `FOR NO KEY UPDATE OF partition SKIP LOCKED`.
-5. Resolve each locked partition's effective policy.
-6. Count its current authoritative live claims.
-7. Select expired claims eligible for steal. A steal replaces an allocation
+2. Reject non-Read-Committed or read-only execution before mutation.
+3. Nonblockingly lock/validate the activation gate and database default.
+4. Re-sort the hinted keys by ascending `scope_key`, lock their partition rows
+   using `FOR NO KEY UPDATE SKIP LOCKED`, and advance the non-authoritative
+   `admission_epoch` decision witness.
+5. In a later internal command with a fresh snapshot, resolve the complete
+   effective tuple and count current authoritative live claims.
+6. Select expired claims eligible for steal. A steal replaces an allocation
    and does not require a free tenant slot.
-8. Compute ready capacity as
+7. Compute ready capacity as
    `max(effective_max_active - live_claims, 0)`.
-9. Select at most that many ready runs for the tenant, ordered by
+8. Select at most that many ready runs for the tenant, ordered by
    `(wake_at, id)`.
-10. Interleave selected partitions so each receives one outcome before a
-    second outcome is assigned, subject to weight and available demand.
-11. Lock run candidates with `FOR UPDATE SKIP LOCKED` and apply the existing
+9. Fill only the bounded dispatcher demand; DCKT-47 makes no interleaving,
+    rotation, preferred, weight, or borrowing promise.
+10. Lock run candidates by ascending ID with `FOR UPDATE SKIP LOCKED`, recheck
+    eligibility, and apply the existing
     token/attempt/poison update.
-12. Advance partition scheduling state using a database-authored logical round
-    or timestamp only for partitions whose final `RETURNING` produced an
-    actual lease or poison outcome.
-13. Return leases and poisoned outcomes through the existing claim batch.
+11. Return leases and poisoned outcomes through the existing claim batch.
 
 The load-bearing invariant is:
 
@@ -461,16 +477,16 @@ The load-bearing invariant is:
 
 No future fast path, including expired recovery, may bypass it.
 
-The locked-partition CTE is the serialization proof, not just an ordering
-suggestion: every live-count and ready-selection lateral query must depend on
-the locked row. At PostgreSQL `READ COMMITTED`, a statement uses a start
-snapshot. A competing additive claimant is safe because it cannot acquire the
-same partition lock and is skipped; a design that waits for the lock and then
-counts from its older statement snapshot is unsafe.
+The locked-partition CTE is explicitly **not** the serialization proof. A
+single statement can establish its snapshot while T1 holds the row, then lock
+the current row without waiting after T1 commits while its aggregate remains
+stale. Authority comes from the function's nonblocking lock command followed
+by a separate fresh-snapshot count command. Syntactic data dependency, CTE
+materialization, lock order, and `SKIP LOCKED` alone are insufficient.
 
 `FOR NO KEY UPDATE` conflicts with policy and claim admission while remaining
-compatible with the `KEY SHARE` lock a child insert may take for the proposed
-foreign key. `FOR UPDATE` would unnecessarily block new-run inserts.
+compatible with the `KEY SHARE` lock a child insert takes for the mandatory
+FK. `FOR UPDATE` would unnecessarily block new-run inserts.
 
 All transactions that need both partition and run locks acquire them in the
 same order: ascending partition `scope_key`, then ascending run ID. Discovery
@@ -488,14 +504,17 @@ separate escalation mechanism.
 
 PostgreSQL does not allow a locking clause at the same query level as
 `DISTINCT` or window functions. Candidate-head discovery therefore occurs in
-an unlocked CTE/subquery, followed by a simple join to partition rows and the
-locking clause. Eligibility is rechecked when actual run rows are updated.
+an unlocked CTE/subquery that supplies one bounded key array to the function.
+The function locks authority rows in a separate internal command. Eligibility
+is rechecked when actual run rows are updated.
 
-### Candidate discovery
+### DCKT-49 future candidate discovery
 
-The current global `LIMIT demand` scans can return only rows from a hot tenant.
-The fair query must choose partition heads before filling additional tenant
-slots, but it must not rank every queued run on each poll.
+Everything in this subsection is future DCKT-49 scope, not the DCKT-47 first
+slice. DCKT-47 may use bounded tenant-blind discovery that returns only rows
+from one hot tenant and may under-claim. DCKT-49's fair query must choose
+partition heads before filling additional tenant slots without ranking every
+queued run on each poll.
 
 `ROW_NUMBER() OVER (PARTITION BY scope_key)` and global `DISTINCT ON` are
 benchmark baselines, not production candidates. They inspect the eligible
@@ -531,8 +550,8 @@ thousands of oldest rows and another holding one recent row, and concurrency
 tests where several pollers rank the same first page while additional eligible
 partitions exist.
 
-Use explicit `last_claimed_at ASC NULLS FIRST` if the first release keeps a
-timestamp cursor; PostgreSQL's default ascending null order would put
+Use explicit `last_claimed_at ASC NULLS FIRST` if DCKT-49 keeps a timestamp
+cursor; PostgreSQL's default ascending null order would put
 never-served partitions last. Use a database timestamp rather than a
 dispatcher clock, and define how all rows selected in one batch advance. A
 logical round/sequence is preferable if timestamps cannot express stable
@@ -554,28 +573,28 @@ starving each other. Tenant partitioning must preserve that property:
 Data-modifying CTEs share one snapshot and cannot observe sibling changes
 except through `RETURNING`. If poisoning expired claims should immediately
 free ready capacity in the same statement, capacity must be derived from that
-`RETURNING` result. The simpler first release may conservatively underfill and
-recover the freed slot on the next poll; it must document and test that choice.
+`RETURNING` result. DCKT-47 deliberately counts before its candidate mutation,
+so expired poison conservatively frees capacity only for the next poll; the
+deterministic suite must preserve that under-fill behavior.
 
-Fairness is applied first across tenants and then reconciled with class
-progress. Neither dimension may be implemented with a global candidate limit
-that hides the other.
+In DCKT-49, fairness is applied first across tenants and then reconciled with
+class progress. DCKT-47 preserves class behavior only among candidates visible
+in its bounded page and explicitly permits a global candidate limit to hide a
+partition.
 
 ## Strict-cap scheduling: first release
 
 The first implementation slice uses:
 
 - exact `max_active` enforcement;
-- `borrowing: false`;
-- one partition outcome per fair round before additional outcomes;
-- `last_claimed_at`, oldest eligibility time, and `scope_key` as stable
-  partition ordering inputs;
+- validated but entirely inert `borrowing`, `preferred_active`, and `weight`;
+- bounded tenant-blind discovery with observable under-claim;
+- no fair rounds, partition cursor/hints, or `last_claimed_at` ordering; and
 - FIFO-like `(eligible_at, run_id)` ordering within a tenant.
 
-This produces moderate round-robin fairness without promising proportional
-resource consumption. `weight` and `preferred_active` may be stored and
-exposed in this slice, but must be documented as inactive until their
-algorithms are enabled.
+This produces exact additive caps but no round-robin, proportional-resource,
+or bounded-wait fairness. DCKT-49 owns rounds/cursors/hints, DCKT-48 owns
+borrowing/preferred behavior, and DCKT-45 owns weight.
 
 ## Active-set weighted service scheduling
 
@@ -1268,8 +1287,9 @@ IDs in ordinary telemetry labels.
 - Race an expired steal and an additive ready claim for the same at-cap
   partition; both paths must obey the same partition-lock invariant.
 - Limits remain database-wide across multiple runtime supervisors.
-- Mixed BEAM configuration cannot create mixed effective defaults; startup
-  verifies the database policy version/fingerprint.
+- Mixed BEAM configuration cannot create mixed effective defaults; `init/2`
+  remains data-only, while readiness/activation and every admission verify the
+  database-authoritative default/function contract under database locks.
 - Different PostgreSQL prefixes have independent accounting.
 - A tenantless deployment forms exactly one partition.
 - `max_active: 0` admits no new ready claims but still permits replacement
@@ -1375,15 +1395,18 @@ production choices.
 ### Phase 1 — exact dynamic hard caps and control plane
 
 - Add and backfill `docket_claim_partitions`.
-- Add recoverable partition eligibility hints and reconciliation.
 - Add tenant-leading partial indexes.
-- Add database-authoritative defaults, policy versioning, trusted override
-  CAS, audit history, and explicit administrative hold state.
-- Enforce database-wide `max_active` in the atomic claim path.
+- Add the explicitly bootstrapped database default, full-tuple versioned CAS,
+  durable replay receipts, prunable immutable audit history, readiness ledger,
+  and `running | hold_new | drain` state.
+- Enforce database-wide `max_active` through the versioned volatile database
+  function and fresh-snapshot authority protocol.
 - Preserve expired-claim recovery at the cap.
 - Add inspection and aggregate telemetry.
 - Add backlog depth/age/creation-rate inspection and a host backpressure hook.
-- Ship with borrowing disabled.
+- Preserve but leave `preferred_active`, `weight`, and `borrowing` inert.
+- Use the two-release gate/capability protocol; do not mix Legacy and
+  TenantFair admission in one prefix.
 
 ### Phase 2 — fair partition rotation
 
@@ -1395,8 +1418,9 @@ production choices.
 - Benchmark hint paging, loose-scan reconciliation, and lateral fill at high
   cardinality.
 
-Phases 1 and 2 may ship together if the query remains reviewable and measured;
-neither should ship alone if a global candidate limit can still hide tenants.
+DCKT-47 deliberately ships Phase 1 without claiming Phase 2. Tenant-blind
+bounded discovery can under-claim or hide a tenant until DCKT-49; this is an
+observable limitation, not an exact-cap violation or fulfilled fairness SLO.
 
 ### Phase 3 — preferred threshold and borrowing
 
@@ -1428,19 +1452,14 @@ neither should ship alone if a global candidate limit can still hide tenants.
 
 ## Decisions still required
 
-1. Final public names for partition configuration and policy administration.
-2. Final administrative-state semantics for retained claims, recovery steals,
-   and manual drains.
-3. Whether strict caps and fair rotation are one release or two internal
-   milestones.
-4. Exact hint-maintenance, cursor-paging, oversampling, and loose-scan fallback
+1. Exact hint-maintenance, cursor-paging, oversampling, and loose-scan fallback
    parameters that satisfy the query-work budget.
-5. The active-set weighted algorithm, first cost objective, admission charge,
+2. The active-set weighted algorithm, first cost objective, admission charge,
    and accounting boundary.
-6. Whether borrowed classification must be a run column or can be preserved
+3. Whether borrowed classification must be a run column or can be preserved
    through another durable operational record.
-7. The documented bound for reclamation after a quiet tenant becomes ready.
-8. Whether effective limits may be tier-aggregated in telemetry without
+4. The documented bound for reclamation after a quiet tenant becomes ready.
+5. Whether effective limits may be tier-aggregated in telemetry without
    exposing a host-defined tier label to Docket.
 
 ## Research basis

@@ -6,9 +6,9 @@ This document coordinates DCKT-47, the safety and control-plane work required
 to ship database-wide exact tenant claim caps. It records delivery order,
 review gates, and evidence requirements. It is not the normative storage,
 control-plane, or admission-serialization contract. DCKT-63 owns those
-decisions, and implementation tickets must follow the contract that DCKT-63
-eventually approves rather than treating examples or questions here as
-normative behavior.
+decisions, and implementation tickets must follow the approved
+[exact-cap contract](docket-exact-cap-contract.md) rather than treating
+examples or questions here as normative behavior.
 
 The design background and phased product direction remain in
 [Tenant-Aware Claim Fairness](docket-tenant-claim-fairness-design.md). This plan
@@ -45,6 +45,7 @@ DCKT-63 -> DCKT-64
 DCKT-64 -> DCKT-65, DCKT-66, DCKT-67
 DCKT-65 -> DCKT-67, DCKT-68
 DCKT-66 -> DCKT-71, DCKT-68
+DCKT-66 -> DCKT-72
 DCKT-67 -> DCKT-72, DCKT-68
 DCKT-72 -> DCKT-71, DCKT-68
 DCKT-71 -> DCKT-68, DCKT-70
@@ -52,12 +53,10 @@ DCKT-68 -> DCKT-69, DCKT-70
 DCKT-69 -> DCKT-70
 ```
 
-Readiness also appears to require an initialized database-authoritative default
-from DCKT-66 before DCKT-72 can prove the prefix ready. That semantic
-`DCKT-66 -> DCKT-72` prerequisite is a required review check for this epic,
-but is not silently asserted here as a changed tracker edge. DCKT-63 must make
-the underlying bootstrap/readiness relationship explicit; then the ticket
-tracker should be reconciled if the approved contract confirms the edge.
+Readiness requires an initialized database-authoritative default from DCKT-66
+before DCKT-72 can prove the prefix ready. DCKT-63 therefore confirms
+`DCKT-66 -> DCKT-72` as a real semantic and tracker dependency, not merely
+stack ancestry.
 
 Git and GitHub use a deterministic linear extension of the graph. This keeps
 every pull request ticket-local and makes both fork legs ancestors of their
@@ -124,10 +123,10 @@ this plan.
 | --- | --- |
 | DCKT-63 | Approves one internally consistent storage, control-plane, and admission-serialization contract and closes every risk listed below with an exact decision table, transaction and lock model, migration/readiness semantics, and mixed-version capability proof. No runtime implementation is hidden in the contract PR. |
 | DCKT-64 | Installs the approved v2 policy/partition shape with prefix-safe, versioned migrations and database invariants. The migration alone cannot activate the new engine. Upgrade and rollback behavior are tested. |
-| DCKT-65 | Creates or reconciles partition state atomically with run creation under the approved authority and lock rules. Concurrent creation, rollback, tenant scope, and existing lifecycle behavior remain covered. |
-| DCKT-66 | Implements authorized, versioned, idempotent policy administration, including stale-write rejection, effective-policy inspection, bootstrap/default handling, and durable audit behavior exactly as approved. Data-plane callers do not gain control-plane authority. |
+| DCKT-65 | Creates partition state atomically with run creation under the approved authority and lock rules. Its conflict path never updates an Admin-created row. Concurrent Admin/lifecycle creation, rollback, tenant scope, and existing lifecycle behavior remain covered. |
+| DCKT-66 | Implements authorized, versioned, idempotent policy administration, including the exact absent-partition virtual version-zero/materialization CAS, stale-write rejection, effective-policy inspection, bootstrap/default handling, and durable receipt/audit behavior exactly as approved. Data-plane callers do not gain control-plane authority. |
 | DCKT-67 | Establishes dual-write before an idempotent, restartable, bounded backfill. Concurrent run creation cannot leave gaps or overwrite newer state, and mixed old/new binaries remain within the approved compatibility envelope. |
-| DCKT-72 | Builds required indexes online, validates foreign keys without an unsafe table-wide rollout step, and proves prefix readiness. Review explicitly verifies whether the DCKT-66 default/bootstrap state is a prerequisite and reconciles the dependency record with DCKT-63. |
+| DCKT-72 | Builds required indexes online, validates the mandatory foreign key without an unsafe table-wide rollout step, and proves prefix readiness. DCKT-66 default bootstrap is a confirmed prerequisite and readiness must reject an uninitialized default. |
 | DCKT-71 | Prevents partial or premature activation across one prefix. The interlock is database-authoritative, checks the approved schema/data/engine capabilities, and fails closed with actionable inspection evidence. |
 | DCKT-68 | Enforces exact caps in one approved serialized admission decision while preserving replacement-steal, downgrade, administrative-state, fencing, poison, and bounded-batch semantics. Legacy behavior remains available until the interlock permits activation. |
 | DCKT-69 | Demonstrates cap safety and progress under concurrent claim, release, commit, expiry, policy update, and activation pressure on PostgreSQL 13 and 17. A deterministic known-bad control uses barriers to enforce this order: T2 establishes its statement snapshot while T1 holds the partition; T1 commits; only then does T2 attempt the partition lock, immediately acquire the current row without waiting or triggering `SKIP LOCKED`, and retain the stale snapshot for same-statement aggregate or candidate reads. On both versions, the production path proves no over-admission under this schedule and, separately, prompt, bounded handling of genuinely held locks. Approved query shapes and bounded work have saved plan and benchmark evidence. |
@@ -202,11 +201,11 @@ pull request. The stacked diff and ticket links must let a reviewer trace each
 shipped behavior from decision, through migration and implementation, to test
 and operator guidance.
 
-## Contract risks owned by DCKT-63
+## Contract risks resolved by DCKT-63
 
-DCKT-63 must close the following questions before dependent implementation is
-treated as contract-complete. This plan deliberately does not choose the
-answers.
+The [exact-cap contract](docket-exact-cap-contract.md) closes the following
+questions. The list remains here as the review checklist for dependent
+implementation; examples in this plan cannot override the selected answers.
 
 1. **Configuration and bootstrap authority.** Which database value is
    authoritative before a tenant-specific row exists; who may initialize or
@@ -233,11 +232,10 @@ answers.
    T2 attempts the partition lock. T2 immediately acquires the current row: it
    does not wait, and `SKIP LOCKED` does not trigger. Aggregate or candidate
    reads in T2's statement can nevertheless retain the earlier snapshot. Lock
-   order, `SKIP LOCKED`, and row data-dependencies require actual PostgreSQL
-   proof and may be insufficient to close this race. DCKT-63 must select a
-   sound serialization and authority model while preserving, or explicitly
-   revising, the DCKT-46 one-statement caller contract. This plan does not
-   select that model.
+   order, `SKIP LOCKED`, and row data-dependencies are insufficient. The
+   selected model preserves DCKT-46 with one call to a `VOLATILE` database
+   function, then separates its nonblocking lock and fresh-snapshot count into
+   different internal commands.
 7. **Old-binary and engine-capability proof.** How the system identifies every
    writer and claimer capability relevant to a prefix, what mixed-version
    window is supported, how stale processes expire from the proof, and why an
@@ -247,6 +245,6 @@ answers.
    who executes activation and rollback; and which failure modes can be
    automatically repaired rather than merely reported.
 
-Dependent tickets may prototype against an explicitly labeled assumption, but
-they cannot convert that assumption into a public or durable contract before
-DCKT-63 resolves it and the relevant reviews accept the resolution.
+Dependent tickets must implement these approved resolutions. A proposed change
+updates the normative contract first and passes the same adversarial review;
+an implementation cannot silently replace the authority model.
