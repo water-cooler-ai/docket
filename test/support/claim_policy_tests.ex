@@ -169,6 +169,54 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
   end
 
+  defmodule Docket.Test.TenantFairConfigClaimPolicy do
+    @moduledoc false
+
+    @behaviour Docket.Postgres.ClaimPolicy
+
+    alias Docket.Postgres.ClaimPolicy.TenantFair.Config
+
+    @marker :tenant_fair_config_contract
+
+    @impl true
+    def init(options, context) do
+      with {:ok, config} <- Config.new(options) do
+        relay({:tenant_fair_config_claim_policy, :init, config, context})
+        {:ok, config}
+      end
+    end
+
+    @impl true
+    def build_plan(context, policy, %Config{} = config) do
+      relay({:tenant_fair_config_claim_policy, :build_plan, config, self()})
+      Docket.Test.AlternateClaimPolicy.build_plan(context, policy, %{marker: @marker})
+    end
+
+    @impl true
+    def decode(rows, decoder, %Config{} = config) do
+      relay({:tenant_fair_config_claim_policy, :decode, config, self()})
+      Docket.Test.AlternateClaimPolicy.decode(rows, decoder, %{marker: @marker})
+    end
+
+    @impl true
+    def observe(plan, decoded, result, duration, %Config{} = config) do
+      relay({:tenant_fair_config_claim_policy, :observe, config, result})
+
+      Docket.Test.AlternateClaimPolicy.observe(
+        plan,
+        decoded,
+        result,
+        duration,
+        %{marker: @marker}
+      )
+    end
+
+    defp relay(message) do
+      if pid = Process.whereis(:docket_claim_policy_relay), do: send(pid, message)
+      :ok
+    end
+  end
+
   defmodule Docket.Test.ClaimPolicyTests do
     @moduledoc false
 

@@ -86,6 +86,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         raise ArgumentError, ":claim_policy must be a keyword list, got: #{inspect(config)}"
       end
 
+      if Enum.count(config, fn {key, _value} -> key == :implementation end) > 1 do
+        raise ArgumentError, ":claim_policy contains duplicate keys: [:implementation]"
+      end
+
       {implementation, implementation_opts} =
         Keyword.pop(config, :implementation, @default_implementation)
 
