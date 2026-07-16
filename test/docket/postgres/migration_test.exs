@@ -6,6 +6,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduletag :postgres
 
     alias Docket.Postgres.ClaimPolicy.OnlineDDL
+    alias Docket.Postgres.ClaimPolicy.TenantFair.Function
     alias Docket.Postgres.TestRepo
 
     defmodule InstallDocket do
@@ -1585,15 +1586,51 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert v2_index_catalog(prefix) == @v2_index_catalog
 
-      assert TestRepo.query!(
-               """
-               SELECT p.proname
-               FROM pg_proc AS p
-               JOIN pg_namespace AS n ON n.oid = p.pronamespace
-               WHERE n.nspname = $1 AND p.proname LIKE 'docket_%'
-               """,
-               [prefix]
-             ).rows == []
+      assert [
+               [
+                 name,
+                 "f",
+                 6,
+                 identity_arguments,
+                 true,
+                 result,
+                 "v",
+                 "u",
+                 false,
+                 search_path,
+                 "plpgsql",
+                 source
+               ]
+             ] =
+               TestRepo.query!(
+                 """
+                 SELECT procedure.proname,
+                        procedure.prokind::text,
+                        procedure.pronargs,
+                        pg_get_function_identity_arguments(procedure.oid),
+                        procedure.proretset,
+                        pg_get_function_result(procedure.oid),
+                        procedure.provolatile::text,
+                        procedure.proparallel::text,
+                        procedure.prosecdef,
+                        procedure.proconfig,
+                        language.lanname,
+                        procedure.prosrc
+                 FROM pg_proc AS procedure
+                 JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+                 JOIN pg_language AS language ON language.oid = procedure.prolang
+                 WHERE namespace.nspname = $1 AND procedure.proname LIKE 'docket_%'
+                 ORDER BY procedure.proname, procedure.oid
+                 """,
+                 [prefix]
+               ).rows
+
+      assert name == Function.name()
+      assert identity_arguments == Function.identity_arguments()
+      assert result == Function.result()
+      assert search_path == Function.search_path()
+      assert source == Function.prosrc(prefix)
+      assert :crypto.hash(:sha256, source) == Function.body_sha256(prefix)
     end
 
     defp singleton_state(prefix) do

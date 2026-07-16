@@ -9,6 +9,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.ClaimPolicy
     alias Docket.Postgres.ClaimPolicy.{Activation, Admin, Backfill, OnlineDDL, Readiness}
     alias Docket.Postgres.ClaimPolicy.Admin.Codec
+    alias Docket.Postgres.ClaimPolicy.TenantFair.Function
     alias Docket.Postgres.ClaimPolicyAdminTestRepo, as: TestRepo
     alias Docket.Postgres.{OnlineMigration, RunStore}
     alias Docket.Postgres.Schemas.GraphVersion
@@ -21,88 +22,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defmodule TenantFairActivationFixture do
       @behaviour Docket.Postgres.ClaimPolicy
 
-      alias Docket.Postgres.ClaimPolicy.{Activation, Legacy, Plan}
-      alias Docket.Postgres.Storage
+      alias Docket.Postgres.ClaimPolicy.TenantFair
+
+      @options [
+        partition_by: :tenant_id,
+        default_preferred_active: 2,
+        default_max_active: 4,
+        default_weight: 1,
+        borrowing: false
+      ]
 
       @impl true
-      def init([], _context), do: {:ok, nil}
+      def init([], context), do: TenantFair.init(@options, context)
 
       @impl true
-      def activation_contract(nil), do: %{engine: :tenant_fair, function_contract: 1}
+      defdelegate activation_contract(state), to: TenantFair
 
       @impl true
-      def build_plan(
-            %{prefix: prefix},
-            %{
-              now: now,
-              limit: limit,
-              orphan_ttl_ms: ttl,
-              max_claim_attempts: max,
-              preference: preference
-            },
-            nil
-          ) do
-        cutoff = DateTime.add(now, -ttl, :millisecond)
-        function = Storage.qualified_table(prefix, Activation.function_contract().name)
-
-        %Plan{
-          statement: """
-          SELECT *
-          FROM #{function}($1, $2, $3, $4, $5, $6) AS claimed(
-            run_id text,
-            tenant_id text,
-            graph_id text,
-            graph_hash text,
-            checkpoint_seq bigint,
-            claim_token uuid,
-            claimed_at timestamp with time zone,
-            claim_attempt integer,
-            poisoned_at timestamp with time zone,
-            poison_reason text,
-            class text,
-            eligible_at timestamp with time zone,
-            ready_candidates bigint,
-            expired_candidates bigint
-          )
-          ORDER BY run_id
-          """,
-          params: [now, cutoff, limit, max, preference && Atom.to_string(preference), []],
-          decoder: %{now: now, orphan_ttl_ms: ttl},
-          observation: %{demand: limit, preference: preference}
-        }
-      end
+      defdelegate build_plan(context, policy, state), to: TenantFair
 
       @impl true
-      def decode(
-            [
-              [
-                nil,
-                nil,
-                nil,
-                nil,
-                nil,
-                nil,
-                nil,
-                nil,
-                nil,
-                nil,
-                "__docket_tenant_fair_gate__",
-                _now,
-                -5,
-                0
-              ]
-            ],
-            _decoder,
-            nil
-          ) do
-        {:error, {:claim_policy_unavailable, :not_ready}, %{}}
-      end
-
-      def decode(rows, decoder, nil), do: Legacy.decode(rows, decoder, nil)
+      defdelegate decode(rows, decoder, state), to: TenantFair
 
       @impl true
-      def observe(plan, decoded, result, duration, nil),
-        do: Legacy.observe(plan, decoded, result, duration, nil)
+      defdelegate observe(plan, decoded, result, duration, state), to: TenantFair
     end
 
     defmodule InstallDocket do
@@ -253,6 +196,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                Activation.activate(
                  activation_context,
                  mode_opts("activate", 1, assertion.assertion_id)
+               )
+
+      assert {:ok,
+              %{
+                leases: [%{run_id: "gate-blocked-run", claim_token: tenant_fair_token}],
+                poisoned: []
+              }} =
+               RunStore.claim_due(activation_context, :system, policy())
+
+      assert :ok =
+               RunStore.release_claim(
+                 activation_context,
+                 :system,
+                 "gate-blocked-run",
+                 tenant_fair_token,
+                 @now
                )
 
       assert {:error, {:claim_policy_unavailable, :inactive_engine}} =
@@ -1064,6 +1023,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       prepare_ready!(context, "public")
       register!(context)
       assertion = attest!(context, "function-negative-proof")
+      drop_function!("public")
 
       assert {:ok, %{reasons: reasons}} = Activation.preflight(context)
       assert :function_contract_mismatch in reasons
@@ -1097,6 +1057,45 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                Activation.activate(
                  context,
                  mode_opts("function-stable", 0, assertion.assertion_id)
+               )
+
+      install_function!("public")
+
+      tampered_source = "\nBEGIN\n  RETURN;\nEND;\n"
+
+      tampered_sql =
+        Function.create_sql("public")
+        |> String.replace_prefix("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION")
+        |> String.replace(Function.prosrc("public"), tampered_source)
+
+      TestRepo.query!(tampered_sql)
+
+      assert {:ok, %{reasons: reasons}} = Activation.preflight(context)
+      assert :function_contract_mismatch in reasons
+
+      assert {:error, {:claim_policy_unavailable, :function_contract_mismatch}} =
+               Activation.activate(
+                 context,
+                 mode_opts("function-body-tampered", 0, assertion.assertion_id)
+               )
+
+      install_function!("public")
+
+      TestRepo.query!("""
+      CREATE FUNCTION docket_tenant_fair_claim_v1(integer)
+      RETURNS integer
+      LANGUAGE sql
+      IMMUTABLE
+      AS 'SELECT $1'
+      """)
+
+      assert {:ok, %{reasons: reasons}} = Activation.preflight(context)
+      assert :function_contract_mismatch in reasons
+
+      assert {:error, {:claim_policy_unavailable, :function_contract_mismatch}} =
+               Activation.activate(
+                 context,
+                 mode_opts("function-overload", 0, assertion.assertion_id)
                )
 
       assert [["legacy", 0]] =
@@ -1319,127 +1318,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp install_function!(prefix) do
-      TestRepo.query!("""
-      CREATE FUNCTION "#{prefix}".docket_tenant_fair_claim_v1(
-        timestamp with time zone,
-        timestamp with time zone,
-        integer,
-        integer,
-        text,
-        text[]
-      )
-      RETURNS SETOF record
-      LANGUAGE plpgsql
-      VOLATILE
-      PARALLEL UNSAFE
-      SECURITY INVOKER
-      SET search_path TO pg_catalog, pg_temp
-      AS $function$
-      DECLARE
-        gate_mode text;
-        gate_readiness text;
-        gate_contract integer;
-      BEGIN
-        IF current_setting('transaction_read_only') = 'on' THEN
-          RETURN QUERY SELECT
-            NULL::text, NULL::text, NULL::text, NULL::text, NULL::bigint,
-            NULL::uuid, NULL::timestamptz, NULL::integer, NULL::timestamptz,
-            NULL::text, '__docket_tenant_fair_gate__'::text, $1,
-            (-4)::bigint, 0::bigint;
-          RETURN;
-        END IF;
-
-        IF current_setting('transaction_isolation') <> 'read committed' THEN
-          RETURN QUERY SELECT
-            NULL::text, NULL::text, NULL::text, NULL::text, NULL::bigint,
-            NULL::uuid, NULL::timestamptz, NULL::integer, NULL::timestamptz,
-            NULL::text, '__docket_tenant_fair_gate__'::text, $1,
-            (-3)::bigint, 0::bigint;
-          RETURN;
-        END IF;
-
-        SELECT admission_mode, readiness, required_function_contract
-        INTO gate_mode, gate_readiness, gate_contract
-        FROM "#{prefix}".docket_claim_admission_gate
-        WHERE id = 1
-        FOR SHARE SKIP LOCKED;
-
-        IF NOT FOUND THEN
-          RETURN QUERY SELECT
-            NULL::text, NULL::text, NULL::text, NULL::text, NULL::bigint,
-            NULL::uuid, NULL::timestamptz, NULL::integer, NULL::timestamptz,
-            NULL::text, '__docket_admission_gate__'::text, $1,
-            (-1)::bigint, 0::bigint;
-          RETURN;
-        END IF;
-
-        IF gate_mode <> 'tenant_fair' OR gate_contract <> 1 THEN
-          RETURN QUERY SELECT
-            NULL::text, NULL::text, NULL::text, NULL::text, NULL::bigint,
-            NULL::uuid, NULL::timestamptz, NULL::integer, NULL::timestamptz,
-            NULL::text, '__docket_admission_gate__'::text, $1,
-            (-2)::bigint, 0::bigint;
-          RETURN;
-        END IF;
-
-        IF gate_readiness <> 'ready' THEN
-          RETURN QUERY SELECT
-            NULL::text, NULL::text, NULL::text, NULL::text, NULL::bigint,
-            NULL::uuid, NULL::timestamptz, NULL::integer, NULL::timestamptz,
-            NULL::text, '__docket_tenant_fair_gate__'::text, $1,
-            (-5)::bigint, 0::bigint;
-          RETURN;
-        END IF;
-
-        PERFORM 1
-        FROM "#{prefix}".docket_claim_policy
-        WHERE id = 1 AND initialized_at IS NOT NULL
-        FOR SHARE SKIP LOCKED;
-
-        IF NOT FOUND THEN
-          RETURN QUERY SELECT
-            NULL::text, NULL::text, NULL::text, NULL::text, NULL::bigint,
-            NULL::uuid, NULL::timestamptz, NULL::integer, NULL::timestamptz,
-            NULL::text, '__docket_admission_gate__'::text, $1,
-            (-1)::bigint, 0::bigint;
-          RETURN;
-        END IF;
-
-        RETURN QUERY
-        WITH candidate AS MATERIALIZED (
-          SELECT id, wake_at AS eligible_at
-          FROM "#{prefix}".docket_runs
-          WHERE status = 'running'
-            AND poisoned_at IS NULL
-            AND claim_token IS NULL
-            AND wake_at <= $1
-            AND claim_attempts < $4
-          ORDER BY wake_at, id
-          LIMIT $3
-          FOR UPDATE SKIP LOCKED
-        ),
-        updated AS (
-          UPDATE "#{prefix}".docket_runs AS runs
-          SET claim_token = pg_catalog.gen_random_uuid(),
-              claimed_at = $1,
-              wake_at = NULL,
-              claim_attempts = runs.claim_attempts + 1
-          FROM candidate
-          WHERE runs.id = candidate.id
-          RETURNING runs.run_id, runs.tenant_id, runs.graph_id, runs.graph_hash,
-                    runs.checkpoint_seq, runs.claim_token, runs.claimed_at,
-                    runs.claim_attempts, candidate.eligible_at
-        )
-        SELECT updated.run_id, updated.tenant_id, updated.graph_id,
-               updated.graph_hash, updated.checkpoint_seq, updated.claim_token,
-               updated.claimed_at, updated.claim_attempts, NULL::timestamptz,
-               NULL::text, 'ready'::text, updated.eligible_at,
-               (SELECT count(*)::bigint FROM candidate), 0::bigint
-        FROM updated;
-      END;
-      $function$
-      """)
+      drop_function!(prefix)
+      TestRepo.query!(Function.create_sql(prefix))
     end
+
+    defp drop_function!(prefix), do: TestRepo.query!(Function.drop_sql(prefix))
 
     defp register!(context, overrides \\ []) do
       assert {:ok, %{instance_id: instance_id, expires_at: %DateTime{}}} =

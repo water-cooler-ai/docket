@@ -1,4 +1,94 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
+  defmodule Docket.Test.TenantFairRunStoreSetup do
+    @moduledoc false
+
+    alias Docket.Postgres.ClaimPolicy.{Activation, Admin, Backfill, OnlineDDL, Readiness}
+    alias Docket.Postgres.ClaimPolicy.TenantFair.Function
+    alias Docket.Postgres.OnlineMigration
+
+    @default_policy %{preferred_active: 1, max_active: 2, weight: 1, borrowing: false}
+
+    def prepare!(repo, implementation_opts) do
+      context =
+        Docket.Postgres.context(
+          repo: repo,
+          claim_policy:
+            [implementation: Docket.Postgres.ClaimPolicy.TenantFair] ++ implementation_opts
+        )
+
+      {:ok, _} =
+        Readiness.attest_dual_write(context,
+          evidence_fingerprint: :crypto.hash(:sha256, "run-store-matrix-dual-write"),
+          source: "run-store-matrix",
+          event_id: "dual-write",
+          actor: "test"
+        )
+
+      advance_until_complete!(context)
+
+      {:ok, %{version: 1}} =
+        Admin.bootstrap_default(context, @default_policy,
+          source: "run-store-matrix",
+          event_id: "bootstrap",
+          actor: "test",
+          expected_version: 0
+        )
+
+      :ok = OnlineMigration.up(repo: repo)
+      fingerprints = OnlineDDL.index_fingerprints("public")
+
+      {:ok, %{version: 1}} =
+        Readiness.verify(context,
+          expected_readiness_epoch: 0,
+          ready_index_ddl_sha256: fingerprints.ready,
+          live_index_ddl_sha256: fingerprints.live,
+          source: "run-store-matrix",
+          event_id: "verify",
+          actor: "test"
+        )
+
+      {:ok, _} =
+        Activation.register_capability(context, "00000000-0000-4000-8000-000000000069",
+          binary_fingerprint: :crypto.hash(:sha256, "run-store-matrix-binary"),
+          writer_contract: 1,
+          gate_contract: 1,
+          function_contract: Function.version(),
+          ttl_ms: :timer.minutes(5)
+        )
+
+      {:ok, assertion} =
+        Activation.attest_old_binaries_absent(context,
+          source: "run-store-matrix",
+          event_id: "old-binaries",
+          actor: "test",
+          evidence_fingerprint: :crypto.hash(:sha256, "run-store-matrix-old-binaries"),
+          expires_at: DateTime.add(DateTime.utc_now(), 300, :second)
+        )
+
+      {:ok, %{outcome: :applied, version: 1}} =
+        Activation.activate(context,
+          source: "run-store-matrix",
+          event_id: "activate",
+          actor: "test",
+          expected_epoch: 0,
+          old_binary_assertion_id: assertion.assertion_id
+        )
+
+      repo.query!(
+        "INSERT INTO docket_claim_partitions (scope_key) VALUES ('') ON CONFLICT DO NOTHING"
+      )
+
+      :ok
+    end
+
+    defp advance_until_complete!(context) do
+      case Backfill.advance(context, batch_size: 10_000) do
+        {:ok, %{phase: :complete}} -> :ok
+        {:ok, _} -> advance_until_complete!(context)
+      end
+    end
+  end
+
   defmodule Docket.Test.ClaimPolicyRunStoreTests do
     @moduledoc false
 
@@ -8,6 +98,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       tests =
         Docket.Test.ClaimPolicyMatrix.implementations()
+        |> Enum.filter(&Map.get(&1, :run_store?, true))
         |> Enum.flat_map(&contract_tests(&1, repo, query_event))
 
       quote do
@@ -20,6 +111,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       implementation = spec.implementation
       implementation_opts = spec.options
       query_marker = spec.query_marker
+      run_store_setup = Map.get(spec, :run_store_setup)
+
+      setup_call =
+        if run_store_setup do
+          quote do
+            :ok = unquote(run_store_setup).prepare!(repo, implementation_opts)
+          end
+        else
+          quote do
+            :ok
+          end
+        end
 
       [
         quote do
@@ -33,7 +136,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             run_id =
               "claim-policy-contract-#{System.unique_integer([:positive, :monotonic])}"
 
-            inserted = insert_run!(run_id)
             root = %{repo: repo, prefix: nil}
 
             claim_policy =
@@ -43,6 +145,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               )
 
             context = Map.put(root, :claim_policy, claim_policy)
+            unquote(setup_call)
+
+            inserted = insert_run!(run_id)
             handler = "claim-policy-run-store-#{System.unique_integer([:positive])}"
 
             :telemetry.attach(

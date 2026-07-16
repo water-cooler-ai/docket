@@ -73,7 +73,7 @@ events unchanged.
 
 ### TenantFair v1 admission observation
 
-A future TenantFair plan opts into the source-owned `:tenant_fair_v1` schema.
+The TenantFair plan opts into the source-owned `:tenant_fair_v1` schema.
 Every successful decode, including a no-op, must return one complete aggregate
 summary. The ClaimPolicy facade validates that summary against the portable
 lease/poison batch and emits
@@ -91,12 +91,12 @@ The event's direct measurements are:
 | `demand`, `leases`, `poisoned`, `outcomes`, `unfilled_demand`, `steals` | Counts. An outcome is one returned lease or poison; an expired lease is a token-replacing steal. `unfilled_demand` is descriptive and does not by itself prove avoidable under-claim. |
 | `eligible_partitions`, `locked_partitions`, `skipped_partitions` | Distinct partition counts considered, successfully locked, and skipped by the bounded plan. |
 | `cap_denied_partitions` | Count of distinct locked, eligible partitions denied additive ready admission because authoritative live claims reached `max_active`; it is not denied backlog rows or a cap-violation count. |
-| `below_preferred_partitions` | Count of locked eligible partitions below `preferred_active`. |
+| `below_preferred_partitions` | Reserved contract-v1 field. The exact-cap engine emits `0`; preferred-share attribution is not inferred. |
 | `default_policy_partitions`, `override_policy_partitions` | Counts of locked partitions consulting each policy source. |
 | `running_partitions`, `hold_new_partitions`, `drain_partitions` | Counts of locked partitions in each administrative state. |
-| `preferred_admissions`, `borrowed_admissions` | Counts of additive ready leases by admission class. Expired replacement steals are neither. |
+| `preferred_admissions`, `borrowed_admissions` | Reserved contract-v1 fields. The exact-cap engine emits both as `0`, so the facade reports `admission_class: :none` even for ready leases. The validator also accepts an exhaustively classified future producer, but rejects partial classification. |
 | `ready_leases`, `ready_poisoned`, `expired_leases`, `expired_poisoned` | Outcome counts by work class and disposition. |
-| `candidate_rows_examined` | Logical candidate rows materialized/considered by the bounded TenantFair plan. It is not PostgreSQL physical rows scanned; physical work and buffers belong to benchmark `EXPLAIN` output. |
+| `candidate_rows_examined` | Sum of rows materialized by the four raw per-key lanes (ready poison, ready ordinary, expired poison, expired ordinary) before state, cap, reservation, locking, or final disposition. Each lane is capped by the then-current remaining demand, so denied rows and lock backups count. Page-visibility probes and later eligibility rechecks do not. This is not PostgreSQL physical rows scanned; physical work and buffers belong to benchmark `EXPLAIN` output. |
 | `under_claimed` | `0` or `1`. It is `1` only when a bounded, trusted audit proves that eligible lockable work was avoidably left unserved. Ordinary `outcomes < demand` remains a partial result, not automatically under-claim. |
 | `ready_claim_wait_ms_count|sum|max` | Ready-lease wait samples in integer milliseconds. Each sample is database `claimed_at - wake_at`; the count equals `ready_leases`. |
 | `expired_recovery_wait_ms_count|sum|max` | Expired outcome recovery samples in integer milliseconds from the prior claim's expiry boundary to its lease/poison resolution. These are never mixed with ready wait. |

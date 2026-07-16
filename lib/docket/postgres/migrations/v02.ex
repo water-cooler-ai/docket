@@ -5,6 +5,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     use Ecto.Migration
 
     alias Docket.Postgres.ClaimPolicy.OnlineDDL
+    alias Docket.Postgres.ClaimPolicy.TenantFair.Function
     alias Docket.Postgres.Storage
 
     @tables [
@@ -337,6 +338,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       execute("INSERT INTO #{policy} (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
       execute("INSERT INTO #{rollout} (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
       execute("INSERT INTO #{gate} (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+      execute(Function.create_sql(prefix))
     end
 
     def down(%{destructive: true, prefix: prefix}) do
@@ -348,6 +350,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       exports = qualified_table(prefix, "docket_claim_audit_exports")
       partitions = qualified_table(prefix, "docket_claim_partitions")
       runs = qualified_table(prefix, "docket_runs")
+
+      execute(Function.drop_sql(prefix))
 
       execute("""
       DO $docket_v02_down$

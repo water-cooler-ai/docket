@@ -209,10 +209,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         invalid!("portable outcomes exceed admission demand", observation)
       end
 
-      if observation.preferred_admissions + observation.borrowed_admissions !=
-           observation.ready_leases do
+      classified = observation.preferred_admissions + observation.borrowed_admissions
+      neutral? = observation.preferred_admissions == 0 and observation.borrowed_admissions == 0
+
+      unless neutral? or classified == observation.ready_leases do
         invalid!(
-          "preferred_admissions + borrowed_admissions must equal ready_leases",
+          "ready admissions must be either intentionally unclassified or exhaustively classified",
           observation
         )
       end

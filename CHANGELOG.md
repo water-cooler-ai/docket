@@ -16,14 +16,23 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- Exact-cap `Docket.Postgres.ClaimPolicy.TenantFair` admission engine and
+  canonical prefix-qualified `docket_tenant_fair_claim_v1` function. One
+  tenant-blind bounded discovery statement invokes the function once; fresh
+  ordered gate/default/partition/run authorities enforce additive ready caps,
+  preserve zero-net steals and poison progress, honor running/hold-new/drain,
+  reserve ready/expired class progress across the locked key page, and mutate
+  each key through one bounded set-based command with truthful raw-candidate
+  accounting plus a poison-first, per-class-bounded decision source that cannot
+  be truncated by a later ID limit. Activation verifies the exact
+  prefix-specific function body and rejects overloads or catalog drift.
 - Prefix-wide audited TenantFair activation and rollback interlock: capability
   heartbeats serialize through the same admission gate as mode changes,
   activation requires bounded external old-binary proof and the canonical
   DCKT-72 readiness/catalog evidence, and gate-aware Legacy fails closed under
   mode, isolation, read-only, and lock contention. Advisory preflight exposes
   exact prefix/default/index/FK/table/implementation evidence; epoch-CAS mode
-  changes remain replayable, prefix isolated, and auditable. DCKT-68 still owns
-  the production TenantFair engine and database function.
+  changes remain replayable, prefix isolated, and auditable.
 - Resumable PostgreSQL v2 online-readiness DDL and verification: generated
   nontransactional host migrations build the two exact tenant-leading indexes
   concurrently, install and validate the partition foreign key in separate

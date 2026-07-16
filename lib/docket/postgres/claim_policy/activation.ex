@@ -16,15 +16,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.ClaimPolicy.Admin.Codec
     alias Docket.Postgres.ClaimPolicy.ControlContext
     alias Docket.Postgres.ClaimPolicy.Readiness
+    alias Docket.Postgres.ClaimPolicy.TenantFair.Function
     alias Docket.Runtime.Clock
 
     @writer_contract 1
     @gate_contract 1
-    @function_contract 1
-    @function_name "docket_tenant_fair_claim_v1"
-    @function_identity_arguments "timestamp with time zone, timestamp with time zone, integer, integer, text, text[]"
-    @function_result "SETOF record"
-    @function_search_path ["search_path=pg_catalog, pg_temp"]
+    @function_contract Function.version()
     @max_bigint 9_223_372_036_854_775_807
     @max_capability_ttl_ms :timer.hours(24)
     @max_assertion_ttl_ms :timer.hours(24)
@@ -61,18 +58,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           }
 
     @doc false
-    def function_contract do
-      %{
-        name: @function_name,
-        identity_arguments: @function_identity_arguments,
-        result: @function_result,
-        volatility: :volatile,
-        parallel: :unsafe,
-        security: :invoker,
-        search_path: @function_search_path,
-        version: @function_contract
-      }
-    end
+    def function_contract, do: Function.catalog_contract()
 
     @doc """
     Registers one expiring, prefix-local upgraded-binary capability.
@@ -539,6 +525,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                           AND NOT procedure.prosecdef
                           AND procedure.proconfig = $5::text[]
                           AND language.lanname = 'plpgsql'
+                          AND procedure.prosrc = $6
                       )::bigint
                FROM pg_proc AS procedure
                JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
@@ -547,10 +534,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                """,
                [
                  control.prefix,
-                 @function_name,
-                 @function_identity_arguments,
-                 @function_result,
-                 @function_search_path
+                 Function.name(),
+                 Function.identity_arguments(),
+                 Function.result(),
+                 Function.search_path(),
+                 Function.prosrc(control.prefix)
                ],
                log: false
              ) do

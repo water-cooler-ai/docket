@@ -187,11 +187,10 @@ use Docket,
   ]
 ```
 
-This is the locked configuration shape, not a claim that TenantFair is already
-selectable. The source-owned configuration value is validated independently;
-the later hard-cap phase adds the selectable engine and schema. Merely accepting
-the configuration must not silently run Legacy under a TenantFair name or imply
-that caps, fair rotation, weights, or borrowing are active. For DCKT-47 these
+This is the locked configuration shape for the selectable TenantFair engine.
+Merely accepting the configuration does not imply that fair rotation, weights,
+or borrowing are active: contract v1 enforces exact caps while those fields
+remain reserved. For DCKT-47 these
 `default_*` values are reviewed configuration inputs only: `init/2` performs no
 database I/O, they are never a claim-time fallback, and the host initializes
 the authoritative database tuple through the explicit control-plane bootstrap.
@@ -202,7 +201,7 @@ Initial validation rules:
 - `default_preferred_active`, `default_max_active`, and `default_weight` are
   required. Their example values are not library defaults.
 - preferred and maximum values are integers in `0..2_147_483_647`, matching
-  the future PostgreSQL signed `integer` columns.
+  the PostgreSQL signed `integer` columns.
 - `preferred_active <= max_active`.
 - `weight` is an integer in `1..2_147_483_647`. Integer weights avoid
   inconsistent floating-point ordering between SQL and application code.
@@ -457,18 +456,28 @@ ordered internal SQL commands:
    `admission_epoch` decision witness.
 5. In a later internal command with a fresh snapshot, resolve the complete
    effective tuple and count current authoritative live claims.
-6. Select expired claims eligible for steal. A steal replaces an allocation
-   and does not require a free tenant slot.
-7. Compute ready capacity as
+6. Compute ready capacity as
    `max(effective_max_active - live_claims, 0)`.
-8. Select at most that many ready runs for the tenant, ordered by
-   `(wake_at, id)`.
-9. Fill only the bounded dispatcher demand; DCKT-47 makes no interleaving,
-    rotation, preferred, weight, or borrowing promise.
-10. Lock run candidates by ascending ID with `FOR UPDATE SKIP LOCKED`, recheck
-    eligibility, and apply the existing
-    token/attempt/poison update.
-11. Return leases and poisoned outcomes through the existing claim batch.
+7. For that key, execute exactly one set-based data-modifying CTE command. Four
+   disjoint FIFO raw lanes (ready poison, ready ordinary, expired poison, and
+   expired ordinary) are each limited by current remaining demand before
+   state/cap disposition. Poison lanes remain visible when an ordinary lane is
+   denied.
+8. After disposition, rank poison first and FIFO within each work class, retain
+   at most current remaining demand ready rows and the same number of expired
+   rows, then lock that entire ID-sorted union with `FOR UPDATE SKIP LOCKED`.
+   No later ID limit may hide one class. The union caps actual locks by twice
+   current remaining demand and preserves the call-wide
+   `2 * original_demand` budget.
+9. At demand two or greater, carry a page-wide ready/expired reservation across
+   keys so an earlier key cannot consume both slots while the other class is
+   visible later. At demand one, apply class preference and fallthrough within
+   its sole hinted key.
+10. Recheck eligibility in the lock and update stages and apply the existing
+    token/attempt/poison update through one `UPDATE ... FROM chosen RETURNING`.
+11. Decrement demand only for returned outcomes, charge the lock budget for
+    actual locks, process each key once, and do not refill or revisit.
+12. Return leases and poisoned outcomes through the existing claim batch.
 
 The load-bearing invariant is:
 
@@ -581,6 +590,15 @@ In DCKT-49, fairness is applied first across tenants and then reconciled with
 class progress. DCKT-47 preserves class behavior only among candidates visible
 in its bounded page and explicitly permits a global candidate limit to hide a
 partition.
+
+Within that bounded page, DCKT-47 carries class reservation across ascending
+keys. Bounded page truncation, per-lane remaining-demand limits, the global run
+lock budget, held or invalidated rows, state/cap denial, and a reservation that
+cannot be consumed after concurrent change may still produce a partial batch.
+The function does not refill or revisit keys. It reports lock contention only
+when no lock or outcome was acquired anywhere and a fresh observational
+recheck proves every omitted mutation candidate is still eligible; deletion or
+invalidation prevents a false contention result.
 
 ## Strict-cap scheduling: first release
 
@@ -847,10 +865,11 @@ Emit aggregate measurements only:
 - eligible partition candidates;
 - partition rows locked and skipped;
 - partitions capped at `max_active`;
-- partitions below preferred;
+- the reserved below-preferred count, emitted as zero by contract v1;
 - policy-source and administrative-state counts (policy versions remain
   numeric inspection/audit inputs, not labels);
-- preferred and borrowed admission decisions;
+- the reserved preferred and borrowed admission counts, both emitted as zero
+  by contract v1;
 - ready and expired outcomes;
 - logical candidate rows examined and selected outcomes;
 - ready claim-wait and expired recovery-wait count/sum/max in integer
@@ -905,9 +924,9 @@ are undefined rather than coerced to zero.
 
 ## Fairness SLO and regression-budget contract
 
-This section is the normative TenantFair reporting contract. It publishes targets
-without pretending that the unimplemented TenantFair engine already emits
-production evidence. A target marked **activation-gated** is a release
+This section is the normative TenantFair reporting contract. It publishes
+targets without treating an installed but inactive engine as production
+evidence. A target marked **activation-gated** is a release
 qualification target: a report must return `not_qualified` until every named
 signal and bound exists. Missing input, an unavailable observation, a zero
 denominator, or a right-censored episode is never converted to zero or silently

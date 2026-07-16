@@ -287,8 +287,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @callback invalid_rows() :: [list()]
     @callback policy_error_rows() :: [list()]
     @callback invalid_policy_error_rows() :: [list()]
+    @callback detailed_observation?() :: boolean()
 
-    @optional_callbacks policy_error_rows: 0, invalid_policy_error_rows: 0
+    @optional_callbacks policy_error_rows: 0,
+                        invalid_policy_error_rows: 0,
+                        detailed_observation?: 0
 
     defmacro __using__(opts) do
       implementation = Keyword.fetch!(opts, :implementation)
@@ -469,6 +472,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           assert success_leases == length(expected_batch.leases)
           assert success_poisoned == length(expected_batch.poisoned)
 
+          if function_exported?(@claim_policy_fixture, :detailed_observation?, 0) and
+               @claim_policy_fixture.detailed_observation?() do
+            assert_receive {[:docket, :postgres, :claim_policy, :admission, :observation],
+                            detail_measurements,
+                            %{
+                              implementation: @claim_policy_implementation,
+                              result: :ok,
+                              admission_class: :none,
+                              observation_status: :available
+                            }}
+
+            assert %{
+                     preferred_admissions: 0,
+                     borrowed_admissions: 0,
+                     below_preferred_partitions: 0
+                   } = detail_measurements
+          end
+
           assert :ok =
                    Docket.Postgres.ClaimPolicy.observe(
                      claim_policy,
@@ -495,7 +516,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           assert map_size(error_measurements) == 4
           assert is_integer(error_duration) and error_duration >= 0
 
-          refute_receive {[:docket, :postgres, :claim_policy, :admission, :observation], _, _}
+          if @claim_policy_fixture.detailed_observation?() do
+            assert_receive {[:docket, :postgres, :claim_policy, :admission, :observation],
+                            %{demand: 7, duration: detail_error_duration},
+                            %{
+                              implementation: @claim_policy_implementation,
+                              result: :error,
+                              admission_class: :none,
+                              observation_status: :unavailable
+                            }}
+
+            assert is_integer(detail_error_duration) and detail_error_duration >= 0
+          else
+            refute_receive {[:docket, :postgres, :claim_policy, :admission, :observation], _, _}
+          end
         end
 
         defp contract_policy do
@@ -591,6 +625,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl true
     def invalid_rows, do: [[:invalid_legacy_row]]
+
+    @impl true
+    def detailed_observation?, do: false
   end
 
   defmodule Docket.Test.AlternateClaimPolicyContract do
@@ -623,5 +660,81 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl true
     def invalid_policy_error_rows, do: [["__invalid_policy_error__"]]
+
+    @impl true
+    def detailed_observation?, do: false
+  end
+
+  defmodule Docket.Test.TenantFairClaimPolicyContract do
+    @moduledoc false
+    @behaviour Docket.Test.ClaimPolicyTests
+
+    @impl true
+    def rows(%{leases: [lease], poisoned: []}) do
+      {:ok, claim_token} = Ecto.UUID.dump(lease.claim_token)
+
+      outcome =
+        [
+          "outcome",
+          nil,
+          lease.run_id,
+          nil,
+          lease.graph_id,
+          lease.graph_hash,
+          lease.checkpoint_seq,
+          claim_token,
+          lease.claimed_at,
+          lease.claim_attempt,
+          nil,
+          nil,
+          "expired",
+          DateTime.add(lease.claimed_at, -8, :second)
+        ] ++ List.duplicate(nil, 28)
+
+      summary =
+        [
+          "summary",
+          nil
+        ] ++
+          List.duplicate(nil, 12) ++
+          [
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            3_000,
+            3_000,
+            1,
+            1,
+            0,
+            1
+          ]
+
+      [outcome, summary]
+    end
+
+    @impl true
+    def invalid_rows, do: [["invalid_tenant_fair_row"]]
+
+    @impl true
+    def detailed_observation?, do: true
   end
 end

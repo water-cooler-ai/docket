@@ -649,8 +649,8 @@ latest successful or demoting proof time. Demotion receipts retain their exact
 sorted reasons after audit pruning.
 
 Readiness does not activate anything. DCKT-72 leaves `admission_mode = legacy`,
-does not install/select the TenantFair engine or claim function, and does not
-change mode/epoch. DCKT-71 owns activation. Ordinary online down is allowed
+does not select the TenantFair engine, replace the V02-installed canonical
+claim function, or change mode/epoch. DCKT-71 owns activation. Ordinary online down is allowed
 only before any readiness or activation history and while the prefix is
 not-ready/Legacy; otherwise use the explicit stopped-fleet destructive teardown
 contract. The intermediate DCKT-64..67 generation-2 schemas were never
@@ -695,9 +695,9 @@ SET search_path TO pg_catalog, pg_temp
 
 Exactly one same-name function may exist in the prefix. An overload or drift in
 arguments, return type, language, volatility, parallel safety, security mode,
-or `search_path` fails closed as `:function_contract_mismatch`. DCKT-68 owns
-the production function and engine; a DCKT-71-only build that does not include
-that delivery is expected to remain non-activatable.
+`search_path`, or the exact prefix-specific `pg_proc.prosrc` bytes fails closed
+as `:function_contract_mismatch`. V02 creates the canonical function after its
+tables and exact-signature teardown drops it before table destruction.
 
 Each participating process heartbeats an expiring capability using a trusted
 resolved backend context. Heartbeats describe only participating upgraded
@@ -788,6 +788,30 @@ instance-selected ClaimPolicy; dispatcher, manual drain, recovery, direct
 configured RunStore, and transaction contexts keep the same portable call
 boundary.
 
+TenantFair v1 tightens `lock_timeout` to 100 ms only for its internal authority
+work and restores the caller's transaction-local value before returning. Its
+`SKIP LOCKED` row authorities therefore return promptly for held gate, default,
+partition, and run rows: a sole skipped authority is unavailable, while a
+successfully locked subset may return a partial batch. The outer candidate
+discovery runs before that function body and acquires no row authority. DCKT-68
+does not claim a bounded response to a conflicting table/DDL lock on that outer
+scan. DCKT-69 owns adversarial outer-discovery/DDL overlap schedules, physical
+plan and buffer proof, high-cardinality qualification, and PostgreSQL 13/17
+release evidence. Operators must apply the DCKT-69 session/role timeout
+configuration; the function's internal timeout is defense in depth, not a
+substitute.
+
+Inside the bounded locked-key page, each key is processed once by one set-based
+run-mutation command. After truthful four-lane raw accounting and disposition,
+the decision source retains at most remaining demand per work class and feeds
+the complete ID-sorted union to `SKIP LOCKED`; no later ID truncation may hide
+a preferred or reserved class. Page truncation, per-class limits, the
+`2 * demand` run-lock budget, state/cap denial, held or concurrently invalidated
+rows, and an unconsumed cross-key class reservation can legitimately leave
+demand unfilled. There is no same-call refill or key revisit. Treat such a
+successful partial batch as bounded under-fill; reserve `:lock_contention` for
+the exact all-still-eligible/no-lock/no-outcome case returned by the function.
+
 Ordinary hot fallback is forbidden while exact caps are promised. Roll back in
 this exact order:
 
@@ -810,7 +834,9 @@ loose-scan reconciliation candidates. This is an exploratory query and plan
 benchmark suite, not a public API or a selectable ClaimPolicy implementation.
 DCKT-72 makes its ready/live predicates and prefix-neutral index DDL hashes
 identical to the online migration, but `runtime_query_parity` remains false;
-DCKT-68 owns the eventual admission SQL/function fingerprint.
+the production TenantFair SQL/function fingerprint is canonical in
+`TenantFair.SQL` and `TenantFair.Function`. Benchmark candidates remain
+non-authoritative until they match that runtime contract.
 
 The runner requires PostgreSQL 13 or newer. CI exercises PostgreSQL 13 as the
 minimum and PostgreSQL 17 as the reference version. Supply an explicitly owned

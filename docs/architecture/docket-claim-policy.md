@@ -158,20 +158,20 @@ attempt/poison events, and the existing
 selected implementation. No event includes tenant, run, graph, or token
 identity as metric metadata.
 
-## Adding TenantFair
+## TenantFair engine
 
-A future `Docket.Postgres.ClaimPolicy.TenantFair` should:
+`Docket.Postgres.ClaimPolicy.TenantFair`:
 
-1. validate only its data-only instance configuration in `init/2` and return
+1. validates only its data-only instance configuration in `init/2` and returns
    `%{engine: :tenant_fair, function_contract: 1}` from
    `activation_contract/1`; readiness,
    schema, mode, and function contract are checked inside admission;
-2. construct one atomic fairness statement in `build_plan/3` using only the
+2. constructs one atomic fairness statement in `build_plan/3` using only the
    supplied quoted identifiers and normalized portable policy;
-3. return a data-only decoder and bounded observation contract in its Plan;
-4. decode the unchanged lease/poison batch shape in `decode/3`;
-5. emit bounded engine-specific observations in `observe/5`; and
-6. run the reusable ClaimPolicy contract plus direct, transaction, supervised,
+3. returns a data-only decoder and bounded observation contract in its Plan;
+4. decodes the unchanged lease/poison batch shape in `decode/3`;
+5. emits bounded engine-specific observations in `observe/5`; and
+6. runs the reusable ClaimPolicy contract plus direct, transaction, supervised,
    manual-drain, concurrency, query-plan, and telemetry suites.
 
 Its locked instance-configuration shape is:
@@ -196,14 +196,59 @@ TenantFair owns validation of those implementation options in `init/2`.
 Fairness configuration does not belong under `:dispatcher`: dispatcher
 concurrency is a per-runtime vehicle ceiling, whereas TenantFair policy is an
 instance-selected PostgreSQL admission engine configuration shared by every
-admission path. The source-owned TenantFair implementation is not present yet;
-the example records the contract for the next slices and must not be used until
-that module and its schema prerequisites ship.
+admission path. Claim-time authority always comes from the locked database
+default or one complete partition override; the instance `default_*`, weight,
+and borrowing values never rescue an uninitialized database default or change
+contract-v1 admission behavior.
 
-No policy-specific change belongs in RunStore, dispatcher, synchronous drain,
+The outer statement discovers a distinct, sorted, bounded `text[]` of eligible
+partition keys without tenant preference and passes it as argument six to
+exactly one canonical function call. Inside the function, fresh READ COMMITTED
+commands acquire gate and default `FOR SHARE SKIP LOCKED`, partitions in
+ascending key order with `FOR NO KEY UPDATE SKIP LOCKED`, and selected run IDs
+in ascending order with `FOR UPDATE SKIP LOCKED`. The locked partition and a
+fresh live-claim count serialize additive ready admission. Expired steals are
+count-neutral; ready and expired poison each consume demand. `hold_new` blocks
+only additive ready leases, while `drain` also blocks ordinary steals; both
+states still permit poison resolution.
+
+For each locked key, exactly one set-based data-modifying CTE command owns run
+selection and mutation. Its four disjoint FIFO raw lanes—ready poison, ready
+ordinary, expired poison, and expired ordinary—are each limited by current
+remaining demand before state/cap disposition. After disposition, poison-first
+FIFO ranking reduces the decision source to at most remaining demand per work
+class. The entire at-most-`2 * remaining` union is then sorted by ID and fed to
+one `SKIP LOCKED` command; there is no later ID limit that can truncate one
+class before preference or reservation. This also preserves the call-wide
+`2 * original_demand` lock budget; eligibility is repeated at lock and update.
+At demand two or greater, a page-wide reservation preserves one outcome for
+each visible class when possible, even when the other class has multiple rows
+in an earlier key. Demand one considers only the single hinted key and applies
+preference with within-key fallthrough.
+
+The bounded algorithm deliberately does not refill or revisit a processed
+key. It may therefore return a partial batch after candidate-page truncation,
+per-lane limits, the lock budget, a held partition or run, concurrent
+invalidation/deletion, state/cap denial, or an unused class reservation. Those
+are bounded under-fill cases, not proof of avoidable under-claim. Exact
+contention is returned only when mutation-eligible work existed, no run lock or
+outcome was acquired anywhere, every omission remains eligible on the later
+fresh recheck, and no invalidation occurred.
+
+The function returns zero or more discriminated outcome rows followed by
+exactly one aggregate summary. Gate, default, isolation, read-only, and exact
+all-skipped contention failures return one data-only error sentinel and no
+outcome or summary. Function-internal SQLSTATE `55P03` is caught at the
+subtransaction boundary, so earlier epoch or claim mutations roll back before
+that sentinel is returned; other SQLSTATEs propagate. A caller-owned
+transaction keeps all successful claim authority provisional until its outer
+commit and rolls it back on error or raise.
+
+No policy-specific branch belongs in RunStore, dispatcher, synchronous drain,
 vehicle, executor, or the portable `Docket.Backend.RunStore` contract. Rolling
-back phase 0 means removing the option or explicitly selecting Legacy; this
-boundary itself adds no migration, index, cap, or tenant-fairness behavior.
+back exact-cap mode follows the prefix-wide deactivation protocol below; merely
+changing one instance's option while the prefix is active is not a safe
+fallback.
 
 ## Rollout and rollback
 

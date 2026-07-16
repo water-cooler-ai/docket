@@ -2,7 +2,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   for %{implementation: implementation, options: options, fixture: fixture} <-
         Docket.Test.ClaimPolicyMatrix.implementations() do
     defmodule Module.concat(implementation, ContractTest) do
-      use ExUnit.Case, async: true
+      # Contract fixtures attach handlers to the process-global telemetry registry.
+      # Serializing the generated modules keeps one implementation's detail event
+      # from being delivered while another implementation is asserting silence.
+      use ExUnit.Case, async: false
 
       use Docket.Test.ClaimPolicyTests,
         implementation: implementation,
@@ -16,8 +19,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     alias Docket.Postgres.ClaimPolicy
     alias Docket.Postgres.ClaimPolicy.Plan
-    alias Docket.Postgres.ClaimPolicy.TenantFair.Config
-    alias Docket.Postgres.ClaimPolicy.TenantFair.Observation
+    alias Docket.Postgres.ClaimPolicy.TenantFair.{Config, Function, Observation, SQL}
 
     @now ~U[2026-07-15 12:00:00.000000Z]
     @maximum_integer 2_147_483_647
@@ -363,6 +365,56 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  default_weight: 1,
                  borrowing: false
                )
+    end
+
+    test "TenantFair function metadata quotes every prefix occurrence and hashes exact body bytes" do
+      prefix = "quoted\"prefix"
+      quoted = ~s("quoted""prefix")
+      source = Function.prosrc(prefix)
+
+      for table <- [
+            "docket_claim_admission_gate",
+            "docket_claim_policy",
+            "docket_claim_partitions",
+            "docket_runs"
+          ] do
+        assert source =~ ~s(#{quoted}."#{table}")
+      end
+
+      function_prefix = "CREATE FUNCTION #{quoted}.\"#{Function.name()}\"("
+      assert String.starts_with?(Function.create_sql(prefix), function_prefix)
+
+      expected_drop =
+        "DROP FUNCTION IF EXISTS #{quoted}.\"#{Function.name()}\"(" <>
+          Function.identity_arguments() <> ")"
+
+      assert Function.drop_sql(prefix) == expected_drop
+
+      assert Function.body_sha256(prefix) == :crypto.hash(:sha256, source)
+      refute Function.body_sha256(prefix) == Function.body_sha256("quoted_prefix")
+
+      assert source =~ "decision_source AS MATERIALIZED"
+      assert source =~ "PARTITION BY work_class"
+      assert source =~ "WHERE decision_rank <= v_remaining"
+      assert source =~ "FROM decision_source AS decision"
+      assert source =~ ~r/ORDER BY runs\.id\s+FOR UPDATE OF runs SKIP LOCKED/
+      refute source =~ ~r/ORDER BY runs\.id\s+LIMIT/
+    end
+
+    test "TenantFair statement owns direct bounded discovery and invokes its function exactly once" do
+      runs = ~s("policy"."docket_runs")
+      function = ~s("policy"."#{Function.name()}")
+      statement = SQL.statement(runs, function)
+
+      assert statement =~ "WITH candidate_partitions AS MATERIALIZED"
+      assert statement =~ "GROUP BY eligible.scope_key"
+      assert statement =~ "ORDER BY min(eligible.eligible_at), eligible.scope_key"
+      assert statement =~ "LIMIT LEAST($3, #{Function.partition_budget()})"
+      assert statement =~ "array_agg(scope_key ORDER BY scope_key)"
+      assert statement =~ "ARRAY[]::text[]"
+      assert length(:binary.matches(statement, function <> "(")) == 1
+      assert length(:binary.matches(statement, runs <> " AS runs")) == 2
+      refute statement =~ ";"
     end
 
     test "validates neutral runtime input before any plan is built" do
@@ -864,6 +916,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert_raise ArgumentError, ~r/policy-source partition counts must equal/, fn ->
         Observation.new!(locked_partitions: 1, eligible_partitions: 1)
       end
+
+      batch = %{leases: [%{}, %{}], poisoned: []}
+
+      neutral =
+        Observation.new!(
+          ready_leases: 2,
+          candidate_rows_examined: 2,
+          ready_claim_wait_ms_count: 2
+        )
+
+      assert Observation.validate_batch!(neutral, batch, 2) == neutral
+
+      exhaustive = %{neutral | preferred_admissions: 1, borrowed_admissions: 1}
+      assert Observation.validate_batch!(exhaustive, batch, 2) == exhaustive
+
+      assert_raise ArgumentError, ~r/intentionally unclassified or exhaustively classified/, fn ->
+        Observation.validate_batch!(%{neutral | preferred_admissions: 1}, batch, 2)
+      end
     end
 
     test "the built Hex artifact excludes ClaimPolicy test support" do
@@ -891,18 +961,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              end)
     end
 
-    test "source ownership forbids reverse dispatch and duplicate Legacy admission code" do
+    test "source ownership forbids reverse dispatch and misplaced Legacy admission code" do
       root = File.cwd!()
       dispatcher = File.read!(Path.join(root, "lib/docket/postgres/dispatcher.ex"))
       postgres = File.read!(Path.join(root, "lib/docket/postgres.ex"))
       legacy_path = Path.join(root, "lib/docket/postgres/claim_policy/legacy.ex")
+      tenant_fair_root = Path.join(root, "lib/docket/postgres/claim_policy/tenant_fair")
       legacy = File.read!(legacy_path)
 
       other_production_sources =
         root
         |> Path.join("lib/**/*.ex")
         |> Path.wildcard()
-        |> Enum.reject(&(&1 == legacy_path))
+        |> Enum.reject(&(&1 == legacy_path or String.starts_with?(&1, tenant_fair_root)))
         |> Enum.map(&File.read!/1)
 
       for signature <- [
@@ -936,7 +1007,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         refute File.read!(source) =~ "RunStore.claim_due("
       end
 
-      refute Code.ensure_loaded?(Docket.Postgres.ClaimPolicy.TenantFair)
+      assert Code.ensure_loaded?(Docket.Postgres.ClaimPolicy.TenantFair)
     end
 
     defp effective_policy(limit \\ 1) do

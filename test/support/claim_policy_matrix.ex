@@ -17,6 +17,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           options: [marker: :run_store_contract],
           fixture: Docket.Test.AlternateClaimPolicyContract,
           query_marker: "independent alternate claim plan: run_store_contract"
+        },
+        %{
+          name: "TenantFair",
+          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+          options: [
+            partition_by: :tenant_id,
+            default_preferred_active: 1,
+            default_max_active: 2,
+            default_weight: 1,
+            borrowing: false
+          ],
+          fixture: Docket.Test.TenantFairClaimPolicyContract,
+          query_marker: "WITH candidate_partitions AS MATERIALIZED",
+          run_store_setup: Docket.Test.TenantFairRunStoreSetup
         }
       ]
     end
