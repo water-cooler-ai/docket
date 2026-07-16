@@ -199,6 +199,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, state} = Admin.get_prefix_state(ctx)
       assert state.schema_generation == 2
+      assert state.backfill_target_id == nil
+      assert state.backfill_cursor == nil
+      assert state.backfill_batches == 0
+      assert state.backfill_rows == 0
+      assert state.backfill_retries == 0
+      assert state.backfill_phase == :not_started
       assert state.default_version == 1
       assert state.default == @policy
       assert state.readiness == :not_ready

@@ -214,9 +214,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         schema_generation integer NOT NULL DEFAULT 2,
         dual_write_assertion_id uuid NULL,
         backfill_phase varchar(24) NOT NULL DEFAULT 'not_started',
+        backfill_target_id bigint NULL,
         backfill_cursor bigint NULL,
         backfill_batches bigint NOT NULL DEFAULT 0,
         backfill_rows bigint NOT NULL DEFAULT 0,
+        backfill_retries bigint NOT NULL DEFAULT 0,
         backfill_completed_at timestamptz NULL,
         backfill_last_error varchar(512) NULL,
         ready_index_valid boolean NOT NULL DEFAULT false,
@@ -228,12 +230,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
         CONSTRAINT docket_claim_rollout_singleton_check CHECK (id = 1),
         CONSTRAINT docket_claim_rollout_generation_check CHECK (schema_generation = 2),
-        CONSTRAINT docket_claim_rollout_backfill_phase_check
-          CHECK (backfill_phase IN ('not_started', 'running', 'reconciling', 'complete')),
+        CONSTRAINT docket_claim_rollout_backfill_phase_check CHECK ((
+          (
+            backfill_phase = 'not_started' AND backfill_target_id IS NULL AND
+            backfill_cursor IS NULL AND backfill_completed_at IS NULL
+          ) OR (
+            backfill_phase IN ('running', 'reconciling') AND
+            backfill_target_id IS NOT NULL AND backfill_target_id >= 0 AND
+            backfill_cursor IS NOT NULL AND backfill_cursor >= 0 AND
+            backfill_cursor <= backfill_target_id AND backfill_completed_at IS NULL
+          ) OR (
+            backfill_phase = 'complete' AND backfill_target_id IS NOT NULL AND
+            backfill_target_id >= 0 AND backfill_cursor IS NOT NULL AND
+            backfill_cursor = backfill_target_id AND missing_partition_count IS NOT NULL AND
+            missing_partition_count >= 0 AND backfill_completed_at IS NOT NULL
+          )
+        ) IS TRUE),
+        CONSTRAINT docket_claim_rollout_target_check
+          CHECK (backfill_target_id IS NULL OR backfill_target_id >= 0),
         CONSTRAINT docket_claim_rollout_cursor_check
           CHECK (backfill_cursor IS NULL OR backfill_cursor >= 0),
         CONSTRAINT docket_claim_rollout_counts_check
-          CHECK (backfill_batches >= 0 AND backfill_rows >= 0),
+          CHECK (backfill_batches >= 0 AND backfill_rows >= 0 AND backfill_retries >= 0),
         CONSTRAINT docket_claim_rollout_fk_disposition_check
           CHECK (fk_disposition IN ('absent', 'not_valid', 'validated')),
         CONSTRAINT docket_claim_rollout_missing_count_check

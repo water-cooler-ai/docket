@@ -221,9 +221,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {"schema_generation", "integer", true, "2", nil},
         {"dual_write_assertion_id", "uuid", false, nil, nil},
         {"backfill_phase", "character varying(24)", true, "'not_started'", nil},
+        {"backfill_target_id", "bigint", false, nil, nil},
         {"backfill_cursor", "bigint", false, nil, nil},
         {"backfill_batches", "bigint", true, "0", nil},
         {"backfill_rows", "bigint", true, "0", nil},
+        {"backfill_retries", "bigint", true, "0", nil},
         {"backfill_completed_at", "timestamp with time zone", false, nil, nil},
         {"backfill_last_error", "character varying(512)", false, nil, nil},
         {"ready_index_valid", "boolean", true, "false", nil},
@@ -906,6 +908,54 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         TestRepo.query("UPDATE docket_claim_rollout SET schema_generation = 3")
       end)
 
+      assert_check_violation("docket_claim_rollout_counts_check", fn ->
+        TestRepo.query("UPDATE docket_claim_rollout SET backfill_retries = -1")
+      end)
+
+      for statement <- [
+            "UPDATE docket_claim_rollout SET backfill_phase = 'running', backfill_cursor = 0",
+            "UPDATE docket_claim_rollout SET backfill_phase = 'running', backfill_target_id = -1, backfill_cursor = 0",
+            "UPDATE docket_claim_rollout SET backfill_phase = 'running', backfill_target_id = 1, backfill_cursor = -1",
+            "UPDATE docket_claim_rollout SET backfill_phase = 'running', backfill_target_id = 1, backfill_cursor = 2",
+            "UPDATE docket_claim_rollout SET backfill_phase = 'reconciling', backfill_target_id = 1",
+            "UPDATE docket_claim_rollout SET backfill_phase = 'complete', backfill_target_id = 1, backfill_cursor = NULL, missing_partition_count = 0, backfill_completed_at = CURRENT_TIMESTAMP",
+            "UPDATE docket_claim_rollout SET backfill_phase = 'complete', backfill_target_id = 1, backfill_cursor = 1, missing_partition_count = NULL, backfill_completed_at = CURRENT_TIMESTAMP",
+            "UPDATE docket_claim_rollout SET backfill_phase = 'complete', backfill_target_id = 1, backfill_cursor = 1, missing_partition_count = 0, backfill_completed_at = NULL"
+          ] do
+        assert_check_violation("docket_claim_rollout_backfill_phase_check", fn ->
+          TestRepo.query(statement)
+        end)
+      end
+
+      TestRepo.query!("""
+      UPDATE docket_claim_rollout
+      SET backfill_phase = 'running', backfill_target_id = 2, backfill_cursor = 0,
+          missing_partition_count = 3
+      """)
+
+      TestRepo.query!("""
+      UPDATE docket_claim_rollout
+      SET backfill_phase = 'reconciling', backfill_cursor = 2,
+          missing_partition_count = 1
+      """)
+
+      TestRepo.query!("""
+      UPDATE docket_claim_rollout
+      SET backfill_phase = 'complete', backfill_cursor = 2,
+          missing_partition_count = 0, backfill_completed_at = CURRENT_TIMESTAMP
+      """)
+
+      TestRepo.query!("""
+      UPDATE docket_claim_rollout
+      SET missing_partition_count = 2
+      """)
+
+      assert TestRepo.query!("""
+             SELECT backfill_phase, backfill_target_id, backfill_cursor,
+                    missing_partition_count, backfill_completed_at IS NOT NULL
+             FROM docket_claim_rollout
+             """).rows == [["complete", 2, 2, 2, true]]
+
       assert_check_violation("docket_claim_rollout_fk_disposition_check", fn ->
         TestRepo.query("UPDATE docket_claim_rollout SET fk_disposition = 'waived'")
       end)
@@ -1384,7 +1434,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert TestRepo.query!("""
              SELECT id, schema_generation, dual_write_assertion_id, backfill_phase,
-                    backfill_cursor, backfill_batches, backfill_rows,
+                    backfill_target_id, backfill_cursor, backfill_batches, backfill_rows,
+                    backfill_retries,
                     backfill_completed_at, backfill_last_error, ready_index_valid,
                     live_index_valid, fk_disposition, missing_partition_count,
                     verified_default_fingerprint, verified_at
@@ -1396,6 +1447,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  nil,
                  "not_started",
                  nil,
+                 nil,
+                 0,
                  0,
                  0,
                  nil,

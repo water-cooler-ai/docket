@@ -209,6 +209,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert ClaimPolicyReceipt.__schema__(:primary_key) == [:source, :event_id]
       end
 
+      test "claim rollout owns finite backfill target and retry fields" do
+        assert ClaimRollout.__schema__(:type, :backfill_target_id) == :integer
+        assert ClaimRollout.__schema__(:type, :backfill_cursor) == :integer
+        assert ClaimRollout.__schema__(:type, :backfill_retries) == :integer
+
+        rollout = %ClaimRollout{}
+        assert rollout.backfill_target_id == nil
+        assert rollout.backfill_cursor == nil
+        assert rollout.backfill_retries == 0
+      end
+
       test "own the exact durable enum string mappings" do
         assert Ecto.Enum.mappings(ClaimPartition, :admin_state) ==
                  [running: "running", hold_new: "hold_new", drain: "drain"]

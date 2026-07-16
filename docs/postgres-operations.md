@@ -369,6 +369,129 @@ private `state`, `payload`, or `metadata` columns. Application-facing tools
 should remain on the scoped facade so tenantless or tenant access can never
 become system access.
 
+### Claim-partition backfill
+
+Schema version 2 installs the rollout ledger but leaves partition backfill
+`not_started`, the exact-cap readiness gate `not_ready`, and admission mode
+`legacy`. Before backfill, the host must deploy atomic partition
+dual-write to every run writer, drain old binaries and their open
+transactions, and record reviewed deployment evidence:
+
+```elixir
+alias Docket.Postgres.ClaimPolicy.{Backfill, Readiness}
+
+{:ok, _assertion} =
+  Readiness.attest_dual_write(context,
+    evidence_fingerprint: :crypto.hash(:sha256, deployment_evidence),
+    actor: "rollout-operator",
+    source: "deployment",
+    event_id: "dual-write-2026-07-16"
+  )
+```
+
+The assertion is non-expiring because it represents a monotonic deployment
+fact, not a process heartbeat. Re-attest after any fleet/binary topology
+change before continuing reconciliation. An assertion is invalid if a legacy
+writer or a pre-deployment transaction can still commit a run without its
+partition.
+
+Advance one bounded transaction at a time. The host decides whether to cancel,
+pause for WAL volume, or wait for replicas between calls; the library never
+sleeps while holding the gate, advisory runner, or rollout row.
+
+```elixir
+Backfill.advance(context,
+  batch_size: 1_000,
+  lock_timeout_ms: 1_000,
+  statement_timeout_ms: 5_000
+)
+```
+
+Repeat only while the host's cancellation and capacity checks allow it. A
+crash after any return is safe: the next call resumes from the committed
+internal `docket_runs.id` cursor and its finite target. The running phase
+inserts only distinct canonical keys from that page with conflict-do-nothing;
+it never changes an Admin-created partition. Reconciliation records an exact
+distinct missing-key count. A positive observation remains visible while a
+new bounded repair pass runs; only a later zero observation marks the phase
+complete. Rechecking complete state may reopen repair only while the gate is
+not ready; a positive observation while ready returns `:prefix_ready`. The
+later online-readiness operation independently recounts and owns indexes, the
+mandatory FK, readiness promotion, and ready-state drift demotion. After
+demotion it may persist a positive `missing_partition_count` while leaving the
+complete phase, target, cursor, counters, and completion time untouched; the
+next backfill advance reopens repair. This operation performs none of those
+readiness-owned changes.
+
+Trusted prefix-local inspection queries are:
+
+```sql
+SELECT schema_generation, dual_write_assertion_id, backfill_phase,
+       backfill_target_id, backfill_cursor, backfill_batches, backfill_rows,
+       backfill_retries, missing_partition_count, backfill_completed_at,
+       backfill_last_error, updated_at
+FROM "YOUR_PREFIX".docket_claim_rollout
+WHERE id = 1;
+
+SELECT count(DISTINCT runs.scope_key) AS missing_scope_keys
+FROM "YOUR_PREFIX".docket_runs AS runs
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM "YOUR_PREFIX".docket_claim_partitions AS partitions
+  WHERE partitions.scope_key = runs.scope_key
+);
+
+SELECT count(*) AS partition_rows,
+       pg_size_pretty(pg_total_relation_size(
+         '"YOUR_PREFIX".docket_claim_partitions'::regclass
+       )) AS retained_size
+FROM "YOUR_PREFIX".docket_claim_partitions;
+
+SELECT count(*) AS dormant_partition_rows
+FROM "YOUR_PREFIX".docket_claim_partitions AS partitions
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM "YOUR_PREFIX".docket_runs AS runs
+  WHERE runs.scope_key = partitions.scope_key
+);
+
+SELECT application_name, state, sync_state,
+       pg_wal_lsn_diff(
+         pg_current_wal_lsn(),
+         COALESCE(replay_lsn, flush_lsn, write_lsn)
+       )::bigint AS retained_wal_bytes
+FROM pg_stat_replication
+ORDER BY application_name;
+```
+
+Rehearse the rollout on a production-shaped copy before operating a populated
+prefix:
+
+- include tenantless runs (`scope_key = ''`), ordinary tenants, and every
+  custom schema prefix independently;
+- use sparse internal run IDs and interrupt after each committed page to prove
+  cursor/target restart behavior;
+- insert current dual-writing runs above the frozen target while pages run and
+  confirm reconciliation remains zero;
+- size a high-dormant/high-distinct-cardinality fixture, observe batch WAL with
+  `pg_current_wal_lsn()`/`pg_wal_lsn_diff`, and pause between calls when the
+  host's WAL budget is exceeded;
+- use `pg_stat_replication` replay/flush LSN lag under the host's database role,
+  stop invoking `advance/2` at the approved byte/time threshold, then resume
+  from the same ledger cursor after replicas recover; and
+- cancel the caller between every phase and inject bounded lock and statement
+  timeouts, verifying only a failed SQL work unit increments retries and that
+  error text contains no tenant or database detail.
+
+Partition rows retain raw historical `scope_key` values even after the last run
+and override disappear. Those values can be personal or confidential data.
+Restrict table/audit access, include dormant rows in storage forecasts and
+erasure inventories, and do not export them through metrics, logs, receipts,
+or generic error tooling. This schema-generation-2 release has no partition
+GC. Deletion requires a
+separately reviewed proof that no run references the key; this backfill never
+deletes a partition.
+
 ## Tenant-fair claim benchmark
 
 The repository includes a source-checkout-only PostgreSQL benchmark for the

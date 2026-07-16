@@ -337,8 +337,10 @@ docket_claim_rollout
   backfill_phase                  varchar(24) not null default 'not_started'
                                   check in ('not_started', 'running',
                                             'reconciling', 'complete')
+  backfill_target_id              bigint null check is null or >= 0
   backfill_cursor                 bigint null check is null or >= 0
   backfill_batches, backfill_rows bigint not null default 0, check >= 0
+  backfill_retries                bigint not null default 0, check >= 0
   backfill_completed_at           timestamptz null
   backfill_last_error             varchar(512) null
   ready_index_valid               boolean not null default false
@@ -371,9 +373,17 @@ docket_claim_capabilities
   expires_at                      timestamptz not null check > last_seen_at
 ```
 
+The complete-phase tuple requires a frozen nonnegative target, cursor equal to
+that target, a non-null nonnegative missing count, and completion time. DCKT-67
+enters `complete` only with `missing_partition_count = 0`. The schema also
+permits a positive count in `complete` so DCKT-72 can persist later drift
+evidence after demoting readiness. That handoff may update only the missing
+evidence (and its readiness-owned state), not DCKT-67's phase, target, cursor,
+work counters, or completion time.
+
 A fresh install and a v1 upgrade both contain exactly three singleton facts:
 the uninitialized policy row `(version 0, all policy fields null)`, the rollout
-row `(generation 2, no assertion, phase not_started, null cursor, zero counts,
+row `(generation 2, no assertion, phase not_started, null target/cursor, zero counts/retries,
 both index flags false, FK absent, missing count/default fingerprint/
 verification null)`, and the
 gate row `(not_ready, readiness epoch 0, legacy, mode epoch 0, function
@@ -498,6 +508,109 @@ put_legal_hold(context, opts)
 delete_legal_hold(context, hold_id, opts)
 prune_events(context, opts)
 ```
+
+The DCKT-67 rollout surfaces are
+`Docket.Postgres.ClaimPolicy.Readiness.attest_dual_write/2` and
+`Docket.Postgres.ClaimPolicy.Backfill.advance/2`. Attestation accepts exactly
+`evidence_fingerprint` (32 bytes), `source`, `event_id`, and `actor`. Its
+versioned request fingerprint excludes actor, its assertion UUID is derived
+deterministically from that fingerprint, and it atomically appends the
+`attest_dual_write` audit event and lifetime receipt, inserts the non-expiring
+`dual_write` assertion, and links the rollout singleton while holding that
+singleton `FOR UPDATE`. First application returns
+`%{outcome: :applied, target: :dual_write, assertion_id: uuid, audit_id: n}`;
+an identical source/event replay returns `outcome: :replayed` with that result
+under `original`. Invalid options return `:invalid_readiness_options`; event
+reuse and bounded rollout contention use the ordinary exact event-conflict and
+rollout-lock results.
+
+The assertion means that every writer uses DCKT-65 atomic partition upsert and
+that every old writer and its open transactions has drained. It is monotonic
+deployment evidence, not a heartbeat inferred by the database. A fleet or
+binary-topology change requires a new attestation before reconciliation; every
+backfill advance validates that the currently linked assertion exists and has
+kind `dual_write`.
+
+`Backfill.advance/2` accepts only `batch_size` (default 1,000, maximum 10,000),
+`lock_timeout_ms` (default/maximum 1,000, reducible), and
+`statement_timeout_ms` (default 5,000, maximum 60,000). One call performs one
+root `READ COMMITTED` transaction and never loops, sleeps, invokes a callback,
+or performs a replica-lag query. Hosts cancel and apply WAL/replica-lag
+throttling between calls. The transaction takes the gate `FOR SHARE NOWAIT`, a
+prefix-derived transaction advisory runner, then the rollout singleton
+`FOR UPDATE`. It rejects transaction contexts, a missing/wrong linked
+assertion, a concurrent runner, and bounded gate/rollout/statement contention
+with sanitized errors; no database or scope text is returned or persisted.
+
+The first advance atomically freezes `backfill_target_id = max(docket_runs.id)`
+(zero when empty) and cursor zero. Running advances scan
+`cursor < id <= target` in ascending `id` order, at most `batch_size` source
+rows, insert the page's distinct canonical `scope_key` values with
+`ON CONFLICT DO NOTHING`, and commit the maximum scanned ID. Higher concurrent
+IDs never extend that finite pass and are safe only because their writers have
+been attested as dual-writing. A sequence value allocated below the target but
+committed late is likewise safe only because attestation requires every old
+transaction to have drained before the target is frozen.
+
+`backfill_batches` counts committed nonempty keyset pages and `backfill_rows`
+counts their scanned source rows; neither counts empty phase transitions or the
+decisive reconciliation query. Exhaustion enters `reconciling` at
+`cursor = target`. Reconciliation computes the exact distinct missing
+`scope_key` anti-count for the frozen target. Zero stores the only decisive
+ready evidence (`missing_partition_count = 0`), completion database time, and
+phase `complete`. A positive count remains inspectable, refreshes the finite
+target, resets cursor to zero while staying `reconciling`, and the next advance
+starts another bounded repair pass. A completed advance independently recounts
+current runs: zero is unchanged; a positive count while the gate is ready
+returns `:prefix_ready` without changing phase or cursor. DCKT-72 owns
+ready-state drift detection and demotion, and may then persist the positive
+`missing_partition_count` evidence without changing DCKT-67's phase, target, or
+cursor. A subsequent completed advance sees the not-ready gate and reopens
+bounded repair in `reconciling`.
+
+Each unit runs below a savepoint. A SQL cancellation/timeout or insert-lock
+failure rolls the unit back while the gate/runner/rollout authorities remain
+held, then commits only a cumulative retry increment, a sanitized last-error
+code, and database `updated_at`. Connection loss can conservatively undercount
+attempts because no database transaction can attest an outcome it did not
+commit. Restart is always another identical `advance/2`; cursor, target,
+counters, phase, last error, completion time, and missing evidence are read
+from the rollout ledger.
+
+Every successful advance returns this exact bounded shape:
+
+```elixir
+{:ok,
+ %{
+   outcome: :advanced | :reconciled | :repairing | :unchanged,
+   phase: :running | :reconciling | :complete,
+   target_id: non_neg_integer,
+   cursor: non_neg_integer,
+   batches: non_neg_integer,
+   rows: non_neg_integer,
+   retries: non_neg_integer,
+   missing_partition_count: non_neg_integer | nil,
+   completed_at: DateTime.t() | nil,
+   last_error: :dual_write_unattested | :backfill_lock_timeout |
+               :backfill_timeout | :missing_partitions |
+               :prefix_ready | :backfill_failed | nil,
+   updated_at: DateTime.t(),
+   batch_rows: non_neg_integer,
+   inserted_partitions: non_neg_integer,
+   observed_missing_partitions: non_neg_integer | nil
+ }}
+```
+
+Exact closed errors are `:invalid_admin_context`,
+`:transaction_context_forbidden`, `:invalid_backfill_options`,
+`:dual_write_unattested`, `:backfill_running`,
+`{:lock_timeout, :gate | :rollout}`, `:backfill_lock_timeout`,
+`:backfill_timeout`, `:prefix_ready`, and
+`:backfill_failed`. Gate/advisory/rollout contention, invalid input, and
+precondition failures never increment retries. Unknown database, connection,
+or exception text is reduced to `:backfill_failed` and is never returned or
+stored. Applicable work and precondition failures use bounded counterparts in
+the ledger's closed last-error vocabulary; target identity never appears in it.
 
 ### DCKT-66 Admin option and result freeze
 

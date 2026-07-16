@@ -16,6 +16,20 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- `Docket.Postgres.ClaimPolicy.Readiness.attest_dual_write/2` and
+  `Docket.Postgres.ClaimPolicy.Backfill.advance/2` for the prefix-local v2
+  partition rollout. The audited, replayable fleet assertion gates a finite,
+  resumable `docket_runs.id` keyset; bounded pages insert distinct canonical
+  partitions without overwriting Admin state, persist the V02 rollout ledger's
+  new `backfill_target_id` and `backfill_retries` alongside cursor/work/error
+  evidence, and complete only after an exact zero-missing reconciliation.
+  Completed ready prefixes return `:prefix_ready` on observed drift; the later
+  readiness operation may persist positive missing evidence after demotion so
+  the next bounded backfill step can reopen repair.
+  Cancellation and WAL/replica-lag throttling occur between calls. This change
+  adds no index, foreign key, readiness promotion, activation, claim engine,
+  fairness hint/cursor, or partition GC; the later online-readiness operation
+  retains those verification responsibilities.
 - `Docket.Postgres.ClaimPolicy.Admin`, the prefix-local dynamic exact-cap
   control plane. It provides explicit one-time default bootstrap, versioned
   default and atomic partition CAS, complete-tuple override/reset/state and
