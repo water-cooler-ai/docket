@@ -893,6 +893,39 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       refute_receive {:alternate_claim_policy, :init, :transaction, _context}
     end
 
+    test "Legacy admission rejects repeatable-read without claim mutation" do
+      run = insert_run!("repeatable-read-admission")
+      context = admission_context()
+
+      assert {:error, {:claim_policy_unavailable, :unsupported_isolation}} =
+               Docket.Postgres.transaction(context, fn tx ->
+                 TestRepo.query!("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ WRITE")
+
+                 RunStore.claim_due(tx, :system, policy(@now))
+               end)
+
+      persisted = row!(run.run_id)
+      assert persisted.claim_token == nil
+      assert persisted.claimed_at == nil
+      assert persisted.claim_attempts == 0
+    end
+
+    test "Legacy admission normalizes read-only SQLSTATE without claim mutation" do
+      run = insert_run!("read-only-admission")
+      context = admission_context()
+
+      assert {:error, {:claim_policy_unavailable, :read_only_transaction}} =
+               Docket.Postgres.transaction(context, fn tx ->
+                 TestRepo.query!("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY")
+                 RunStore.claim_due(tx, :system, policy(@now))
+               end)
+
+      persisted = row!(run.run_id)
+      assert persisted.claim_token == nil
+      assert persisted.claimed_at == nil
+      assert persisted.claim_attempts == 0
+    end
+
     test "claims ready and expired paths under one demand bound and returns lightweight leases" do
       old = DateTime.add(@now, -10, :second)
       ready = insert_run!("ready", wake_at: DateTime.add(old, -1, :second))

@@ -49,9 +49,17 @@ updates. The mutation must enforce
 
 ## Selected authority model
 
-DCKT-47 preserves DCKT-46 exactly: `RunStore.claim_due/3` issues one client
-query containing one top-level PostgreSQL statement, and callers, portable
-results, ClaimPolicy callbacks, and the data-only plan boundary do not change.
+DCKT-47 preserves DCKT-46's portable RunStore method set, caller result
+contract, instance-level implementation selection, and one-query data-only
+plan boundary: `RunStore.claim_due/3` issues one client query containing one
+top-level PostgreSQL statement. The internal ClaimPolicy decoder algebra is
+additively widened from successful batches and normalized decoder defects to
+also accept `{:error, data_only_reason, bounded_observation}`. This lets the
+same statement report bounded fail-closed policy outcomes without changing the
+portable `{:ok, claim_batch} | {:error, reason}` result. The optional internal
+activation metadata callback is likewise not a new RunStore method or a
+per-call selector; ClaimPolicy callbacks are therefore not claimed to be
+byte-for-byte unchanged.
 The TenantFair plan's statement is a single call of the prefix-qualified
 `docket_tenant_fair_claim_v1(...)` set-returning database function. The function
 is `VOLATILE`, `PARALLEL UNSAFE`, `SECURITY INVOKER`, has a fixed safe
@@ -60,6 +68,18 @@ computes one bounded candidate partition-key array and calls the function
 exactly once with that array; row-driven, lateral, or repeated function
 invocation is forbidden. The array is a non-authoritative hint and is sorted
 again inside the function before locking.
+
+Function contract v1 freezes the catalog-visible shape as
+`docket_tenant_fair_claim_v1(timestamptz, timestamptz, integer, integer, text,
+text[]) RETURNS SETOF record`, implemented in `plpgsql`, with
+`VOLATILE PARALLEL UNSAFE SECURITY INVOKER` and exactly
+`SET search_path TO pg_catalog, pg_temp`. Activation requires exactly one
+same-name function in the selected prefix and exactly one match for that full
+shape; an overload, altered attribute, different language/search path, or
+function in another prefix cannot satisfy it. The resolved ClaimPolicy must
+also declare exactly `%{engine: :tenant_fair, function_contract: 1}` through
+its optional `activation_contract/1` callback. That callback is proof about the
+already-selected instance policy, not a selector and not a RunStore option.
 
 The function contains multiple ordered internal SQL commands. This distinction
 is load-bearing: the one-statement contract is a client/RunStore boundary, not
@@ -86,6 +106,12 @@ work until that outer commit succeeds. Any database serialization/deadlock
 failure aborts and retries the whole caller transaction; retrying only the
 function call is forbidden. Long caller transactions are allowed but
 observable as contention and are operationally discouraged.
+
+Activation control transactions independently set `READ COMMITTED READ WRITE`
+as their first command, before receipt lookup, and only then install bounded
+local timeouts. This overrides a role/session default such as Repeatable Read
+without accepting a caller-owned transaction; mutators still reject raw outer
+transaction contexts before issuing SQL.
 
 ### Why the obvious alternatives are not authority
 
@@ -928,8 +954,9 @@ The prefix interlock surface is
 `Docket.Postgres.ClaimPolicy.Activation` with exact functions
 `register_capability/3`, `attest_old_binaries_absent/2`, `preflight/1`,
 `activate/2`, and `deactivate/2`.
-`preflight/1` is an advisory, non-locking read that always returns this exact
-shape for a valid context:
+`preflight/1` is an advisory read that always returns this exact shape for a
+valid context. Its catalog fields come from the same canonical evidence helper
+used by DCKT-72 verification:
 
 ```elixir
 {:ok,
@@ -940,6 +967,23 @@ shape for a valid context:
    readiness: :not_ready | :ready,
    readiness_epoch: non_neg_integer,
    required_function_contract: 1,
+   selected_implementation_contract:
+     %{engine: :tenant_fair, function_contract: 1} | :none,
+   active_implementation_contract:
+     %{engine: :tenant_fair, function_contract: 1} | :none,
+   default_fingerprint: binary | nil,
+   verified_default_fingerprint: binary | nil,
+   schema_generation: non_neg_integer,
+   backfill_phase: :not_started | :running | :reconciling | :complete,
+   online_phase: :not_started | :ready_index | :live_index | :fk_not_valid | :complete,
+   recorded_missing_partition_count: non_neg_integer | nil,
+   missing_partition_count: non_neg_integer | nil,
+   ready_index_valid: boolean,
+   live_index_valid: boolean,
+   foreign_key_validated: boolean,
+   expected_tables_present: boolean,
+   expected_table_count: non_neg_integer,
+   expected_table_total: pos_integer,
    live_capability_count: non_neg_integer,
    old_binary_assertion_expires_at: DateTime.t() | nil,
    reasons: sorted_reason_atoms
@@ -948,9 +992,18 @@ shape for a valid context:
 
 Here `activatable` is true exactly when `reasons` is empty. The report is not
 an authorization token: activation reacquires the gate and rechecks every
-predicate. Its reason set is the lexical-order subset of
+predicate. A missing-count field is `nil` when the rollout has not recorded a
+count or the catalog source tables are unavailable; preflight never converts
+unknown evidence to zero. Its reason set is the lexical-order subset of
 `[:capability_mismatch, :function_contract_mismatch, :not_ready,
-:old_binary_assertion_expired]`.
+:old_binary_assertion_expired]`. The `:not_ready` reason is computed from the
+complete readiness contract, not only the gate bit; catalog/default drift
+therefore disables activation even before a demotion is persisted. The
+function reason covers both halves of the
+contract: the resolved context must select a ClaimPolicy declaring TenantFair
+contract v1, and the selected prefix must contain the one exact catalog
+function described above. A Legacy context therefore reports this reason even
+if the function happens to exist.
 Activate/deactivate require `expected_epoch`, `source`, `event_id`, and `actor`;
 activate additionally requires the unexpired old-binary assertion reference.
 A matching CAS commits `expected_epoch + 1` and returns the same applied/replay
@@ -965,8 +1018,9 @@ Readiness is changed only through
 `Docket.Postgres.ClaimPolicy.Readiness.attest_dual_write/2` and `verify/2`.
 Both attestations require source/event/actor and a bounded external deployment
 evidence fingerprint. The dual-write assertion is durable and has no expiry;
-the old-binary-absence assertion requires a future expiry and must still be
-live when activation takes its gate lock. Verification is the only operation
+the old-binary-absence assertion requires an expiry no more than 24 hours in
+the future and must still be live when activation takes its gate lock.
+Verification is the only operation
 that can set `readiness: :ready` or demote it after drift.
 `verify/2` requires `expected_readiness_epoch`, source/event/actor, and the
 approved DDL fingerprints. Promotion returns the normal applied result with
@@ -981,6 +1035,8 @@ Exact non-CAS failures are:
 | --- | --- |
 | bare Repo, unresolved or wrong backend context | `{:error, :invalid_admin_context}` |
 | mutator called inside an outer transaction | `{:error, :transaction_context_forbidden}` |
+| malformed capability registration UUID/options | `{:error, :invalid_capability}` |
+| malformed activation/assertion options, including a missing or malformed old-binary assertion UUID | `{:error, :invalid_activation_options}` |
 | admission not `read committed` | `{:error, {:claim_policy_unavailable, :unsupported_isolation}}` |
 | admission in read-only transaction | `{:error, {:claim_policy_unavailable, :read_only_transaction}}` |
 | data-plane gate/default or all-authority contention | `{:error, {:claim_policy_unavailable, :lock_contention}}` |
@@ -989,6 +1045,7 @@ Exact non-CAS failures are:
 | control-plane lock timeout | `{:error, {:lock_timeout, authority}}`, where `authority` is exactly `:gate`, `:rollout`, `:default`, or `{:partition, owner_scope}` |
 | activation while gate readiness is not ready | `{:error, {:activation_precondition_failed, :not_ready}}` |
 | missing/expired old-binary assertion | `{:error, {:activation_precondition_failed, :old_binary_assertion_expired}}` |
+| incompatible capability registration while TenantFair is active | `{:error, :incompatible_capability}` |
 | live capability missing required contract | `{:error, {:activation_precondition_failed, :capability_mismatch}}` |
 | installed/caller function contract differs from gate | `{:error, {:claim_policy_unavailable, :function_contract_mismatch}}` |
 | admission after readiness drift demotion | `{:error, {:claim_policy_unavailable, :not_ready}}` |
@@ -1067,7 +1124,7 @@ so no earlier data-plane lock can precede this order.
 | readiness promote or drift demote | `FOR UPDATE` | `FOR UPDATE` | `FOR SHARE` | read-only reconciliation | read-only verification | waits out admission with bounded timeout; gate change and evidence commit atomically |
 | activate/deactivate | `FOR UPDATE` | `FOR SHARE` | `FOR SHARE` | none | none | waits out admission and rollout writer with bounded timeout; commits mode atomically |
 | old-binary assertion | none | `FOR UPDATE` | none | none | none | audit-producing assertion participates in commit-order serialization |
-| capability heartbeat | none | none | none | none | none | insert/upsert only; allocates no audit ID and is never authority by itself |
+| capability heartbeat | `FOR SHARE` | none | none | none | none | serializes before insert/upsert; active mode rejects a mismatched writer/gate/function contract; allocates no audit ID |
 | audit export completion, legal-hold add/delete, audit pruning | none | `FOR UPDATE` | none | none | none | bounded rollout timeout; replay rechecked after the lock; policy/gate/partition state is never touched |
 | run creation | none | none | none | plain MVCC existence read; only absent/invisible rows use unique `INSERT ... ON CONFLICT DO NOTHING`; mandatory FK takes `KEY SHARE` | insert | committed row: no partition-row wait; competing first writer: uniqueness may wait within configured timeout |
 | refresh/release/commit/abandon/retry-poison | none | none | none | none | existing fenced run update | never introduces run-then-partition order |
@@ -1241,10 +1298,16 @@ the clear.
 ### Activation and engine exclusion
 
 Activation's exclusive gate conflicts with every participating admission's
-shared gate. Therefore activation either waits out a pre-existing admission
-before changing mode, or changes mode first and makes every later Legacy gate
-predicate fail. New attempts do not queue behind the exclusive holder; they
-return promptly. The exclusive transaction rechecks readiness, default,
+shared gate. Therefore activation waits out every admission that acquires a
+shared gate before the mode change, or changes mode first and makes every later
+Legacy gate predicate fail. A new admission skips a gate already held
+exclusively and returns promptly. PostgreSQL does not, however, promise that a
+queued `FOR UPDATE` waiter prevents a compatible `FOR SHARE SKIP LOCKED`
+participant from joining an existing shared-row MultiXact. Such a participant
+remains safe because activation must wait it out too, but sustained Legacy
+traffic can make activation hit its bounded lock timeout. Operators quiesce or
+stop admission attempts before retrying; the interlock does not claim queued
+writer anti-barging. The exclusive transaction rechecks readiness, default,
 capabilities, external old-binary assertion, and function contract under the
 same lock as the mode/epoch update. The external assertion is necessary because
 an activation-unaware binary cannot be proven absent by a table it never
@@ -1278,6 +1341,9 @@ rechecks the failure, sets not-ready, increments `readiness_epoch`, updates the
 rollout evidence, appends a `readiness_demoted` audit/receipt, and returns
 `{:ok, %{outcome: :demoted, target: :readiness, previous_version: n,
 version: n + 1, reasons: sorted_reason_atoms, audit_id: audit_id}}`. It does not
+replace the rollout's last recorded missing count when the source tables needed
+for a current recount are absent; advisory current evidence remains `nil` while
+the coherent prior recorded count is retained. It does not
 change `admission_mode`: an active TenantFair prefix remains selected but
 immediately fail-closed. In-flight shared-gate admissions finish before the
 demotion commits; all attempts beginning afterward return the exact not-ready
@@ -1300,16 +1366,41 @@ requires both:
   or the fleet was stopped/drained, recorded with actor, deployment evidence
   reference, expiry, and source/event receipt.
 
-An expired capability cannot satisfy preflight. An expired old-binary
-assertion also blocks activation. This is the honest boundary between a
-database interlock and fleet orchestration.
+An expired capability cannot satisfy preflight. An old-binary assertion must
+expire after the assertion transaction's database wall time and no more than
+24 hours after it; an expired assertion also blocks activation. This is the
+honest boundary between a database interlock and fleet orchestration.
+
+Capability registration first takes the gate `FOR SHARE` and only then upserts
+the capability row. Activation takes the same gate `FOR UPDATE` before reading
+live capabilities. Consequently a registration that wins first is included in
+activation validation, while activation that wins first causes a later
+incompatible heartbeat to fail as `:incompatible_capability`; no incompatible
+capability can commit behind an active TenantFair mode.
 
 Activation takes the gate `FOR UPDATE`, which waits with a bounded timeout for
-all activation-aware in-flight admissions holding `FOR SHARE`. New admissions
-skip the queued/exclusive gate. Under that lock activation re-verifies
-readiness, default fingerprint, capabilities, operator assertion, and installed
-function contract; then it changes `legacy -> tenant_fair`, increments the mode
-epoch exactly once, and appends audit/receipt state atomically. After commit,
+all activation-aware in-flight admissions holding `FOR SHARE`. Admissions skip
+a gate once it is held exclusively. While that exclusive request is merely
+queued behind an existing shared holder, PostgreSQL may admit another compatible
+shared participant; activation waits it out too and may return the exact gate
+lock timeout under sustained traffic. Under the acquired lock activation
+rechecks the lifetime receipt before epoch or mutable predicates, so a
+concurrent identical request replays and changed reuse conflicts even when the
+winner advanced the epoch while this request waited. It samples
+`clock_timestamp()` once after acquiring the gate and uses that post-lock
+database wall time for both assertion and capability expiry; transaction-start
+time is not acceptable for fleet evidence.
+
+Activation then
+re-verifies the complete readiness tuple—not only the gate's coarse ready
+bit—including schema generation, dual-write assertion kind, coherent completed
+backfill, fresh zero-missing recount, completed online phase, both recorded and
+actual exact indexes, validated mandatory FK, and the verified/current
+initialized default fingerprint. It then re-verifies capabilities, the operator
+assertion, the selected TenantFair implementation contract, and the exact
+installed function catalog shape. Only then does it change
+`legacy -> tenant_fair`, increment the mode epoch exactly once, and append
+audit/receipt state atomically. After commit,
 gate-aware Legacy returns unavailable and TenantFair may admit. The function
 reads and returns the current epoch under the gate; it never trusts a cached
 mode or default.

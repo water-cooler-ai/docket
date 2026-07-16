@@ -38,6 +38,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
            %{
              repo: repo,
              prefix: prefix,
+             implementation_contract: ClaimPolicy.activation_contract(claim_policy),
              transaction_scope: Map.get(context, :transaction_scope, false),
              identifiers: %{
                policy: plan.identifiers.claim_policy,
@@ -47,6 +48,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                assertions: plan.identifiers.claim_assertions,
                rollout: plan.identifiers.claim_rollout,
                gate: plan.identifiers.claim_admission_gate,
+               capabilities: plan.identifiers.claim_capabilities,
                runs: plan.identifiers.runs
              }
            }}

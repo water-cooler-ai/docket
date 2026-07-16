@@ -108,6 +108,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @callback decode(rows :: [list()], decoder :: term(), state :: term()) ::
                 {:ok, claim_batch(), observation :: map()}
+                | {:error, reason :: term(), observation :: map()}
 
     @callback observe(
                 plan_observation :: map(),
@@ -116,6 +117,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 duration :: integer(),
                 state :: term()
               ) :: :ok
+
+    @callback activation_contract(state :: term()) ::
+                %{
+                  required(:engine) => :tenant_fair,
+                  required(:function_contract) => pos_integer()
+                }
+
+    @optional_callbacks activation_contract: 1
 
     @doc false
     @spec new(keyword(), Docket.Backend.ctx()) :: t()
@@ -181,6 +190,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc false
     @spec implementation(t()) :: module()
     def implementation(%__MODULE__{implementation: implementation}), do: implementation
+
+    @doc false
+    @spec activation_contract(t()) ::
+            %{required(:engine) => :tenant_fair, required(:function_contract) => pos_integer()}
+            | :none
+    def activation_contract(%__MODULE__{
+          implementation: implementation,
+          implementation_state: state
+        }) do
+      if function_exported?(implementation, :activation_contract, 1) do
+        case implementation.activation_contract(state) do
+          %{engine: :tenant_fair, function_contract: contract} = metadata
+          when is_integer(contract) and contract > 0 and map_size(metadata) == 2 ->
+            metadata
+
+          _other ->
+            :none
+        end
+      else
+        :none
+      end
+    rescue
+      _error -> :none
+    catch
+      _kind, _reason -> :none
+    end
 
     @doc false
     @spec admin_context?(t(), term(), module(), String.t(), identifiers()) :: boolean()
@@ -282,7 +317,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @doc false
     @spec decode(t(), Plan.t(), [list()]) ::
-            {:ok, claim_batch(), map()} | {:error, {:claim_policy_decode_failed, term()}}
+            {:ok, claim_batch(), map()}
+            | {:error, term(), map()}
+            | {:error, {:claim_policy_decode_failed, term()}}
     def decode(%__MODULE__{} = claim_policy, %Plan{} = plan, rows) when is_list(rows) do
       try do
         case claim_policy.implementation.decode(
@@ -295,6 +332,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             validate_observation!(observation, :decoded, claim_policy.implementation)
             validate_admission_observation!(plan, observation, batch, claim_policy.implementation)
             {:ok, batch, observation}
+
+          {:error, reason, observation} when is_map(observation) ->
+            if data_only?(reason) do
+              validate_observation!(observation, :decoded, claim_policy.implementation)
+              {:error, reason, observation}
+            else
+              {:error,
+               {:claim_policy_decode_failed, {:invalid_return, {:error, reason, observation}}}}
+            end
 
           other ->
             {:error, {:claim_policy_decode_failed, {:invalid_return, other}}}

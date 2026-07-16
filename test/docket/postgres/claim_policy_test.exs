@@ -89,10 +89,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       def decode(_rows, _decoder, :decode), do: raise("decoder failed")
+
+      def decode(_rows, _decoder, :bounded_error),
+        do: {:error, {:claim_policy_unavailable, :lock_contention}, %{gate: :unavailable}}
+
       def decode(_rows, _decoder, _mode), do: {:ok, %{leases: [], poisoned: []}, %{}}
 
       def observe(_plan, _decoded, _result, _duration, :observe), do: raise("observer failed")
       def observe(_plan, _decoded, _result, _duration, _mode), do: :ok
+    end
+
+    defmodule ActivationContractImplementation do
+      def init([contract: contract], _context), do: {:ok, contract}
+
+      def activation_contract(:raise), do: raise("invalid activation metadata")
+      def activation_contract(contract), do: contract
+
+      def build_plan(_context, _policy, _state) do
+        %Plan{statement: "SELECT 1", params: [], decoder: %{}, observation: %{}}
+      end
+
+      def decode(_rows, _decoder, _state), do: {:ok, %{leases: [], poisoned: []}, %{}}
+      def observe(_plan, _decoded, _result, _duration, _state), do: :ok
     end
 
     setup do
@@ -160,6 +178,42 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           context
         )
       end
+    end
+
+    test "activation metadata is optional, exact, and fail closed" do
+      context = %{repo: __MODULE__.Repo, prefix: "public"}
+
+      exact =
+        ClaimPolicy.new(
+          [
+            implementation: ActivationContractImplementation,
+            contract: %{engine: :tenant_fair, function_contract: 1}
+          ],
+          context
+        )
+
+      assert ClaimPolicy.activation_contract(exact) == %{
+               engine: :tenant_fair,
+               function_contract: 1
+             }
+
+      for invalid <- [
+            %{engine: :tenant_fair, function_contract: 1, extra: true},
+            %{engine: :legacy, function_contract: 1},
+            %{engine: :tenant_fair, function_contract: 0},
+            :raise
+          ] do
+        policy =
+          ClaimPolicy.new(
+            [implementation: ActivationContractImplementation, contract: invalid],
+            context
+          )
+
+        assert ClaimPolicy.activation_contract(policy) == :none
+      end
+
+      legacy = ClaimPolicy.new([], context)
+      assert ClaimPolicy.activation_contract(legacy) == :none
     end
 
     test "normalizes the future TenantFair configuration into one bounded data-only value" do
@@ -495,6 +549,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert_receive {[:docket, :postgres, :claim_policy, :admission], %{leases: 0},
                       %{implementation: FailingCallbackImplementation, result: :ok}}
+    end
+
+    test "implementations can decode one statement into a bounded policy error" do
+      context = %{repo: __MODULE__.Repo, prefix: "public"}
+
+      claim_policy =
+        ClaimPolicy.new(
+          [implementation: FailingCallbackImplementation, mode: :bounded_error],
+          context
+        )
+
+      plan = ClaimPolicy.build_plan(claim_policy, context, effective_policy())
+
+      assert {:error, {:claim_policy_unavailable, :lock_contention}, %{gate: :unavailable}} =
+               ClaimPolicy.decode(claim_policy, plan, [[1]])
     end
 
     test "emits a closed TenantFair observation for mixed success despite observer failure" do

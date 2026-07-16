@@ -73,6 +73,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @impl true
+    def decode([["__bounded_policy_error__"]], _decoder, %{marker: marker}) do
+      relay({:alternate_claim_policy, :decode, marker, self()})
+      {:error, {:claim_policy_unavailable, :lock_contention}, %{gate: :unavailable}}
+    end
+
+    def decode([["__invalid_policy_error__"]], _decoder, %{marker: marker}) do
+      relay({:alternate_claim_policy, :decode, marker, self()})
+      {:error, {:invalid_reason, self()}, %{}}
+    end
+
     def decode(rows, %{orphan_ttl_ms: ttl}, %{marker: marker}) do
       relay({:alternate_claim_policy, :decode, marker, self()})
 
@@ -275,6 +285,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @callback rows(Docket.Postgres.ClaimPolicy.claim_batch()) :: [list()]
     @callback invalid_rows() :: [list()]
+    @callback policy_error_rows() :: [list()]
+    @callback invalid_policy_error_rows() :: [list()]
+
+    @optional_callbacks policy_error_rows: 0, invalid_policy_error_rows: 0
 
     defmacro __using__(opts) do
       implementation = Keyword.fetch!(opts, :implementation)
@@ -363,6 +377,38 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                      plan,
                      @claim_policy_fixture.invalid_rows()
                    )
+        end
+
+        test "accepts the alternate implementation's bounded data-only policy error variant" do
+          if function_exported?(@claim_policy_fixture, :policy_error_rows, 0) do
+            {claim_policy, context} = contract_policy()
+
+            plan =
+              Docket.Postgres.ClaimPolicy.build_plan(claim_policy, context, effective_policy())
+
+            assert {:error, {:claim_policy_unavailable, :lock_contention}, %{gate: :unavailable}} =
+                     Docket.Postgres.ClaimPolicy.decode(
+                       claim_policy,
+                       plan,
+                       apply(@claim_policy_fixture, :policy_error_rows, [])
+                     )
+          end
+        end
+
+        test "rejects the alternate implementation's non-data policy error reason" do
+          if function_exported?(@claim_policy_fixture, :invalid_policy_error_rows, 0) do
+            {claim_policy, context} = contract_policy()
+
+            plan =
+              Docket.Postgres.ClaimPolicy.build_plan(claim_policy, context, effective_policy())
+
+            assert {:error, {:claim_policy_decode_failed, {:invalid_return, _invalid}}} =
+                     Docket.Postgres.ClaimPolicy.decode(
+                       claim_policy,
+                       plan,
+                       apply(@claim_policy_fixture, :invalid_policy_error_rows, [])
+                     )
+          end
         end
 
         test "identifies the selected implementation in exact success and error telemetry" do
@@ -571,5 +617,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl true
     def invalid_rows, do: [[:invalid_alternate_row]]
+
+    @impl true
+    def policy_error_rows, do: [["__bounded_policy_error__"]]
+
+    @impl true
+    def invalid_policy_error_rows, do: [["__invalid_policy_error__"]]
   end
 end

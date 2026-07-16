@@ -538,6 +538,13 @@ never dropped automatically. Repair is refused while the prefix is ready. A
 drift-demoted TenantFair-selected prefix is not ready and may be repaired;
 repair never changes admission mode.
 
+If schema drift removes a table needed for the missing-partition recount,
+verification still commits an audited `not_ready` demotion. The rollout ledger
+retains its last coherent recorded missing count (required by a completed
+backfill tuple), while activation preflight reports the unavailable current
+count as `nil`; operators must not interpret the retained value as a fresh
+catalog observation.
+
 Inspect durable progress separately from schema generation:
 
 ```sql
@@ -659,6 +666,140 @@ object OIDs while repairing only exact invalid artifacts. Record server major,
 settings, DDL fingerprints, ledger transitions, WAL/disk/lag observations, and
 the final zero/count/catalog queries. PostgreSQL 13 and 17 both remain required
 release gates.
+
+### Prefix-wide TenantFair activation interlock
+
+Activation is a two-release operation, never an instance canary. Release A
+deploys partition-upserting writers and activation-aware Legacy everywhere,
+drains activation-unaware binaries and their open transactions, and completes
+default bootstrap, backfill, online DDL, FK validation, and readiness while the
+prefix remains in `legacy` mode. Release B deploys the matching TenantFair
+function/engine contract everywhere before any prefix flip.
+
+Use a context whose instance-selected ClaimPolicy is the deployed TenantFair
+implementation when calling preflight and activate. Contract v1 requires that
+implementation's optional `activation_contract/1` callback to return exactly
+`%{engine: :tenant_fair, function_contract: 1}`. A Legacy-selected context is
+intentionally not activatable; activation never changes the selected policy.
+
+The installed prefix function must have this exact catalog shape:
+
+```sql
+<prefix>.docket_tenant_fair_claim_v1(
+  timestamptz, timestamptz, integer, integer, text, text[]
+) RETURNS SETOF record
+LANGUAGE plpgsql
+VOLATILE PARALLEL UNSAFE SECURITY INVOKER
+SET search_path TO pg_catalog, pg_temp
+```
+
+Exactly one same-name function may exist in the prefix. An overload or drift in
+arguments, return type, language, volatility, parallel safety, security mode,
+or `search_path` fails closed as `:function_contract_mismatch`. DCKT-68 owns
+the production function and engine; a DCKT-71-only build that does not include
+that delivery is expected to remain non-activatable.
+
+Each participating process heartbeats an expiring capability using a trusted
+resolved backend context. Heartbeats describe only participating upgraded
+processes; they can never prove an old activation-unaware binary absent.
+Registration takes the prefix gate `FOR SHARE`, then upserts the capability.
+Once TenantFair is active, a heartbeat whose writer, gate, or function contract
+does not match the active gate is rejected as `{:error,
+:incompatible_capability}`:
+
+```elixir
+alias Docket.Postgres.ClaimPolicy.Activation
+
+Activation.register_capability(context, stable_instance_uuid,
+  binary_fingerprint: :crypto.hash(:sha256, reviewed_binary_identity),
+  writer_contract: 1,
+  gate_contract: 1,
+  function_contract: 1,
+  ttl_ms: :timer.minutes(5)
+)
+```
+
+After the deployment system proves the old fleet absent—or the fleet is fully
+stopped and drained—record that separate expiring assertion. Do not generate
+this evidence from the capability table. Expiry must be after the database wall
+clock and at most 24 hours in the future when the audit transaction runs:
+
+```elixir
+{:ok, assertion} =
+  Activation.attest_old_binaries_absent(context,
+    evidence_fingerprint: :crypto.hash(:sha256, deployment_evidence),
+    expires_at: DateTime.add(DateTime.utc_now(), 300, :second),
+    actor: "rollout-operator",
+    source: "deployment",
+    event_id: "old-binaries-absent-2026-07-16"
+  )
+
+{:ok, report} = Activation.preflight(context)
+true = report.activatable
+```
+
+Preflight is advisory. Preserve the returned mode/epoch and inspect
+`selected_implementation_contract`, `active_implementation_contract`,
+`default_fingerprint`, `verified_default_fingerprint`, `schema_generation`,
+both rollout phases, recorded and current missing counts, exact ready/live
+index validity, FK validation, expected-table count/presence, live capability
+count, and assertion expiry. These readiness/catalog values are produced by
+the same canonical DCKT-72 evidence reader, and any drift makes `activatable`
+false even if the coarse gate has not yet been demoted. Recorded or current
+missing counts are `nil` when they have not been established; unknown evidence
+is never presented as zero. The
+mutating call reacquires the gate and rechecks the complete coherent readiness
+tuple, current catalog/count/default facts, selected implementation contract,
+and exact function catalog shape; a preflight report is never an authorization
+token. After acquiring the gate it resolves receipt replay/conflict before the
+expected epoch, then samples `clock_timestamp()` once for assertion and
+capability expiry. Evidence that expired while activation waited cannot
+authorize the flip.
+
+Activation starts its own transaction with `SET TRANSACTION ISOLATION LEVEL
+READ COMMITTED READ WRITE` before receipt lookup or any other query, then sets
+bounded local lock and statement timeouts. Role or session defaults such as
+Repeatable Read therefore cannot pin a stale readiness snapshot. Caller-owned
+transactions remain forbidden for activation and every other control mutator.
+
+Quiesce Legacy polling before activation. The exclusive `FOR UPDATE` gate waits
+out every admission holding `FOR SHARE`. A gate already held exclusively makes
+new admissions return promptly, but PostgreSQL may let another compatible
+`FOR SHARE SKIP LOCKED` participant join an existing shared-row MultiXact while
+the exclusive request is only queued. That participant is still safe—the flip
+waits it out too—but sustained Legacy traffic can produce
+`{:error, {:lock_timeout, :gate}}`. Stop or quiesce admission attempts and retry
+the identical source/event request; do not claim queued-writer anti-barging.
+
+```elixir
+Activation.activate(context,
+  expected_epoch: report.mode_epoch,
+  old_binary_assertion_id: assertion.assertion_id,
+  actor: "rollout-operator",
+  source: "deployment",
+  event_id: "activate-tenant-fair-2026-07-16"
+)
+```
+
+On commit, activation-aware Legacy fails closed for that prefix. TenantFair
+remains fail closed unless mode, readiness, function contract, and its fresh
+gate/default/partition authorities all match. The API never changes the
+instance-selected ClaimPolicy; dispatcher, manual drain, recovery, direct
+configured RunStore, and transaction contexts keep the same portable call
+boundary.
+
+Ordinary hot fallback is forbidden while exact caps are promised. Roll back in
+this exact order:
+
+1. stop new TenantFair polling and wait out or terminate admission statements;
+2. call `Activation.deactivate/2` with the current epoch under the exclusive gate;
+3. declare the exact-cap guarantee abandoned at that deactivation commit; and
+4. only then restart gate-aware Legacy and inspect existing claims/fences.
+
+Deactivation deliberately does not require ready state, a live capability, or
+an old-binary assertion, so readiness drift cannot trap rollback. It increments
+the monotonic epoch and audits `exact_cap_guarantee: false`; it does not clear
+or preempt existing claim tokens.
 
 ## Tenant-fair claim benchmark
 

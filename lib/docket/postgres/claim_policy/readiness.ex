@@ -17,6 +17,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @lock_timeout_ms 1_000
     @statement_timeout_ms 5_000
+    @expected_tables ~w(
+      docket_graph_versions
+      docket_runs
+      docket_events
+      docket_claim_policy
+      docket_claim_partitions
+      docket_claim_policy_events
+      docket_claim_policy_receipts
+      docket_claim_policy_holds
+      docket_claim_audit_exports
+      docket_claim_assertions
+      docket_claim_rollout
+      docket_claim_admission_gate
+      docket_claim_capabilities
+    )
 
     @doc "Records fleet-wide partition dual-write evidence atomically with audit and replay state."
     @spec attest_dual_write(Docket.Backend.ctx(), keyword()) ::
@@ -55,6 +70,78 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         |> retry_verification_source_event_race(control, meta, fingerprint)
         |> normalize_error()
       end
+    end
+
+    @doc false
+    def catalog_evidence(control) do
+      table_count =
+        control.repo.query!(
+          """
+          SELECT count(*)::bigint
+          FROM pg_class AS class
+          JOIN pg_namespace AS namespace ON namespace.oid = class.relnamespace
+          WHERE namespace.nspname = $1 AND class.relkind = 'r'
+            AND class.relname = ANY($2::text[])
+          """,
+          [control.prefix, @expected_tables],
+          log: false
+        ).rows
+
+      expected = OnlineDDL.index_fingerprints(control.prefix)
+
+      case table_count do
+        [[count]] when count == length(@expected_tables) ->
+          missing =
+            control.repo.query!(
+              """
+              SELECT count(DISTINCT runs.scope_key)::bigint
+              FROM #{control.identifiers.runs} AS runs
+              WHERE NOT EXISTS (
+                SELECT 1 FROM #{control.identifiers.partitions} AS partitions
+                WHERE partitions.scope_key = runs.scope_key
+              )
+              """,
+              [],
+              log: false
+            ).rows
+
+          with [[missing_count]] <- missing,
+               {:ok, online} <- OnlineMigration.inspect_state(control.repo, control.prefix) do
+            {:ok,
+             Map.merge(online, %{
+               schema_complete: true,
+               expected_table_count: count,
+               expected_table_total: length(@expected_tables),
+               missing_count: missing_count,
+               ready_hash: expected.ready,
+               live_hash: expected.live
+             })}
+          else
+            _ -> {:error, :readiness_failed}
+          end
+
+        [[count]] ->
+          {:ok,
+           %{
+             schema_complete: false,
+             expected_table_count: count,
+             expected_table_total: length(@expected_tables),
+             missing_count: nil,
+             ready_index_valid: false,
+             live_index_valid: false,
+             fk_disposition: :absent,
+             fk_definition_valid: false,
+             ready_hash: expected.ready,
+             live_hash: expected.live
+           }}
+
+        _ ->
+          {:error, :readiness_failed}
+      end
+    rescue
+      _error -> {:error, :readiness_failed}
+    catch
+      _kind, _reason -> {:error, :readiness_failed}
     end
 
     defp transact_verification(control, meta, fingerprint) do
@@ -260,113 +347,60 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp collect_evidence(control, rollout, gate, default, meta) do
-      missing =
-        control.repo.query!(
-          """
-          SELECT count(DISTINCT runs.scope_key)::bigint
-          FROM #{control.identifiers.runs} AS runs
-          WHERE NOT EXISTS (
-            SELECT 1 FROM #{control.identifiers.partitions} AS partitions
-            WHERE partitions.scope_key = runs.scope_key
-          )
-          """,
-          [],
-          log: false
-        ).rows
+      with {:ok, catalog} <- catalog_evidence(control) do
+        if catalog.schema_complete do
+          reasons =
+            []
+            |> reason(rollout.generation != 2, :schema_generation)
+            |> reason(rollout.assertion_kind != "dual_write", :dual_write_unattested)
+            |> reason(rollout.backfill != "complete", :backfill_incomplete)
+            |> reason(
+              rollout.missing != 0 or catalog.missing_count != 0,
+              :missing_partitions
+            )
+            |> reason(not default.initialized, :default_uninitialized)
+            |> reason(gate.function_contract != 1, :gate_contract_invalid)
+            |> reason(
+              not catalog.ready_index_valid or not rollout.ready or
+                rollout.ready_hash != catalog.ready_hash or
+                meta.ready_index_ddl_sha256 != catalog.ready_hash,
+              :ready_index_invalid
+            )
+            |> reason(
+              not catalog.live_index_valid or not rollout.live or
+                rollout.live_hash != catalog.live_hash or
+                meta.live_index_ddl_sha256 != catalog.live_hash,
+              :live_index_invalid
+            )
+            |> reason(
+              not catalog.fk_definition_valid or catalog.fk_disposition != :validated or
+                rollout.fk != "validated" or
+                rollout.online != "complete",
+              :foreign_key_unvalidated
+            )
+            |> reason(
+              gate.readiness == "ready" and default.initialized and
+                rollout.verified_default != default.fingerprint,
+              :default_fingerprint_changed
+            )
+            |> Enum.sort()
 
-      expected_tables = [
-        "docket_graph_versions",
-        "docket_runs",
-        "docket_events",
-        "docket_claim_policy",
-        "docket_claim_partitions",
-        "docket_claim_policy_events",
-        "docket_claim_policy_receipts",
-        "docket_claim_policy_holds",
-        "docket_claim_audit_exports",
-        "docket_claim_assertions",
-        "docket_claim_rollout",
-        "docket_claim_admission_gate",
-        "docket_claim_capabilities"
-      ]
-
-      table_count =
-        control.repo.query!(
-          """
-          SELECT count(*)::bigint
-          FROM pg_class AS class
-          JOIN pg_namespace AS namespace ON namespace.oid = class.relnamespace
-          WHERE namespace.nspname = $1 AND class.relkind = 'r'
-            AND class.relname = ANY($2::text[])
-          """,
-          [control.prefix, expected_tables],
-          log: false
-        ).rows
-
-      with [[missing_count]] <- missing,
-           [[13]] <- table_count,
-           {:ok, online} <- OnlineMigration.inspect_state(control.repo, control.prefix) do
-        expected = OnlineDDL.index_fingerprints(control.prefix)
-
-        reasons =
-          []
-          |> reason(rollout.generation != 2, :schema_generation)
-          |> reason(rollout.assertion_kind != "dual_write", :dual_write_unattested)
-          |> reason(rollout.backfill != "complete", :backfill_incomplete)
-          |> reason(rollout.missing != 0 or missing_count != 0, :missing_partitions)
-          |> reason(not default.initialized, :default_uninitialized)
-          |> reason(gate.function_contract != 1, :gate_contract_invalid)
-          |> reason(
-            not online.ready_index_valid or not rollout.ready or
-              rollout.ready_hash != expected.ready or
-              meta.ready_index_ddl_sha256 != expected.ready,
-            :ready_index_invalid
-          )
-          |> reason(
-            not online.live_index_valid or not rollout.live or
-              rollout.live_hash != expected.live or meta.live_index_ddl_sha256 != expected.live,
-            :live_index_invalid
-          )
-          |> reason(
-            not online.fk_definition_valid or online.fk_disposition != :validated or
-              rollout.fk != "validated" or
-              rollout.online != "complete",
-            :foreign_key_unvalidated
-          )
-          |> reason(
-            gate.readiness == "ready" and default.initialized and
-              rollout.verified_default != default.fingerprint,
-            :default_fingerprint_changed
-          )
-          |> Enum.sort()
-
-        {:ok,
-         %{
-           reasons: reasons,
-           missing_count: missing_count,
-           ready_index_valid: online.ready_index_valid,
-           live_index_valid: online.live_index_valid,
-           fk_disposition: online.fk_disposition,
-           fk_definition_valid: online.fk_definition_valid,
-           ready_hash: expected.ready,
-           live_hash: expected.live
-         }}
-      else
-        [[_missing_count]] when table_count != [[13]] ->
           {:ok,
            %{
-             reasons: [:schema_generation],
-             missing_count: rollout.missing || 0,
-             ready_index_valid: false,
-             live_index_valid: false,
-             fk_disposition: :absent,
-             fk_definition_valid: false,
-             ready_hash: OnlineDDL.index_fingerprint(control.prefix, :ready),
-             live_hash: OnlineDDL.index_fingerprint(control.prefix, :live)
+             reasons: reasons,
+             missing_count: catalog.missing_count,
+             ready_index_valid: catalog.ready_index_valid,
+             live_index_valid: catalog.live_index_valid,
+             fk_disposition: catalog.fk_disposition,
+             fk_definition_valid: catalog.fk_definition_valid,
+             ready_hash: catalog.ready_hash,
+             live_hash: catalog.live_hash
            }}
-
-        _ ->
-          {:error, :readiness_failed}
+        else
+          {:ok,
+           catalog
+           |> Map.put(:reasons, [:schema_generation])}
+        end
       end
     end
 
@@ -429,6 +463,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         readiness = if outcome == :demoted, do: "not_ready", else: "ready"
         {online_phase, online_complete?} = evidence_online_phase(evidence)
 
+        persisted_missing_count =
+          if is_nil(evidence.missing_count),
+            do: rollout.missing,
+            else: evidence.missing_count
+
         control.repo.query!(
           """
           UPDATE #{control.identifiers.gate}
@@ -460,7 +499,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             evidence.ready_hash,
             evidence.live_hash,
             Atom.to_string(evidence.fk_disposition),
-            evidence.missing_count,
+            persisted_missing_count,
             if(outcome == :demoted, do: rollout.verified_default, else: default.fingerprint)
           ],
           log: false

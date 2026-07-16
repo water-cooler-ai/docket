@@ -4,6 +4,12 @@
 entrypoint. ClaimPolicy is an internal engine seam behind that entrypoint, not
 an alternate caller-facing store.
 
+The portable RunStore method set, instance-level selection rule, and caller
+result remain unchanged. Internally, `decode/3` is additively widened to return
+bounded data-only policy errors with observations as well as successful
+batches; this is an internal result-algebra extension, not a new portable
+method or per-call implementation override.
+
 ## Final call and ownership direction
 
 Every production, recovery, manual, and inline admission follows one direction:
@@ -40,7 +46,7 @@ timezone representation.
 ## Implementation contract
 
 An implementation declares `@behaviour Docket.Postgres.ClaimPolicy` and
-provides four callbacks:
+provides four required callbacks plus one optional activation callback:
 
 - `init/2` validates implementation configuration once per backend instance.
   It receives the normalized prefix and quoted identifiers, but no Repo or
@@ -49,10 +55,19 @@ provides four callbacks:
   claim policy, and instance state. It returns one
   `Docket.Postgres.ClaimPolicy.Plan` without performing database I/O.
 - `decode/3` receives only the rows from that plan's statement, the plan's
-  data-only decoder contract, and instance state. It returns the portable
-  claim batch plus bounded observation data.
+  data-only decoder contract, and instance state. It returns either the
+  portable claim batch or a data-only policy error, plus bounded observation
+  data. The error form lets one atomic statement distinguish a fail-closed
+  gate result from ordinary empty eligibility without adding a RunStore policy
+  branch.
 - `observe/5` owns implementation-specific result, selection, attempt, poison,
   and error observations.
+- `activation_contract/1`, when implemented, identifies the resolved instance
+  as the TenantFair engine for the frozen database-function contract. It must
+  return exactly `%{engine: :tenant_fair, function_contract: 1}` for contract
+  v1. Missing, malformed, or raising callbacks are treated as no activation
+  contract. This metadata is control-plane proof only: it cannot select an
+  implementation, replace the context-bound policy, or alter a RunStore call.
 
 The facade validates that a plan contains one non-empty SQL statement, a
 parameter list, a data-only decoder contract, and bounded data-only observation
@@ -68,6 +83,12 @@ have installed claim tokens, ordinary orphan-TTL recovery remains the safety
 net for such an implementation defect. Observation callbacks are isolated:
 they cannot change an already-decoded result or suppress the facade's generic
 admission event.
+
+The facade accepts the error variant only when both the reason and bounded
+observation are data-only. A PID, function, query capability, or other opaque
+runtime value in the reason is normalized as an invalid decoder return. The
+shared implementation contract exercises both the alternate engine's valid
+policy-error variant and a rejected non-data reason.
 
 Each admission must be one atomic PostgreSQL operation: one RunStore-issued
 client query containing one top-level PostgreSQL statement. No callback
@@ -114,6 +135,21 @@ limit, demand-one preference/fallthrough, multi-demand class progress,
 claim-token installation, expired steal behavior, and max-attempt poison
 mutation in one statement.
 
+The activation-aware plan first acquires the prefix gate with
+`FOR SHARE SKIP LOCKED`. Every candidate and update data-depends on the locked
+row authorizing `legacy`; a skipped gate returns lock contention and a locked
+TenantFair-mode gate returns inactive-engine. Pre-activation selection,
+decoding, telemetry, poison, and portable caller results are otherwise
+unchanged.
+
+The same one statement materializes its transaction context before the gate.
+Repeatable Read or Serializable returns `:unsupported_isolation` without
+feeding any modifying CTE. PostgreSQL rejects a data-modifying CTE in a
+read-only transaction even when its input is empty; RunStore therefore maps
+only SQLSTATE `25006` at the generic query boundary to
+`:read_only_transaction`. No implementation-specific retry or second client
+query is added.
+
 Legacy also owns parameter normalization, lease and poison decoding, candidate
 and selection statistics, eligibility ages, fallback and steal accounting,
 attempt/poison events, and the existing
@@ -126,7 +162,9 @@ identity as metric metadata.
 
 A future `Docket.Postgres.ClaimPolicy.TenantFair` should:
 
-1. validate only its data-only instance configuration in `init/2`; readiness,
+1. validate only its data-only instance configuration in `init/2` and return
+   `%{engine: :tenant_fair, function_contract: 1}` from
+   `activation_contract/1`; readiness,
    schema, mode, and function contract are checked inside admission;
 2. construct one atomic fairness statement in `build_plan/3` using only the
    supplied quoted identifiers and normalized portable policy;

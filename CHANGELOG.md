@@ -16,6 +16,14 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- Prefix-wide audited TenantFair activation and rollback interlock: capability
+  heartbeats serialize through the same admission gate as mode changes,
+  activation requires bounded external old-binary proof and the canonical
+  DCKT-72 readiness/catalog evidence, and gate-aware Legacy fails closed under
+  mode, isolation, read-only, and lock contention. Advisory preflight exposes
+  exact prefix/default/index/FK/table/implementation evidence; epoch-CAS mode
+  changes remain replayable, prefix isolated, and auditable. DCKT-68 still owns
+  the production TenantFair engine and database function.
 - Resumable PostgreSQL v2 online-readiness DDL and verification: generated
   nontransactional host migrations build the two exact tenant-leading indexes
   concurrently, install and validate the partition foreign key in separate

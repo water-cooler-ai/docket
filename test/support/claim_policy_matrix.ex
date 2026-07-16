@@ -9,7 +9,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           implementation: Docket.Postgres.ClaimPolicy.Legacy,
           options: [],
           fixture: Docket.Test.LegacyClaimPolicyContract,
-          query_marker: "WITH ready_candidates AS MATERIALIZED"
+          query_marker: "WITH transaction_context AS MATERIALIZED"
         },
         %{
           name: "alternate",

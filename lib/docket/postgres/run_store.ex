@@ -231,11 +231,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           {:ok, %{rows: rows}} ->
             case ClaimPolicy.decode(claim_policy, plan, rows) do
               {:ok, batch, observation} -> {{:ok, batch}, observation}
+              {:error, reason, observation} -> {{:error, reason}, observation}
               {:error, reason} -> {{:error, reason}, nil}
             end
 
           {:error, reason} ->
-            {{:error, reason}, nil}
+            {{:error, normalize_claim_query_error(reason)}, nil}
         end
 
       :ok = ClaimPolicy.observe(claim_policy, plan, decoded_observation, result, started)
@@ -245,6 +246,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def claim_due(_ctx, scope, _policy) do
       raise ArgumentError, "claim_due scope must be :system, got: #{inspect(scope)}"
     end
+
+    defp normalize_claim_query_error(%Postgrex.Error{
+           postgres: %{code: :read_only_sql_transaction}
+         }) do
+      {:claim_policy_unavailable, :read_only_transaction}
+    end
+
+    defp normalize_claim_query_error(reason), do: reason
 
     @doc """
     Refreshes the claim timestamp when `claim_token` is still current.
