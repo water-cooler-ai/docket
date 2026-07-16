@@ -146,9 +146,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp clock_now!(clock) do
       case clock.() do
-        :database -> :database
-        %DateTime{} = now -> now
-        other -> raise ArgumentError, "pruner clock must return a DateTime or :database, got: #{inspect(other)}"
+        :database ->
+          :database
+
+        %DateTime{} = now ->
+          now
+
+        other ->
+          raise ArgumentError,
+                "pruner clock must return a DateTime or :database, got: #{inspect(other)}"
       end
     end
 
