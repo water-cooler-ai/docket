@@ -9,7 +9,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     alias Docket.Postgres.BackendTestRepo, as: TestRepo
     alias Docket.Postgres.BackendSandboxTestRepo, as: SandboxRepo
+    alias Docket.Postgres.{AdmissionPhase, Dispatcher}
     alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}
+    alias Docket.Test.ConcurrentAdmissionHarness
     alias Docket.Test.Fixtures.Graphs
 
     @migration_version 20_260_711_000_025
@@ -139,6 +141,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         notifier: :none
     end
 
+    defmodule ConcurrentManualHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        testing: :manual,
+        notifier: :none
+    end
+
     defmodule ClockedManualHost do
       use Docket,
         backend: Docket.Postgres,
@@ -236,6 +246,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       stop_host(PoisonHost)
       stop_host(InlineHost)
       stop_host(ManualHost)
+      stop_host(ConcurrentManualHost)
       stop_host(ClockedManualHost)
       stop_host(AlternatePolicyManualHost)
       stop_host(TenantFairConfigManualHost)
@@ -327,6 +338,116 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, %{drained: 0, poisoned: [], outcomes: [], limit_reached: false}} =
                ManualHost.drain_runs(max_runs: 10)
+    end
+
+    test "independent manual runtimes drain through distinct checked-out connections" do
+      start_supervised!(ManualHost)
+      start_supervised!(ConcurrentManualHost)
+      assert {:ok, reference} = ManualHost.save_graph(Graphs.minimal_linear())
+      assert {:ok, first} = ManualHost.start_run(reference, %{"value" => "first"})
+      assert {:ok, second} = ManualHost.start_run(reference, %{"value" => "second"})
+
+      results =
+        ConcurrentAdmissionHarness.run_callers!(TestRepo, [
+          {:manual_one, fn -> ManualHost.drain_runs(max_runs: 1) end},
+          {:manual_two, fn -> ConcurrentManualHost.drain_runs(max_runs: 1) end}
+        ])
+
+      assert results |> Enum.map(& &1.backend_pid) |> Enum.uniq() |> length() == 2
+
+      for %{result: result} <- results do
+        assert {:ok, %{drained: 1, poisoned: [], limit_reached: true}} = result
+      end
+
+      assert {:ok, %{status: :done}} = ManualHost.fetch_run(first.id)
+      assert {:ok, %{status: :done}} = ManualHost.fetch_run(second.id)
+    end
+
+    test "supervised dispatchers claim through distinct checked-out PostgreSQL connections" do
+      start_supervised!(ManualHost)
+      assert {:ok, reference} = ManualHost.save_graph(Graphs.minimal_linear())
+      assert {:ok, _first} = ManualHost.start_run(reference, %{"value" => "first"})
+      assert {:ok, _second} = ManualHost.start_run(reference, %{"value" => "second"})
+
+      parent = self()
+      barrier = make_ref()
+
+      first_phase =
+        start_supervised!(%{id: make_ref(), start: {AdmissionPhase, :start_link, [[]]}})
+
+      second_phase =
+        start_supervised!(%{id: make_ref(), start: {AdmissionPhase, :start_link, [[]]}})
+
+      launch = fn name ->
+        fn lease ->
+          vehicle = spawn(fn -> receive(do: (:stop -> :ok)) end)
+          send(parent, {:launched, name, lease, vehicle})
+          {:ok, vehicle}
+        end
+      end
+
+      dispatchers =
+        for {name, phase, registered_name} <- [
+              {:first, first_phase, Module.concat(__MODULE__, FirstPinnedDispatcher)},
+              {:second, second_phase, Module.concat(__MODULE__, SecondPinnedDispatcher)}
+            ] do
+          context =
+            Docket.Postgres.TestAdmissionContext.resolve(TestRepo, %{
+              admission_phase: phase,
+              concurrent_admission_probe: %{
+                owner: parent,
+                ref: barrier,
+                name: name,
+                timeout: 5_000
+              }
+            })
+
+          start_supervised!(
+            {Dispatcher,
+             name: registered_name,
+             context: context,
+             run_store: ConcurrentAdmissionHarness.PinnedRunStore,
+             concurrency: 1,
+             poll_interval_ms: 60_000,
+             orphan_ttl_ms: 30_000,
+             max_claim_attempts: 3,
+             drain_timeout_ms: 0,
+             launch: launch.(name),
+             clock: &DateTime.utc_now/0,
+             jitter: fn interval -> interval end}
+          )
+
+          registered_name
+        end
+
+      checked_out =
+        for _ <- 1..2 do
+          assert_receive {ConcurrentAdmissionHarness.PinnedRunStore, ^barrier, :checked_out, name,
+                          worker, backend_pid},
+                         1_000
+
+          %{name: name, worker: worker, backend_pid: backend_pid}
+        end
+
+      assert Enum.sort(Enum.map(checked_out, & &1.name)) == [:first, :second]
+      assert checked_out |> Enum.map(& &1.worker) |> Enum.uniq() |> length() == 2
+      assert checked_out |> Enum.map(& &1.backend_pid) |> Enum.uniq() |> length() == 2
+
+      Enum.each(checked_out, fn participant ->
+        send(participant.worker, {ConcurrentAdmissionHarness.PinnedRunStore, barrier, :go})
+      end)
+
+      launched =
+        for _ <- 1..2 do
+          assert_receive {:launched, name, lease, vehicle}, 2_000
+          %{name: name, lease: lease, vehicle: vehicle}
+        end
+
+      assert Enum.sort(Enum.map(launched, & &1.name)) == [:first, :second]
+      assert launched |> Enum.map(& &1.lease.run_id) |> Enum.uniq() |> length() == 2
+
+      Enum.each(dispatchers, fn dispatcher -> assert :ok = stop_supervised(dispatcher) end)
+      Enum.each(launched, &send(&1.vehicle, :stop))
     end
 
     test "one instance clock governs facade timestamps and manual claims" do
