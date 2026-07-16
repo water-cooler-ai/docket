@@ -78,6 +78,16 @@ database functions, and trusted implementation code could obtain a globally
 known Repo on its own, so this is an extension contract rather than a security
 sandbox. The boundary never injects an application-side query capability.
 
+For DCKT-47, "one statement" does not mean "one MVCC snapshot." The approved
+TenantFair plan computes one bounded candidate-key array and invokes one
+prefix-qualified `VOLATILE PARALLEL UNSAFE SECURITY INVOKER` database function
+exactly once. That function acquires nonblocking gate/default/partition locks
+in ordered internal commands, advances the partition decision witness, and
+uses a later internal command's fresh `READ COMMITTED` snapshot for live count
+and mutation. A bare CTE that locks and aggregates under the top-level snapshot
+is explicitly non-conforming. Non-Read-Committed and read-only transactions
+fail closed; transaction-scoped leases remain provisional until outer commit.
+
 Every implementation is registered once in the source-owned
 `test/support/claim_policy_matrix.ex`; both the focused ClaimPolicy suite and
 the live RunStore suite consume that registry. Each implementation runs the
@@ -116,8 +126,8 @@ identity as metric metadata.
 
 A future `Docket.Postgres.ClaimPolicy.TenantFair` should:
 
-1. validate its instance configuration and required schema compatibility in
-   `init/2`;
+1. validate only its data-only instance configuration in `init/2`; readiness,
+   schema, mode, and function contract are checked inside admission;
 2. construct one atomic fairness statement in `build_plan/3` using only the
    supplied quoted identifiers and normalized portable policy;
 3. return a data-only decoder and bounded observation contract in its Plan;
@@ -181,3 +191,11 @@ drain calls cannot override it. Roll back by restarting affected instances
 after removing `:claim_policy` or explicitly selecting
 `Docket.Postgres.ClaimPolicy.Legacy`. Phase 0 needs no ClaimPolicy migration,
 so rollback restores the legacy engine without a database downgrade.
+
+That generic alternate-engine canary applies only before a prefix promises
+exact caps. DCKT-47 supersedes it for TenantFair activation: activation-aware
+Legacy and TenantFair may coexist as deployed code, but the prefix gate permits
+only one engine to admit. Ordinary mixed-engine canaries and hot fallback are
+forbidden. Exact-cap rollback stops TenantFair admission, changes the audited
+prefix mode/epoch under the exclusive gate, explicitly abandons the cap
+guarantee, and only then resumes gate-aware Legacy.
