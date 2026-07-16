@@ -59,7 +59,7 @@ effects require their own stable idempotency scheme.
 
 ## Tenant fairness telemetry boundary
 
-The DCKT-58 contract defines tenant fairness over the persisted PostgreSQL
+The tenant-fairness contract defines fairness over the persisted PostgreSQL
 `scope_key`, but raw `scope_key` and `tenant_id` are forbidden as ordinary
 admission telemetry metadata and metric labels. Run ID, graph ID/hash, claim
 token, tier, host account identity, policy version, and arbitrary error text are
@@ -210,7 +210,7 @@ bounds. The full operational vocabulary and conditional formula live in
 [`architecture/docket-tenant-claim-fairness-design.md`](architecture/docket-tenant-claim-fairness-design.md).
 
 The normative target matrix, bounded `tenant_fair_report_input/v1` inspection
-schema, unavailable/right-censored rules, worked report, and DCKT-50
+schema, unavailable/right-censored rules, worked report, and acceptance
 traceability live in that document's
 [fairness SLO and regression-budget contract](architecture/docket-tenant-claim-fairness-design.md#fairness-slo-and-regression-budget-contract).
 Default telemetry supplies aggregate volume and wait totals; trusted inspection

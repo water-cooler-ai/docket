@@ -2,8 +2,8 @@
 
 Status: implementation design for the PostgreSQL durable runtime after `0.1.0`;
 the identity, vocabulary, instance-configuration, and bounded observation
-contracts are locked by DCKT-58/DCKT-59, while the TenantFair engine and its
-schema remain unimplemented.
+contracts are locked, while the TenantFair engine and its schema remain
+unimplemented.
 
 This document turns the tenant-fairness roadmap item into an implementation
 plan. The migration version and later query-tuning values remain provisional.
@@ -165,7 +165,7 @@ the mapping from plans to resolved numeric policy.
 
 ## Instance configuration contract
 
-Tenant fairness remains opt-in for compatibility. DCKT-46 made ClaimPolicy an
+Tenant fairness remains opt-in for compatibility. ClaimPolicy is an
 instance-selected boundary, so fairness configuration belongs to the selected
 implementation at the top level, not inside dispatcher mechanics:
 
@@ -185,7 +185,7 @@ use Docket,
 ```
 
 This is the locked configuration shape, not a claim that TenantFair is already
-selectable. DCKT-61 adds and validates the source-owned configuration value;
+selectable. The source-owned configuration value is validated independently;
 the later hard-cap phase adds the selectable engine and schema. Merely accepting
 the configuration must not silently run Legacy under a TenantFair name or imply
 that caps, fair rotation, weights, or borrowing are active.
@@ -886,7 +886,7 @@ are undefined rather than coerced to zero.
 
 ## Fairness SLO and regression-budget contract
 
-This section is the normative DCKT-60 reporting contract. It publishes targets
+This section is the normative TenantFair reporting contract. It publishes targets
 without pretending that the unimplemented TenantFair engine already emits
 production evidence. A target marked **activation-gated** is a release
 qualification target: a report must return `not_qualified` until every named
@@ -1231,9 +1231,9 @@ not claim equality. Cap-denial volume equals the covered sum of
 in the header. The per-partition cap and fairness numerators come only from the
 bounded trusted input, never from identity-free aggregate events.
 
-### DCKT-50 traceability
+### Acceptance traceability
 
-| DCKT-50 acceptance criterion | Contract or evidence |
+| Acceptance criterion | Contract or evidence |
 | --- | --- |
 | Tenant identity cannot be selected from untrusted run payload data. | [Trusted partition identity](#trusted-partition-identity) and persisted generated `scope_key`. |
 | All policy concepts have precise operational definitions and units. | [Fairness vocabulary](#fairness-vocabulary), population definitions above, and TenantFair v1 measurements in [`../telemetry.md`](../telemetry.md). |

@@ -473,7 +473,7 @@ under-claim. The check intentionally has no p95/p99, latency,
 throughput, exact cost, or planner-node-count gate; shared-runner timing and
 minor PostgreSQL planner changes are not release regressions by themselves.
 
-### DCKT-60 query regression budget
+### TenantFair query regression budget
 
 The published `QUERY-1` budget compares a candidate with an approved prior
 artifact for the same candidate and only when both non-smoke artifacts have
