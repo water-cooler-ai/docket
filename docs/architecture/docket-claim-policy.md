@@ -66,19 +66,22 @@ count-neutral. Schema v2 advances every considered partition's epoch, including
 cap-denied and empty visits. That mechanism is exact-cap-safe but is not the
 DCKT-75 fairness proof.
 
-Schema v3 separates two kinds of durable state:
+Schema v3 installs the state from which DCKT-78 must enforce two separate
+progress rules:
 
-- a domain-global circular scan cursor advances for every committed inspected
-  hint position, including lock skip, denial, staleness, and emptiness; and
-- partition `admission_epoch` advances exactly once only for a committed
-  nonempty grant and never drives scan traversal.
+- DCKT-78 must advance the domain-global circular scan cursor for every
+  committed unfinished-ring visit, including lock skip, denial, dormancy, and
+  emptiness; and
+- DCKT-78 must advance partition `admission_epoch` exactly once only for a
+  committed nonempty grant; the epoch must never drive scan traversal.
 
-The cursor is linearized across independent pollers. Between target
-inspections, another partition may receive at most one grant. A grant returns
-between one and the ratified `Q` outcomes; a zero-outcome locked visit is an
-unsuccessful inspection. TenantFair partition order supersedes Legacy global
-age-first order, while the portable ready/expired reservation, demand-one
-preference/fallback, poison, and stable within-choice age/ID behavior remain.
+DCKT-78 must linearize the cursor across independent pollers and enforce the
+round/no-repeat rule: between target inspections, another partition may
+receive at most one grant. A grant must return between one and the ratified
+`Q` outcomes; a zero-outcome locked visit is an unsuccessful inspection.
+TenantFair partition order will supersede Legacy global age-first order while
+preserving the portable ready/expired reservation, demand-one
+preference/fallback, poison, and stable within-choice age/ID behavior.
 
 The exact bound, frozen qualification population, finite-opportunity
 assumption, demand-aware scan-call formula, Legacy counterexample, and proof
@@ -98,7 +101,7 @@ interlock.
 For an existing v1 installation:
 
 1. stop Docket dispatchers and all run writers;
-2. apply the generated transactional v1-to-v2 migration;
+2. apply the generated transactional v1-to-current migration;
 3. deploy one homogeneous application version;
 4. configure every instance for the same engine; and
 5. restart processing.
@@ -106,6 +109,11 @@ For an existing v1 installation:
 This stopped upgrade is the v0.1.0 operational contract. Online schema changes,
 fleet attestations, readiness ledgers, activation ceremonies, audited mode
 history, and hot mixed-version rollout are deferred.
+
+An existing schema-v2 development installation uses `--upgrade-from-v2` and
+can roll that host migration back to v2. See
+[TenantFair schema-v3 active-ring decision](docket-tenant-fair-schema-v3.md)
+for the additive objects and evidence boundary.
 
 ## Test contract
 

@@ -40,10 +40,14 @@ when you want to understand *why* the contracts are shaped the way they are.
    - The v0.1.0 exact per-owner cap plus the frozen conditional bounded-bypass
      fair-rotation population, cursor, service-accounting, proof-oracle, and
      stopped-upgrade invariants.
-10. `docket-claim-policy.md`
+10. `docket-tenant-fair-schema-v3.md`
+    - The fixed TenantFair discovery budgets, authoritative unfinished ring,
+      durable cursor, chosen query shapes, rejected baselines, and non-release
+      diagnostic boundary for DCKT-76.
+11. `docket-claim-policy.md`
     - The RunStore-to-ClaimPolicy boundary and the implemented Legacy and
       TenantFair engines.
-11. `docket-runtime-design.md`
+12. `docket-runtime-design.md`
     - Historical 0.0.1 runtime research and background: goals, alternatives
       considered (Pregel, LangGraph, Temporal), and future design space.
 

@@ -3,8 +3,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @shortdoc "Generates a Docket PostgreSQL migration"
 
     @moduledoc """
-    Generates either a fresh Docket schema migration or the ordinary v1-to-v2
-    exact-cap upgrade.
+    Generates a fresh Docket schema migration, a host v1-to-current upgrade,
+    or the additive v2-to-v3 TenantFair fairness-state upgrade.
     """
 
     use Mix.Task
@@ -17,6 +17,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       migrations_path: :string,
       repo: [:string, :keep],
       upgrade_from_v1: :boolean,
+      upgrade_from_v2: :boolean,
       prefix: :string
     ]
     @aliases [r: :repo]
@@ -34,12 +35,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           Mix.raise("--prefix must be a lowercase identifier up to 63 bytes")
         end
 
+        from_v1? = Keyword.get(opts, :upgrade_from_v1, false)
+        from_v2? = Keyword.get(opts, :upgrade_from_v2, false)
+
+        if from_v1? and from_v2? do
+          Mix.raise("choose at most one of --upgrade-from-v1 and --upgrade-from-v2")
+        end
+
+        current_version = Docket.Postgres.Migration.current_version()
+
         {basename, migration_name, version, down_version} =
-          if Keyword.get(opts, :upgrade_from_v1, false) do
-            {"upgrade_docket_to_v2", UpgradeDocketToV2, 2, 2}
-          else
-            {"add_docket_tables", AddDocketTables, Docket.Postgres.Migration.current_version(),
-             Docket.Postgres.Migration.initial_version()}
+          case {from_v1?, from_v2?} do
+            {true, false} ->
+              {"upgrade_docket_to_v3", UpgradeDocketToV3, current_version, current_version}
+
+            {false, true} ->
+              {"upgrade_docket_v2_to_v3", UpgradeDocketV2ToV3, current_version, current_version}
+
+            {false, false} ->
+              {"add_docket_tables", AddDocketTables, current_version,
+               Docket.Postgres.Migration.initial_version()}
           end
 
         file = Path.join(path, "#{timestamp()}_#{basename}.exs")

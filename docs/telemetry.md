@@ -58,20 +58,23 @@ effects require their own stable idempotency scheme.
 
 ## Fair-rotation evidence boundary
 
-Schema v2 emits only the generic ClaimPolicy and claim events in the catalog
-above. It does not expose the cursor, visit, grant, or service-epoch evidence
-needed to prove the DCKT-75 bounded-bypass contract. Its query duration and the
-existing TenantFair timing score are not substitutes for that evidence.
+The provisional schema-v2 admission engine emits only the generic ClaimPolicy
+and claim events in the catalog above, even when running on schema v3. It does
+not expose the cursor, visit, grant, or service-epoch evidence needed to prove
+the DCKT-75 bounded-bypass contract. Its query duration and the existing
+TenantFair timing score are not substitutes for that evidence.
 
-Schema v3 must keep the generic admission event and add one bounded,
-identity-free fair-rotation observation. Its aggregate measurements cover:
+Schema v3 installs the durable state and fixed budgets but does not yet change
+the current generic admission telemetry. DCKT-78 must keep the generic event
+and add one bounded, identity-free fair-rotation observation whose aggregate
+measurements cover:
 
 - configured inspection budget `S` and grant outcome limit `Q`;
-- scan pages, unique hint positions inspected, cursor advances, and wraps;
+- scan pages, unfinished-ring visits inspected, cursor advances, and wraps;
 - partition locks, lock skips, grants, leases, poison outcomes, and total
   outcomes;
 - cap-denied, stale, and empty visits;
-- hint repairs, reconciliation work, and explicit work-budget exhaustion; and
+- unfinished-ring membership transitions and explicit work-budget exhaustion; and
 - `admission_epoch` advances.
 
 For every available committed observation:
@@ -81,7 +84,7 @@ outcomes = leases + poisoned
 outcomes <= Q * grants
 grants <= locked visits
 admission_epoch advances = grants
-cursor advances = hint positions inspected
+cursor advances = unfinished-ring positions inspected
 ```
 
 A denial, stale/empty visit, or lock skip contributes no grant and no service-

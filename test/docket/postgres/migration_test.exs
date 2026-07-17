@@ -8,10 +8,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @v1 20_260_716_000_101
     @v2 20_260_716_000_102
-    @private 20_260_716_000_103
-    @private_v1 20_260_716_000_104
-    @private_v2 20_260_716_000_105
-    @failed_v2 20_260_716_000_106
+    @v3 20_260_716_000_103
+    @private 20_260_716_000_104
+    @private_v1 20_260_716_000_105
+    @private_v2 20_260_716_000_106
+    @private_v3 20_260_716_000_107
+    @failed_v2 20_260_716_000_108
+    @failed_v3 20_260_716_000_109
+    @host_v1_to_current 20_260_716_000_110
 
     defmodule InstallV1 do
       use Ecto.Migration
@@ -23,6 +27,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       use Ecto.Migration
       def up, do: Docket.Postgres.Migration.up(version: 2)
       def down, do: Docket.Postgres.Migration.down(version: 2)
+    end
+
+    defmodule UpgradeV3 do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(version: 3)
+      def down, do: Docket.Postgres.Migration.down(version: 3)
     end
 
     defmodule InstallPrivate do
@@ -43,6 +53,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down(prefix: "docket_private", version: 2)
     end
 
+    defmodule UpgradePrivateV3 do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(prefix: "docket_private", version: 3)
+      def down, do: Docket.Postgres.Migration.down(prefix: "docket_private", version: 3)
+    end
+
     defmodule FailedUpgradeV2 do
       use Ecto.Migration
 
@@ -53,6 +69,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       def down, do: :ok
+    end
+
+    defmodule FailedUpgradeV3 do
+      use Ecto.Migration
+
+      def up do
+        Docket.Postgres.Migration.up(version: 3)
+        flush()
+        raise "forced v3 rollback"
+      end
+
+      def down, do: :ok
+    end
+
+    defmodule HostV1ToCurrent do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(version: 3)
+      def down, do: Docket.Postgres.Migration.down(version: 3)
     end
 
     setup do
@@ -87,6 +121,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ]
     end
 
+    test "fresh v3 installs one authoritative unfinished ring and policy cursor" do
+      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 3
+
+      assert Enum.sort(owned_claim_tables("public")) == current_claim_tables()
+
+      assert [[0]] = TestRepo.query!("SELECT scan_ring_position FROM docket_claim_policy").rows
+
+      assert TestRepo.query!("SELECT count(*) FROM docket_claim_schedule").rows == [[0]]
+      assert function_count("public") == 1
+      assert membership_function_count("public") == 1
+      assert membership_trigger_count("public") == 1
+      assert activity_function_count("public") == 1
+      assert activity_trigger_count("public") == 1
+      assert run_truncate_guard_trigger_count("public") == 1
+      assert schedule_truncate_guard_trigger_count("public") == 1
+    end
+
     test "ordinary v1-to-v2 upgrade backfills existing scopes transactionally" do
       :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
 
@@ -97,6 +150,71 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert TestRepo.query!("SELECT scope_key FROM docket_claim_partitions ORDER BY scope_key").rows ==
                [[""], ["tenant-a"]]
+    end
+
+    test "populated v2-to-v3 backfills one authoritative unfinished row per partition" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "run-a")
+      insert_v1_graph_and_run(nil, "run-system")
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      TestRepo.query!(
+        "UPDATE docket_claim_partitions " <>
+          "SET max_active = 7, partition_version = 4, admission_epoch = 9 " <>
+          "WHERE scope_key = 'tenant-a'"
+      )
+
+      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+
+      assert TestRepo.query!(
+               "SELECT scope_key, unfinished_count " <>
+                 "FROM docket_claim_schedule ORDER BY scope_key"
+             ).rows == [["", 1], ["tenant-a", 1]]
+
+      assert [[7, 4, 9]] =
+               TestRepo.query!(
+                 "SELECT max_active, partition_version, admission_epoch " <>
+                   "FROM docket_claim_partitions WHERE scope_key = 'tenant-a'"
+               ).rows
+
+      assert [[2, 2, 2]] =
+               TestRepo.query!(
+                 "SELECT count(*), count(DISTINCT scope_key), " <>
+                   "count(DISTINCT ring_position) FROM docket_claim_schedule"
+               ).rows
+    end
+
+    test "v3 repairs schema-valid v2 runs whose partition row is missing" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "run-a")
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      TestRepo.query!("DELETE FROM docket_claim_partitions WHERE scope_key = 'tenant-a'")
+      assert TestRepo.query!("SELECT count(*) FROM docket_claim_partitions").rows == [[0]]
+
+      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+
+      assert TestRepo.query!("SELECT scope_key, unfinished_count FROM docket_claim_schedule").rows ==
+               [["tenant-a", 1]]
+    end
+
+    test "host v1-to-current and fresh-current paths have equivalent schemas" do
+      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+      fresh = schema_signature("public")
+
+      :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "run-a", "docket_private")
+      :ok = Ecto.Migrator.up(TestRepo, @private_v3, UpgradePrivateV3, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(
+               repo: TestRepo,
+               prefix: "docket_private"
+             ) == 3
+
+      assert schema_signature("docket_private") == fresh
+
+      assert TestRepo.query!("SELECT scope_key FROM docket_private.docket_claim_schedule").rows ==
+               [["tenant-a"]]
     end
 
     test "fresh v2 and a populated v1-to-v2 upgrade have equivalent schemas" do
@@ -140,6 +258,44 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ).rows
 
       assert TestRepo.query!("SELECT count(*) FROM docket_claim_partitions").rows == [[0]]
+    end
+
+    test "v3 constraints reject duplicate, orphan, and invalid cursor state" do
+      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+
+      TestRepo.query!(
+        "INSERT INTO docket_claim_partitions (scope_key) VALUES ('tenant'), ('tenant-2')"
+      )
+
+      [ring_position] =
+        TestRepo.query!(
+          "SELECT ring_position FROM docket_claim_schedule WHERE scope_key = 'tenant'"
+        ).rows
+        |> hd()
+
+      rejected = [
+        "UPDATE docket_claim_policy SET scan_ring_position = -1 WHERE id = 1",
+        "UPDATE docket_claim_schedule SET unfinished_count = -1 WHERE scope_key = 'tenant'",
+        "UPDATE docket_claim_schedule SET unfinished_count = 1 WHERE scope_key = 'tenant'",
+        "UPDATE docket_claim_schedule SET ready_candidate_cursor_id = 1 " <>
+          "WHERE scope_key = 'tenant'",
+        "INSERT INTO docket_claim_schedule (scope_key) VALUES ('orphan')",
+        "INSERT INTO docket_claim_schedule (scope_key, ring_position) OVERRIDING SYSTEM VALUE " <>
+          "VALUES ('tenant-2', #{ring_position})",
+        "UPDATE docket_claim_schedule SET ring_position = DEFAULT WHERE scope_key = 'tenant'",
+        "UPDATE docket_claim_schedule SET scope_key = 'moved' WHERE scope_key = 'tenant'",
+        "DELETE FROM docket_claim_schedule WHERE scope_key = 'tenant'"
+      ]
+
+      Enum.each(rejected, fn statement ->
+        assert_raise Postgrex.Error, fn -> TestRepo.query!(statement) end
+      end)
+
+      TestRepo.query!("DELETE FROM docket_claim_partitions WHERE scope_key = 'tenant-2'")
+
+      assert TestRepo.query!(
+               "SELECT count(*) FROM docket_claim_schedule WHERE scope_key = 'tenant-2'"
+             ).rows == [[0]]
     end
 
     @tag timeout: 20_000
@@ -212,6 +368,34 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert v1_runs("public") == [["run-a", "tenant-a"]]
     end
 
+    test "a failed transactional v3 upgrade preserves the populated v2 schema" do
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      TestRepo.query!(
+        "INSERT INTO docket_claim_partitions " <>
+          "(scope_key, max_active, partition_version, admission_epoch) " <>
+          "VALUES ('tenant', 4, 7, 11)"
+      )
+
+      before = schema_signature("public")
+
+      assert_raise RuntimeError, "forced v3 rollback", fn ->
+        Ecto.Migrator.up(TestRepo, @failed_v3, FailedUpgradeV3, log: false)
+      end
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+      assert schema_signature("public") == before
+
+      assert Enum.sort(owned_claim_tables("public")) ==
+               ["docket_claim_partitions", "docket_claim_policy"]
+
+      assert [["tenant", 4, 7, 11]] =
+               TestRepo.query!(
+                 "SELECT scope_key, max_active, partition_version, admission_epoch " <>
+                   "FROM docket_claim_partitions"
+               ).rows
+    end
+
     test "a populated custom-prefix upgrade backfills tenant and tenantless scopes" do
       :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a", "docket_private")
@@ -241,14 +425,149 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert v1_runs("public") == [["run-a", "tenant-a"], ["run-system", nil]]
     end
 
+    test "v3 down removes only fairness objects and preserves exact-cap v2 state" do
+      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+
+      TestRepo.query!(
+        "INSERT INTO docket_claim_partitions " <>
+          "(scope_key, max_active, partition_version, admission_epoch) " <>
+          "VALUES ('tenant', 5, 3, 12)"
+      )
+
+      :ok = Ecto.Migrator.down(TestRepo, @v3, UpgradeV3, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+
+      assert Enum.sort(owned_claim_tables("public")) ==
+               ["docket_claim_partitions", "docket_claim_policy"]
+
+      assert [["tenant", 5, 3, 12]] =
+               TestRepo.query!(
+                 "SELECT scope_key, max_active, partition_version, admission_epoch " <>
+                   "FROM docket_claim_partitions"
+               ).rows
+
+      assert function_count("public") == 1
+      assert membership_function_count("public") == 0
+      assert membership_trigger_count("public") == 0
+      assert activity_function_count("public") == 0
+      assert activity_trigger_count("public") == 0
+      assert run_truncate_guard_trigger_count("public") == 0
+      assert schedule_truncate_guard_trigger_count("public") == 0
+    end
+
+    test "host v1-to-current rollback target removes only v3 and lands on v2" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "run-a")
+
+      :ok = Ecto.Migrator.up(TestRepo, @host_v1_to_current, HostV1ToCurrent, log: false)
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 3
+
+      :ok = Ecto.Migrator.down(TestRepo, @host_v1_to_current, HostV1ToCurrent, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+      assert v1_runs("public") == [["run-a", "tenant-a"]]
+
+      assert Enum.sort(owned_claim_tables("public")) ==
+               ["docket_claim_partitions", "docket_claim_policy"]
+    end
+
+    test "cursor, epoch, and run state share one transaction boundary" do
+      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+      TestRepo.query!("INSERT INTO docket_claim_partitions (scope_key) VALUES ('tenant')")
+
+      [[position]] =
+        TestRepo.query!(
+          "SELECT ring_position FROM docket_claim_schedule WHERE scope_key = 'tenant'"
+        ).rows
+
+      assert {:error, :rollback} =
+               TestRepo.transaction(fn ->
+                 TestRepo.query!(
+                   "UPDATE docket_claim_policy " <>
+                     "SET scan_ring_position = $1 WHERE id = 1",
+                   [position]
+                 )
+
+                 TestRepo.query!(
+                   "UPDATE docket_claim_partitions " <>
+                     "SET admission_epoch = admission_epoch + 1 WHERE scope_key = 'tenant'"
+                 )
+
+                 TestRepo.rollback(:rollback)
+               end)
+
+      assert [[0, 0]] = cursor_and_epoch()
+
+      assert {:ok, :committed} =
+               TestRepo.transaction(fn ->
+                 TestRepo.query!(
+                   "UPDATE docket_claim_policy " <>
+                     "SET scan_ring_position = $1 WHERE id = 1",
+                   [position]
+                 )
+
+                 TestRepo.query!(
+                   "UPDATE docket_claim_partitions " <>
+                     "SET admission_epoch = admission_epoch + 1 WHERE scope_key = 'tenant'"
+                 )
+
+                 :committed
+               end)
+
+      assert [[^position, 1]] = cursor_and_epoch()
+    end
+
+    test "concurrent first partition creation materializes one immutable ring position" do
+      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+
+      results =
+        1..8
+        |> Task.async_stream(
+          fn _index ->
+            TestRepo.query!(
+              "INSERT INTO docket_claim_partitions (scope_key) VALUES ('tenant') " <>
+                "ON CONFLICT (scope_key) DO NOTHING"
+            )
+          end,
+          max_concurrency: 8,
+          timeout: 5_000
+        )
+        |> Enum.to_list()
+
+      assert Enum.all?(results, &match?({:ok, %Postgrex.Result{}}, &1))
+      assert TestRepo.query!("SELECT count(*) FROM docket_claim_partitions").rows == [[1]]
+      assert TestRepo.query!("SELECT count(*) FROM docket_claim_schedule").rows == [[1]]
+
+      assert TestRepo.query!("SELECT count(DISTINCT ring_position) FROM docket_claim_schedule").rows ==
+               [[1]]
+    end
+
     test "supports an explicit prefix without cross-schema objects" do
       :ok = Ecto.Migrator.up(TestRepo, @private, InstallPrivate, log: false)
 
-      assert Enum.sort(owned_claim_tables("docket_private")) ==
-               ["docket_claim_partitions", "docket_claim_policy"]
+      TestRepo.query!(
+        "INSERT INTO docket_private.docket_claim_partitions (scope_key) " <>
+          "VALUES ('prefix-tenant')"
+      )
+
+      assert Enum.sort(owned_claim_tables("docket_private")) == current_claim_tables()
+
+      assert TestRepo.query!("SELECT scope_key FROM docket_private.docket_claim_schedule").rows ==
+               [["prefix-tenant"]]
 
       assert owned_claim_tables("public") == []
       assert function_count("docket_private") == 1
+      assert run_truncate_guard_trigger_count("docket_private") == 1
+      assert schedule_truncate_guard_trigger_count("docket_private") == 1
+    end
+
+    defp current_claim_tables do
+      [
+        "docket_claim_partitions",
+        "docket_claim_policy",
+        "docket_claim_schedule"
+      ]
     end
 
     defp owned_claim_tables(prefix) do
@@ -276,6 +595,117 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ).rows
       |> hd()
       |> hd()
+    end
+
+    defp membership_function_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_proc
+        JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+        WHERE pg_namespace.nspname = $1
+          AND proname = 'docket_claim_schedule_partition_v1'
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp membership_trigger_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = $1
+          AND trigger.tgname = 'docket_claim_schedule_partition_insert'
+          AND NOT trigger.tgisinternal
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp activity_function_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_proc
+        JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+        WHERE pg_namespace.nspname = $1
+          AND proname = 'docket_claim_schedule_activity_v1'
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp activity_trigger_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = $1
+          AND trigger.tgname = 'docket_claim_schedule_run_activity'
+          AND NOT trigger.tgisinternal
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp run_truncate_guard_trigger_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = $1
+          AND trigger.tgname = 'docket_claim_schedule_run_truncate_guard'
+          AND relation.relname = 'docket_runs'
+          AND trigger.tgtype = 34
+          AND NOT trigger.tgisinternal
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp schedule_truncate_guard_trigger_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = $1
+          AND trigger.tgname = 'docket_claim_schedule_truncate_guard'
+          AND relation.relname = 'docket_claim_schedule'
+          AND trigger.tgtype = 34
+          AND NOT trigger.tgisinternal
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp cursor_and_epoch do
+      TestRepo.query!("""
+      SELECT policy.scan_ring_position, partitions.admission_epoch
+      FROM docket_claim_policy AS policy
+      CROSS JOIN docket_claim_partitions AS partitions
+      WHERE policy.id = 1 AND partitions.scope_key = 'tenant'
+      """).rows
     end
 
     defp scope_indexes(prefix) do
@@ -357,12 +787,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           [prefix]
         ).rows
 
+      triggers =
+        TestRepo.query!(
+          """
+          SELECT relation.relname, trigger.tgname, pg_get_triggerdef(trigger.oid)
+          FROM pg_trigger AS trigger
+          JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+          JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = $1
+            AND relation.relname LIKE 'docket_%'
+            AND NOT trigger.tgisinternal
+          ORDER BY relation.relname, trigger.tgname
+          """,
+          [prefix]
+        ).rows
+
       %{
         columns: normalize_schema(columns, prefix),
         constraints: normalize_schema(constraints, prefix),
         indexes: normalize_schema(indexes, prefix),
         sequences: normalize_schema(sequences, prefix),
-        functions: normalize_schema(functions, prefix)
+        functions: normalize_schema(functions, prefix),
+        triggers: normalize_schema(triggers, prefix)
       }
     end
 

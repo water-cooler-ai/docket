@@ -69,6 +69,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  "SELECT max_active, partition_version FROM docket_claim_partitions " <>
                    "WHERE scope_key = 'acme'"
                ).rows
+
+      assert [[0]] =
+               TestRepo.query!(
+                 "SELECT unfinished_count FROM docket_claim_schedule WHERE scope_key = 'acme'"
+               ).rows
     end
 
     test "administers the tenantless partition through override and effective state", %{

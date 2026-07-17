@@ -659,6 +659,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp insert_persisted_run!(run, checkpoint_type, overrides) do
       {:ok, attrs} = RunCodec.dump(run)
 
+      TestRepo.insert_all(ClaimPartition, [%{scope_key: ""}], on_conflict: :nothing)
+
       attrs
       |> Map.merge(%{
         tenant_id: nil,

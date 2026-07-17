@@ -9,7 +9,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         FairRotationOracle.bounds!(
           target: "low",
           cohort: ["hot", "low"],
-          hints: ["hot", "low"],
+          ring: [{10, "hot"}, {40, "low"}],
           scan_budget: 2,
           quantum: 1,
           lock_failures: 0
@@ -22,19 +22,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "accepts a trace at every frozen bound" do
       trace = [
-        event(1, 1, 0, 1, 2, "hot", :grant, 2, 1),
-        event(2, 1, 1, 2, 1, "stale", :stale, 0, 0),
-        event(2, 2, 2, 0, 1, "low", :lock_skip, 0, 0),
-        event(3, 1, 0, 1, 2, "hot", :grant, 2, 1),
-        event(4, 1, 1, 2, 1, "stale", :empty, 0, 0),
-        event(4, 2, 2, 0, 1, "low", :grant, 1, 1)
+        event(1, 1, 0, 10, 2, "hot", :grant, 2, 1),
+        event(2, 1, 10, 40, 1, "dormant", :stale, 0, 0),
+        event(2, 2, 40, 90, 1, "low", :lock_skip, 0, 0),
+        event(3, 1, 90, 10, 2, "hot", :grant, 2, 1),
+        event(4, 1, 10, 40, 1, "dormant", :empty, 0, 0),
+        event(4, 2, 40, 90, 1, "low", :grant, 1, 1)
       ]
 
       result =
         FairRotationOracle.assert_trace!(trace,
           target: "low",
           cohort: ["hot", "low"],
-          hints: ["hot", "stale", "low"],
+          ring: [{10, "hot"}, {40, "dormant"}, {90, "low"}],
           scan_budget: 2,
           quantum: 2,
           lock_failures: 1
@@ -50,15 +50,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "rejects synthetic service credit for an unsuccessful inspection" do
       trace = [
-        event(1, 1, 0, 1, 1, "stale", :stale, 0, 1),
-        event(1, 2, 1, 0, 1, "low", :grant, 1, 1)
+        event(1, 1, 0, 10, 1, "dormant", :stale, 0, 1),
+        event(1, 2, 10, 90, 1, "low", :grant, 1, 1)
       ]
 
       assert_raise ArgumentError, ~r/cannot return outcomes or advance admission_epoch/, fn ->
         FairRotationOracle.assert_trace!(trace,
           target: "low",
           cohort: ["low"],
-          hints: ["stale", "low"],
+          ring: [{10, "dormant"}, {90, "low"}],
           scan_budget: 2,
           quantum: 1,
           lock_failures: 0
@@ -66,18 +66,38 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    test "accepts sparse absolute positions and repeated wrap when H is less than S" do
+      trace = [
+        event(1, 1, 0, 50, 1, "low", :lock_skip, 0, 0),
+        event(1, 2, 50, 50, 1, "low", :grant, 1, 1)
+      ]
+
+      result =
+        FairRotationOracle.assert_trace!(trace,
+          target: "low",
+          cohort: ["low"],
+          ring: [{50, "low"}],
+          scan_budget: 2,
+          quantum: 1,
+          lock_failures: 1
+        )
+
+      assert result.observed_scan_calls == 1
+      assert result.observed_other_grants == 0
+    end
+
     test "rejects skipped or repeated cursor positions" do
       trace = [
-        event(1, 1, 0, 1, 1, "hot", :grant, 1, 1),
-        event(2, 1, 0, 1, 1, "hot", :grant, 1, 1),
-        event(3, 1, 1, 0, 1, "low", :grant, 1, 1)
+        event(1, 1, 0, 10, 1, "hot", :grant, 1, 1),
+        event(2, 1, 0, 10, 1, "hot", :grant, 1, 1),
+        event(3, 1, 10, 40, 1, "low", :grant, 1, 1)
       ]
 
       assert_raise ArgumentError, ~r/scan cursor is not contiguous/, fn ->
         FairRotationOracle.assert_trace!(trace,
           target: "low",
           cohort: ["hot", "low"],
-          hints: ["hot", "low"],
+          ring: [{10, "hot"}, {40, "low"}],
           scan_budget: 1,
           quantum: 1,
           lock_failures: 0
@@ -87,16 +107,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "rejects an early stop when a grant did not fill demand" do
       trace = [
-        event(1, 1, 0, 1, 2, "hot", :grant, 1, 1),
-        event(2, 1, 1, 2, 1, "stale", :stale, 0, 0),
-        event(2, 2, 2, 0, 1, "low", :grant, 1, 1)
+        event(1, 1, 0, 10, 2, "hot", :grant, 1, 1),
+        event(2, 1, 10, 40, 1, "dormant", :stale, 0, 0),
+        event(2, 2, 40, 90, 1, "low", :grant, 1, 1)
       ]
 
       assert_raise ArgumentError, ~r/unfilled scan call 1/, fn ->
         FairRotationOracle.assert_trace!(trace,
           target: "low",
           cohort: ["hot", "low"],
-          hints: ["hot", "stale", "low"],
+          ring: [{10, "hot"}, {40, "dormant"}, {90, "low"}],
           scan_budget: 2,
           quantum: 1,
           lock_failures: 0

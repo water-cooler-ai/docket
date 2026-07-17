@@ -943,6 +943,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ~w(
                  docket_claim_partitions
                  docket_claim_policy
+                 docket_claim_schedule
                  docket_events
                  docket_graph_versions
                  docket_runs
@@ -955,7 +956,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  log: false
                )
 
-      assert comment == "2"
+      assert comment == "3"
     end
 
     defp await_replacement(name, old_pid, attempts \\ 100)

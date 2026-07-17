@@ -7,7 +7,6 @@ database via `DOCKET_BENCH_DATABASE_URL`.
 - **Scorecard** (`bench/postgres/scorecard.exs`, this document): system-level
   scenarios against the real supervised runtime, condensed into named 0–100
   scores with invariant gates.
-
 ## Scorecard
 
 ```

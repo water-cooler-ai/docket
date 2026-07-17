@@ -68,25 +68,28 @@ The proof targets one low-volume partition `t`. A qualification window opens
 immediately before the first qualifying TenantFair scan after both of these
 facts have committed:
 
-1. `t` has a complete normal-path eligibility hint; and
+1. `t` has `unfinished_count > 0` and occupies the unfinished ring; and
 2. an authoritative recheck would permit at least one outcome for `t`.
 
 The window closes at the database linearization point of `t`'s first committed
 grant. The qualification population is frozen for this v0.1 proof:
 
-- `P` is a fixed set containing `t` and every partition allowed to receive a
-  grant during the window;
-- every member of `P` is continuously admissible throughout the window;
+- `P` is a fixed set containing `t` and every partition that receives a grant
+  during the window;
+- `t` remains continuously admissible throughout the window; other members of
+  `P` may be intermittently eligible;
 - no partition outside `P` receives a grant; and
-- `C` is a fixed, duplicate-free cyclic hint population containing `P`.
+- `C` is the fixed duplicate-free cyclic population of scopes whose
+  transactionally maintained `unfinished_count` is positive, and it contains
+  `P`.
 
-Population or hint churn, a cap or administrative-policy change, engine or
-schema change, loss of target admissibility, incomplete target hints, or a
-rolled-back/error statement makes the window ineligible. It never turns a
-pending or failed window into a pass. A later contract may publish a union-over-
-window churn bound; v0.1 does not infer one from maximum simultaneous tenants.
+A zero-to-positive or positive-to-zero unfinished-ring membership change, a
+cap or administrative-policy change, engine or schema change, loss of target
+admissibility, or a rolled-back/error statement makes the window ineligible.
+A positive-to-positive counter change does not change `C`. An ineligible event
+never turns a pending or failed window into a pass.
 
-Continuously admissible means that at each target mutation opportunity at
+Target continuous admissibility means that at each target mutation opportunity at
 least one row survives the authoritative rechecks and is permitted by the
 existing rules:
 
@@ -105,9 +108,15 @@ changing the population.
 
 The following terms are normative:
 
-- An **inspection** consumes one distinct hint position in durable cursor
-  order. Lock skip, cap denial, stale evidence, or an empty recheck is an
-  unsuccessful inspection.
+DCKT-76 clarified the word "inspection" as a cursor visit rather than unique
+membership: `C` remains duplicate-free, while a call with `H < S` may revisit a
+position after a complete wrap. This is an erratum to the original "distinct"
+wording, not a change to the round/no-repeat invariant or any formula below.
+
+- An **inspection** is one visit to an unfinished-ring position in durable cursor order.
+  Membership in `C` is unique, but when `H < S` the cursor may complete a wrap
+  and revisit a position in the same call. Lock skip, cap denial, a currently
+  dormant scope, or an empty recheck is an unsuccessful inspection.
 - A **grant** is one committed acquisition of partition authority followed by
   `1..Q` committed lease or poison outcomes from that partition. A zero-outcome
   locked visit is not a grant.
@@ -121,10 +130,10 @@ The following terms are normative:
 
 Let:
 
-- `A = |P|`, the fixed continuously admissible grant population;
-- `H = |C|`, the fixed unique hint positions, including stale-positive
-  positions, so `1 <= A <= H`;
-- `S >= 1`, the maximum distinct hint positions a qualifying call may inspect;
+- `A = |P|`, the fixed target-plus-competing-grant population;
+- `H = |C|`, the fixed unique unfinished-ring positions, including future,
+  waiting/parked, claimed, and poisoned nonterminal scopes, so `1 <= A <= H`;
+- `S >= 1`, the maximum unfinished-ring visits a qualifying call may inspect;
 - `Q >= 1`, the maximum outcomes one grant may return, further limited by the
   caller's remaining `policy.limit`; and
 - `L >= 0`, the maximum consecutive target inspections that may fail before
@@ -173,7 +182,7 @@ other-partition outcomes <= Q * (L + 1) * (A - 1)
 
 The claim-call bound must account for demand-stop behavior. In one target-
 inspection interval, up to `A - 1` competitor grants can each fill demand and
-end a call. The target plus the remaining `H - A` non-granting hint positions
+end a call. The target plus the remaining `H - A` non-granting ring positions
 consume full inspection-budget calls. Counting through and including the
 target-grant call:
 
@@ -202,16 +211,17 @@ advances exactly once per committed nonempty grant, regardless of whether the
 grant returned one outcome or `Q` outcomes. It does not advance for denial,
 staleness, cap rejection, emptiness, lock skip, error, or rollback.
 
-The independent scan cursor advances for every committed inspection. Cursor
-movement, any grant's `admission_epoch` increment, and its run outcomes are in
-the same transaction; rollback persists none of them. The schema-v2 behavior
-that advances `admission_epoch` after every considered locked partition is
+The logically independent scan cursor is stored on the existing singleton
+claim-policy row and advances for every committed inspection. Cursor movement,
+any grant's `admission_epoch` increment, and its run outcomes are in the same
+transaction; rollback persists none of them. The schema-v2 behavior that
+advances `admission_epoch` after every considered locked partition is
 provisional and must be replaced, not reinterpreted as v0.1 fairness evidence.
 
-## Strict improvement over Legacy
+## Conditional frozen-trace separation from Legacy
 
 The deterministic counterexample uses only ordinary ready work, demand one,
-and stable age/ID ordering. Seed one hot partition with `N` older ready rows and
+and stable age/ID ordering. For `N >= 2`, seed one hot partition with `N` older ready rows and
 then make one low-volume partition ready. After each outcome, complete it before
 the next call so both engines see continued capacity.
 
@@ -225,6 +235,10 @@ low-volume partition's grant, independently of `N`. Timing measurements may
 compare the engines on the same machine, but latency and throughput are not the
 correctness oracle.
 
+This is a strict separation on that eligible frozen trace, not a claim of
+global dominance for dynamic membership, other demand/class mixes, elapsed
+latency, throughput, or processing-time fairness.
+
 ## Proof evidence and telemetry boundary
 
 The deterministic PostgreSQL harness is the correctness oracle. Its test-only,
@@ -237,8 +251,9 @@ and benchmark duration cannot order concurrent grants.
 The current `FairRotationOracle` helper is the pure numeric scaffold: it checks
 cursor continuity, per-call demand/budget use, nonempty grants, epoch deltas,
 round/no-repeat, and the three bounds. Schema-v3 integration work must feed it
-database-authored traces and separately prove fixed hint/admissibility fixture
-coverage and the inherited live safety/class invariants.
+database-authored traces and separately prove exact unfinished-count
+maintenance, fixed ring membership, admissibility fixtures, and the inherited
+live safety/class invariants.
 
 Together, the trace oracle and the named live integration suites check:
 
@@ -255,8 +270,8 @@ Together, the trace oracle and the named live integration suites check:
 Default telemetry remains identity-free and is operational evidence only. The
 future fair-rotation observation reports bounded aggregate scan pages,
 positions inspected, cursor advances/wraps, partition locks/skips, grants,
-leases, poison outcomes, cap denials, stale/empty visits, hint repairs,
-reconciliation work, service-epoch advances, and work-budget exhaustion. It
+leases, poison outcomes, cap denials, dormant/empty visits, unfinished-ring
+membership transitions, service-epoch advances, and work-budget exhaustion. It
 never emits tenant, scope, run, graph, cursor token, or claim-token identity as
 an ordinary metric label. Aggregate telemetry cannot reconstruct per-target
 bypass and never replaces the deterministic trace.
@@ -293,9 +308,7 @@ or borrowing in v0.1.0.
 Schema version 2 installs the policy row, partition table, ordinary supporting
 indexes, and exact-cap claim function in one host-owned transactional
 migration. During the v1-to-v2 migration, the runs table is locked against
-concurrent inserts while existing scope keys are backfilled. The current
-binary requires schema version 2 at runtime; schema version 1 is only an
-upgrade/rollback waypoint for the previous binary.
+concurrent inserts while existing scope keys are backfilled.
 
 The exact-cap cleanup rewrote the unreleased DCKT-68 version-2 migration rather
 than adding a conversion for its discarded development schema. A local or test
@@ -303,9 +316,14 @@ database that applied that earlier development migration must be recreated, or
 rolled back with matching old code before adopting the rewritten migration. No
 released v2 database uses that discarded shape.
 
-Schema version 3 is an additive development migration that must install the
-separate hint/cursor/reconciliation state required by the frozen fair-rotation
-proof without weakening schema-v2 safety.
+Schema version 3 is the additive DCKT-76 migration. It installs the unique
+scheduling ring with an exact trigger-maintained unfinished-run count and adds
+the scan position to the existing policy row without weakening schema-v2
+safety. The current
+binary requires schema version 3; version 2 is its immediate rollback point
+and version 1 remains the older host upgrade waypoint. The ratified constants,
+query shapes, and non-release diagnostic boundary are in
+[TenantFair schema-v3 active-ring decision](docket-tenant-fair-schema-v3.md).
 
 The supported upgrade remains stopped and homogeneous. Online migration and
 readiness, governance, audit/evidence platforms, enterprise rollout,

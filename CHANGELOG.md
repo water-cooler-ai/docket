@@ -16,6 +16,18 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- PostgreSQL schema version 3 adds one prefix-local TenantFair scheduling table
+  with an exact trigger-maintained count of nonterminal runs per tenant and
+  stores the serialized scan position on the existing policy row. Fixed `S =
+  32`, `Q = 8`, exact-key
+  lock/run-mutation-input ceilings, and bounded poison-safe candidate
+  continuation were checked with non-release query-plan experiments. The ring
+  is an authoritative eligibility superset rather than a lossy cache, so
+  DCKT-77 repair machinery is not part of the v0.1.0 MVP; admission and
+  executable fairness proof remain in DCKT-78 and DCKT-79. Because no count
+  repair path exists by design, truncating runs or the authoritative schedule
+  fails closed instead of bypassing row triggers and silently desynchronizing
+  membership.
 - PostgreSQL run creation now atomically materializes the canonical
   owner-derived claim partition with an inherited cap and version-zero state.
   Concurrent first inserts use `ON CONFLICT DO NOTHING`, preserving Admin-owned
