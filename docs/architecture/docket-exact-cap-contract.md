@@ -47,8 +47,9 @@ Partition locking serializes the final-slot decision across callers.
 
 The function considers at most `demand + 1` partitions from the bounded page.
 After each considered partition it increments `admission_epoch`; discovery
-orders by that epoch, then scope key. This provides bounded cross-scope
-rotation without a separate scheduler or reporting ledger.
+orders by that epoch, then the partition's oldest eligible timestamp, then
+scope key. This provides bounded cross-scope rotation without a separate
+scheduler or reporting ledger.
 
 ## Engine interlock
 

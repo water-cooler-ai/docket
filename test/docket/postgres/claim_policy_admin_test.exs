@@ -5,14 +5,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduletag :postgres
 
     alias Docket.Postgres.ClaimPolicy.Admin
+    alias Docket.Postgres.Storage
     alias Docket.Postgres.ClaimPolicyAdminTestRepo, as: TestRepo
 
     @migration_version 20_260_716_000_068
+    @prefixed_migration_version 20_260_716_000_069
 
     defmodule InstallDocket do
       use Ecto.Migration
       def up, do: Docket.Postgres.Migration.up()
       def down, do: Docket.Postgres.Migration.down()
+    end
+
+    defmodule InstallDocketPrefixed do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(prefix: "docket_private")
+      def down, do: Docket.Postgres.Migration.down(prefix: "docket_private")
     end
 
     setup do
@@ -30,7 +38,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, %{max_active: 4, version: 1}} =
                Admin.put_default(context, 4, expected_version: 0)
 
-      assert {:error, :stale} = Admin.put_default(context, 5, expected_version: 0)
+      assert_no_state_change(context, {:error, :stale}, fn ->
+        Admin.put_default(context, 5, expected_version: 0)
+      end)
+
       assert {:ok, %{max_active: 3, version: 2}} = Admin.put_default(context, 3)
       assert {:ok, %{max_active: 3, version: 2}} = Admin.get_default(context)
     end
@@ -60,10 +71,193 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ).rows
     end
 
-    test "validates caps, scopes, and options", %{context: context} do
-      assert {:error, :invalid_max_active} = Admin.put_default(context, 0)
-      assert {:error, :invalid_owner_scope} = Admin.put_override(context, :system, 1)
-      assert {:error, :invalid_options} = Admin.put_default(context, 1, actor: "unused")
+    test "administers the tenantless partition through override and effective state", %{
+      context: context
+    } do
+      assert {:ok, %{max_active: 5, version: 1}} =
+               Admin.put_default(context, 5, expected_version: 0)
+
+      assert {:ok,
+              %{
+                owner_scope: :tenantless,
+                max_active: 5,
+                source: :default,
+                default_version: 1,
+                override_version: 0
+              }} = Admin.get_effective(context, :tenantless)
+
+      assert [] = partition_rows(context)
+
+      assert {:ok, %{max_active: 2, version: 1}} =
+               Admin.put_override(context, :tenantless, 2, expected_version: 0)
+
+      assert {:ok,
+              %{
+                owner_scope: :tenantless,
+                max_active: 2,
+                source: :override,
+                default_version: 1,
+                override_version: 1
+              }} = Admin.get_effective(context, :tenantless)
+
+      assert [["", 2, 1]] = partition_rows(context)
+
+      assert {:ok, %{max_active: nil, version: 2}} =
+               Admin.reset_override(context, :tenantless, expected_version: 1)
+
+      assert {:ok,
+              %{
+                owner_scope: :tenantless,
+                max_active: 5,
+                source: :default,
+                default_version: 1,
+                override_version: 2
+              }} = Admin.get_effective(context, :tenantless)
+
+      assert [["", nil, 2]] = partition_rows(context)
+    end
+
+    test "routes all administration through an explicit custom prefix", %{context: context} do
+      :ok =
+        Ecto.Migrator.up(
+          TestRepo,
+          @prefixed_migration_version,
+          InstallDocketPrefixed,
+          log: false
+        )
+
+      prefixed_context = Docket.Postgres.context(repo: TestRepo, prefix: "docket_private")
+
+      assert {:ok, %{max_active: nil, version: 0}} = Admin.get_default(prefixed_context)
+
+      assert {:ok, %{max_active: 7, version: 1}} =
+               Admin.put_default(prefixed_context, 7, expected_version: 0)
+
+      assert {:ok, %{max_active: 3, version: 1}} =
+               Admin.put_override(prefixed_context, {:tenant, "private-acme"}, 3,
+                 expected_version: 0
+               )
+
+      assert {:ok,
+              %{
+                owner_scope: {:tenant, "private-acme"},
+                max_active: 3,
+                source: :override,
+                default_version: 1,
+                override_version: 1
+              }} = Admin.get_effective(prefixed_context, {:tenant, "private-acme"})
+
+      assert {:ok, %{max_active: nil, version: 2}} =
+               Admin.reset_override(prefixed_context, {:tenant, "private-acme"},
+                 expected_version: 1
+               )
+
+      assert {:ok, %{max_active: 7, source: :default, override_version: 2}} =
+               Admin.get_effective(prefixed_context, {:tenant, "private-acme"})
+
+      assert {:ok, %{max_active: nil, version: 0}} = Admin.get_default(context)
+      assert [] = partition_rows(context)
+      assert [["private-acme", nil, 2]] = partition_rows(prefixed_context)
+    end
+
+    test "stale and invalid operations leave current state exactly unchanged", %{
+      context: context
+    } do
+      assert {:ok, %{version: 1}} = Admin.put_default(context, 5, expected_version: 0)
+
+      assert {:ok, %{version: 1}} =
+               Admin.put_override(context, {:tenant, "acme"}, 2, expected_version: 0)
+
+      assert_no_state_change(context, {:error, :stale}, fn ->
+        Admin.put_default(context, 6, expected_version: 0)
+      end)
+
+      assert_no_state_change(context, {:error, :invalid_max_active}, fn ->
+        Admin.put_default(context, 0)
+      end)
+
+      assert_no_state_change(context, {:error, :invalid_expected_version}, fn ->
+        Admin.put_default(context, 6, expected_version: -1)
+      end)
+
+      assert_no_state_change(context, {:error, :invalid_options}, fn ->
+        Admin.put_default(context, 6, actor: "unused")
+      end)
+
+      assert_no_state_change(context, {:error, :stale}, fn ->
+        Admin.put_override(context, {:tenant, "acme"}, 3, expected_version: 0)
+      end)
+
+      assert_no_state_change(context, {:error, :stale}, fn ->
+        Admin.reset_override(context, {:tenant, "acme"}, expected_version: 0)
+      end)
+
+      assert_no_state_change(context, {:error, :invalid_max_active}, fn ->
+        Admin.put_override(context, {:tenant, "acme"}, 0)
+      end)
+
+      assert_no_state_change(context, {:error, :invalid_owner_scope}, fn ->
+        Admin.put_override(context, :system, 1)
+      end)
+
+      assert_no_state_change(context, {:error, :invalid_expected_version}, fn ->
+        Admin.reset_override(context, {:tenant, "acme"}, expected_version: -1)
+      end)
+
+      assert_no_state_change(context, {:error, :invalid_options}, fn ->
+        Admin.reset_override(context, {:tenant, "acme"}, actor: "unused")
+      end)
+
+      assert_no_state_change(context, {:error, :stale}, fn ->
+        Admin.put_override(context, {:tenant, "missing"}, 3, expected_version: 1)
+      end)
+
+      refute Enum.any?(partition_rows(context), fn [scope_key, _maximum, _version] ->
+               scope_key == "missing"
+             end)
+    end
+
+    defp assert_no_state_change(context, expected_error, operation) do
+      before = admin_state(context)
+      assert expected_error == operation.()
+      assert admin_state(context) == before
+    end
+
+    defp admin_state(context) do
+      {repo, prefix} = tables(context)
+
+      %{
+        policy:
+          repo.query!(
+            "SELECT admission_mode, max_active, policy_version, initialized_at, updated_at " <>
+              "FROM #{prefix.policy} WHERE id = 1"
+          ).rows,
+        partitions:
+          repo.query!(
+            "SELECT scope_key, max_active, partition_version, admission_epoch, " <>
+              "inserted_at, updated_at FROM #{prefix.partitions} ORDER BY scope_key"
+          ).rows
+      }
+    end
+
+    defp partition_rows(context) do
+      {repo, prefix} = tables(context)
+
+      repo.query!(
+        "SELECT scope_key, max_active, partition_version " <>
+          "FROM #{prefix.partitions} ORDER BY scope_key"
+      ).rows
+    end
+
+    defp tables(context) do
+      {repo, configured_prefix} = Storage.context!(context)
+      prefix = Storage.physical_prefix!(repo, configured_prefix)
+
+      {repo,
+       %{
+         policy: Storage.qualified_table(prefix, "docket_claim_policy"),
+         partitions: Storage.qualified_table(prefix, "docket_claim_partitions")
+       }}
     end
   end
 end

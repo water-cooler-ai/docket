@@ -46,12 +46,12 @@ CI builds and tests three release gates (`.github/workflows/ci.yml`):
 - **core** — `DOCKET_CORE_ONLY=1`, which drops `ecto_sql`/`postgrex` from
   `deps/0` in `mix.exs` to mirror a core-only host.
 - **live Postgres** — PostgreSQL 13 and 17 exercise migrations, constraints,
-  concurrency, recovery, retention, notification fallback, query plans, and a
-  bounded tenant-fair claim benchmark smoke check.
+  exact-cap concurrency, recovery, retention, and notification fallback.
 
 Every gate compiles with `--warnings-as-errors`. The full and core gates run
 the default suite; the live Postgres gate includes the tests tagged
-`:postgres`. To reproduce the core gate locally:
+`:postgres`. The exploratory TenantFair benchmark is not part of the v0.1
+release gate. To reproduce the core gate locally:
 
 ```sh
 DOCKET_CORE_ONLY=1 mix deps.get

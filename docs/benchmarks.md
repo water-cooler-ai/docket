@@ -57,9 +57,10 @@ fairness — run once per entry in the `claim_policies` registry
 (`bench/support/scorecard/config.ex`) and carry the policy name in the
 scenario column, e.g. `60% hot tenant @16 [legacy]`. Each entry's config is
 passed straight through as the runtime's `claim_policy` backend option. The
-registry currently holds only the default legacy implementation; when the
-TenantFair engine ships, adding one entry produces side-by-side scored rows
-for both policies, turning the fairness rows into a direct policy comparison.
+v0.1 registry intentionally holds only the default Legacy implementation.
+TenantFair correctness is covered by deterministic PostgreSQL tests, not by a
+release benchmark gate. Adding TenantFair scorecard rows is post-v0.1
+performance work and must not be treated as correctness evidence.
 
 Interpretation caveats:
 
@@ -88,10 +89,11 @@ wrong one.
 
 ### Profiles
 
-`smoke` finishes in well under a minute and is the CI shape
-(`--profile smoke --check`); `local` is the default developer profile;
-`scale` grows backlogs roughly an order of magnitude for dedicated runs.
-Exact knobs live in `bench/support/scorecard/config.ex`.
+`smoke` finishes in well under a minute and is the optional local plumbing
+check (`--profile smoke --check`); it is not a v0.1 CI release gate. `local` is
+the default developer profile; `scale` grows backlogs roughly an order of
+magnitude for dedicated runs. Exact knobs live in
+`bench/support/scorecard/config.ex`.
 
 ## Relationship to the DCKT-38 exploratory harness
 
