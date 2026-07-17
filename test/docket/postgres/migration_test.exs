@@ -136,6 +136,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert membership_trigger_count("public") == 1
       assert activity_function_count("public") == 1
       assert activity_trigger_count("public") == 1
+      assert run_truncate_guard_trigger_count("public") == 1
+      assert schedule_truncate_guard_trigger_count("public") == 1
     end
 
     test "ordinary v1-to-v2 upgrade backfills existing scopes transactionally" do
@@ -450,6 +452,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert membership_trigger_count("public") == 0
       assert activity_function_count("public") == 0
       assert activity_trigger_count("public") == 0
+      assert run_truncate_guard_trigger_count("public") == 0
+      assert schedule_truncate_guard_trigger_count("public") == 0
     end
 
     test "host v1-to-current rollback target removes only v3 and lands on v2" do
@@ -554,6 +558,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert owned_claim_tables("public") == []
       assert function_count("docket_private") == 1
+      assert run_truncate_guard_trigger_count("docket_private") == 1
+      assert schedule_truncate_guard_trigger_count("docket_private") == 1
     end
 
     defp current_claim_tables do
@@ -655,6 +661,44 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> hd()
     end
 
+    defp run_truncate_guard_trigger_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = $1
+          AND trigger.tgname = 'docket_claim_schedule_run_truncate_guard'
+          AND relation.relname = 'docket_runs'
+          AND trigger.tgtype = 34
+          AND NOT trigger.tgisinternal
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp schedule_truncate_guard_trigger_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = $1
+          AND trigger.tgname = 'docket_claim_schedule_truncate_guard'
+          AND relation.relname = 'docket_claim_schedule'
+          AND trigger.tgtype = 34
+          AND NOT trigger.tgisinternal
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
     defp cursor_and_epoch do
       TestRepo.query!("""
       SELECT policy.scan_ring_position, partitions.admission_epoch
@@ -743,12 +787,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           [prefix]
         ).rows
 
+      triggers =
+        TestRepo.query!(
+          """
+          SELECT relation.relname, trigger.tgname, pg_get_triggerdef(trigger.oid)
+          FROM pg_trigger AS trigger
+          JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+          JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = $1
+            AND relation.relname LIKE 'docket_%'
+            AND NOT trigger.tgisinternal
+          ORDER BY relation.relname, trigger.tgname
+          """,
+          [prefix]
+        ).rows
+
       %{
         columns: normalize_schema(columns, prefix),
         constraints: normalize_schema(constraints, prefix),
         indexes: normalize_schema(indexes, prefix),
         sequences: normalize_schema(sequences, prefix),
-        functions: normalize_schema(functions, prefix)
+        functions: normalize_schema(functions, prefix),
+        triggers: normalize_schema(triggers, prefix)
       }
     end
 

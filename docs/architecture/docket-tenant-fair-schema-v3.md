@@ -85,8 +85,11 @@ scope is immutable, and the positive unfinished count prevents deleting a
 partition that still owns running or parked/resumable work. Terminal states are
 absorbing, so terminal history does not retain partition authority. Ordinary
 application updates to the counter are rejected and underflow fails closed. As
-with every schema invariant, the threat model trusts the schema owner not to
-install DDL that bypasses triggers or constraints.
+there is intentionally no count-repair path, statement triggers reject
+truncating either `docket_runs` or `docket_claim_schedule`; the latter also
+blocks a cascading partition truncate. As with every schema invariant, the
+threat model trusts the schema owner not to drop, disable, or otherwise bypass
+triggers or constraints.
 
 ## Lock graph
 

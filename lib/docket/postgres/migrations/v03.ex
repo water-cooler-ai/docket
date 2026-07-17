@@ -10,8 +10,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @membership_trigger "docket_claim_schedule_partition_insert"
     @membership_guard_function "docket_claim_schedule_guard_v1"
     @membership_guard_trigger "docket_claim_schedule_guard"
+    @schedule_truncate_guard_trigger "docket_claim_schedule_truncate_guard"
     @activity_function "docket_claim_schedule_activity_v1"
     @activity_trigger "docket_claim_schedule_run_activity"
+    @run_truncate_guard_trigger "docket_claim_schedule_run_truncate_guard"
     @terminal_status_sql Docket.Run.terminal_statuses()
                          |> Enum.map_join(", ", &"'#{&1}'")
 
@@ -77,7 +79,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       SET search_path TO pg_catalog, pg_temp
       AS $docket_claim_schedule_guard_v1$
       BEGIN
-        IF TG_OP = 'UPDATE' THEN
+        IF TG_OP = 'TRUNCATE' THEN
+          RAISE EXCEPTION 'TRUNCATE docket_claim_schedule is unsupported because unfinished membership is authoritative'
+            USING ERRCODE = 'integrity_constraint_violation';
+        ELSIF TG_OP = 'UPDATE' THEN
           IF NEW.scope_key IS DISTINCT FROM OLD.scope_key OR
              NEW.ring_position IS DISTINCT FROM OLD.ring_position THEN
             RAISE EXCEPTION 'docket claim schedule membership is immutable'
@@ -158,7 +163,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       SET search_path TO pg_catalog, pg_temp
       AS $docket_claim_schedule_activity_v1$
       BEGIN
-        IF TG_OP = 'UPDATE' AND NEW.scope_key IS DISTINCT FROM OLD.scope_key THEN
+        IF TG_OP = 'TRUNCATE' THEN
+          RAISE EXCEPTION 'TRUNCATE docket_runs is unsupported because unfinished counts are trigger-maintained'
+            USING ERRCODE = 'integrity_constraint_violation';
+        ELSIF TG_OP = 'UPDATE' AND NEW.scope_key IS DISTINCT FROM OLD.scope_key THEN
           RAISE EXCEPTION 'docket run ownership is immutable'
             USING ERRCODE = 'integrity_constraint_violation';
         ELSIF TG_OP = 'INSERT' THEN
@@ -222,6 +230,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       """)
 
       execute("""
+      CREATE TRIGGER #{@run_truncate_guard_trigger}
+      BEFORE TRUNCATE ON #{runs}
+      FOR EACH STATEMENT
+      EXECUTE FUNCTION #{activity_function}()
+      """)
+
+      execute("""
       UPDATE #{schedule} AS schedule
       SET unfinished_count = unfinished.unfinished_count,
           updated_at = CURRENT_TIMESTAMP
@@ -240,6 +255,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       FOR EACH ROW
       EXECUTE FUNCTION #{membership_guard_function}()
       """)
+
+      execute("""
+      CREATE TRIGGER #{@schedule_truncate_guard_trigger}
+      BEFORE TRUNCATE ON #{schedule}
+      FOR EACH STATEMENT
+      EXECUTE FUNCTION #{membership_guard_function}()
+      """)
     end
 
     def down(%{prefix: prefix}) do
@@ -255,10 +277,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       execute("LOCK TABLE #{partitions} IN SHARE ROW EXCLUSIVE MODE")
       execute("LOCK TABLE #{runs} IN SHARE ROW EXCLUSIVE MODE")
 
+      execute("DROP TRIGGER IF EXISTS #{@run_truncate_guard_trigger} ON #{runs}")
       execute("DROP TRIGGER IF EXISTS #{@activity_trigger} ON #{runs}")
       execute("DROP FUNCTION IF EXISTS #{activity_function}()")
       execute("DROP TRIGGER IF EXISTS #{@membership_trigger} ON #{partitions}")
       execute("DROP FUNCTION IF EXISTS #{membership_function}()")
+      execute("DROP TRIGGER IF EXISTS #{@schedule_truncate_guard_trigger} ON #{schedule}")
       execute("DROP TRIGGER IF EXISTS #{@membership_guard_trigger} ON #{schedule}")
       execute("DROP FUNCTION IF EXISTS #{membership_guard_function}()")
       execute("DROP TABLE IF EXISTS #{schedule}")

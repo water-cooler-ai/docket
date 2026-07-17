@@ -193,6 +193,37 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert TestRepo.query!("SELECT count(*) FROM docket_claim_schedule").rows == [[0]]
     end
 
+    test "truncate paths fail closed and preserve authoritative unfinished membership" do
+      seed_runs(1)
+
+      run_message =
+        "TRUNCATE docket_runs is unsupported because unfinished counts are trigger-maintained"
+
+      schedule_message =
+        "TRUNCATE docket_claim_schedule is unsupported because unfinished membership is authoritative"
+
+      attempts = [
+        {"TRUNCATE docket_runs CASCADE", run_message},
+        {"TRUNCATE docket_events, docket_runs", run_message},
+        {"TRUNCATE docket_claim_schedule", schedule_message},
+        {"TRUNCATE docket_claim_partitions CASCADE", schedule_message}
+      ]
+
+      for {statement, expected_message} <- attempts do
+        error = assert_raise Postgrex.Error, fn -> TestRepo.query!(statement) end
+        assert error.postgres.code == :integrity_constraint_violation
+        assert error.postgres.message == expected_message
+
+        assert TestRepo.query!("SELECT count(*) FROM docket_runs").rows == [[2]]
+        assert TestRepo.query!("SELECT count(*) FROM docket_claim_partitions").rows == [[1]]
+
+        assert TestRepo.query!(
+                 "SELECT unfinished_count FROM docket_claim_schedule " <>
+                   "WHERE scope_key = 'tenant-0001'"
+               ).rows == [[2]]
+      end
+    end
+
     test "waiting runs stay unfinished and cannot be orphaned before resuming" do
       seed_runs(1)
 
