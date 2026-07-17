@@ -105,9 +105,15 @@ changing the population.
 
 The following terms are normative:
 
-- An **inspection** consumes one distinct hint position in durable cursor
-  order. Lock skip, cap denial, stale evidence, or an empty recheck is an
-  unsuccessful inspection.
+DCKT-76 clarified the word "inspection" as a cursor visit rather than unique
+membership: `C` remains duplicate-free, while a call with `H < S` may revisit a
+position after a complete wrap. This is an erratum to the original "distinct"
+wording, not a change to the round/no-repeat invariant or any formula below.
+
+- An **inspection** is one visit to a hint position in durable cursor order.
+  Membership in `C` is unique, but when `H < S` the cursor may complete a wrap
+  and revisit a position in the same call. Lock skip, cap denial, stale
+  evidence, or an empty recheck is an unsuccessful inspection.
 - A **grant** is one committed acquisition of partition authority followed by
   `1..Q` committed lease or poison outcomes from that partition. A zero-outcome
   locked visit is not a grant.
@@ -124,7 +130,7 @@ Let:
 - `A = |P|`, the fixed continuously admissible grant population;
 - `H = |C|`, the fixed unique hint positions, including stale-positive
   positions, so `1 <= A <= H`;
-- `S >= 1`, the maximum distinct hint positions a qualifying call may inspect;
+- `S >= 1`, the maximum hint-position visits a qualifying call may inspect;
 - `Q >= 1`, the maximum outcomes one grant may return, further limited by the
   caller's remaining `policy.limit`; and
 - `L >= 0`, the maximum consecutive target inspections that may fail before
@@ -293,9 +299,7 @@ or borrowing in v0.1.0.
 Schema version 2 installs the policy row, partition table, ordinary supporting
 indexes, and exact-cap claim function in one host-owned transactional
 migration. During the v1-to-v2 migration, the runs table is locked against
-concurrent inserts while existing scope keys are backfilled. The current
-binary requires schema version 2 at runtime; schema version 1 is only an
-upgrade/rollback waypoint for the previous binary.
+concurrent inserts while existing scope keys are backfilled.
 
 The exact-cap cleanup rewrote the unreleased DCKT-68 version-2 migration rather
 than adding a conversion for its discarded development schema. A local or test
@@ -303,9 +307,13 @@ database that applied that earlier development migration must be recreated, or
 rolled back with matching old code before adopting the rewritten migration. No
 released v2 database uses that discarded shape.
 
-Schema version 3 is an additive development migration that must install the
-separate hint/cursor/reconciliation state required by the frozen fair-rotation
-proof without weakening schema-v2 safety.
+Schema version 3 is the additive DCKT-76 migration. It installs the unique
+scheduling ring, one scan cursor, independent class reconciliation cursors,
+and conservative hint fields without weakening schema-v2 safety. The current
+binary requires schema version 3; version 2 is its immediate rollback point
+and version 1 remains the older host upgrade waypoint. The ratified constants,
+query shapes, and plan evidence are in
+[TenantFair schema-v3 budgets and query shapes](docket-tenant-fair-schema-v3.md).
 
 The supported upgrade remains stopped and homogeneous. Online migration and
 readiness, governance, audit/evidence platforms, enterprise rollout,

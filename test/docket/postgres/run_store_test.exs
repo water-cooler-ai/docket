@@ -174,6 +174,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert Map.take(persisted, claim_partition_fields()) ==
                Map.take(admin_partition, claim_partition_fields())
+
+      assert claim_schedule_count("tenant") == 1
     end
 
     test "a committed partition remains unchanged after its last run is deleted" do
@@ -216,6 +218,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Enum.map(outcomes, & &1.result) == Enum.map(runs, &{:ok, &1})
       assert TestRepo.aggregate(Run, :count) == length(runs)
       assert claim_partition_count("tenant") == 1
+      assert claim_schedule_count("tenant") == 1
 
       assert %ClaimPartition{
                partition_version: 0,
@@ -236,6 +239,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                )
 
       refute claim_partition("invalid-partition")
+      assert claim_schedule_count("invalid-partition") == 0
 
       non_durable = initialized_run("non-durable", input: %{"owner" => self()})
 
@@ -249,6 +253,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                )
 
       refute claim_partition("codec-partition")
+      assert claim_schedule_count("codec-partition") == 0
 
       missing_graph = initialized_run("missing-graph", graph_hash: "not-published")
 
@@ -262,6 +267,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                )
 
       refute claim_partition("fk-partition")
+      assert claim_schedule_count("fk-partition") == 0
 
       original = initialized_run("duplicate-across-partitions")
 
@@ -279,6 +285,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert claim_partition!("").scope_key == ""
       refute claim_partition("x")
+      assert claim_schedule_count("") == 1
+      assert claim_schedule_count("x") == 0
       assert TestRepo.aggregate(Run, :count) == 1
     end
 
@@ -303,6 +311,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       refute TestRepo.get_by(Run, run_id: run.id)
       refute claim_partition("tenant")
+      assert claim_schedule_count("tenant") == 0
     end
 
     test "an uncommitted admission epoch update and run lock do not block another insert" do
@@ -434,6 +443,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert Map.take(persisted, claim_partition_fields()) ==
                Map.take(admin_partition, claim_partition_fields())
+
+      assert claim_schedule_count("x") == 1
     end
 
     test "run listing applies graph and status filters in SQL without decoding state" do
@@ -2491,6 +2502,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
 
       TestRepo.one(query)
+    end
+
+    defp claim_schedule_count(scope_key, prefix \\ "public") do
+      TestRepo.query!(
+        ~s|SELECT count(*) FROM "#{prefix}"."docket_claim_schedule" WHERE scope_key = $1|,
+        [scope_key]
+      ).rows
+      |> hd()
+      |> hd()
     end
   end
 end
