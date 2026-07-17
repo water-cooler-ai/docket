@@ -70,8 +70,8 @@ Schema v3 installs the state from which DCKT-78 must enforce two separate
 progress rules:
 
 - DCKT-78 must advance the domain-global circular scan cursor for every
-  committed inspected hint-position visit, including lock skip, denial,
-  staleness, and emptiness; and
+  committed unfinished-ring visit, including lock skip, denial, dormancy, and
+  emptiness; and
 - DCKT-78 must advance partition `admission_epoch` exactly once only for a
   committed nonempty grant; the epoch must never drive scan traversal.
 
@@ -112,7 +112,7 @@ history, and hot mixed-version rollout are deferred.
 
 An existing schema-v2 development installation uses `--upgrade-from-v2` and
 can roll that host migration back to v2. See
-[TenantFair schema-v3 budgets and query shapes](docket-tenant-fair-schema-v3.md)
+[TenantFair schema-v3 active-ring decision](docket-tenant-fair-schema-v3.md)
 for the additive objects and evidence boundary.
 
 ## Test contract

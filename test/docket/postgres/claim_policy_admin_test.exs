@@ -70,9 +70,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    "WHERE scope_key = 'acme'"
                ).rows
 
-      assert [[1]] =
+      assert [[0]] =
                TestRepo.query!(
-                 "SELECT count(*) FROM docket_claim_schedule WHERE scope_key = 'acme'"
+                 "SELECT unfinished_count FROM docket_claim_schedule WHERE scope_key = 'acme'"
                ).rows
     end
 

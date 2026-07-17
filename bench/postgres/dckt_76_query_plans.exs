@@ -45,6 +45,7 @@ defmodule Docket.Bench.DCKT76QueryPlans do
       tables = create_fixture!(prefix)
       seed_fixture!(tables)
       Repo.query!("ANALYZE #{tables.schedule}")
+      Repo.query!("ANALYZE #{tables.schedule_sparse}")
       Repo.query!("ANALYZE #{tables.schedule_small}")
       Repo.query!("ANALYZE #{tables.runs}")
       Repo.query!("ANALYZE #{tables.partitions}")
@@ -61,69 +62,76 @@ defmodule Docket.Bench.DCKT76QueryPlans do
 
   defp create_fixture!(prefix) do
     schedule = table(prefix, "docket_claim_schedule")
+    schedule_sparse = table(prefix, "docket_claim_schedule_sparse")
     schedule_small = table(prefix, "docket_claim_schedule_small")
     runs = table(prefix, "docket_runs")
     partitions = table(prefix, "docket_claim_partitions")
-    scan_cursor = table(prefix, "docket_claim_scan_cursor")
+    policy = table(prefix, "docket_claim_policy")
 
     Repo.query!("""
     CREATE TABLE #{schedule} (
       scope_key text PRIMARY KEY,
       ring_position bigint GENERATED ALWAYS AS IDENTITY NOT NULL UNIQUE,
-      may_have_ready_at timestamptz NULL,
-      may_have_claimed_at timestamptz NULL,
+      unfinished_count bigint NOT NULL,
       ready_candidate_cursor_at timestamptz NULL,
       ready_candidate_cursor_id bigint NULL,
-      expired_candidate_cursor_at timestamptz NULL,
-      expired_candidate_cursor_id bigint NULL,
-      ready_dirty boolean NOT NULL DEFAULT true,
-      claimed_dirty boolean NOT NULL DEFAULT true,
-      in_cohort boolean GENERATED ALWAYS AS (
-        ready_dirty OR claimed_dirty OR
-        may_have_ready_at IS NOT NULL OR may_have_claimed_at IS NOT NULL
-      ) STORED,
-      CHECK ((ready_candidate_cursor_at IS NULL) = (ready_candidate_cursor_id IS NULL)),
-      CHECK ((expired_candidate_cursor_at IS NULL) = (expired_candidate_cursor_id IS NULL))
+      CHECK (unfinished_count >= 0),
+      CHECK ((ready_candidate_cursor_at IS NULL) = (ready_candidate_cursor_id IS NULL))
     )
     """)
 
     Repo.query!("""
-    CREATE INDEX docket_claim_schedule_cohort_ring_index
+    CREATE INDEX docket_claim_schedule_unfinished_ring_index
     ON #{schedule} (ring_position)
     INCLUDE (
-      scope_key, may_have_ready_at, may_have_claimed_at, ready_dirty, claimed_dirty
+      scope_key, unfinished_count,
+      ready_candidate_cursor_at, ready_candidate_cursor_id
     )
-    WHERE in_cohort
+    WHERE unfinished_count > 0
+    """)
+
+    Repo.query!("""
+    CREATE TABLE #{schedule_sparse} (
+      scope_key text PRIMARY KEY,
+      ring_position bigint GENERATED ALWAYS AS IDENTITY NOT NULL UNIQUE,
+      unfinished_count bigint NOT NULL,
+      ready_candidate_cursor_at timestamptz NULL,
+      ready_candidate_cursor_id bigint NULL,
+      CHECK (unfinished_count >= 0),
+      CHECK ((ready_candidate_cursor_at IS NULL) = (ready_candidate_cursor_id IS NULL))
+    )
+    """)
+
+    Repo.query!("""
+    CREATE INDEX docket_claim_schedule_sparse_unfinished_ring_index
+    ON #{schedule_sparse} (ring_position)
+    INCLUDE (
+      scope_key, unfinished_count,
+      ready_candidate_cursor_at, ready_candidate_cursor_id
+    )
+    WHERE unfinished_count > 0
     """)
 
     Repo.query!("""
     CREATE TABLE #{schedule_small} (
       scope_key text PRIMARY KEY,
       ring_position bigint GENERATED ALWAYS AS IDENTITY NOT NULL UNIQUE,
-      may_have_ready_at timestamptz NULL,
-      may_have_claimed_at timestamptz NULL,
+      unfinished_count bigint NOT NULL,
       ready_candidate_cursor_at timestamptz NULL,
       ready_candidate_cursor_id bigint NULL,
-      expired_candidate_cursor_at timestamptz NULL,
-      expired_candidate_cursor_id bigint NULL,
-      ready_dirty boolean NOT NULL DEFAULT true,
-      claimed_dirty boolean NOT NULL DEFAULT true,
-      in_cohort boolean GENERATED ALWAYS AS (
-        ready_dirty OR claimed_dirty OR
-        may_have_ready_at IS NOT NULL OR may_have_claimed_at IS NOT NULL
-      ) STORED,
-      CHECK ((ready_candidate_cursor_at IS NULL) = (ready_candidate_cursor_id IS NULL)),
-      CHECK ((expired_candidate_cursor_at IS NULL) = (expired_candidate_cursor_id IS NULL))
+      CHECK (unfinished_count >= 0),
+      CHECK ((ready_candidate_cursor_at IS NULL) = (ready_candidate_cursor_id IS NULL))
     )
     """)
 
     Repo.query!("""
-    CREATE INDEX docket_claim_schedule_small_cohort_ring_index
+    CREATE INDEX docket_claim_schedule_small_unfinished_ring_index
     ON #{schedule_small} (ring_position)
     INCLUDE (
-      scope_key, may_have_ready_at, may_have_claimed_at, ready_dirty, claimed_dirty
+      scope_key, unfinished_count,
+      ready_candidate_cursor_at, ready_candidate_cursor_id
     )
-    WHERE in_cohort
+    WHERE unfinished_count > 0
     """)
 
     Repo.query!("""
@@ -136,10 +144,9 @@ defmodule Docket.Bench.DCKT76QueryPlans do
     """)
 
     Repo.query!("""
-    CREATE TABLE #{scan_cursor} (
+    CREATE TABLE #{policy} (
       id smallint PRIMARY KEY,
-      ring_position bigint NOT NULL,
-      scan_call_sequence bigint NOT NULL
+      scan_ring_position bigint NOT NULL
     )
     """)
 
@@ -171,10 +178,11 @@ defmodule Docket.Bench.DCKT76QueryPlans do
 
     %{
       schedule: schedule,
+      schedule_sparse: schedule_sparse,
       schedule_small: schedule_small,
       runs: runs,
       partitions: partitions,
-      scan_cursor: scan_cursor
+      policy: policy
     }
   end
 
@@ -182,13 +190,8 @@ defmodule Docket.Bench.DCKT76QueryPlans do
     Repo.query!(
       """
       INSERT INTO #{tables.schedule}
-        (scope_key, may_have_ready_at, may_have_claimed_at, ready_dirty, claimed_dirty)
-      SELECT 'tenant-' || lpad(series::text, 5, '0'),
-             CASE WHEN series % 250 = 0 THEN CURRENT_TIMESTAMP ELSE NULL END,
-             CASE WHEN series % 400 = 0 THEN CURRENT_TIMESTAMP - interval '2 hours'
-                  ELSE NULL END,
-             false,
-             false
+        (scope_key, unfinished_count)
+      SELECT 'tenant-' || lpad(series::text, 5, '0'), 1
       FROM generate_series(1, $1) AS series
       """,
       [@partitions]
@@ -196,11 +199,20 @@ defmodule Docket.Bench.DCKT76QueryPlans do
 
     Repo.query!("""
     INSERT INTO #{tables.schedule}
-      (scope_key, may_have_ready_at, ready_dirty, claimed_dirty)
-    VALUES ('hot', CURRENT_TIMESTAMP - interval '1 day', false, false)
+      (scope_key, unfinished_count)
+    VALUES ('hot', #{@deep_ready})
     """)
 
-    Repo.query!("INSERT INTO #{tables.schedule_small} (scope_key) VALUES ('only')")
+    Repo.query!("""
+    INSERT INTO #{tables.schedule_sparse} (scope_key, unfinished_count)
+    SELECT 'tenant-' || lpad(series::text, 5, '0'),
+           CASE WHEN series % 250 = 0 OR series % 400 = 0 THEN 1 ELSE 0 END
+    FROM generate_series(1, #{@partitions}) AS series
+    """)
+
+    Repo.query!(
+      "INSERT INTO #{tables.schedule_small} (scope_key, unfinished_count) VALUES ('only', 1)"
+    )
 
     Repo.query!("""
     INSERT INTO #{tables.partitions} (scope_key)
@@ -208,7 +220,7 @@ defmodule Docket.Bench.DCKT76QueryPlans do
     FROM generate_series(1, #{@partitions}) AS series
     """)
 
-    Repo.query!("INSERT INTO #{tables.scan_cursor} VALUES (1, 0, 0)")
+    Repo.query!("INSERT INTO #{tables.policy} VALUES (1, 0)")
 
     Repo.query!(
       """
@@ -308,15 +320,9 @@ defmodule Docket.Bench.DCKT76QueryPlans do
       rejected_global_grouping: explain(rejected_global, [now, cutoff]),
       rejected_rank_before_lock: explain(rejected_rank_before_lock, [now]),
       selected_ring_scan: explain(QueryShapes.scan_positions(tables.schedule), [0]),
+      selected_sparse_ring_scan: explain(QueryShapes.scan_positions(tables.schedule_sparse), [0]),
       selected_ring_scan_h_lt_s:
         explain_with_index_bias(QueryShapes.scan_positions(tables.schedule_small), [0]),
-      selected_ready_reconciliation:
-        explain(QueryShapes.reconciliation_heads(tables.runs, :ready), ["tenant-19990", now]),
-      selected_expired_reconciliation:
-        explain(
-          QueryShapes.reconciliation_heads(tables.runs, :expired),
-          ["tenant-19990", cutoff]
-        ),
       selected_ready_candidates:
         explain(QueryShapes.run_candidates(tables.runs, :ready), ["hot", now]),
       selected_ready_candidate_continuation:
@@ -329,7 +335,7 @@ defmodule Docket.Bench.DCKT76QueryPlans do
           QueryShapes.run_candidates(tables.runs, :expired),
           ["tenant-00001", cutoff]
         ),
-      selected_scan_cursor_lock: explain(QueryShapes.scan_cursor_lock(tables.scan_cursor), []),
+      selected_scan_cursor_lock: explain(QueryShapes.scan_cursor_lock(tables.policy), []),
       selected_mutation_ids: explain(QueryShapes.mutation_ids(), [Enum.to_list(1..100)])
     }
 
@@ -353,26 +359,25 @@ defmodule Docket.Bench.DCKT76QueryPlans do
       },
       fixtures: %{
         partitions: @partitions,
-        active_or_dirty_ring_positions: 121,
+        unfinished_ring_positions: @partitions + 1,
+        sparse_unfinished_ring_positions: 120,
         deep_ready_rows: @deep_ready,
         one_row_tenants: @one_row_tenants,
         future_timer_rows: @future_timers,
         expired_rows: @expired_rows,
-        stale_or_empty_positive_positions: 60
+        target_scan_positions_per_call: Budgets.scan_inspections()
       },
       budgets: Budgets.as_map(),
       decisions: %{
         rejected_global_grouping: "work grows with eligible run and tenant populations",
         rejected_rank_before_lock: "global window ranks before partition authority",
         selected_ring_scan: "fixed recursive keyset seeks, including repeated wrap when H < S",
-        selected_reconciliation:
-          "fixed recursive loose-index scope heads plus one exact-scope due probe",
         selected_candidates:
           "fixed exact-partition ready and expired structural prefixes before bounded ranking"
       },
       assertions: %{
         query_plan_evidence_is_not_fairness_proof: true,
-        schema_v3_requires_dckt_77_78_79_for_shipped_proof: true,
+        schema_v3_requires_dckt_78_79_for_shipped_proof: true,
         selected_shapes_pass_fixed_logical_work_budgets: true
       },
       summaries: summaries,
@@ -502,9 +507,8 @@ defmodule Docket.Bench.DCKT76QueryPlans do
   defp assert_evidence!(summaries) do
     expected_rows = %{
       selected_ring_scan: Budgets.scan_inspections(),
+      selected_sparse_ring_scan: Budgets.scan_inspections(),
       selected_ring_scan_h_lt_s: Budgets.scan_inspections(),
-      selected_ready_reconciliation: Budgets.ready_reconciliation_partitions(),
-      selected_expired_reconciliation: Budgets.expired_reconciliation_partitions(),
       selected_ready_candidates: Budgets.run_lock_attempts(),
       selected_ready_candidate_continuation: Budgets.run_lock_attempts(),
       selected_expired_candidates: 1,
@@ -542,14 +546,13 @@ defmodule Docket.Bench.DCKT76QueryPlans do
     end)
 
     required_indexes = %{
-      selected_ring_scan: "docket_claim_schedule_cohort_ring_index",
-      selected_ring_scan_h_lt_s: "docket_claim_schedule_small_cohort_ring_index",
-      selected_ready_reconciliation: "docket_runs_scope_ready_index",
-      selected_expired_reconciliation: "docket_runs_scope_expired_index",
+      selected_ring_scan: "docket_claim_schedule_unfinished_ring_index",
+      selected_sparse_ring_scan: "docket_claim_schedule_sparse_unfinished_ring_index",
+      selected_ring_scan_h_lt_s: "docket_claim_schedule_small_unfinished_ring_index",
       selected_ready_candidates: "docket_runs_scope_ready_index",
       selected_ready_candidate_continuation: "docket_runs_scope_ready_index",
       selected_expired_candidates: "docket_runs_scope_expired_index",
-      selected_scan_cursor_lock: "docket_claim_scan_cursor_pkey",
+      selected_scan_cursor_lock: "docket_claim_policy_pkey",
       selected_exact_partition_lock_locked: "docket_claim_partitions_pkey",
       selected_exact_lock_attempts_locked_prefix: "docket_runs_pkey"
     }
@@ -573,9 +576,8 @@ defmodule Docket.Bench.DCKT76QueryPlans do
 
     index_visit_ceilings = %{
       selected_ring_scan: 2 * Budgets.scan_inspections(),
+      selected_sparse_ring_scan: 2 * Budgets.scan_inspections(),
       selected_ring_scan_h_lt_s: 2 * Budgets.scan_inspections(),
-      selected_ready_reconciliation: 4 * Budgets.ready_reconciliation_partitions(),
-      selected_expired_reconciliation: 4 * Budgets.expired_reconciliation_partitions(),
       selected_ready_candidates: Budgets.run_lock_attempts(),
       selected_ready_candidate_continuation: 2 * Budgets.run_lock_attempts(),
       selected_expired_candidates: Budgets.run_lock_attempts(),
@@ -594,9 +596,8 @@ defmodule Docket.Bench.DCKT76QueryPlans do
 
     recursive_row_ceilings = %{
       selected_ring_scan: Budgets.scan_inspections(),
-      selected_ring_scan_h_lt_s: Budgets.scan_inspections(),
-      selected_ready_reconciliation: Budgets.ready_reconciliation_partitions(),
-      selected_expired_reconciliation: Budgets.expired_reconciliation_partitions()
+      selected_sparse_ring_scan: Budgets.scan_inspections(),
+      selected_ring_scan_h_lt_s: Budgets.scan_inspections()
     }
 
     Enum.each(recursive_row_ceilings, fn {name, ceiling} ->

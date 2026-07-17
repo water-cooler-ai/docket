@@ -351,10 +351,10 @@ re-execution, not a partial durable moment.
 
 Schema version 2 adds the policy and partition authority used by
 `Docket.Postgres.ClaimPolicy.TenantFair`. Schema version 3 adds its unique
-scheduling ring, global scan cursor, separate scope-key ready/expired
-reconciliation cursors, and bounded-query constants. Its repair cadence is
-defined in committed cursor-owned poll statements, including empty-cohort
-polls, so later hint repair cannot deadlock on an empty ring. The admission
+scheduling ring, exact trigger-maintained unfinished-run count, global scan
+cursor, and bounded-query constants. The unfinished ring is an authoritative
+superset of current eligibility, so future timers and parked running work may
+consume an unsuccessful inspection without becoming invisible. The admission
 engine remains on the provisional v2 mechanics until DCKT-78; schema presence
 alone is not a fairness proof. Enable TenantFair consistently across the
 fleet:

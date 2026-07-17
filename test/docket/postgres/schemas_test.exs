@@ -177,6 +177,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    :admission_mode,
                    :max_active,
                    :policy_version,
+                   :scan_ring_position,
                    :initialized_at,
                    :updated_at
                  ]

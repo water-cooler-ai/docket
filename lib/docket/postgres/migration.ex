@@ -5,9 +5,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     Version 1 contains durable graphs, runs, and events. Version 2 adds the
     minimal exact-cap policy and partition authority plus its claim function
-    and supporting indexes. Version 3 adds the TenantFair scheduling ring,
-    domain cursor, and independent reconciliation cursors. Every step is an
-    ordinary transactional migration.
+    and supporting indexes. Version 3 adds one authoritative unfinished-tenant
+    scheduling table and stores the domain cursor on existing policy authority.
+    Every step is an ordinary transactional migration.
     """
 
     use Ecto.Migration

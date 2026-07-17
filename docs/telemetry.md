@@ -70,11 +70,11 @@ and add one bounded, identity-free fair-rotation observation whose aggregate
 measurements cover:
 
 - configured inspection budget `S` and grant outcome limit `Q`;
-- scan pages, hint-position visits inspected, cursor advances, and wraps;
+- scan pages, unfinished-ring visits inspected, cursor advances, and wraps;
 - partition locks, lock skips, grants, leases, poison outcomes, and total
   outcomes;
 - cap-denied, stale, and empty visits;
-- hint repairs, reconciliation work, and explicit work-budget exhaustion; and
+- unfinished-ring membership transitions and explicit work-budget exhaustion; and
 - `admission_epoch` advances.
 
 For every available committed observation:
@@ -84,7 +84,7 @@ outcomes = leases + poisoned
 outcomes <= Q * grants
 grants <= locked visits
 admission_epoch advances = grants
-cursor advances = hint positions inspected
+cursor advances = unfinished-ring positions inspected
 ```
 
 A denial, stale/empty visit, or lock skip contributes no grant and no service-

@@ -16,15 +16,15 @@ entries below reflect what has landed so far.
 
 ### Added
 
-- PostgreSQL schema version 3 adds the prefix-local TenantFair scheduling ring,
-  one serialized domain scan cursor, separate ready/expired reconciliation
-  cursors, conservative eligibility hints, and atomic trigger-backed ring
-  membership. Fixed `S = 32`, `Q = 8`, exact-key lock/run-mutation-input
-  ceilings, bounded poison-safe candidate continuation, and class-local
-  recursive loose-index repair budgets are backed by reproducible JSON query
-  plans with logical-work assertions. This is the DCKT-76 schema/query
-  prerequisite; hint completeness, admission, and executable fairness proof
-  remain in DCKT-77 through DCKT-79.
+- PostgreSQL schema version 3 adds one prefix-local TenantFair scheduling table
+  with an exact trigger-maintained count of nonterminal runs per tenant and
+  stores the serialized scan position on the existing policy row. Fixed `S =
+  32`, `Q = 8`, exact-key
+  lock/run-mutation-input ceilings, and bounded poison-safe candidate
+  continuation are backed by reproducible JSON query plans with logical-work
+  assertions. The ring is an authoritative eligibility superset rather than a
+  lossy cache, so DCKT-77 repair machinery is not part of the v0.1.0 MVP;
+  admission and executable fairness proof remain in DCKT-78 and DCKT-79.
 - PostgreSQL run creation now atomically materializes the canonical
   owner-derived claim partition with an inherited cap and version-zero state.
   Concurrent first inserts use `ON CONFLICT DO NOTHING`, preserving Admin-owned

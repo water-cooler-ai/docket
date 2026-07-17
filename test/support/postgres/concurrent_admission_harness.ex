@@ -15,8 +15,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def bounds!(opts) when is_list(opts) do
         target = Keyword.fetch!(opts, :target)
         cohort = opts |> Keyword.fetch!(:cohort) |> MapSet.new()
-        hints = hints!(opts)
-        hint_count = length(hints)
+        ring = ring!(opts)
+        ring_count = length(ring)
         scan_budget = positive!(opts, :scan_budget)
         quantum = positive!(opts, :quantum)
         lock_failures = non_negative!(opts, :lock_failures)
@@ -26,23 +26,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           raise ArgumentError, "fair-rotation cohort must contain the target"
         end
 
-        hint_set = MapSet.new(hints)
+        ring_set = ring |> Enum.map(&elem(&1, 1)) |> MapSet.new()
 
-        unless MapSet.subset?(cohort, hint_set) do
-          raise ArgumentError, "fair-rotation hints must contain every cohort partition"
+        unless MapSet.subset?(cohort, ring_set) do
+          raise ArgumentError, "fair-rotation ring must contain every cohort partition"
         end
 
-        if population == 0 or population > hint_count do
+        if population == 0 or population > ring_count do
           raise ArgumentError,
-                "fair-rotation population must satisfy 1 <= A <= H, got A=#{population}, H=#{hint_count}"
+                "fair-rotation population must satisfy 1 <= A <= H, got A=#{population}, H=#{ring_count}"
         end
 
         grant_bound = (lock_failures + 1) * (population - 1)
 
         %{
           population: population,
-          hints: hints,
-          hint_count: hint_count,
+          ring: ring,
+          ring_count: ring_count,
           scan_budget: scan_budget,
           quantum: quantum,
           lock_failures: lock_failures,
@@ -50,7 +50,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           other_outcomes: quantum * grant_bound,
           scan_calls:
             (lock_failures + 1) *
-              (population - 1 + ceil_div(hint_count - population + 1, scan_budget))
+              (population - 1 + ceil_div(ring_count - population + 1, scan_budget))
         }
       end
 
@@ -66,7 +66,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         through_target_call = Enum.take_while(committed, &(&1.call <= target_call))
         window = Enum.take(committed, target_index + 1)
 
-        assert_cursor!(through_target_call, bounds.hints)
+        assert_cursor!(through_target_call, bounds.ring)
         assert_call_budgets!(through_target_call, bounds.scan_budget)
         assert_events!(window, cohort, bounds.quantum)
         assert_rounds!(window, target)
@@ -198,20 +198,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end)
       end
 
-      defp assert_cursor!(events, hints) do
-        hint_count = length(hints)
-
+      defp assert_cursor!(events, ring) do
         Enum.reduce(events, nil, fn event, prior_after ->
           if prior_after != nil and event.cursor_before != prior_after do
             fail!("scan cursor is not contiguous between visits")
           end
 
-          unless event.cursor_before < hint_count and
-                   event.cursor_after == rem(event.cursor_before + 1, hint_count) do
-            fail!("scan cursor did not advance exactly one cyclic hint position")
+          {expected_after, expected_partition} =
+            Enum.find(ring, fn {position, _partition} -> position > event.cursor_before end) ||
+              hd(ring)
+
+          unless event.cursor_after == expected_after do
+            fail!("scan cursor did not advance to the next cyclic ring position")
           end
 
-          unless Enum.at(hints, event.cursor_before) == event.partition do
+          unless expected_partition == event.partition do
             fail!("inspected partition does not match the frozen cursor position")
           end
 
@@ -297,17 +298,39 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end
       end
 
-      defp hints!(opts) do
-        case Keyword.fetch!(opts, :hints) do
-          hints when is_list(hints) and hints != [] ->
-            if Enum.uniq(hints) == hints do
-              hints
-            else
-              raise ArgumentError, "fair-rotation hints must be duplicate-free"
+      defp ring!(opts) do
+        case Keyword.fetch!(opts, :ring) do
+          ring when is_list(ring) and ring != [] ->
+            valid? =
+              Enum.all?(ring, fn
+                {position, partition} ->
+                  is_integer(position) and position > 0 and not is_nil(partition)
+
+                _other ->
+                  false
+              end)
+
+            unless valid? do
+              raise ArgumentError,
+                    "ring must contain positive {ring_position, partition} pairs"
             end
 
-          hints ->
-            raise ArgumentError, "hints must be a non-empty list, got: #{inspect(hints)}"
+            positions = Enum.map(ring, &elem(&1, 0))
+            partitions = Enum.map(ring, &elem(&1, 1))
+
+            cond do
+              positions != Enum.sort(positions) ->
+                raise ArgumentError, "fair-rotation ring must be ordered by ring position"
+
+              Enum.uniq(positions) != positions or Enum.uniq(partitions) != partitions ->
+                raise ArgumentError, "fair-rotation ring must be duplicate-free"
+
+              true ->
+                ring
+            end
+
+          ring ->
+            raise ArgumentError, "ring must be a non-empty list, got: #{inspect(ring)}"
         end
       end
 

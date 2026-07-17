@@ -41,9 +41,9 @@ when you want to understand *why* the contracts are shaped the way they are.
      fair-rotation population, cursor, service-accounting, proof-oracle, and
      stopped-upgrade invariants.
 10. `docket-tenant-fair-schema-v3.md`
-    - The fixed TenantFair discovery/repair budgets, durable ring and cursor
-      state, chosen query shapes, rejected baselines, and PostgreSQL plan
-      evidence for DCKT-76.
+    - The fixed TenantFair discovery budgets, authoritative unfinished ring,
+      durable cursor, chosen query shapes, rejected baselines, and PostgreSQL
+      plan evidence for DCKT-76.
 11. `docket-claim-policy.md`
     - The RunStore-to-ClaimPolicy boundary and the implemented Legacy and
       TenantFair engines.

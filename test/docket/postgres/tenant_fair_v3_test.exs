@@ -29,11 +29,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                scan_inspections: 32,
                grant_outcomes: 8,
                run_lock_attempts: 16,
-               ready_reconciliation_partitions: 32,
-               expired_reconciliation_partitions: 32,
-               reconciliation_cadence_scan_calls: 32,
-               ready_reconciliation_offset: 0,
-               expired_reconciliation_offset: 16,
                max_grants_per_scan_call: 32,
                max_outcomes_per_scan_call: 256,
                max_run_lock_attempts_per_scan_call: 512,
@@ -45,16 +40,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       schedule = ~s("docket_claim_schedule")
       runs = ~s("docket_runs")
       scan = QueryShapes.scan_positions(schedule)
-      ready_repair = QueryShapes.reconciliation_heads(runs, :ready)
-      expired_repair = QueryShapes.reconciliation_heads(runs, :expired)
       ready_candidates = QueryShapes.run_candidates(runs, :ready)
       expired_candidates = QueryShapes.run_candidates(runs, :expired)
       rotating_ready = QueryShapes.rotating_run_candidates(runs, :ready)
 
       for statement <- [
             scan,
-            ready_repair,
-            expired_repair,
             ready_candidates,
             expired_candidates,
             rotating_ready
@@ -67,13 +58,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         refute statement =~ "SKIP LOCKED"
       end
 
-      assert scan =~ "WHERE in_cohort"
+      assert scan =~ "WHERE unfinished_count > 0"
       assert scan =~ "visit_ordinal < 32"
-      assert ready_repair =~ "candidate.scope_key > $1"
-      assert ready_repair =~ "candidate.scope_key = heads.scope_key"
-      assert ready_repair =~ "LIMIT 1"
-      assert expired_repair =~ "candidate.scope_key > $1"
-      assert expired_repair =~ "LIMIT 1"
       assert ready_candidates =~ "candidate.scope_key = $1"
       assert ready_candidates =~ "LIMIT 16"
       assert expired_candidates =~ "candidate.scope_key = $1"
@@ -87,18 +73,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert exact_lock =~ "FOR UPDATE OF runs SKIP LOCKED"
     end
 
-    test "cohort traversal is fixed at S across repeated wrap and ignores clean dormancy" do
-      seed_partitions(1_000)
+    test "active traversal is fixed at S, excludes zero-count tenants, and wraps" do
+      seed_runs(40)
 
-      TestRepo.query!(
-        "UPDATE docket_claim_schedule " <>
-          "SET ready_dirty = false, claimed_dirty = false"
-      )
-
-      TestRepo.query!(
-        "UPDATE docket_claim_schedule SET may_have_ready_at = CURRENT_TIMESTAMP " <>
-          "WHERE scope_key IN ('tenant-0001', 'tenant-1000')"
-      )
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET status = 'done', claim_token = NULL, claimed_at = NULL, wake_at = NULL,
+          finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE scope_key NOT IN ('tenant-0001', 'tenant-0040')
+      """)
 
       [[first_position]] =
         TestRepo.query!(
@@ -112,16 +95,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ).rows
 
       assert length(rows) == Budgets.scan_inspections()
-      assert Enum.map(rows, &Enum.at(&1, 6)) == Enum.to_list(1..Budgets.scan_inspections())
+      assert Enum.map(rows, &Enum.at(&1, 5)) == Enum.to_list(1..Budgets.scan_inspections())
 
       assert rows |> Enum.map(&Enum.at(&1, 1)) |> Enum.uniq() |> Enum.sort() ==
-               ["tenant-0001", "tenant-1000"]
+               ["tenant-0001", "tenant-0040"]
 
-      assert rows |> Enum.map(&Enum.at(&1, 7)) |> List.last() == 16
+      assert rows |> Enum.map(&Enum.at(&1, 6)) |> List.last() == 16
 
       TestRepo.query!(
-        "UPDATE docket_claim_schedule SET may_have_ready_at = NULL " <>
-          "WHERE scope_key = 'tenant-1000'"
+        "UPDATE docket_runs " <>
+          "SET status = 'done', claim_token = NULL, claimed_at = NULL, wake_at = NULL, " <>
+          "finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " <>
+          "WHERE scope_key = 'tenant-0040'"
       )
 
       one_position_rows =
@@ -132,35 +117,111 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert length(one_position_rows) == Budgets.scan_inspections()
       assert Enum.uniq(Enum.map(one_position_rows, &Enum.at(&1, 1))) == ["tenant-0001"]
-      assert one_position_rows |> List.last() |> Enum.at(7) == 31
+      assert one_position_rows |> List.last() |> Enum.at(6) == 31
     end
 
-    test "recursive loose-index reconciliation visits unique class heads across wrap" do
-      seed_runs(40)
-      now = DateTime.utc_now()
-      cutoff = DateTime.add(now, -3_600, :second)
+    test "unfinished counts follow nonterminal state atomically and protect membership" do
+      seed_runs(1)
 
-      ready_rows =
-        TestRepo.query!(
-          QueryShapes.reconciliation_heads(~s("docket_runs"), :ready),
-          ["tenant-0035", now]
-        ).rows
+      assert TestRepo.query!(
+               "SELECT unfinished_count FROM docket_claim_schedule " <>
+                 "WHERE scope_key = 'tenant-0001'"
+             ).rows == [[2]]
 
-      expired_rows =
-        TestRepo.query!(
-          QueryShapes.reconciliation_heads(~s("docket_runs"), :expired),
-          ["tenant-0035", cutoff]
-        ).rows
+      assert {:error, :rollback} =
+               TestRepo.transaction(fn ->
+                 TestRepo.query!("""
+                 UPDATE docket_runs
+                 SET status = 'done', wake_at = NULL, finished_at = CURRENT_TIMESTAMP
+                 WHERE run_id = 'ready-1'
+                 """)
 
-      assert length(ready_rows) == Budgets.ready_reconciliation_partitions()
-      assert length(expired_rows) == Budgets.expired_reconciliation_partitions()
-      assert ready_rows |> Enum.map(&hd/1) |> Enum.uniq() |> length() == length(ready_rows)
-      assert expired_rows |> Enum.map(&hd/1) |> Enum.uniq() |> length() == length(expired_rows)
-      assert Enum.map(ready_rows, &Enum.at(&1, 1)) == Enum.to_list(1..32)
-      assert Enum.any?(ready_rows, &Enum.at(&1, 2))
-      assert Enum.any?(expired_rows, &Enum.at(&1, 2))
-      assert Enum.all?(ready_rows, &(Enum.at(&1, 3) != nil))
-      assert Enum.all?(expired_rows, &(Enum.at(&1, 3) != nil))
+                 assert TestRepo.query!(
+                          "SELECT unfinished_count FROM docket_claim_schedule " <>
+                            "WHERE scope_key = 'tenant-0001'"
+                        ).rows == [[1]]
+
+                 TestRepo.rollback(:rollback)
+               end)
+
+      assert TestRepo.query!(
+               "SELECT unfinished_count FROM docket_claim_schedule " <>
+                 "WHERE scope_key = 'tenant-0001'"
+             ).rows == [[2]]
+
+      assert_raise Postgrex.Error, fn ->
+        TestRepo.query!("DELETE FROM docket_claim_partitions WHERE scope_key = 'tenant-0001'")
+      end
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET status = 'done', claim_token = NULL, claimed_at = NULL, wake_at = NULL,
+          finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE scope_key = 'tenant-0001'
+      """)
+
+      assert TestRepo.query!(
+               "SELECT unfinished_count FROM docket_claim_schedule " <>
+                 "WHERE scope_key = 'tenant-0001'"
+             ).rows == [[0]]
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET status = 'running', finished_at = NULL, wake_at = CURRENT_TIMESTAMP,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE run_id = 'ready-1'
+      """)
+
+      assert TestRepo.query!(
+               "SELECT unfinished_count FROM docket_claim_schedule " <>
+                 "WHERE scope_key = 'tenant-0001'"
+             ).rows == [[1]]
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET status = 'done', wake_at = NULL, finished_at = CURRENT_TIMESTAMP,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE run_id = 'ready-1'
+      """)
+
+      assert TestRepo.query!(
+               "SELECT unfinished_count FROM docket_claim_schedule " <>
+                 "WHERE scope_key = 'tenant-0001'"
+             ).rows == [[0]]
+
+      TestRepo.query!("DELETE FROM docket_claim_partitions WHERE scope_key = 'tenant-0001'")
+      assert TestRepo.query!("SELECT count(*) FROM docket_claim_schedule").rows == [[0]]
+    end
+
+    test "waiting runs stay unfinished and cannot be orphaned before resuming" do
+      seed_runs(1)
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET status = 'waiting', claim_token = NULL, claimed_at = NULL, wake_at = NULL,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE run_id = 'ready-1'
+      """)
+
+      assert TestRepo.query!(
+               "SELECT unfinished_count FROM docket_claim_schedule " <>
+                 "WHERE scope_key = 'tenant-0001'"
+             ).rows == [[2]]
+
+      assert_raise Postgrex.Error, fn ->
+        TestRepo.query!("DELETE FROM docket_claim_partitions WHERE scope_key = 'tenant-0001'")
+      end
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET status = 'running', wake_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE run_id = 'ready-1'
+      """)
+
+      assert TestRepo.query!(
+               "SELECT unfinished_count FROM docket_claim_schedule " <>
+                 "WHERE scope_key = 'tenant-0001'"
+             ).rows == [[2]]
     end
 
     test "persisted ready continuation reaches poison beyond two cap-denied K pages" do
@@ -299,12 +360,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       blocker =
         Task.async(fn ->
           TestRepo.transaction(fn ->
-            assert [[0, 0]] =
-                     TestRepo.query!(QueryShapes.scan_cursor_lock(~s("docket_claim_scan_cursor"))).rows
+            assert [[0]] =
+                     TestRepo.query!(QueryShapes.scan_cursor_lock(~s("docket_claim_policy"))).rows
 
             TestRepo.query!(
-              "UPDATE docket_claim_scan_cursor " <>
-                "SET ring_position = 99, scan_call_sequence = 1 WHERE id = 1"
+              "UPDATE docket_claim_policy " <>
+                "SET scan_ring_position = 99 WHERE id = 1"
             )
 
             send(parent, {:cursor_locked, self()})
@@ -325,7 +386,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             TestRepo.query!("SET lock_timeout = '100ms'")
 
             try do
-              TestRepo.query!(QueryShapes.scan_cursor_lock(~s("docket_claim_scan_cursor")))
+              TestRepo.query!(QueryShapes.scan_cursor_lock(~s("docket_claim_policy")))
             after
               TestRepo.query!("SET lock_timeout = 0")
             end
@@ -336,9 +397,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       send(blocker_pid, :rollback)
       assert Task.await(blocker, 2_000) == {:error, :intentional}
 
-      assert TestRepo.query!(
-               "SELECT ring_position, scan_call_sequence FROM docket_claim_scan_cursor"
-             ).rows == [[0, 0]]
+      assert TestRepo.query!("SELECT scan_ring_position FROM docket_claim_policy").rows == [[0]]
     end
 
     test "exact-key lock attempts cannot scan past a locked prefix" do
@@ -396,6 +455,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         SELECT 'tenant-' || lpad(series::text, 4, '0'),
                'graph', 'hash', decode('01', 'hex'), CURRENT_TIMESTAMP
         FROM generate_series(1, $1) AS series
+        """,
+        [count]
+      )
+
+      TestRepo.query!(
+        """
+        INSERT INTO docket_claim_partitions (scope_key)
+        SELECT 'tenant-' || lpad(series::text, 4, '0')
+        FROM generate_series(1, $1) AS series
+        ON CONFLICT (scope_key) DO NOTHING
         """,
         [count]
       )

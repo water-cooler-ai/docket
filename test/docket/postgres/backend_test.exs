@@ -941,11 +941,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert tables ==
                ~w(
-                 docket_claim_expired_reconciliation
                  docket_claim_partitions
                  docket_claim_policy
-                 docket_claim_ready_reconciliation
-                 docket_claim_scan_cursor
                  docket_claim_schedule
                  docket_events
                  docket_graph_versions
