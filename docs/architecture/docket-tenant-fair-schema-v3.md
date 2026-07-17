@@ -162,27 +162,21 @@ count-neutral at cap, so v0.1 adds no expired continuation state.
 - `ORDER BY ... LIMIT n FOR UPDATE SKIP LOCKED` is not a work bound because it
   may scan arbitrarily many locked rows to return `n` unlocked rows.
 
-## Reproducible evidence
+## Non-release diagnostic result
 
-Run:
+During DCKT-76 review, an ephemeral PostgreSQL 15 `EXPLAIN (ANALYZE, BUFFERS)`
+experiment exercised full, sparse, and `H < S` ring shapes plus bounded
+candidate and lock probes. The selected shapes stayed inside the ratified
+logical ceilings and used their intended indexes; the rejected global shapes
+processed work proportional to eligible-run population. The experiment and
+its generated plans are intentionally not shipped with v0.1.0, and their warm-
+cache timings are neither a release benchmark nor fairness evidence.
 
-```sh
-mix run bench/postgres/dckt_76_query_plans.exs
-```
-
-The harness records `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` plans and checks
-fixed root cardinality, selected indexes, recursive ceilings, exact-key lock
-attempts, and absence of selected sequential or bitmap heap scans. One fixture
-contains 20,000 unfinished positions plus one hot tenant; a second contains
-20,000 registered partitions but only 120 unfinished positions. Both return
-exactly `S = 32` positions with 63 index visits and zero filtered rows. The
-`H < S` fixture proves repeated wrap.
-
-The evidence is a bounded-work and index-shape gate. Full-cycle call count is
-honestly `ceil(H / S)` in the no-grant case; elapsed latency must be measured under
-real deployments. Any narrower readiness accelerator remains post-MVP until
-observed dormant unfinished populations or latency prove it necessary; it may
-not become the only route by which unfinished work is discovered.
+Full-cycle call count is honestly `ceil(H / S)` in the no-grant case; elapsed
+latency must be measured under real deployments. Any narrower readiness
+accelerator remains post-MVP until observed dormant unfinished populations or
+latency prove it necessary; it may not become the only route by which
+unfinished work is discovered.
 
 ## Migration boundary
 

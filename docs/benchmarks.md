@@ -7,23 +7,6 @@ database via `DOCKET_BENCH_DATABASE_URL`.
 - **Scorecard** (`bench/postgres/scorecard.exs`, this document): system-level
   scenarios against the real supervised runtime, condensed into named 0–100
   scores with invariant gates.
-- **DCKT-76 query plans** (`bench/postgres/dckt_76_query_plans.exs`):
-  deterministic schema-v3 unfinished-ring and candidate shape evidence. It
-  records `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` and asserts required
-  indexes plus fixed recursive, scan, lock, and mutation work ceilings; it is
-  not a timing score or fairness proof.
-
-Run the DCKT-76 evidence harness against a local PostgreSQL database with:
-
-```sh
-mix run bench/postgres/dckt_76_query_plans.exs
-```
-
-Set `DOCKET_DCKT76_DATABASE_URL` when the default local `postgres` database is
-not appropriate. The harness creates and removes only its uniquely named
-scratch schema. The ratified constants and interpretation are documented in
-[TenantFair schema-v3 active-ring decision](architecture/docket-tenant-fair-schema-v3.md).
-
 ## Scorecard
 
 ```

@@ -21,10 +21,10 @@ entries below reflect what has landed so far.
   stores the serialized scan position on the existing policy row. Fixed `S =
   32`, `Q = 8`, exact-key
   lock/run-mutation-input ceilings, and bounded poison-safe candidate
-  continuation are backed by reproducible JSON query plans with logical-work
-  assertions. The ring is an authoritative eligibility superset rather than a
-  lossy cache, so DCKT-77 repair machinery is not part of the v0.1.0 MVP;
-  admission and executable fairness proof remain in DCKT-78 and DCKT-79.
+  continuation were checked with non-release query-plan experiments. The ring
+  is an authoritative eligibility superset rather than a lossy cache, so
+  DCKT-77 repair machinery is not part of the v0.1.0 MVP; admission and
+  executable fairness proof remain in DCKT-78 and DCKT-79.
 - PostgreSQL run creation now atomically materializes the canonical
   owner-derived claim partition with an inherited cap and version-zero state.
   Concurrent first inserts use `ON CONFLICT DO NOTHING`, preserving Admin-owned

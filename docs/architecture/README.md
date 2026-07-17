@@ -42,8 +42,8 @@ when you want to understand *why* the contracts are shaped the way they are.
      stopped-upgrade invariants.
 10. `docket-tenant-fair-schema-v3.md`
     - The fixed TenantFair discovery budgets, authoritative unfinished ring,
-      durable cursor, chosen query shapes, rejected baselines, and PostgreSQL
-      plan evidence for DCKT-76.
+      durable cursor, chosen query shapes, rejected baselines, and non-release
+      diagnostic boundary for DCKT-76.
 11. `docket-claim-policy.md`
     - The RunStore-to-ClaimPolicy boundary and the implemented Legacy and
       TenantFair engines.

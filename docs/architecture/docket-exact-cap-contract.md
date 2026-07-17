@@ -322,7 +322,7 @@ the scan position to the existing policy row without weakening schema-v2
 safety. The current
 binary requires schema version 3; version 2 is its immediate rollback point
 and version 1 remains the older host upgrade waypoint. The ratified constants,
-query shapes, and plan evidence are in
+query shapes, and non-release diagnostic boundary are in
 [TenantFair schema-v3 active-ring decision](docket-tenant-fair-schema-v3.md).
 
 The supported upgrade remains stopped and homogeneous. Online migration and
