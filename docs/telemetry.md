@@ -56,6 +56,51 @@ Claims fence durable state only. A stolen claim can execute node code and
 external effects more than once even though only one moment commits. External
 effects require their own stable idempotency scheme.
 
+## Fair-rotation evidence boundary
+
+Schema v2 emits only the generic ClaimPolicy and claim events in the catalog
+above. It does not expose the cursor, visit, grant, or service-epoch evidence
+needed to prove the DCKT-75 bounded-bypass contract. Its query duration and the
+existing TenantFair timing score are not substitutes for that evidence.
+
+Schema v3 must keep the generic admission event and add one bounded,
+identity-free fair-rotation observation. Its aggregate measurements cover:
+
+- configured inspection budget `S` and grant outcome limit `Q`;
+- scan pages, unique hint positions inspected, cursor advances, and wraps;
+- partition locks, lock skips, grants, leases, poison outcomes, and total
+  outcomes;
+- cap-denied, stale, and empty visits;
+- hint repairs, reconciliation work, and explicit work-budget exhaustion; and
+- `admission_epoch` advances.
+
+For every available committed observation:
+
+```text
+outcomes = leases + poisoned
+outcomes <= Q * grants
+grants <= locked visits
+admission_epoch advances = grants
+cursor advances = hint positions inspected
+```
+
+A denial, stale/empty visit, or lock skip contributes no grant and no service-
+epoch advance. A statement that fails before scan authority, or later rolls
+back with its caller, supplies no committed cursor/grant evidence. Operational
+attempt telemetry may still describe such work, so collectors must not
+silently treat attempt counts as durable proof.
+
+Metadata remains bounded enums such as implementation, result, and observation
+availability. Tenant ID, raw `scope_key`, run or graph identity, cursor token,
+and claim token are forbidden as ordinary metric labels. Per-target bypass
+requires an identity-bearing, database-ordered trace in the deterministic test
+or trusted inspection plane; aggregate telemetry cannot reconstruct it.
+
+The normative populations, units, formulas, exclusions, and Legacy control are
+in the [exact-cap and fair-rotation admission contract](architecture/docket-exact-cap-contract.md).
+Timing and query-plan benchmarks remain separate regression evidence and never
+replace that correctness oracle.
+
 ## Benchmark derivations
 
 - Throughput: rate of `lifecycle.committed.count`; checkpoint and superstep
