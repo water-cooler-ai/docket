@@ -72,25 +72,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               inspect(ctx)
     end
 
-    defp transaction_context(
-           %{
-             claim_policy: claim_policy,
-             postgres_backend: postgres_backend,
-             postgres_admin_identity: postgres_admin_identity
-           },
-           repo,
-           prefix
-         ) do
-      %{
-        repo: repo,
-        prefix: prefix,
-        postgres_backend: postgres_backend,
-        postgres_admin_identity: postgres_admin_identity,
-        claim_policy: claim_policy,
-        transaction_scope: true
-      }
-    end
-
     defp transaction_context(%{claim_policy: claim_policy}, repo, prefix) do
       %{repo: repo, prefix: prefix, claim_policy: claim_policy}
     end

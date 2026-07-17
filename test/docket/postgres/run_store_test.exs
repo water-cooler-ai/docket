@@ -100,11 +100,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert %ClaimPartition{
                scope_key: "",
-               preferred_active: nil,
                max_active: nil,
-               weight: nil,
-               borrowing: nil,
-               admin_state: :running,
                partition_version: 0,
                admission_epoch: 0
              } = claim_partition!("")
@@ -160,15 +156,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              }
     end
 
-    test "committed-row fast path preserves every Admin-owned field" do
+    test "committed-row fast path preserves current override and cursor fields" do
       admin_partition =
         TestRepo.insert!(%ClaimPartition{
           scope_key: "tenant",
-          preferred_active: 2,
           max_active: 5,
-          weight: 3,
-          borrowing: true,
-          admin_state: :drain,
           partition_version: 7,
           admission_epoch: 11
         })
@@ -226,7 +218,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert claim_partition_count("tenant") == 1
 
       assert %ClaimPartition{
-               admin_state: :running,
                partition_version: 0,
                admission_epoch: 0
              } = claim_partition!("tenant")
@@ -383,7 +374,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert claim_partition!("tenant").admission_epoch == 1
     end
 
-    test "an uncommitted Admin first insert wins permitted uniqueness arbitration unchanged" do
+    test "an uncommitted override first insert wins uniqueness arbitration unchanged" do
       parent = self()
       ref = make_ref()
 
@@ -393,11 +384,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             partition =
               TestRepo.insert!(%ClaimPartition{
                 scope_key: "x",
-                preferred_active: 4,
                 max_active: 9,
-                weight: 2,
-                borrowing: false,
-                admin_state: :hold_new,
                 partition_version: 12,
                 admission_epoch: 17
               })
@@ -878,7 +865,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       assert_receive {:alternate_claim_policy, :init, :transaction,
-                      %{prefix: "public", identifiers: %{runs: ~s("public"."docket_runs")}}}
+                      %{
+                        prefix: nil,
+                        identifiers: %{
+                          runs: ~s("docket_runs"),
+                          claim_policy: ~s("docket_claim_policy"),
+                          claim_partitions: ~s("docket_claim_partitions")
+                        }
+                      }}
 
       root = Map.put(root, :claim_policy, claim_policy)
 
@@ -2435,11 +2429,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp claim_partition_fields do
       [
         :scope_key,
-        :preferred_active,
         :max_active,
-        :weight,
-        :borrowing,
-        :admin_state,
         :partition_version,
         :admission_epoch,
         :inserted_at,

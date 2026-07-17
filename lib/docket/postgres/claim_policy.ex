@@ -11,7 +11,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     """
 
     alias Docket.Postgres.Storage
-    alias Docket.Postgres.ClaimPolicy.TenantFair.Observation
     alias Docket.Runtime.Clock
 
     @default_implementation Docket.Postgres.ClaimPolicy.Legacy
@@ -46,61 +45,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           }
 
     @type init_context :: %{
-            required(:prefix) => String.t(),
-            required(:identifiers) => identifiers()
+            required(:prefix) => String.t() | nil,
+            required(:identifiers) => %{
+              required(:runs) => String.t(),
+              required(:claim_policy) => String.t(),
+              required(:claim_partitions) => String.t()
+            }
           }
 
     @type plan_context :: %{
-            required(:prefix) => String.t(),
-            required(:identifiers) => identifiers()
+            required(:prefix) => String.t() | nil,
+            required(:identifiers) => %{
+              required(:runs) => String.t(),
+              required(:claim_policy) => String.t(),
+              required(:claim_partitions) => String.t()
+            }
           }
-
-    @type identifiers :: %{
-            required(:runs) => String.t(),
-            required(:claim_policy) => String.t(),
-            required(:claim_partitions) => String.t(),
-            required(:claim_policy_receipts) => String.t(),
-            required(:claim_policy_events) => String.t(),
-            required(:claim_policy_holds) => String.t(),
-            required(:claim_audit_exports) => String.t(),
-            required(:claim_assertions) => String.t(),
-            required(:claim_rollout) => String.t(),
-            required(:claim_admission_gate) => String.t(),
-            required(:claim_capabilities) => String.t()
-          }
-
-    @identifier_tables %{
-      runs: "docket_runs",
-      claim_policy: "docket_claim_policy",
-      claim_partitions: "docket_claim_partitions",
-      claim_policy_receipts: "docket_claim_policy_receipts",
-      claim_policy_events: "docket_claim_policy_events",
-      claim_policy_holds: "docket_claim_policy_holds",
-      claim_audit_exports: "docket_claim_audit_exports",
-      claim_assertions: "docket_claim_assertions",
-      claim_rollout: "docket_claim_rollout",
-      claim_admission_gate: "docket_claim_admission_gate",
-      claim_capabilities: "docket_claim_capabilities"
-    }
 
     @type claim_batch :: %{required(:leases) => [map()], required(:poisoned) => [map()]}
     @type claim_result :: {:ok, claim_batch()} | {:error, term()}
 
     @opaque t :: %__MODULE__{
               implementation: module(),
-              implementation_state: term(),
-              policy_context: plan_context(),
-              admin_repo: module() | nil,
-              admin_identity: term()
+              implementation_state: term()
             }
 
-    @enforce_keys [
-      :implementation,
-      :implementation_state,
-      :policy_context,
-      :admin_repo,
-      :admin_identity
-    ]
+    @enforce_keys [:implementation, :implementation_state]
     defstruct @enforce_keys
 
     @callback init(keyword(), init_context()) :: {:ok, state :: term()} | {:error, term()}
@@ -118,14 +88,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 state :: term()
               ) :: :ok
 
-    @callback activation_contract(state :: term()) ::
-                %{
-                  required(:engine) => :tenant_fair,
-                  required(:function_contract) => pos_integer()
-                }
-
-    @optional_callbacks activation_contract: 1
-
     @doc false
     @spec new(keyword(), Docket.Backend.ctx()) :: t()
     def new(config, context) do
@@ -142,11 +104,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       validate_implementation!(implementation)
 
-      policy_context = init_context!(context)
-      {_repo, _prefix} = Storage.context!(context)
-
       implementation_state =
-        case implementation.init(implementation_opts, policy_context) do
+        case implementation.init(implementation_opts, init_context!(context)) do
           {:ok, state} ->
             state
 
@@ -163,10 +122,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       %__MODULE__{
         implementation: implementation,
-        implementation_state: implementation_state,
-        policy_context: policy_context,
-        admin_repo: nil,
-        admin_identity: nil
+        implementation_state: implementation_state
       }
     end
 
@@ -190,77 +146,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc false
     @spec implementation(t()) :: module()
     def implementation(%__MODULE__{implementation: implementation}), do: implementation
-
-    @doc false
-    @spec activation_contract(t()) ::
-            %{required(:engine) => :tenant_fair, required(:function_contract) => pos_integer()}
-            | :none
-    def activation_contract(%__MODULE__{
-          implementation: implementation,
-          implementation_state: state
-        }) do
-      if function_exported?(implementation, :activation_contract, 1) do
-        case implementation.activation_contract(state) do
-          %{engine: :tenant_fair, function_contract: contract} = metadata
-          when is_integer(contract) and contract > 0 and map_size(metadata) == 2 ->
-            metadata
-
-          _other ->
-            :none
-        end
-      else
-        :none
-      end
-    rescue
-      _error -> :none
-    catch
-      _kind, _reason -> :none
-    end
-
-    @doc false
-    @spec admin_context?(t(), term(), module(), String.t(), identifiers()) :: boolean()
-    def admin_context?(
-          %__MODULE__{
-            admin_repo: repo,
-            admin_identity: identity,
-            policy_context: %{prefix: prefix, identifiers: identifiers} = policy_context,
-            implementation: implementation,
-            implementation_state: implementation_state
-          },
-          identity,
-          repo,
-          prefix,
-          identifiers
-        ) do
-      valid_factory_identity?(
-        identity,
-        repo,
-        prefix,
-        identifiers,
-        {implementation, implementation_state, policy_context}
-      )
-    end
-
-    def admin_context?(%__MODULE__{}, _identity, _repo, _prefix, _identifiers), do: false
-
-    defp valid_factory_identity?(identity, repo, prefix, identifiers, policy_binding)
-         when is_function(identity, 0) do
-      with {:module, Docket.Postgres} <- :erlang.fun_info(identity, :module),
-           {:arity, 0} <- :erlang.fun_info(identity, :arity),
-           {:docket_postgres_admin_v1, nonce, ^repo, ^prefix, ^identifiers, ^policy_binding}
-           when is_binary(nonce) and byte_size(nonce) == 32 <- identity.() do
-        true
-      else
-        _ -> false
-      end
-    rescue
-      _ -> false
-    catch
-      _, _ -> false
-    end
-
-    defp valid_factory_identity?(_identity, _repo, _prefix, _identifiers, _policy_binding),
-      do: false
 
     @doc false
     @spec effective_policy!(runtime_input()) :: runtime_input()
@@ -302,11 +187,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc false
     @spec build_plan(t(), Docket.Backend.ctx(), runtime_input()) :: Plan.t()
     def build_plan(%__MODULE__{} = claim_policy, context, effective_policy) do
-      _ = Storage.context!(context)
-
       plan =
         claim_policy.implementation.build_plan(
-          claim_policy.policy_context,
+          plan_context!(context),
           effective_policy,
           claim_policy.implementation_state
         )
@@ -330,17 +213,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           {:ok, %{leases: leases, poisoned: poisoned} = batch, observation}
           when is_list(leases) and is_list(poisoned) and is_map(observation) ->
             validate_observation!(observation, :decoded, claim_policy.implementation)
-            validate_admission_observation!(plan, observation, batch, claim_policy.implementation)
             {:ok, batch, observation}
 
           {:error, reason, observation} when is_map(observation) ->
-            if data_only?(reason) do
-              validate_observation!(observation, :decoded, claim_policy.implementation)
-              {:error, reason, observation}
-            else
-              {:error,
-               {:claim_policy_decode_failed, {:invalid_return, {:error, reason, observation}}}}
-            end
+            validate_observation!(observation, :decoded, claim_policy.implementation)
+            {:error, reason, observation}
 
           other ->
             {:error, {:claim_policy_decode_failed, {:invalid_return, other}}}
@@ -380,14 +257,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           _kind, _reason -> :ok
         end
 
-      emit_admission_observation(
-        claim_policy.implementation,
-        plan,
-        decoded_observation,
-        duration,
-        result
-      )
-
       emit_admission(claim_policy.implementation, plan, duration, result)
       :ok
     end
@@ -395,22 +264,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc false
     @spec plan_context!(Docket.Backend.ctx()) :: plan_context()
     def plan_context!(context) do
-      {repo, prefix} = Storage.context!(context)
-      policy_context(Storage.physical_prefix!(repo, prefix))
+      {_repo, prefix} = Storage.context!(context)
+      policy_context(prefix)
     end
 
     defp init_context!(context) do
-      {repo, prefix} = Storage.context!(context)
-      policy_context(Storage.physical_prefix!(repo, prefix))
+      {_repo, prefix} = Storage.context!(context)
+      policy_context(prefix)
     end
 
     defp policy_context(prefix) do
       %{
         prefix: prefix,
-        identifiers:
-          Map.new(@identifier_tables, fn {key, table} ->
-            {key, Storage.qualified_table(prefix, table)}
-          end)
+        identifiers: %{
+          runs: Storage.qualified_table(prefix, "docket_runs"),
+          claim_policy: Storage.qualified_table(prefix, "docket_claim_policy"),
+          claim_partitions: Storage.qualified_table(prefix, "docket_claim_partitions")
+        }
       }
     end
 
@@ -468,7 +338,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp validate_observation!(observation, stage, implementation)
          when is_map(observation) and map_size(observation) <= @max_observation_keys do
       if data_only?(observation) do
-        validate_reserved_admission_observation!(observation, stage, implementation)
+        :ok
       else
         invalid_observation!(stage, implementation)
       end
@@ -481,66 +351,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       raise ArgumentError,
             "ClaimPolicy implementation #{inspect(implementation)} #{stage} observation must be " <>
               "a data-only map with at most #{@max_observation_keys} keys"
-    end
-
-    defp validate_reserved_admission_observation!(observation, stage, implementation) do
-      case Map.fetch(observation, :admission_observation) do
-        :error ->
-          :ok
-
-        {:ok, reserved} ->
-          try do
-            case stage do
-              :plan -> Observation.validate_plan!(reserved)
-              :decoded -> Observation.validate!(reserved)
-            end
-
-            :ok
-          rescue
-            exception in ArgumentError ->
-              raise ArgumentError,
-                    "ClaimPolicy implementation #{inspect(implementation)} has an invalid " <>
-                      "#{stage} admission observation: #{Exception.message(exception)}"
-          end
-      end
-    end
-
-    defp validate_admission_observation!(%Plan{} = plan, decoded, batch, implementation) do
-      plan_contract = Map.get(plan.observation, :admission_observation)
-      decoded_contract = Map.get(decoded, :admission_observation)
-
-      cond do
-        is_nil(plan_contract) and is_nil(decoded_contract) ->
-          :ok
-
-        is_nil(plan_contract) ->
-          invalid_admission_contract!(
-            implementation,
-            "decoded observation opted in without a plan declaration"
-          )
-
-        is_nil(decoded_contract) ->
-          invalid_admission_contract!(
-            implementation,
-            "successful decode omitted the declared TenantFair observation"
-          )
-
-        true ->
-          try do
-            Observation.validate_plan!(plan_contract)
-            Observation.validate_batch!(decoded_contract, batch, plan.demand)
-            :ok
-          rescue
-            exception in ArgumentError ->
-              invalid_admission_contract!(implementation, Exception.message(exception))
-          end
-      end
-    end
-
-    defp invalid_admission_contract!(implementation, requirement) do
-      raise ArgumentError,
-            "ClaimPolicy implementation #{inspect(implementation)} admission observation " <>
-              "contract failed: #{requirement}"
     end
 
     defp data_only?(value)
@@ -557,140 +367,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp data_only?(_value), do: false
-
-    defp emit_admission_observation(
-           implementation,
-           %Plan{} = plan,
-           decoded_observation,
-           duration,
-           result
-         ) do
-      case Map.get(plan.observation, :admission_observation) do
-        %Observation.Plan{} ->
-          emit_declared_admission_observation(
-            implementation,
-            plan,
-            decoded_observation,
-            duration,
-            result
-          )
-
-        _other ->
-          :ok
-      end
-    end
-
-    defp emit_declared_admission_observation(
-           implementation,
-           %Plan{} = plan,
-           %{admission_observation: %Observation{} = observation},
-           duration,
-           {:ok, %{leases: leases, poisoned: poisoned}}
-         ) do
-      outcomes = length(leases) + length(poisoned)
-
-      measurements =
-        observation
-        |> Observation.measurements()
-        |> Map.merge(%{
-          duration: duration,
-          demand: plan.demand,
-          leases: length(leases),
-          poisoned: length(poisoned),
-          outcomes: outcomes,
-          unfilled_demand: max(plan.demand - outcomes, 0),
-          steals: observation.expired_leases
-        })
-
-      metadata = %{
-        implementation: implementation,
-        schema: Observation.schema(),
-        result: :ok,
-        observation_status: :available,
-        admission_class:
-          bounded_class(
-            observation.preferred_admissions,
-            observation.borrowed_admissions,
-            :preferred,
-            :borrowed
-          ),
-        work_class:
-          bounded_class(
-            observation.ready_leases + observation.ready_poisoned,
-            observation.expired_leases + observation.expired_poisoned,
-            :ready,
-            :expired
-          ),
-        batch_shape: batch_shape(observation, outcomes, plan.demand),
-        policy_source:
-          bounded_class(
-            observation.default_policy_partitions,
-            observation.override_policy_partitions,
-            :default,
-            :override
-          ),
-        admin_state: admin_state(observation)
-      }
-
-      :telemetry.execute(
-        [:docket, :postgres, :claim_policy, :admission, :observation],
-        measurements,
-        metadata
-      )
-    end
-
-    defp emit_declared_admission_observation(
-           implementation,
-           %Plan{} = plan,
-           _decoded_observation,
-           duration,
-           result
-         ) do
-      :telemetry.execute(
-        [:docket, :postgres, :claim_policy, :admission, :observation],
-        %{duration: duration, demand: plan.demand},
-        %{
-          implementation: implementation,
-          schema: Observation.schema(),
-          result: Docket.Telemetry.result_kind(result),
-          observation_status: :unavailable,
-          admission_class: :none,
-          work_class: :none,
-          batch_shape: :error,
-          policy_source: :none,
-          admin_state: :none
-        }
-      )
-    end
-
-    defp bounded_class(0, 0, _left, _right), do: :none
-    defp bounded_class(left_count, 0, left, _right) when left_count > 0, do: left
-    defp bounded_class(0, right_count, _left, right) when right_count > 0, do: right
-
-    defp bounded_class(left_count, right_count, _left, _right)
-         when left_count > 0 and right_count > 0,
-         do: :mixed
-
-    defp admin_state(%Observation{} = observation) do
-      active =
-        [
-          {:running, observation.running_partitions},
-          {:hold_new, observation.hold_new_partitions},
-          {:drain, observation.drain_partitions}
-        ]
-        |> Enum.filter(fn {_state, count} -> count > 0 end)
-
-      case active do
-        [] -> :none
-        [{state, _count}] -> state
-        _mixed -> :mixed
-      end
-    end
-
-    defp batch_shape(%Observation{under_claimed: 1}, _outcomes, _demand), do: :under_claim
-    defp batch_shape(_observation, 0, _demand), do: :no_op
-    defp batch_shape(_observation, demand, demand), do: :full
-    defp batch_shape(_observation, _outcomes, _demand), do: :partial
 
     defp emit_admission(implementation, %Plan{} = plan, duration, result) do
       {leases, poisoned} =

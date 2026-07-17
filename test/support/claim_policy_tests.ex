@@ -227,59 +227,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
   end
 
-  defmodule Docket.Test.ObservedClaimPolicy do
-    @moduledoc false
-
-    @behaviour Docket.Postgres.ClaimPolicy
-
-    alias Docket.Postgres.ClaimPolicy.Plan
-    alias Docket.Postgres.ClaimPolicy.TenantFair.Observation
-
-    @impl true
-    def init(options, _context) do
-      {:ok,
-       %{
-         batch: Keyword.fetch!(options, :batch),
-         observation: Keyword.get(options, :observation),
-         declare?: Keyword.get(options, :declare?, true),
-         decode?: Keyword.get(options, :decode?, true),
-         observe: Keyword.get(options, :observe, :ok)
-       }}
-    end
-
-    @impl true
-    def build_plan(_context, _policy, state) do
-      observation =
-        if state.declare?,
-          do: %{admission_observation: Observation.plan(), private_plan_marker: :retained},
-          else: %{private_plan_marker: :retained}
-
-      %Plan{
-        statement: "SELECT 1",
-        params: [],
-        decoder: %{},
-        observation: observation
-      }
-    end
-
-    @impl true
-    def decode(_rows, _decoder, state) do
-      observation =
-        if state.decode?,
-          do: %{admission_observation: state.observation, private_decode_marker: :retained},
-          else: %{private_decode_marker: :retained}
-
-      {:ok, state.batch, observation}
-    end
-
-    @impl true
-    def observe(_plan, _decoded, _result, _duration, %{observe: :raise}) do
-      raise "TenantFair observer failed"
-    end
-
-    def observe(_plan, _decoded, _result, _duration, _state), do: :ok
-  end
-
   defmodule Docket.Test.ClaimPolicyTests do
     @moduledoc false
 

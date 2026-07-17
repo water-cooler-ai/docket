@@ -44,53 +44,6 @@ defmodule Docket.TelemetryTest do
            }
   end
 
-  test "TenantFair admission observation labels have closed keys and enum values" do
-    event = [:docket, :postgres, :claim_policy, :admission, :observation]
-
-    metadata = %{
-      implementation: Docket.Postgres.ClaimPolicy.Legacy,
-      schema: :tenant_fair_v1,
-      result: :ok,
-      observation_status: :available,
-      admission_class: :mixed,
-      work_class: :expired,
-      batch_shape: :under_claim,
-      policy_source: :override,
-      admin_state: :hold_new,
-      tenant_id: "tenant-secret",
-      scope_key: "scope-secret",
-      run_id: "run-secret",
-      graph_id: "graph-secret",
-      graph_hash: "hash-secret",
-      claim_token: "token-secret",
-      implementation_state: %{tenant_id: "nested-secret"}
-    }
-
-    assert Docket.Telemetry.metric_metadata(event, metadata) == %{
-             implementation: Docket.Postgres.ClaimPolicy.Legacy,
-             schema: :tenant_fair_v1,
-             result: :ok,
-             observation_status: :available,
-             admission_class: :mixed,
-             work_class: :expired,
-             batch_shape: :under_claim,
-             policy_source: :override,
-             admin_state: :hold_new
-           }
-
-    assert Docket.Telemetry.metric_metadata(event, %{
-             implementation: "tenant-selected-implementation",
-             schema: :tenant_fair_v2,
-             result: {:error, "tenant-secret"},
-             observation_status: "tenant-secret",
-             admission_class: "tenant-secret",
-             work_class: :unknown,
-             batch_shape: :unknown,
-             policy_source: "tenant-secret",
-             admin_state: :unknown
-           }) == %{}
-  end
-
   test "lifecycle and nested store spans share correlation without leaking it to labels" do
     parent = self()
     id = "lifecycle-correlation-#{System.unique_integer([:positive])}"

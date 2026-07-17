@@ -104,35 +104,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       prefix = Storage.physical_prefix!(repo, configured_prefix)
       name = Keyword.get(opts, :name)
 
-      claim_policy =
-        ClaimPolicy.new(Keyword.get(opts, :claim_policy, []), %{
-          repo: repo,
-          prefix: prefix
-        })
-
-      identifiers = ClaimPolicy.plan_context!(%{repo: repo, prefix: prefix}).identifiers
-      admin_identity = factory_admin_identity(claim_policy, repo, prefix, identifiers)
-      claim_policy = %{claim_policy | admin_repo: repo, admin_identity: admin_identity}
-
       resolved = %{
         repo: repo,
         prefix: prefix,
-        postgres_backend: __MODULE__,
-        postgres_admin_identity: admin_identity,
-        claim_policy: claim_policy
+        claim_policy:
+          ClaimPolicy.new(Keyword.get(opts, :claim_policy, []), %{repo: repo, prefix: prefix})
       }
 
       if name, do: Map.put(resolved, :admission_phase, admission_phase_name(name)), else: resolved
-    end
-
-    defp factory_admin_identity(claim_policy, repo, prefix, identifiers) do
-      nonce = :crypto.strong_rand_bytes(32)
-
-      fn ->
-        {:docket_postgres_admin_v1, nonce, repo, prefix, identifiers,
-         {claim_policy.implementation, claim_policy.implementation_state,
-          claim_policy.policy_context}}
-      end
     end
 
     @impl Docket.Backend

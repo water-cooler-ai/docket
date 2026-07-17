@@ -253,6 +253,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {:claim_policy_unavailable, :read_only_transaction}
     end
 
+    defp normalize_claim_query_error(%Postgrex.Error{postgres: %{code: :lock_not_available}}) do
+      {:claim_policy_unavailable, :lock_contention}
+    end
+
     defp normalize_claim_query_error(reason), do: reason
 
     @doc """

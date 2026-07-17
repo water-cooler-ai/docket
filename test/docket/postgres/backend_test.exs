@@ -178,10 +178,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         notifier: :none,
         claim_policy: [
           implementation: Docket.Test.TenantFairConfigClaimPolicy,
-          partition_by: :tenant_id,
-          default_preferred_active: 2,
-          default_max_active: 4,
-          default_weight: 1
+          default_max_active: 4
         ]
     end
 
@@ -201,10 +198,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         pruner: @pruner,
         claim_policy: [
           implementation: Docket.Test.TenantFairConfigClaimPolicy,
-          partition_by: :tenant_id,
-          default_preferred_active: 2,
-          default_max_active: 4,
-          default_weight: 1
+          default_max_active: 4
         ]
     end
 
@@ -526,11 +520,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end)
 
       expected = %Docket.Postgres.ClaimPolicy.TenantFair.Config{
-        partition_by: :tenant_id,
-        default_preferred_active: 2,
-        default_max_active: 4,
-        default_weight: 1,
-        borrowing: false
+        default_max_active: 4
       }
 
       start_supervised!(TenantFairConfigManualHost)
@@ -563,11 +553,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end)
 
       expected = %Docket.Postgres.ClaimPolicy.TenantFair.Config{
-        partition_by: :tenant_id,
-        default_preferred_active: 2,
-        default_max_active: 4,
-        default_weight: 1,
-        borrowing: false
+        default_max_active: 4
       }
 
       start_supervised!(TenantFairConfigSupervisedHost)
@@ -955,16 +941,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert tables ==
                ~w(
-                 docket_claim_admission_gate
-                 docket_claim_assertions
-                 docket_claim_audit_exports
-                 docket_claim_capabilities
                  docket_claim_partitions
                  docket_claim_policy
-                 docket_claim_policy_events
-                 docket_claim_policy_holds
-                 docket_claim_policy_receipts
-                 docket_claim_rollout
                  docket_events
                  docket_graph_versions
                  docket_runs

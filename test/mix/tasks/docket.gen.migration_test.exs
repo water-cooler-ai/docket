@@ -43,7 +43,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, _ast} = Code.string_to_quoted(content)
     end
 
-    test "generates an explicit v1-to-v2 upgrade with routine-down refusal" do
+    test "generates an explicit ordinary v1-to-v2 upgrade" do
       [file] =
         Mix.Tasks.Docket.Gen.Migration.run([
           "-r",
@@ -67,47 +67,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, _ast} = Code.string_to_quoted(content)
     end
 
-    test "generates separate nontransactional online migration with explicit custom prefix" do
-      [file] =
-        Mix.Tasks.Docket.Gen.Migration.run([
-          "-r",
-          "Docket.Postgres.TestRepo",
-          "--migrations-path",
-          @tmp_path,
-          "--online",
-          "--prefix",
-          "docket_private"
-        ])
-
-      assert Path.basename(file) =~ ~r/^\d{14}_complete_docket_v2_online\.exs$/
-      content = File.read!(file)
-
-      assert content =~
-               "defmodule Docket.Postgres.TestRepo.Migrations.CompleteDocketV2Online do"
-
-      assert content =~ "@disable_ddl_transaction true"
-
-      assert content =~
-               "Docket.Postgres.OnlineMigration.up(repo: repo(), prefix: \"docket_private\")"
-
-      assert content =~
-               "Docket.Postgres.OnlineMigration.down(repo: repo(), prefix: \"docket_private\")"
-
-      assert {:ok, _ast} = Code.string_to_quoted(content)
-    end
-
-    test "rejects ambiguous online upgrade generation and unsafe prefixes" do
-      assert_raise Mix.Error, fn ->
-        Mix.Tasks.Docket.Gen.Migration.run([
-          "-r",
-          "Docket.Postgres.TestRepo",
-          "--migrations-path",
-          @tmp_path,
-          "--online",
-          "--upgrade-from-v1"
-        ])
-      end
-
+    test "rejects unsafe prefixes" do
       assert_raise Mix.Error, fn ->
         Mix.Tasks.Docket.Gen.Migration.run([
           "-r",

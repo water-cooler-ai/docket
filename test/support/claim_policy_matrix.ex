@@ -9,7 +9,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           implementation: Docket.Postgres.ClaimPolicy.Legacy,
           options: [],
           fixture: Docket.Test.LegacyClaimPolicyContract,
-          query_marker: "WITH transaction_context AS MATERIALIZED"
+          query_marker: "ready_candidates AS MATERIALIZED"
         },
         %{
           name: "alternate",
@@ -21,15 +21,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         %{
           name: "TenantFair",
           implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-          options: [
-            partition_by: :tenant_id,
-            default_preferred_active: 1,
-            default_max_active: 2,
-            default_weight: 1,
-            borrowing: false
-          ],
+          options: [default_max_active: 2],
           fixture: Docket.Test.TenantFairClaimPolicyContract,
-          query_marker: "WITH candidate_partitions AS MATERIALIZED",
+          query_marker: "WITH eligible_partitions AS MATERIALIZED",
           run_store_setup: Docket.Test.TenantFairRunStoreSetup
         }
       ]

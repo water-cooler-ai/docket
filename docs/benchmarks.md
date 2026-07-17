@@ -1,16 +1,12 @@
 # Benchmarks
 
-Docket ships two source-checkout benchmark suites under `bench/`. Neither is
-part of the public API or the Hex package contract; both require a dedicated
-PostgreSQL database via `DOCKET_BENCH_DATABASE_URL`.
+Docket ships one source-checkout benchmark suite under `bench/`. It is not part
+of the public API or Hex package contract and requires a dedicated PostgreSQL
+database via `DOCKET_BENCH_DATABASE_URL`.
 
 - **Scorecard** (`bench/postgres/scorecard.exs`, this document): system-level
   scenarios against the real supervised runtime, condensed into named 0–100
   scores with invariant gates.
-- **Tenant-fair claim** (`bench/postgres/tenant_fair_claim.exs`, documented in
-  `docs/postgres-operations.md`): SQL-prototype comparison for the TenantFair
-  admission engine's candidate queries. A different layer — it measures
-  candidate statements, not the running system.
 
 ## Scorecard
 
@@ -71,12 +67,9 @@ Interpretation caveats:
   so a number becomes a trend line on one machine; comparing scores across
   hardware is meaningless. Ratio-based scores (scaling, fairness, surge) are
   dimensionless and travel better.
-- **Both fairness rows are expected to score low** while the legacy
-  tenant-blind claim policy is the default: the scenarios construct exactly
-  the head-of-line convoys the TenantFair design
-  (`docs/architecture/docket-tenant-claim-fairness-design.md`) exists to fix,
-  and the rows are the regression hooks for that work. A low score here is an
-  honest baseline, not a defect in the run.
+- **Fairness scores depend on the selected claim policy.** Keep comparisons on
+  the same database and machine, and treat them as regression signals rather
+  than release evidence.
 - **Claim efficiency measures the raw claim path under concurrent callers.**
   Production serializes admission through one dispatcher per instance, so this
   is a ceiling probe, not a production simulation.

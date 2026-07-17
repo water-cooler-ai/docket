@@ -6,19 +6,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Schemas.GraphVersion
     alias Docket.Postgres.Schemas.Run
 
-    alias Docket.Postgres.Schemas.{
-      ClaimAdmissionGate,
-      ClaimAssertion,
-      ClaimAuditExport,
-      ClaimCapability,
-      ClaimPartition,
-      ClaimPolicy,
-      ClaimPolicyEvent,
-      ClaimPolicyHold,
-      ClaimPolicyReceipt,
-      ClaimRollout
-    }
-
     @valid_run %{
       run_id: "run_1",
       graph_id: "g1",
@@ -174,98 +161,35 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    describe "v2 source-owned row codecs" do
-      test "bind every schema to its prefix-local source" do
-        assert %{
-                 ClaimPolicy => "docket_claim_policy",
-                 ClaimPartition => "docket_claim_partitions",
-                 ClaimPolicyReceipt => "docket_claim_policy_receipts",
-                 ClaimPolicyEvent => "docket_claim_policy_events",
-                 ClaimPolicyHold => "docket_claim_policy_holds",
-                 ClaimAuditExport => "docket_claim_audit_exports",
-                 ClaimAssertion => "docket_claim_assertions",
-                 ClaimRollout => "docket_claim_rollout",
-                 ClaimAdmissionGate => "docket_claim_admission_gate",
-                 ClaimCapability => "docket_claim_capabilities"
-               } ==
-                 Map.new(
-                   [
-                     ClaimPolicy,
-                     ClaimPartition,
-                     ClaimPolicyReceipt,
-                     ClaimPolicyEvent,
-                     ClaimPolicyHold,
-                     ClaimAuditExport,
-                     ClaimAssertion,
-                     ClaimRollout,
-                     ClaimAdmissionGate,
-                     ClaimCapability
-                   ],
-                   &{&1, &1.__schema__(:source)}
-                 )
+    describe "exact-cap schemas" do
+      test "bind only the current policy and partition authority" do
+        assert Docket.Postgres.Schemas.ClaimPolicy.__schema__(:source) ==
+                 "docket_claim_policy"
+
+        assert Docket.Postgres.Schemas.ClaimPartition.__schema__(:source) ==
+                 "docket_claim_partitions"
       end
 
-      test "marks both durable receipt identity columns as the composite primary key" do
-        assert ClaimPolicyReceipt.__schema__(:primary_key) == [:source, :event_id]
-      end
-
-      test "claim rollout owns finite backfill target and retry fields" do
-        assert ClaimRollout.__schema__(:type, :backfill_target_id) == :integer
-        assert ClaimRollout.__schema__(:type, :backfill_cursor) == :integer
-        assert ClaimRollout.__schema__(:type, :backfill_retries) == :integer
-
-        rollout = %ClaimRollout{}
-        assert rollout.backfill_target_id == nil
-        assert rollout.backfill_cursor == nil
-        assert rollout.backfill_retries == 0
-      end
-
-      test "own the exact durable enum string mappings" do
-        assert Ecto.Enum.mappings(ClaimPartition, :admin_state) ==
-                 [running: "running", hold_new: "hold_new", drain: "drain"]
-
-        assert Ecto.Enum.mappings(ClaimPolicyReceipt, :target_kind) ==
+      test "keep the persisted model minimal" do
+        assert Docket.Postgres.Schemas.ClaimPolicy.__schema__(:fields) ==
                  [
-                   default: "default",
-                   partition: "partition",
-                   bulk: "bulk",
-                   activation: "activation",
-                   readiness: "readiness",
-                   audit: "audit"
+                   :id,
+                   :admission_mode,
+                   :max_active,
+                   :policy_version,
+                   :initialized_at,
+                   :updated_at
                  ]
 
-        assert Ecto.Enum.mappings(ClaimPolicyReceipt, :outcome) ==
-                 [applied: "applied", unchanged: "unchanged", demoted: "demoted"]
-
-        assert Ecto.Enum.mappings(ClaimAssertion, :assertion_kind) ==
-                 [dual_write: "dual_write", old_binaries_absent: "old_binaries_absent"]
-
-        assert Ecto.Enum.mappings(ClaimRollout, :backfill_phase) ==
+        assert Docket.Postgres.Schemas.ClaimPartition.__schema__(:fields) ==
                  [
-                   not_started: "not_started",
-                   running: "running",
-                   reconciling: "reconciling",
-                   complete: "complete"
+                   :scope_key,
+                   :max_active,
+                   :partition_version,
+                   :admission_epoch,
+                   :inserted_at,
+                   :updated_at
                  ]
-
-        assert Ecto.Enum.mappings(ClaimRollout, :fk_disposition) ==
-                 [absent: "absent", not_valid: "not_valid", validated: "validated"]
-
-        assert Ecto.Enum.mappings(ClaimAdmissionGate, :readiness) ==
-                 [not_ready: "not_ready", ready: "ready"]
-
-        assert Ecto.Enum.mappings(ClaimAdmissionGate, :admission_mode) ==
-                 [legacy: "legacy", tenant_fair: "tenant_fair"]
-      end
-
-      test "redact policy fingerprints and target identity" do
-        assert Enum.sort(ClaimPolicyReceipt.__schema__(:redact_fields)) ==
-                 [:request_fingerprint, :target_fingerprints]
-
-        assert Enum.sort(ClaimPolicyEvent.__schema__(:redact_fields)) ==
-                 [:after_value, :before_value, :request_fingerprint, :target_keys]
-
-        assert ClaimCapability.__schema__(:redact_fields) == [:binary_fingerprint]
       end
     end
   end

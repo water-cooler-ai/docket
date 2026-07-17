@@ -307,8 +307,9 @@ can't be expressed with `path`/`equals`/`all`/`any`.
 ## Theme 9 — Tenant-partitioned claim fairness (v0.1.1 follow-up)
 
 The detailed implementation plan, including dynamic per-tenant policy,
-weighted service, strict ceilings, and non-preemptive borrowing, is maintained in
-[`architecture/docket-tenant-claim-fairness-design.md`](architecture/docket-tenant-claim-fairness-design.md).
+weighted service, strict ceilings, and non-preemptive borrowing, remains a
+post-v0.1 design area. The smaller shipped invariant is documented in
+[`architecture/docket-exact-cap-contract.md`](architecture/docket-exact-cap-contract.md).
 
 Add moderate multi-tenant fairness to the shared durable dispatcher without
 preempting node execution or weakening claim fencing. A global dispatcher

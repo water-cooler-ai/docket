@@ -28,7 +28,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl true
     def build_plan(
-          %{identifiers: %{runs: table, claim_admission_gate: gate}},
+          %{identifiers: %{runs: table, claim_policy: policy}},
           %{
             now: %DateTime{} = now,
             limit: limit,
@@ -42,7 +42,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       cutoff = DateTime.add(now, -ttl, :millisecond)
 
       %Plan{
-        statement: claim_statement(table, gate),
+        statement: claim_statement(table, policy),
         params: [now, cutoff, limit, max, preference && Atom.to_string(preference)],
         decoder: %{now: now, orphan_ttl_ms: ttl},
         observation: %{demand: limit, preference: preference}
@@ -222,7 +222,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @doc false
     @spec claim_statement(String.t(), String.t()) :: String.t()
-    def claim_statement(table, gate) when is_binary(table) and is_binary(gate) do
+    def claim_statement(table, policy) when is_binary(table) and is_binary(policy) do
       """
       WITH transaction_context AS MATERIALIZED (
         SELECT current_setting('transaction_isolation') AS isolation,
@@ -231,7 +231,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       admission_gate AS MATERIALIZED (
         SELECT gate.admission_mode
         FROM transaction_context
-        CROSS JOIN #{gate} AS gate
+        CROSS JOIN #{policy} AS gate
         WHERE transaction_context.isolation = 'read committed'
           AND NOT transaction_context.read_only
           AND gate.id = 1

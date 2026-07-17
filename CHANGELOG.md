@@ -16,56 +16,8 @@ entries below reflect what has landed so far.
 
 ### Added
 
-- Exact-cap `Docket.Postgres.ClaimPolicy.TenantFair` admission engine and
-  canonical prefix-qualified `docket_tenant_fair_claim_v1` function. One
-  tenant-blind bounded discovery statement invokes the function once; fresh
-  ordered gate/default/partition/run authorities enforce additive ready caps,
-  preserve zero-net steals and poison progress, honor running/hold-new/drain,
-  reserve ready/expired class progress across the locked key page, and mutate
-  each key through one bounded set-based command with truthful raw-candidate
-  accounting plus a poison-first, per-class-bounded decision source that cannot
-  be truncated by a later ID limit. Activation verifies the exact
-  prefix-specific function body and rejects overloads or catalog drift.
-- Prefix-wide audited TenantFair activation and rollback interlock: capability
-  heartbeats serialize through the same admission gate as mode changes,
-  activation requires bounded external old-binary proof and the canonical
-  DCKT-72 readiness/catalog evidence, and gate-aware Legacy fails closed under
-  mode, isolation, read-only, and lock contention. Advisory preflight exposes
-  exact prefix/default/index/FK/table/implementation evidence; epoch-CAS mode
-  changes remain replayable, prefix isolated, and auditable.
-- Resumable PostgreSQL v2 online-readiness DDL and verification: generated
-  nontransactional host migrations build the two exact tenant-leading indexes
-  concurrently, install and validate the partition foreign key in separate
-  restartable phases, and persist prefix-local evidence. Catalog proof rejects
-  foreign, constraint-owned, or shape-mismatched objects; interrupted exact
-  indexes can be repaired only while fail-closed. Replayable readiness checks
-  promote or demote the gate from live schema/default/backfill evidence without
-  activating TenantFair admission, which remains owned by the later activation
-  rollout.
-- `Docket.Postgres.ClaimPolicy.Readiness.attest_dual_write/2` and
-  `Docket.Postgres.ClaimPolicy.Backfill.advance/2` for the prefix-local v2
-  partition rollout. The audited, replayable fleet assertion gates a finite,
-  resumable `docket_runs.id` keyset; bounded pages insert distinct canonical
-  partitions without overwriting Admin state, persist the V02 rollout ledger's
-  new `backfill_target_id` and `backfill_retries` alongside cursor/work/error
-  evidence, and complete only after an exact zero-missing reconciliation.
-  Completed ready prefixes return `:prefix_ready` on observed drift; the later
-  readiness operation may persist positive missing evidence after demotion so
-  the next bounded backfill step can reopen repair.
-  Cancellation and WAL/replica-lag throttling occur between calls. This change
-  adds no index, foreign key, readiness promotion, activation, claim engine,
-  fairness hint/cursor, or partition GC; the later online-readiness operation
-  retains those verification responsibilities.
-- `Docket.Postgres.ClaimPolicy.Admin`, the prefix-local dynamic exact-cap
-  control plane. It provides explicit one-time default bootstrap, versioned
-  default and atomic partition CAS, complete-tuple override/reset/state and
-  effective reads, lifetime source-event replay receipts, immutable audit,
-  host-attested export watermarks, legal holds, and bounded keyset pruning.
-  Mutations use the frozen gate/rollout/default/partition lock order and an
-  audit commit-order barrier; host authorization remains outside Docket, and
-  readiness, activation, and TenantFair admission remain disabled.
 - PostgreSQL run creation now atomically materializes the canonical
-  owner-derived claim partition with inherited, running, version-zero defaults.
+  owner-derived claim partition with an inherited cap and version-zero state.
   Concurrent first inserts use `ON CONFLICT DO NOTHING`, preserving Admin-owned
   state and versions. A non-locking existence read keeps established
   partitions off that uniqueness path, so run creation does not wait behind an
@@ -74,10 +26,14 @@ entries below reflect what has landed so far.
   after their last run disappears and are never selected from serialized
   payload identity.
 - PostgreSQL schema version 2: prefix-local exact-cap policy, partition,
-  durable receipt/audit, rollout, admission-gate, assertion, and capability
-  tables with an explicitly uninitialized default. ClaimPolicy implementations
-  now receive the additive quoted identifier context while Legacy behavior
-  remains selected and unchanged.
+  ordinary supporting indexes, engine interlock, and TenantFair claim function.
+  Existing scope keys are backfilled transactionally while inserts are blocked.
+  ClaimPolicy implementations receive the additive quoted identifier context.
+- Exact-cap `Docket.Postgres.ClaimPolicy.TenantFair` admission with one persisted
+  default, optional per-owner overrides, concurrent final-slot serialization,
+  count-neutral expired recovery, cap-reduction debt, and bounded cross-owner
+  rotation. The current-state Admin API supports versioned default and override
+  changes without rollout ledgers, audit history, or governance workflows.
 - `Docket.BackendTests`, a source-owned shared ExUnit suite under
   `test/support`. One explicit backend matrix generates identical black-box
   cases for the memory and PostgreSQL bundles; external backend projects can

@@ -347,6 +347,67 @@ only adds latency because polling remains correctness. Fence loss discards the
 proposal and recovery replans from the last committed run, so its cost is
 re-execution, not a partial durable moment.
 
+## Exact per-owner caps
+
+Schema version 2 adds the minimal policy and partition authority needed by
+`Docket.Postgres.ClaimPolicy.TenantFair`. Enable it consistently across the
+fleet:
+
+```elixir
+claim_policy: [
+  implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+  default_max_active: 4
+]
+```
+
+The configured value initializes an unset database default. Thereafter use the
+small current-state API:
+
+```elixir
+alias Docket.Postgres.ClaimPolicy.Admin
+
+{:ok, default} = Admin.get_default(context)
+{:ok, updated} = Admin.put_default(context, 8, expected_version: default.version)
+
+{:ok, override} =
+  Admin.put_override(context, {:tenant, "tenant-a"}, 2, expected_version: 0)
+
+{:ok, effective} = Admin.get_effective(context, {:tenant, "tenant-a"})
+
+{:ok, _reset} =
+  Admin.reset_override(context, {:tenant, "tenant-a"},
+    expected_version: override.version
+  )
+```
+
+Reducing a cap below the current live count does not terminate claims. It
+creates debt and blocks additive ready claims until completions bring the live
+count below the new cap. Expired lease recovery remains count-neutral.
+
+### Existing v1 installations
+
+The generated upgrade is an ordinary transactional migration:
+
+```sh
+mix docket.gen.migration -r MyApp.Repo --upgrade-from-v1
+mix ecto.migrate -r MyApp.Repo
+```
+
+Stop dispatchers and all Docket run writers before the upgrade, deploy one
+homogeneous binary version, migrate, and restart. The migration locks the runs
+table against inserts while it backfills owner partitions. The current binary
+requires schema version 2; version 1 is only the rollback point for the old
+binary. Online migrations, readiness ledgers, fleet attestations, and audited
+activation are intentionally outside the v0.1.0 contract.
+
+Fresh installations generated without `--upgrade-from-v1` install both schema
+versions in one host migration.
+
+DCKT-68's development-only version-2 schema is not an upgrade source. This
+cleanup rewrites v2 before the 0.1.0 release; recreate any local/test database
+that already applied that development migration, or roll it back using the
+matching DCKT-68 code first.
+
 ## Operational inspection
 
 Use `inspect_run` for per-run scheduling, claim age, attempt counts, and poison
@@ -368,621 +429,6 @@ database role, honor the configured schema prefix, and avoid decoding the
 private `state`, `payload`, or `metadata` columns. Application-facing tools
 should remain on the scoped facade so tenantless or tenant access can never
 become system access.
-
-### Claim-partition backfill
-
-Schema version 2 installs the rollout ledger but leaves partition backfill
-`not_started`, the exact-cap readiness gate `not_ready`, and admission mode
-`legacy`. Before backfill, the host must deploy atomic partition
-dual-write to every run writer, drain old binaries and their open
-transactions, and record reviewed deployment evidence:
-
-```elixir
-alias Docket.Postgres.ClaimPolicy.{Backfill, Readiness}
-
-{:ok, _assertion} =
-  Readiness.attest_dual_write(context,
-    evidence_fingerprint: :crypto.hash(:sha256, deployment_evidence),
-    actor: "rollout-operator",
-    source: "deployment",
-    event_id: "dual-write-2026-07-16"
-  )
-```
-
-The assertion is non-expiring because it represents a monotonic deployment
-fact, not a process heartbeat. Re-attest after any fleet/binary topology
-change before continuing reconciliation. An assertion is invalid if a legacy
-writer or a pre-deployment transaction can still commit a run without its
-partition.
-
-Advance one bounded transaction at a time. The host decides whether to cancel,
-pause for WAL volume, or wait for replicas between calls; the library never
-sleeps while holding the gate, advisory runner, or rollout row.
-
-```elixir
-Backfill.advance(context,
-  batch_size: 1_000,
-  lock_timeout_ms: 1_000,
-  statement_timeout_ms: 5_000
-)
-```
-
-Repeat only while the host's cancellation and capacity checks allow it. A
-crash after any return is safe: the next call resumes from the committed
-internal `docket_runs.id` cursor and its finite target. The running phase
-inserts only distinct canonical keys from that page with conflict-do-nothing;
-it never changes an Admin-created partition. Reconciliation records an exact
-distinct missing-key count. A positive observation remains visible while a
-new bounded repair pass runs; only a later zero observation marks the phase
-complete. Rechecking complete state may reopen repair only while the gate is
-not ready; a positive observation while ready returns `:prefix_ready`. The
-later online-readiness operation independently recounts and owns indexes, the
-mandatory FK, readiness promotion, and ready-state drift demotion. After
-demotion it may persist a positive `missing_partition_count` while leaving the
-complete phase, target, cursor, counters, and completion time untouched; the
-next backfill advance reopens repair. This operation performs none of those
-readiness-owned changes.
-
-Trusted prefix-local inspection queries are:
-
-```sql
-SELECT schema_generation, dual_write_assertion_id, backfill_phase,
-       backfill_target_id, backfill_cursor, backfill_batches, backfill_rows,
-       backfill_retries, missing_partition_count, backfill_completed_at,
-       backfill_last_error, updated_at
-FROM "YOUR_PREFIX".docket_claim_rollout
-WHERE id = 1;
-
-SELECT count(DISTINCT runs.scope_key) AS missing_scope_keys
-FROM "YOUR_PREFIX".docket_runs AS runs
-WHERE NOT EXISTS (
-  SELECT 1
-  FROM "YOUR_PREFIX".docket_claim_partitions AS partitions
-  WHERE partitions.scope_key = runs.scope_key
-);
-
-SELECT count(*) AS partition_rows,
-       pg_size_pretty(pg_total_relation_size(
-         '"YOUR_PREFIX".docket_claim_partitions'::regclass
-       )) AS retained_size
-FROM "YOUR_PREFIX".docket_claim_partitions;
-
-SELECT count(*) AS dormant_partition_rows
-FROM "YOUR_PREFIX".docket_claim_partitions AS partitions
-WHERE NOT EXISTS (
-  SELECT 1
-  FROM "YOUR_PREFIX".docket_runs AS runs
-  WHERE runs.scope_key = partitions.scope_key
-);
-
-SELECT application_name, state, sync_state,
-       pg_wal_lsn_diff(
-         pg_current_wal_lsn(),
-         COALESCE(replay_lsn, flush_lsn, write_lsn)
-       )::bigint AS retained_wal_bytes
-FROM pg_stat_replication
-ORDER BY application_name;
-```
-
-Rehearse the rollout on a production-shaped copy before operating a populated
-prefix:
-
-- include tenantless runs (`scope_key = ''`), ordinary tenants, and every
-  custom schema prefix independently;
-- use sparse internal run IDs and interrupt after each committed page to prove
-  cursor/target restart behavior;
-- insert current dual-writing runs above the frozen target while pages run and
-  confirm reconciliation remains zero;
-- size a high-dormant/high-distinct-cardinality fixture, observe batch WAL with
-  `pg_current_wal_lsn()`/`pg_wal_lsn_diff`, and pause between calls when the
-  host's WAL budget is exceeded;
-- use `pg_stat_replication` replay/flush LSN lag under the host's database role,
-  stop invoking `advance/2` at the approved byte/time threshold, then resume
-  from the same ledger cursor after replicas recover; and
-- cancel the caller between every phase and inject bounded lock and statement
-  timeouts, verifying only a failed SQL work unit increments retries and that
-  error text contains no tenant or database detail.
-
-Partition rows retain raw historical `scope_key` values even after the last run
-and override disappear. Those values can be personal or confidential data.
-Restrict table/audit access, include dormant rows in storage forecasts and
-erasure inventories, and do not export them through metrics, logs, receipts,
-or generic error tooling. This schema-generation-2 release has no partition
-GC. Deletion requires a
-separately reviewed proof that no run references the key; this backfill never
-deletes a partition.
-
-### Online indexes, foreign key, and readiness
-
-The online artifact is deliberately separate from the transactional V02
-migration. The Repo must use PostgreSQL advisory migration locking so the lock
-covers the gap between autocommit DDL and Ecto's `schema_migrations` record:
-
-```elixir
-config :my_app, MyApp.Repo, migration_lock: :pg_advisory_lock
-```
-
-Generate and commit one prefix-explicit artifact. Never paste these operations
-into the transactional schema migration:
-
-```sh
-mix docket.gen.migration --online --prefix YOUR_PREFIX -r MyApp.Repo
-```
-
-The generated module has `@disable_ddl_transaction true`. Docket also takes a
-prefix session advisory runner across all autocommit phases. Readiness
-verification takes the same authority transactionally, so a first promotion
-cannot race online down; DCKT-71 activation must participate in the same
-authority. Calls from an outer transaction and repos using table migration
-locks are refused.
-
-Run only after the dual-write assertion is current and backfill shows
-`complete` with zero missing partitions. The helper performs these restartable
-checkpoints:
-
-1. create/repair the tenant-leading ready index concurrently;
-2. create/repair the tenant-leading live/expired index concurrently;
-3. recount current runs, then install the exact FK as `NOT VALID`; and
-4. validate the FK separately and mark the online checkpoint `complete`.
-
-`NOT VALID` avoids a historical validation scan during installation, but it
-immediately enforces new writes. A returned old writer that omits partition
-dual-write can therefore fail run insertion; stop and drain it rather than
-removing the constraint. Validation is separately retryable. A canceled
-`CREATE INDEX CONCURRENTLY` can leave a same-name invalid artifact. On restart,
-Docket proves that object's table OID, keys, include count, access method,
-nonconstraint/nonprimary/nonexclusion status, immediate semantics, default
-opclasses/collations/order, and exact predicate before dropping and rebuilding
-it concurrently. A foreign-definition object—valid or invalid—is
-never dropped automatically. Repair is refused while the prefix is ready. A
-drift-demoted TenantFair-selected prefix is not ready and may be repaired;
-repair never changes admission mode.
-
-If schema drift removes a table needed for the missing-partition recount,
-verification still commits an audited `not_ready` demotion. The rollout ledger
-retains its last coherent recorded missing count (required by a completed
-backfill tuple), while activation preflight reports the unavailable current
-count as `nil`; operators must not interpret the retained value as a fresh
-catalog observation.
-
-Inspect durable progress separately from schema generation:
-
-```sql
-SELECT schema_generation, online_phase, online_attempts, online_last_error,
-       online_started_at, online_completed_at,
-       ready_index_valid, encode(ready_index_ddl_sha256, 'hex') AS ready_hash,
-       live_index_valid, encode(live_index_ddl_sha256, 'hex') AS live_hash,
-       fk_disposition, missing_partition_count,
-       encode(verified_default_fingerprint, 'hex') AS default_hash,
-       verified_at
-FROM "YOUR_PREFIX".docket_claim_rollout
-WHERE id = 1;
-
-SELECT gate.readiness, gate.readiness_epoch, gate.admission_mode,
-       gate.mode_epoch, gate.required_function_contract
-FROM "YOUR_PREFIX".docket_claim_admission_gate AS gate
-WHERE gate.id = 1;
-
-SELECT index_relid::regclass, phase, lockers_total, lockers_done,
-       blocks_total, blocks_done, tuples_total, tuples_done
-FROM pg_stat_progress_create_index
-WHERE relid = '"YOUR_PREFIX".docket_runs'::regclass;
-
-SELECT conname, convalidated, confmatchtype, condeferrable, condeferred,
-       confupdtype, confdeltype
-FROM pg_constraint
-WHERE conrelid = '"YOUR_PREFIX".docket_runs'::regclass
-  AND conname = 'docket_runs_scope_key_claim_partition_fkey';
-```
-
-Before every invocation, record free tablespace/disk headroom, current WAL LSN,
-replica retained bytes/time, and the number of long transactions. Concurrent
-index creation can temporarily require roughly another index-sized allocation;
-do not begin without the host's measured headroom. Use these observations:
-
-```sql
-SELECT pg_size_pretty(pg_table_size('"YOUR_PREFIX".docket_runs'::regclass)),
-       pg_size_pretty(pg_indexes_size('"YOUR_PREFIX".docket_runs'::regclass)),
-       pg_current_wal_lsn();
-
-SELECT pid, application_name, state, sync_state,
-       pg_wal_lsn_diff(pg_current_wal_lsn(),
-         COALESCE(replay_lsn, flush_lsn, write_lsn))::bigint AS lag_bytes
-FROM pg_stat_replication
-ORDER BY application_name;
-
-SELECT pid, now() - xact_start AS transaction_age, state, query
-FROM pg_stat_activity
-WHERE datname = current_database() AND xact_start IS NOT NULL
-ORDER BY xact_start;
-```
-
-The helper uses a lock timeout no greater than one second and a bounded server
-statement timeout (at least one second, five minutes by default, and at most one
-hour). Its client query deadline is longer than the server deadline. On normal
-and handled-error exits, checked cleanup first disables that deadline, proves
-the advisory unlock, and restores prior session settings. A cleanup-query or
-unlock mismatch raises instead of reporting success; a disconnected PostgreSQL
-session releases its lock. To cancel, use the deployment job's normal
-cancellation first; a database operator may use `pg_cancel_backend(pid)` only
-after matching the exact prefix DDL in `pg_stat_activity`. Never use
-`pg_terminate_backend` as a routine throttle. After cancellation, wait for
-cleanup, inspect
-`pg_stat_progress_create_index`, `pg_index.indisvalid`, the FK catalog, and the
-ledger, then rerun the same generated migration. Do not issue hand-written
-`DROP INDEX`, mark ledger flags manually, or use `IF NOT EXISTS` as proof.
-
-Pause retries when free disk falls below the host threshold, WAL growth exceeds
-budget, any required replica exceeds the approved byte/time lag, a long
-transaction prevents an old snapshot from clearing, or cancellation remains
-in progress. The library never queries replicas or sleeps while holding its
-runner. Resume only after the external condition clears. Attempts/errors are
-closed ledger codes; database and tenant text is intentionally absent.
-
-After online completion and explicit default bootstrap, compute the approved
-prefix-neutral hashes from `Docket.Postgres.ClaimPolicy.OnlineDDL` and verify:
-
-```elixir
-alias Docket.Postgres.ClaimPolicy.{OnlineDDL, Readiness}
-
-hashes = OnlineDDL.index_fingerprints(context.prefix)
-
-Readiness.verify(context,
-  expected_readiness_epoch: current_epoch,
-  ready_index_ddl_sha256: hashes.ready,
-  live_index_ddl_sha256: hashes.live,
-  actor: "rollout-operator",
-  source: "deployment",
-  event_id: "online-ready-2026-07-16"
-)
-```
-
-Verification rechecks the complete table/catalog set, current zero-missing
-count, dual-write/backfill facts, exact indexes/FK, function-contract metadata,
-and initialized default under gate -> rollout -> default locks. A wrong supplied
-hash deliberately fails closed. A changed default or later index/FK/partition
-drift demotes a ready prefix and increments its readiness epoch. After repair,
-a fresh event at the new epoch records the current default fingerprint and may
-re-promote. A successful unchanged verification leaves the epoch and gate state
-alone but refreshes rollout `verified_at`/`updated_at`, so `verified_at` is the
-latest successful or demoting proof time. Demotion receipts retain their exact
-sorted reasons after audit pruning.
-
-Readiness does not activate anything. DCKT-72 leaves `admission_mode = legacy`,
-does not select the TenantFair engine, replace the V02-installed canonical
-claim function, or change mode/epoch. DCKT-71 owns activation. Ordinary online down is allowed
-only before any readiness or activation history and while the prefix is
-not-ready/Legacy; otherwise use the explicit stopped-fleet destructive teardown
-contract. The intermediate DCKT-64..67 generation-2 schemas were never
-released: recreate those developer databases or apply the reviewed stacked
-branch patch manually. The online runner does not alter a prior draft V02.
-
-Rehearse on a production-shaped copy with populated v1 tenantless and tenant
-runs, current concurrent dual-writing inserts, default and every custom prefix,
-and replicas attached. Inject interruption after each committed checkpoint,
-cancel both concurrent index creation and FK validation, hold conflicting table
-locks to prove bounded timeout, and verify a rerun preserves already-correct
-object OIDs while repairing only exact invalid artifacts. Record server major,
-settings, DDL fingerprints, ledger transitions, WAL/disk/lag observations, and
-the final zero/count/catalog queries. PostgreSQL 13 and 17 both remain required
-release gates.
-
-### Prefix-wide TenantFair activation interlock
-
-Activation is a two-release operation, never an instance canary. Release A
-deploys partition-upserting writers and activation-aware Legacy everywhere,
-drains activation-unaware binaries and their open transactions, and completes
-default bootstrap, backfill, online DDL, FK validation, and readiness while the
-prefix remains in `legacy` mode. Release B deploys the matching TenantFair
-function/engine contract everywhere before any prefix flip.
-
-Use a context whose instance-selected ClaimPolicy is the deployed TenantFair
-implementation when calling preflight and activate. Contract v1 requires that
-implementation's optional `activation_contract/1` callback to return exactly
-`%{engine: :tenant_fair, function_contract: 1}`. A Legacy-selected context is
-intentionally not activatable; activation never changes the selected policy.
-
-The installed prefix function must have this exact catalog shape:
-
-```sql
-<prefix>.docket_tenant_fair_claim_v1(
-  timestamptz, timestamptz, integer, integer, text, text[]
-) RETURNS SETOF record
-LANGUAGE plpgsql
-VOLATILE PARALLEL UNSAFE SECURITY INVOKER
-SET search_path TO pg_catalog, pg_temp
-```
-
-Exactly one same-name function may exist in the prefix. An overload or drift in
-arguments, return type, language, volatility, parallel safety, security mode,
-`search_path`, or the exact prefix-specific `pg_proc.prosrc` bytes fails closed
-as `:function_contract_mismatch`. V02 creates the canonical function after its
-tables and exact-signature teardown drops it before table destruction.
-
-Each participating process heartbeats an expiring capability using a trusted
-resolved backend context. Heartbeats describe only participating upgraded
-processes; they can never prove an old activation-unaware binary absent.
-Registration takes the prefix gate `FOR SHARE`, then upserts the capability.
-Once TenantFair is active, a heartbeat whose writer, gate, or function contract
-does not match the active gate is rejected as `{:error,
-:incompatible_capability}`:
-
-```elixir
-alias Docket.Postgres.ClaimPolicy.Activation
-
-Activation.register_capability(context, stable_instance_uuid,
-  binary_fingerprint: :crypto.hash(:sha256, reviewed_binary_identity),
-  writer_contract: 1,
-  gate_contract: 1,
-  function_contract: 1,
-  ttl_ms: :timer.minutes(5)
-)
-```
-
-After the deployment system proves the old fleet absent—or the fleet is fully
-stopped and drained—record that separate expiring assertion. Do not generate
-this evidence from the capability table. Expiry must be after the database wall
-clock and at most 24 hours in the future when the audit transaction runs:
-
-```elixir
-{:ok, assertion} =
-  Activation.attest_old_binaries_absent(context,
-    evidence_fingerprint: :crypto.hash(:sha256, deployment_evidence),
-    expires_at: DateTime.add(DateTime.utc_now(), 300, :second),
-    actor: "rollout-operator",
-    source: "deployment",
-    event_id: "old-binaries-absent-2026-07-16"
-  )
-
-{:ok, report} = Activation.preflight(context)
-true = report.activatable
-```
-
-Preflight is advisory. Preserve the returned mode/epoch and inspect
-`selected_implementation_contract`, `active_implementation_contract`,
-`default_fingerprint`, `verified_default_fingerprint`, `schema_generation`,
-both rollout phases, recorded and current missing counts, exact ready/live
-index validity, FK validation, expected-table count/presence, live capability
-count, and assertion expiry. These readiness/catalog values are produced by
-the same canonical DCKT-72 evidence reader, and any drift makes `activatable`
-false even if the coarse gate has not yet been demoted. Recorded or current
-missing counts are `nil` when they have not been established; unknown evidence
-is never presented as zero. The
-mutating call reacquires the gate and rechecks the complete coherent readiness
-tuple, current catalog/count/default facts, selected implementation contract,
-and exact function catalog shape; a preflight report is never an authorization
-token. After acquiring the gate it resolves receipt replay/conflict before the
-expected epoch, then samples `clock_timestamp()` once for assertion and
-capability expiry. Evidence that expired while activation waited cannot
-authorize the flip.
-
-Activation starts its own transaction with `SET TRANSACTION ISOLATION LEVEL
-READ COMMITTED READ WRITE` before receipt lookup or any other query, then sets
-bounded local lock and statement timeouts. Role or session defaults such as
-Repeatable Read therefore cannot pin a stale readiness snapshot. Caller-owned
-transactions remain forbidden for activation and every other control mutator.
-
-Quiesce Legacy polling before activation. The exclusive `FOR UPDATE` gate waits
-out every admission holding `FOR SHARE`. A gate already held exclusively makes
-new admissions return promptly, but PostgreSQL may let another compatible
-`FOR SHARE SKIP LOCKED` participant join an existing shared-row MultiXact while
-the exclusive request is only queued. That participant is still safe—the flip
-waits it out too—but sustained Legacy traffic can produce
-`{:error, {:lock_timeout, :gate}}`. Stop or quiesce admission attempts and retry
-the identical source/event request; do not claim queued-writer anti-barging.
-
-```elixir
-Activation.activate(context,
-  expected_epoch: report.mode_epoch,
-  old_binary_assertion_id: assertion.assertion_id,
-  actor: "rollout-operator",
-  source: "deployment",
-  event_id: "activate-tenant-fair-2026-07-16"
-)
-```
-
-On commit, activation-aware Legacy fails closed for that prefix. TenantFair
-remains fail closed unless mode, readiness, function contract, and its fresh
-gate/default/partition authorities all match. The API never changes the
-instance-selected ClaimPolicy; dispatcher, manual drain, recovery, direct
-configured RunStore, and transaction contexts keep the same portable call
-boundary.
-
-TenantFair v1 tightens `lock_timeout` to 100 ms only for its internal authority
-work and restores the caller's transaction-local value before returning. Its
-`SKIP LOCKED` row authorities therefore return promptly for held gate, default,
-partition, and run rows: a sole skipped authority is unavailable, while a
-successfully locked subset may return a partial batch. The outer candidate
-discovery runs before that function body and acquires no row authority. DCKT-68
-does not claim a bounded response to a conflicting table/DDL lock on that outer
-scan. DCKT-69 owns adversarial outer-discovery/DDL overlap schedules, physical
-plan and buffer proof, high-cardinality qualification, and PostgreSQL 13/17
-release evidence. Operators must apply the DCKT-69 session/role timeout
-configuration; the function's internal timeout is defense in depth, not a
-substitute.
-
-Inside the bounded locked-key page, each key is processed once by one set-based
-run-mutation command. After truthful four-lane raw accounting and disposition,
-the decision source retains at most remaining demand per work class and feeds
-the complete ID-sorted union to `SKIP LOCKED`; no later ID truncation may hide
-a preferred or reserved class. Page truncation, per-class limits, the
-`2 * demand` run-lock budget, state/cap denial, held or concurrently invalidated
-rows, and an unconsumed cross-key class reservation can legitimately leave
-demand unfilled. There is no same-call refill or key revisit. Treat such a
-successful partial batch as bounded under-fill; reserve `:lock_contention` for
-the exact all-still-eligible/no-lock/no-outcome case returned by the function.
-
-Ordinary hot fallback is forbidden while exact caps are promised. Roll back in
-this exact order:
-
-1. stop new TenantFair polling and wait out or terminate admission statements;
-2. call `Activation.deactivate/2` with the current epoch under the exclusive gate;
-3. declare the exact-cap guarantee abandoned at that deactivation commit; and
-4. only then restart gate-aware Legacy and inspect existing claims/fences.
-
-Deactivation deliberately does not require ready state, a live capability, or
-an old-binary assertion, so readiness drift cannot trap rollback. It increments
-the monotonic epoch and audits `exact_cap_guarantee: false`; it does not clear
-or preempt existing claim tokens.
-
-## Tenant-fair claim benchmark
-
-The repository includes a source-checkout-only PostgreSQL benchmark for the
-tenant-fair candidate-discovery work. It compares the known ranking-window and
-`DISTINCT ON` failure baselines with bounded partition-hint/cursor and recursive
-loose-scan reconciliation candidates. This is an exploratory query and plan
-benchmark suite, not a public API or a selectable ClaimPolicy implementation.
-DCKT-72 makes its ready/live predicates and prefix-neutral index DDL hashes
-identical to the online migration, but `runtime_query_parity` remains false;
-the production TenantFair SQL/function fingerprint is canonical in
-`TenantFair.SQL` and `TenantFair.Function`. Benchmark candidates remain
-non-authoritative until they match that runtime contract.
-
-The runner requires PostgreSQL 13 or newer. CI exercises PostgreSQL 13 as the
-minimum and PostgreSQL 17 as the reference version. Supply an explicitly owned
-benchmark database URL and invoke the bounded profile with:
-
-```sh
-DOCKET_BENCH_DATABASE_URL=postgres://localhost/docket_bench \
-  mix run bench/postgres/tenant_fair_claim.exs -- --profile smoke --check
-```
-
-The runner creates and owns a scratch schema in that database. Inside it, the
-fixture installs Docket's real migration tables and provisional benchmark-only
-policy, partition-hint, and tenant-leading index DDL. It never modifies the
-runtime hot path, but the database role must still be allowed to create and
-drop the scratch schema. Do not point the benchmark at a database unless that
-scratch-schema lifecycle and its seeded data are safe. The provisional objects
-are query prototypes only; future runtime migrations and TenantFair SQL remain
-the authority, and candidates promoted to runtime must be rechecked for exact
-ClaimPolicy, cap, locking, decoding, and telemetry parity.
-
-### Profiles and repeatability
-
-`smoke` is deliberately small and exists for deterministic result, artifact,
-and broad plan-shape regression checks. Larger profiles exercise independently
-configurable queued-row, queued-tenant, dormant-tenant, hot-tenant, capped-
-tenant, and ready/expired cardinalities. Each candidate run records its resolved
-page size, oversampling factor, and reconciliation work budget. Run an explicit
-matrix of those options when selecting thresholds; one run is evidence for only
-the values in its manifest. The reconciliation budget must be an exact multiple
-of page size times oversampling, so the runner never rounds a requested budget
-up to a larger page.
-
-Each candidate/profile combination uses a fixed timestamp and integer seed,
-seeds and analyzes the resolved fixture, completes its configured warmup, then
-reseeds the same fixture for measurement. Saved `EXPLAIN` operations are rolled
-back so data-modifying plans do not consume the measured claim fixture. Use the
-same PostgreSQL major version, resolved scenario, seed, database settings, and
-machine class when comparing runs. Cache state, autovacuum, concurrent database
-traffic, and storage still affect timings even when fixture contents are
-deterministic.
-
-Artifacts default to:
-
-```text
-tmp/bench/postgres/tenant_fair_claim/<run-id>/
-```
-
-The versioned machine-readable artifact set records the resolved scenarios and
-candidate thresholds, seed and fixed time, git/runtime/database versions,
-relevant database settings, aggregate measurements, and relative paths to raw
-samples and saved `EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON)`
-plans. Environment and source identity live in the manifest; aggregates live in
-the summary. Preserve the whole run directory when comparing or publishing
-results; a summary without its raw samples and plans is incomplete evidence.
-
-### Metric interpretation
-
-- Checkout time is measured from the caller's checkout request until it owns a
-  connection. Ecto query `queue_time` may be absent for queries executed on an
-  already checked-out connection and is not substituted for this measurement.
-- Query time is caller-observed bounded claim-path time on an owned connection;
-  the cursor candidate may execute multiple recorded page statements inside one
-  transaction, while the recursive candidate spends its full work budget in one
-  loose scan. Commit throughput counts completed claim
-  commits over the measured wall-clock window; rollback warmup and plan capture
-  are excluded. Sustainable claim/requeue-cycle throughput, when present, is
-  labeled separately.
-- p50, p95, and p99 use the artifact's documented quantile method and sample
-  population. A percentile from the smoke profile is a serialization and
-  plumbing check, not statistically useful performance evidence.
-- Physical scan work is derived from base-relation and bitmap-index scan nodes
-  in the saved plan and is kept separate from any future runtime logical
-  candidate counters. Rows scanned per lease is undefined when the statement
-  returns no outcome and must not be coerced to zero.
-- Root plan buffer counters are the statement totals. Summing parent and child
-  buffer counters double-counts work. `EXPLAIN ANALYZE` executes data-modifying
-  CTEs, so the runner always captures plans inside an explicit rollback.
-- `SKIP LOCKED` normally skips rather than waits. Skipped partitions and the
-  benchmark's explicit blocker/control audit are the contention evidence. A
-  separate audit holds the deep hot tenant's partition lock and requires full
-  progress from other tenants; the recursive candidate also has to progress
-  beyond a fully locked first scan slice. Checkout or whole-query duration is
-  not a row-lock wait measurement.
-- Fewer outcomes than demand is a partial batch, not automatically an
-  avoidable under-claim. The under-claim flag requires the bounded control
-  audit to prove that eligible, lockable work remained. A candidate that fails
-  that correctness audit is ineligible for latency or throughput comparisons,
-  even if returning less work makes it appear faster.
-
-CI runs only `--profile smoke --check`. The check may assert bounded work,
-deterministic under-claim controls, concurrent cap safety, required artifact
-fields, and coarse plan structure. Measured partial batches are audited against
-the same cap-aware eligibility policy before they are classified as avoidable
-under-claim. The check intentionally has no p95/p99, latency,
-throughput, exact cost, or planner-node-count gate; shared-runner timing and
-minor PostgreSQL planner changes are not release regressions by themselves.
-
-### TenantFair query regression budget
-
-The published `QUERY-1` budget compares a candidate with an approved prior
-artifact for the same candidate and only when both non-smoke artifacts have
-the same `normalized_workload_fingerprint`, PostgreSQL major/settings
-fingerprint, and an operator-assigned `benchmark_environment_id` identifying
-the same machine class. The comparison record also fingerprints both
-artifacts' `runtime`, `postgres`, and `config` objects. The normalized workload is the complete
-resolved `config` after removing only artifact/control keys `output`, `check`,
-and `keep_schema`; both normalized objects must be byte-identical. Query and
-DDL hashes must match, or that
-record must name and approve the intentional hash transition. A result is
-comparable only when both artifacts independently have
-the same named `benchmark_candidate`, that candidate's
-`performance_eligibility.eligible = true`, `measurements.error_count = 0`, and
-at least 1,000 samples. Select exactly one row where
-`candidates[].candidate == benchmark_candidate`, then read:
-
-```text
-candidates[].measurements.query_us.p95
-candidates[].measurements.query_us.p99
-candidates[].measurements.sample_count
-candidates[].performance_eligibility.eligible
-candidates[].performance_eligibility.checks
-candidates[].query_sha256
-candidates[].plan_path
-samples_path
-manifest_path
-```
-
-from `summary.json`, and read `source.sha256` and `provisional_ddl_sha256` from
-`manifest.json`. `benchmark_environment_id`, the two artifact paths, reference
-approval, fingerprints, and any approved hash transition are the bounded
-`tenant_fair_report_input/v1` comparison fields; the runner does not infer
-hardware equivalence. Each artifact path names an exact immutable artifact root
-or `summary.json`, whose relative manifest, samples, and selected plan files
-must all exist. The target is candidate/reference p95 `<= 1.20` and p99
-`<= 1.30`. Checkout and commit distributions remain separately named; plan
-execution milliseconds are one rolled-back `EXPLAIN ANALYZE` sample and are not
-substituted for the query distribution. A failed correctness audit makes the latency comparison
-ineligible rather than fast.
-
-The current manifest says `runtime_parity: false` and
-`exploratory_pre_runtime_prototype`; consequently this budget supports only
-prototype-to-prototype candidate regression decisions. It becomes runtime
-qualification evidence only after exact runtime query/DDL hashes replace the
-prototype hashes. It never becomes a production latency SLO without a separate
-production event population and target. See the full
-[fairness SLO and regression-budget contract](architecture/docket-tenant-claim-fairness-design.md#fairness-slo-and-regression-budget-contract).
 
 ## Migration from 0.0.1
 
