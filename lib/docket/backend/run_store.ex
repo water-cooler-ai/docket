@@ -241,18 +241,23 @@ defmodule Docket.Backend.RunStore do
 
     * With `limit >= 2` and both classes non-empty, at least one outcome
       (lease or poison - the reservation is per outcome, not per lease) goes
-      to each class; the remaining demand takes the oldest eligible rows
-      under the stable `(eligible_at, id)` tie-break.
+      to each class. The remaining demand follows the implementation's
+      admission order with a stable `(eligible_at, id)` tie-break inside equal
+      scheduling priority. Legacy uses global age-first order; a partition-fair
+      implementation may put bounded partition rotation ahead of global age.
     * With `limit == 1`, the optional `policy.preference` class is served
       first, falling through to the other class when the preferred one is
-      empty so preference never wastes demand. Without a preference the
-      oldest eligible row wins regardless of class.
+      empty so preference never wastes demand. Without a preference, stable
+      age/ID order decides among rows with equal implementation scheduling
+      priority; a partition-fair implementation may put its partition order
+      ahead of global age.
 
-  Eligibility-time ordering provides aging, not fairness. Implementations
-  promise no strict FIFO, no bounded queue wait, no tenant or workload-class
-  fairness, and no starvation freedom under sustained arrivals or persistent
-  row locks; concurrent claimants may skip locked rows, so per-class
-  progress holds only up to rows another transaction currently holds.
+  Eligibility-time ordering provides aging, not fairness. Unless a selected
+  implementation publishes a narrower conditional contract, implementations
+  promise no strict FIFO, bounded queue wait, tenant or workload-class
+  fairness, or starvation freedom under sustained arrivals or persistent row
+  locks. Concurrent claimants may skip locked rows, so per-class progress holds
+  only up to rows another transaction currently holds.
   """
   @callback claim_due(ctx(), :system, claim_policy()) ::
               {:ok, claim_batch()} | {:error, term()}

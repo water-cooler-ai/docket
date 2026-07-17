@@ -37,7 +37,8 @@ when you want to understand *why* the contracts are shaped the way they are.
      rationale behind list-write concatenation, natural zeros, and
      reducer-aware write validation.
 9. `docket-exact-cap-contract.md`
-   - The v0.1.0 exact per-owner cap, concurrency, rotation, administration, and
+   - The v0.1.0 exact per-owner cap plus the frozen conditional bounded-bypass
+     fair-rotation population, cursor, service-accounting, proof-oracle, and
      stopped-upgrade invariants.
 10. `docket-claim-policy.md`
     - The RunStore-to-ClaimPolicy boundary and the implemented Legacy and
