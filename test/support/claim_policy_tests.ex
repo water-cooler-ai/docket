@@ -73,6 +73,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @impl true
+    def decode([["__bounded_policy_error__"]], _decoder, %{marker: marker}) do
+      relay({:alternate_claim_policy, :decode, marker, self()})
+      {:error, {:claim_policy_unavailable, :lock_contention}, %{gate: :unavailable}}
+    end
+
+    def decode([["__invalid_policy_error__"]], _decoder, %{marker: marker}) do
+      relay({:alternate_claim_policy, :decode, marker, self()})
+      {:error, {:invalid_reason, self()}, %{}}
+    end
+
     def decode(rows, %{orphan_ttl_ms: ttl}, %{marker: marker}) do
       relay({:alternate_claim_policy, :decode, marker, self()})
 
@@ -217,64 +227,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
   end
 
-  defmodule Docket.Test.ObservedClaimPolicy do
-    @moduledoc false
-
-    @behaviour Docket.Postgres.ClaimPolicy
-
-    alias Docket.Postgres.ClaimPolicy.Plan
-    alias Docket.Postgres.ClaimPolicy.TenantFair.Observation
-
-    @impl true
-    def init(options, _context) do
-      {:ok,
-       %{
-         batch: Keyword.fetch!(options, :batch),
-         observation: Keyword.get(options, :observation),
-         declare?: Keyword.get(options, :declare?, true),
-         decode?: Keyword.get(options, :decode?, true),
-         observe: Keyword.get(options, :observe, :ok)
-       }}
-    end
-
-    @impl true
-    def build_plan(_context, _policy, state) do
-      observation =
-        if state.declare?,
-          do: %{admission_observation: Observation.plan(), private_plan_marker: :retained},
-          else: %{private_plan_marker: :retained}
-
-      %Plan{
-        statement: "SELECT 1",
-        params: [],
-        decoder: %{},
-        observation: observation
-      }
-    end
-
-    @impl true
-    def decode(_rows, _decoder, state) do
-      observation =
-        if state.decode?,
-          do: %{admission_observation: state.observation, private_decode_marker: :retained},
-          else: %{private_decode_marker: :retained}
-
-      {:ok, state.batch, observation}
-    end
-
-    @impl true
-    def observe(_plan, _decoded, _result, _duration, %{observe: :raise}) do
-      raise "TenantFair observer failed"
-    end
-
-    def observe(_plan, _decoded, _result, _duration, _state), do: :ok
-  end
-
   defmodule Docket.Test.ClaimPolicyTests do
     @moduledoc false
 
     @callback rows(Docket.Postgres.ClaimPolicy.claim_batch()) :: [list()]
     @callback invalid_rows() :: [list()]
+    @callback policy_error_rows() :: [list()]
+    @callback invalid_policy_error_rows() :: [list()]
+    @callback detailed_observation?() :: boolean()
+
+    @optional_callbacks policy_error_rows: 0,
+                        invalid_policy_error_rows: 0,
+                        detailed_observation?: 0
 
     defmacro __using__(opts) do
       implementation = Keyword.fetch!(opts, :implementation)
@@ -365,6 +329,38 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    )
         end
 
+        test "accepts the alternate implementation's bounded data-only policy error variant" do
+          if function_exported?(@claim_policy_fixture, :policy_error_rows, 0) do
+            {claim_policy, context} = contract_policy()
+
+            plan =
+              Docket.Postgres.ClaimPolicy.build_plan(claim_policy, context, effective_policy())
+
+            assert {:error, {:claim_policy_unavailable, :lock_contention}, %{gate: :unavailable}} =
+                     Docket.Postgres.ClaimPolicy.decode(
+                       claim_policy,
+                       plan,
+                       apply(@claim_policy_fixture, :policy_error_rows, [])
+                     )
+          end
+        end
+
+        test "rejects the alternate implementation's non-data policy error reason" do
+          if function_exported?(@claim_policy_fixture, :invalid_policy_error_rows, 0) do
+            {claim_policy, context} = contract_policy()
+
+            plan =
+              Docket.Postgres.ClaimPolicy.build_plan(claim_policy, context, effective_policy())
+
+            assert {:error, {:claim_policy_decode_failed, {:invalid_return, _invalid}}} =
+                     Docket.Postgres.ClaimPolicy.decode(
+                       claim_policy,
+                       plan,
+                       apply(@claim_policy_fixture, :invalid_policy_error_rows, [])
+                     )
+          end
+        end
+
         test "identifies the selected implementation in exact success and error telemetry" do
           {claim_policy, context} = contract_policy()
 
@@ -423,6 +419,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           assert success_leases == length(expected_batch.leases)
           assert success_poisoned == length(expected_batch.poisoned)
 
+          if function_exported?(@claim_policy_fixture, :detailed_observation?, 0) and
+               @claim_policy_fixture.detailed_observation?() do
+            assert_receive {[:docket, :postgres, :claim_policy, :admission, :observation],
+                            detail_measurements,
+                            %{
+                              implementation: @claim_policy_implementation,
+                              result: :ok,
+                              admission_class: :none,
+                              observation_status: :available
+                            }}
+
+            assert %{
+                     preferred_admissions: 0,
+                     borrowed_admissions: 0,
+                     below_preferred_partitions: 0
+                   } = detail_measurements
+          end
+
           assert :ok =
                    Docket.Postgres.ClaimPolicy.observe(
                      claim_policy,
@@ -449,7 +463,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           assert map_size(error_measurements) == 4
           assert is_integer(error_duration) and error_duration >= 0
 
-          refute_receive {[:docket, :postgres, :claim_policy, :admission, :observation], _, _}
+          if @claim_policy_fixture.detailed_observation?() do
+            assert_receive {[:docket, :postgres, :claim_policy, :admission, :observation],
+                            %{demand: 7, duration: detail_error_duration},
+                            %{
+                              implementation: @claim_policy_implementation,
+                              result: :error,
+                              admission_class: :none,
+                              observation_status: :unavailable
+                            }}
+
+            assert is_integer(detail_error_duration) and detail_error_duration >= 0
+          else
+            refute_receive {[:docket, :postgres, :claim_policy, :admission, :observation], _, _}
+          end
         end
 
         defp contract_policy do
@@ -545,6 +572,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl true
     def invalid_rows, do: [[:invalid_legacy_row]]
+
+    @impl true
+    def detailed_observation?, do: false
   end
 
   defmodule Docket.Test.AlternateClaimPolicyContract do
@@ -571,5 +601,87 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl true
     def invalid_rows, do: [[:invalid_alternate_row]]
+
+    @impl true
+    def policy_error_rows, do: [["__bounded_policy_error__"]]
+
+    @impl true
+    def invalid_policy_error_rows, do: [["__invalid_policy_error__"]]
+
+    @impl true
+    def detailed_observation?, do: false
+  end
+
+  defmodule Docket.Test.TenantFairClaimPolicyContract do
+    @moduledoc false
+    @behaviour Docket.Test.ClaimPolicyTests
+
+    @impl true
+    def rows(%{leases: [lease], poisoned: []}) do
+      {:ok, claim_token} = Ecto.UUID.dump(lease.claim_token)
+
+      outcome =
+        [
+          "outcome",
+          nil,
+          lease.run_id,
+          nil,
+          lease.graph_id,
+          lease.graph_hash,
+          lease.checkpoint_seq,
+          claim_token,
+          lease.claimed_at,
+          lease.claim_attempt,
+          nil,
+          nil,
+          "expired",
+          DateTime.add(lease.claimed_at, -8, :second)
+        ] ++ List.duplicate(nil, 28)
+
+      summary =
+        [
+          "summary",
+          nil
+        ] ++
+          List.duplicate(nil, 12) ++
+          [
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            3_000,
+            3_000,
+            1,
+            1,
+            0,
+            1
+          ]
+
+      [outcome, summary]
+    end
+
+    @impl true
+    def invalid_rows, do: [["invalid_tenant_fair_row"]]
+
+    @impl true
+    def detailed_observation?, do: true
   end
 end

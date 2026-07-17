@@ -1,45 +1,59 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.MigrationTest do
-    # Runs against a live Postgres; excluded by default. See test_helper.exs.
     use ExUnit.Case, async: false
 
     @moduletag :postgres
 
     alias Docket.Postgres.TestRepo
 
-    defmodule InstallDocket do
-      use Ecto.Migration
+    @v1 20_260_716_000_101
+    @v2 20_260_716_000_102
+    @private 20_260_716_000_103
+    @private_v1 20_260_716_000_104
+    @private_v2 20_260_716_000_105
+    @failed_v2 20_260_716_000_106
 
-      def up, do: Docket.Postgres.Migration.up()
-      def down, do: Docket.Postgres.Migration.down()
+    defmodule InstallV1 do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(version: 1)
+      def down, do: Docket.Postgres.Migration.down(version: 1)
     end
 
-    defmodule InstallDocketPrefixed do
+    defmodule UpgradeV2 do
       use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(version: 2)
+      def down, do: Docket.Postgres.Migration.down(version: 2)
+    end
 
+    defmodule InstallPrivate do
+      use Ecto.Migration
       def up, do: Docket.Postgres.Migration.up(prefix: "docket_private")
       def down, do: Docket.Postgres.Migration.down(prefix: "docket_private")
     end
 
-    defmodule InstallDocketReservedPrefix do
+    defmodule InstallPrivateV1 do
       use Ecto.Migration
-
-      def up, do: Docket.Postgres.Migration.up(prefix: "select")
-      def down, do: Docket.Postgres.Migration.down(prefix: "select")
+      def up, do: Docket.Postgres.Migration.up(prefix: "docket_private", version: 1)
+      def down, do: Docket.Postgres.Migration.down(prefix: "docket_private", version: 1)
     end
 
-    @migration_version 20_260_709_000_001
-    @prefixed_migration_version 20_260_709_000_002
-    @reserved_prefix_migration_version 20_260_709_000_003
+    defmodule UpgradePrivateV2 do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(prefix: "docket_private", version: 2)
+      def down, do: Docket.Postgres.Migration.down(prefix: "docket_private", version: 2)
+    end
 
-    @tables ~w(docket_events docket_graph_versions docket_runs)
+    defmodule FailedUpgradeV2 do
+      use Ecto.Migration
 
-    @run_columns ~w(
-      id run_id tenant_id scope_key graph_id graph_hash status step state
-      checkpoint_seq latest_checkpoint_type claim_token
-      claimed_at wake_at claim_attempts claim_abandons poisoned_at poison_reason
-      inserted_at started_at updated_at finished_at
-    )
+      def up do
+        Docket.Postgres.Migration.up(version: 2)
+        flush()
+        raise "forced v2 rollback"
+      end
+
+      def down, do: :ok
+    end
 
     setup do
       config = TestRepo.config()
@@ -49,615 +63,384 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :ok
     end
 
-    test "V01 installs, removes, and reinstalls the final schema on a fresh Postgres" do
-      install!()
+    test "fresh v2 installs only current policy and partition authority" do
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
 
-      assert tables("public") == @tables
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
-      assert columns("docket_runs") == Enum.sort(@run_columns)
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
 
-      assert column_type("docket_graph_versions", "graph") == "bytea"
-      assert column_default("docket_graph_versions", "inserted_at") =~ "clock_timestamp()"
+      assert Enum.sort(owned_claim_tables("public")) ==
+               ["docket_claim_partitions", "docket_claim_policy"]
 
-      assert column_type("docket_runs", "state") == "bytea"
-
-      assert column_type("docket_runs", "poison_reason") == "text"
-      assert column_type("docket_events", "payload") == "bytea"
-      assert column_type("docket_events", "metadata") == "bytea"
-
-      assert nullable?("docket_runs", "tenant_id")
-      refute nullable?("docket_runs", "scope_key")
-      assert nullable?("docket_graph_versions", "tenant_id")
-      refute nullable?("docket_graph_versions", "scope_key")
-      refute nullable?("docket_runs", "started_at")
-
-      indexes = indexes("docket_runs")
-
-      assert indexes["docket_runs_run_id_index"] =~ "CREATE UNIQUE INDEX"
-
-      assert indexes["docket_runs_list_order_index"] =~
-               "(started_at DESC, run_id DESC)"
-
-      assert indexes["docket_runs_tenant_list_order_index"] =~
-               "(tenant_id, started_at DESC, run_id DESC)"
-
-      assert indexes["docket_runs_tenant_id_status_index"] =~
-               "WHERE (tenant_id IS NOT NULL)"
-
-      assert indexes["docket_runs_tenant_id_graph_id_status_index"] =~
-               "WHERE (tenant_id IS NOT NULL)"
-
-      ready = indexes["docket_runs_wake_at_id_index"]
-
-      assert ready =~ "btree (wake_at, id)"
-      assert ready =~ "status = 'running'"
-      assert ready =~ "poisoned_at IS NULL"
-      assert ready =~ "claim_token IS NULL"
-      assert ready =~ "wake_at IS NOT NULL"
-
-      expired = indexes["docket_runs_claimed_at_id_index"]
-
-      assert expired =~ "btree (claimed_at, id)"
-      assert expired =~ "status = 'running'"
-      assert expired =~ "poisoned_at IS NULL"
-      assert expired =~ "claim_token IS NOT NULL"
-
-      assert indexes["docket_runs_poisoned_at_index"] =~ "WHERE (poisoned_at IS NOT NULL)"
-
-      assert indexes["docket_runs_status_updated_at_index"] =~ "(status, updated_at)"
-
-      terminal_retention = indexes["docket_runs_updated_at_id_index"]
-      assert terminal_retention =~ "btree (updated_at, id)"
-      assert terminal_retention =~ "status = ANY"
-
-      assert indexes["docket_runs_graph_id_graph_hash_index"] =~ "(graph_id, graph_hash)"
-
-      graph_indexes = indexes("docket_graph_versions")
-
-      assert graph_indexes["docket_graph_versions_scope_graph_index"] =~
-               "CREATE UNIQUE INDEX"
-
-      revision_order =
-        graph_indexes["docket_graph_versions_scope_revision_order_index"]
-
-      assert revision_order =~ "(scope_key, graph_id, inserted_at DESC, graph_hash DESC)"
-      refute Map.has_key?(graph_indexes, "docket_graph_versions_graph_id_graph_hash_index")
-      refute Map.has_key?(graph_indexes, "docket_graph_versions_revision_order_index")
-
-      assert indexes("docket_events")["docket_events_run_id_seq_index"] =~
-               "CREATE UNIQUE INDEX"
-
-      assert indexes("docket_events")["docket_events_inserted_at_id_index"] =~
-               "(inserted_at, id)"
-
-      assert_row_round_trip()
-
-      assert :ok = Ecto.Migrator.down(TestRepo, @migration_version, InstallDocket, log: false)
-
-      assert tables("public") == []
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 0
-
-      assert :ok = Ecto.Migrator.up(TestRepo, @migration_version, InstallDocket, log: false)
-
-      assert tables("public") == @tables
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
-    end
-
-    test "migrates up and down inside a dedicated schema prefix" do
-      assert :ok =
-               Ecto.Migrator.up(
-                 TestRepo,
-                 @prefixed_migration_version,
-                 InstallDocketPrefixed,
-                 log: false
-               )
-
-      assert tables("docket_private") == @tables
-      assert tables("public") == []
-
-      assert Docket.Postgres.Migration.migrated_version(
-               repo: TestRepo,
-               prefix: "docket_private"
-             ) == 1
-
-      assert {:ok, _} = insert_run([], "docket_private")
-
-      assert :ok =
-               Ecto.Migrator.down(
-                 TestRepo,
-                 @prefixed_migration_version,
-                 InstallDocketPrefixed,
-                 log: false
-               )
-
-      assert tables("docket_private") == []
-    end
-
-    test "quotes a valid prefix that is also a Postgres keyword" do
-      assert :ok =
-               Ecto.Migrator.up(
-                 TestRepo,
-                 @reserved_prefix_migration_version,
-                 InstallDocketReservedPrefix,
-                 log: false
-               )
-
-      assert tables("select") == @tables
-
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo, prefix: "select") == 1
-
-      assert :ok =
-               Ecto.Migrator.down(
-                 TestRepo,
-                 @reserved_prefix_migration_version,
-                 InstallDocketReservedPrefix,
-                 log: false
-               )
-
-      assert tables("select") == []
-    end
-
-    test "accepts every valid lifecycle row shape" do
-      install!()
-
-      now = DateTime.utc_now()
-
-      valid_shapes = [
-        ready_running: [],
-        claimed_running: [wake_at: nil, claim_token: uuid(), claimed_at: now],
-        poisoned_running: [
-          wake_at: nil,
-          poisoned_at: now,
-          poison_reason: "max_claim_attempts_exceeded"
-        ],
-        waiting: [status: "waiting", wake_at: nil],
-        done: [status: "done", wake_at: nil, finished_at: now],
-        failed: [status: "failed", wake_at: nil, finished_at: now],
-        cancelled: [status: "cancelled", wake_at: nil, finished_at: now]
-      ]
-
-      for {shape, overrides} <- valid_shapes do
-        assert {:ok, _} = insert_run(overrides), "expected valid shape #{shape} to insert"
-      end
-    end
-
-    test "rejects every invalid lifecycle tuple through raw SQL" do
-      install!()
-
-      now = DateTime.utc_now()
-
-      # Each case is one minimal mutation off a valid row, so exactly the
-      # named constraint fires. A non-running row carrying poison violates
-      # the waiting/terminal-idle and poisoned-shape constraints
-      # inseparably, so that case accepts either name.
-      invalid_tuples = [
-        {"unknown status", [status: "created", wake_at: nil], ~w(docket_runs_status_check)},
-        {"running with finished_at", [finished_at: now], ~w(docket_runs_finished_at_check)},
-        {"done without finished_at", [status: "done", wake_at: nil],
-         ~w(docket_runs_finished_at_check)},
-        {"claim token without claimed_at", [wake_at: nil, claim_token: uuid()],
-         ~w(docket_runs_claim_pair_check)},
-        {"claimed_at without claim token", [claimed_at: now], ~w(docket_runs_claim_pair_check)},
-        {"poisoned_at without poison_reason", [wake_at: nil, poisoned_at: now],
-         ~w(docket_runs_poison_pair_check)},
-        {"poison_reason without poisoned_at", [poison_reason: "stuck"],
-         ~w(docket_runs_poison_pair_check)},
-        {"waiting with a wake", [status: "waiting"], ~w(docket_runs_waiting_terminal_idle_check)},
-        {"waiting with a claim",
-         [status: "waiting", wake_at: nil, claim_token: uuid(), claimed_at: now],
-         ~w(docket_runs_waiting_terminal_idle_check)},
-        {"waiting with poison",
-         [
-           status: "waiting",
-           wake_at: nil,
-           poisoned_at: now,
-           poison_reason: "stuck"
-         ], ~w(docket_runs_waiting_terminal_idle_check docket_runs_poisoned_shape_check)},
-        {"terminal with a wake", [status: "done", finished_at: now],
-         ~w(docket_runs_waiting_terminal_idle_check)},
-        {"poisoned with a claim",
-         [
-           wake_at: nil,
-           poisoned_at: now,
-           poison_reason: "stuck",
-           claim_token: uuid(),
-           claimed_at: now
-         ], ~w(docket_runs_poisoned_shape_check)},
-        {"poisoned with a wake", [poisoned_at: now, poison_reason: "stuck"],
-         ~w(docket_runs_poisoned_shape_check)},
-        {"running with both wake and claim", [claim_token: uuid(), claimed_at: now],
-         ~w(docket_runs_running_schedule_check)},
-        {"running with neither wake nor claim", [wake_at: nil],
-         ~w(docket_runs_running_schedule_check)},
-        {"negative step", [step: -1], ~w(docket_runs_counters_check)},
-        {"negative checkpoint_seq", [checkpoint_seq: -1], ~w(docket_runs_counters_check)},
-        {"negative claim_attempts", [claim_attempts: -1], ~w(docket_runs_counters_check)},
-        {"negative claim_abandons", [claim_abandons: -1], ~w(docket_runs_counters_check)}
-      ]
-
-      for {label, overrides, constraints} <- invalid_tuples do
-        assert {:error, %Postgrex.Error{postgres: %{code: :check_violation} = pg}} =
-                 insert_run(overrides),
-               "expected #{label} to raise a check violation"
-
-        assert pg.constraint in constraints,
-               "expected #{label} to violate one of #{inspect(constraints)}, " <>
-                 "got #{inspect(pg.constraint)}"
-      end
-
-      assert {:error, %Postgrex.Error{postgres: %{code: :not_null_violation} = pg}} =
-               insert_run(started_at: nil)
-
-      assert pg.column == "started_at"
-    end
-
-    test "referential integrity binds runs to graphs and events to runs" do
-      install!()
-
-      # A run cannot reference a graph version that was never published.
-      assert {:error, %Postgrex.Error{postgres: %{code: :foreign_key_violation} = pg}} =
-               insert_run(graph_hash: "unpublished")
-
-      assert pg.constraint == "docket_runs_graph_scope_fkey"
-
-      assert {:ok, _} = insert_run([])
-
-      # A referenced graph version cannot be deleted; an unreferenced one can.
-      insert_graph_version!("g_unused", "hash_unused")
-
-      assert {:error, %Postgrex.Error{postgres: %{code: :foreign_key_violation}}} =
-               TestRepo.query(
-                 "DELETE FROM docket_graph_versions WHERE graph_id = 'g1'",
-                 []
-               )
-
-      assert %{num_rows: 1} =
+      assert [[1, "legacy", nil, 0, nil]] =
                TestRepo.query!(
-                 "DELETE FROM docket_graph_versions WHERE graph_id = 'g_unused'",
-                 []
-               )
+                 "SELECT id, admission_mode, max_active, policy_version, initialized_at " <>
+                   "FROM docket_claim_policy"
+               ).rows
 
-      # An event cannot reference a missing run.
-      assert {:error, %Postgrex.Error{postgres: %{code: :foreign_key_violation} = pg}} =
-               insert_event("no_such_run", 1)
+      assert function_count("public") == 1
 
-      assert pg.constraint == "docket_events_run_id_fkey"
-
-      # Deleting a run cascades to its events.
-      {:ok, %{rows: [[run_id]]}} =
-        insert_run(status: "done", wake_at: nil, finished_at: DateTime.utc_now())
-
-      assert {:ok, _} = insert_event(run_id, 1)
-      assert {:ok, _} = insert_event(run_id, 2)
-
-      assert %{num_rows: 1} =
-               TestRepo.query!("DELETE FROM docket_runs WHERE run_id = $1", [run_id])
-
-      assert %{rows: [[0]]} =
-               TestRepo.query!("SELECT count(*) FROM docket_events WHERE run_id = $1", [run_id])
-    end
-
-    test "scoped graph identity binds tenantless and tenant-owned runs without NULL holes" do
-      install!()
-
-      assert {:ok, %{rows: [[tenantless_run]]}} = insert_run([])
-      assert {:ok, %{rows: [[tenant_run]]}} = insert_run(tenant_id: "acme")
-
-      assert %{rows: [["", nil]]} =
-               TestRepo.query!(
-                 "SELECT scope_key, tenant_id FROM docket_runs WHERE run_id = $1",
-                 [tenantless_run]
-               )
-
-      assert %{rows: [["acme", "acme"]]} =
-               TestRepo.query!(
-                 "SELECT scope_key, tenant_id FROM docket_runs WHERE run_id = $1",
-                 [tenant_run]
-               )
-
-      assert {:error, %Postgrex.Error{postgres: %{code: :foreign_key_violation} = pg}} =
-               TestRepo.query(
-                 "UPDATE docket_runs SET tenant_id = 'other' WHERE run_id = $1",
-                 [tenant_run]
-               )
-
-      assert pg.constraint == "docket_runs_graph_scope_fkey"
-
-      for table <- ["docket_graph_versions", "docket_runs"] do
-        assert {:error, %Postgrex.Error{postgres: %{code: :check_violation} = pg}} =
-                 TestRepo.query(
-                   "UPDATE #{table} SET tenant_id = '' WHERE tenant_id IS NULL",
-                   []
-                 )
-
-        assert pg.constraint in [
-                 "docket_graph_versions_tenant_id_check",
-                 "docket_runs_tenant_id_check"
+      assert Enum.sort(scope_indexes("public")) ==
+               [
+                 "docket_runs_scope_expired_index",
+                 "docket_runs_scope_live_index",
+                 "docket_runs_scope_ready_index"
                ]
-      end
     end
 
-    test "dispatch and poison-introspection scans use their partial indexes" do
-      install!()
+    test "ordinary v1-to-v2 upgrade backfills existing scopes transactionally" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
 
-      ready_scan = """
-      SELECT id FROM docket_runs
-      WHERE status = 'running' AND poisoned_at IS NULL
-        AND claim_token IS NULL AND wake_at <= now()
-      ORDER BY wake_at, id
-      LIMIT 10
-      """
+      insert_v1_graph_and_run("tenant-a", "run-a")
+      insert_v1_graph_and_run(nil, "run-system")
 
-      expired_scan = """
-      SELECT id FROM docket_runs
-      WHERE status = 'running' AND poisoned_at IS NULL
-        AND claim_token IS NOT NULL AND claimed_at < now() - interval '1 minute'
-      ORDER BY claimed_at, id
-      LIMIT 10
-      """
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
 
-      poison_scan = """
-      SELECT id FROM docket_runs
-      WHERE poisoned_at IS NOT NULL
-      ORDER BY poisoned_at
-      """
-
-      assert explain(ready_scan) =~ "docket_runs_wake_at_id_index"
-      assert explain(expired_scan) =~ "docket_runs_claimed_at_id_index"
-      assert explain(poison_scan) =~ "docket_runs_poisoned_at_index"
+      assert TestRepo.query!("SELECT scope_key FROM docket_claim_partitions ORDER BY scope_key").rows ==
+               [[""], ["tenant-a"]]
     end
 
-    test "newest-first run collection scans use stable listing indexes" do
-      install!()
+    test "fresh v2 and a populated v1-to-v2 upgrade have equivalent schemas" do
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+      fresh = schema_signature("public")
 
-      system_scan = """
-      SELECT run_id, started_at FROM docket_runs
-      ORDER BY started_at DESC, run_id DESC
-      LIMIT 10
-      """
+      :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "run-a", "docket_private")
+      :ok = Ecto.Migrator.up(TestRepo, @private_v2, UpgradePrivateV2, log: false)
 
-      tenant_scan = """
-      SELECT run_id, started_at FROM docket_runs
-      WHERE tenant_id = 'tenant-1'
-      ORDER BY started_at DESC, run_id DESC
-      LIMIT 10
-      """
+      assert schema_signature("docket_private") == fresh
 
-      assert explain(system_scan) =~ "docket_runs_list_order_index"
-      assert explain(tenant_scan) =~ "docket_runs_tenant_list_order_index"
+      assert TestRepo.query!("SELECT scope_key FROM docket_private.docket_claim_partitions").rows ==
+               [["tenant-a"]]
     end
 
-    defp install! do
-      assert :ok = Ecto.Migrator.up(TestRepo, @migration_version, InstallDocket, log: false)
+    test "database constraints reject invalid exact-cap authority" do
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      rejected = [
+        "UPDATE docket_claim_policy SET admission_mode = 'invalid' WHERE id = 1",
+        "UPDATE docket_claim_policy SET max_active = 0, policy_version = 1, " <>
+          "initialized_at = CURRENT_TIMESTAMP WHERE id = 1",
+        "UPDATE docket_claim_policy SET policy_version = -1 WHERE id = 1",
+        "INSERT INTO docket_claim_partitions (scope_key, max_active) VALUES ('bad-cap', 0)",
+        "INSERT INTO docket_claim_partitions (scope_key, partition_version) " <>
+          "VALUES ('bad-version', -1)",
+        "INSERT INTO docket_claim_partitions (scope_key, admission_epoch) " <>
+          "VALUES ('bad-epoch', -1)"
+      ]
+
+      Enum.each(rejected, fn statement ->
+        error = assert_raise Postgrex.Error, fn -> TestRepo.query!(statement) end
+        assert error.postgres.code == :check_violation
+      end)
+
+      assert [["legacy", nil, 0, nil]] =
+               TestRepo.query!(
+                 "SELECT admission_mode, max_active, policy_version, initialized_at " <>
+                   "FROM docket_claim_policy"
+               ).rows
+
+      assert TestRepo.query!("SELECT count(*) FROM docket_claim_partitions").rows == [[0]]
     end
 
-    defp assert_row_round_trip do
-      now = DateTime.utc_now()
+    @tag timeout: 20_000
+    test "v1 inserts serialize before the v2 backfill snapshot on distinct connections" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      parent = self()
 
-      assert {:ok, _version} =
-               %{graph_id: "g1", graph_hash: "abc123", graph: <<131, 106>>}
-               |> Docket.Postgres.Schemas.GraphVersion.changeset()
-               |> TestRepo.insert()
+      writer =
+        Task.async(fn ->
+          TestRepo.checkout(
+            fn ->
+              TestRepo.transaction(fn ->
+                [[writer_backend]] = TestRepo.query!("SELECT pg_backend_pid()").rows
+                insert_v1_graph_and_run("tenant-late", "run-late")
+                send(parent, {:writer_ready, self(), writer_backend})
 
-      assert {:ok, run} =
-               %{
-                 run_id: "run_1",
-                 graph_id: "g1",
-                 graph_hash: "abc123",
-                 status: :running,
-                 state: <<131, 106>>,
-                 started_at: now,
-                 wake_at: now
-               }
-               |> Docket.Postgres.Schemas.Run.changeset()
-               |> TestRepo.insert()
+                receive do
+                  :observe_migration -> :ok
+                after
+                  5_000 -> raise "timed out waiting for the migration backend"
+                end
 
-      assert run.step == 0
-      assert run.checkpoint_seq == 0
-      assert run.claim_attempts == 0
-      assert run.poisoned_at == nil
-      assert run.poison_reason == nil
-      assert run.tenant_id == nil
-      assert run.scope_key == ""
+                migration_backend = await_migration_lock_wait!(writer_backend)
+                send(parent, {:migration_waiting, self(), migration_backend})
 
-      assert {:error, changeset} =
-               %{
-                 run_id: "run_1",
-                 graph_id: "g1",
-                 graph_hash: "abc123",
-                 status: :running,
-                 state: <<131, 106>>,
-                 started_at: now,
-                 wake_at: now
-               }
-               |> Docket.Postgres.Schemas.Run.changeset()
-               |> TestRepo.insert()
-
-      assert {"has already been taken", _meta} = changeset.errors[:run_id]
-
-      assert {:ok, _event} =
-               %{
-                 run_id: "run_1",
-                 seq: 1,
-                 type: :run_initialized,
-                 step: 0,
-                 payload: <<131, 116, 0, 0, 0, 0>>,
-                 metadata: <<131, 116, 0, 0, 0, 0>>,
-                 occurred_at: now
-               }
-               |> Docket.Postgres.Schemas.Event.changeset()
-               |> TestRepo.insert()
-    end
-
-    # Inserts a docket_runs row through raw SQL — bypassing changesets on
-    # purpose — as a ready `running` row unless overridden. Publishes the
-    # success.
-    defp insert_run(overrides, prefix \\ "public") do
-      now = DateTime.utc_now()
-
-      base = %{
-        run_id: "run_#{System.unique_integer([:positive])}",
-        tenant_id: nil,
-        graph_id: "g1",
-        graph_hash: "abc123",
-        status: "running",
-        step: 0,
-        state: <<131, 106>>,
-        checkpoint_seq: 0,
-        latest_checkpoint_type: nil,
-        claim_token: nil,
-        claimed_at: nil,
-        wake_at: now,
-        claim_attempts: 0,
-        claim_abandons: 0,
-        poisoned_at: nil,
-        poison_reason: nil,
-        inserted_at: now,
-        started_at: now,
-        updated_at: now,
-        finished_at: nil
-      }
-
-      row = Map.merge(base, Map.new(overrides))
-      ensure_graph_version(prefix, row.tenant_id)
-      columns = Map.keys(base)
-      placeholders = Enum.map_join(1..length(columns), ", ", &"$#{&1}")
-
-      TestRepo.query(
-        """
-        INSERT INTO #{prefix}.docket_runs (#{Enum.join(columns, ", ")})
-        VALUES (#{placeholders})
-        RETURNING run_id
-        """,
-        Enum.map(columns, &Map.fetch!(row, &1))
-      )
-    end
-
-    defp insert_event(run_id, seq) do
-      now = DateTime.utc_now()
-
-      TestRepo.query(
-        """
-        INSERT INTO docket_events
-          (run_id, seq, type, step, payload, metadata, occurred_at, inserted_at)
-        VALUES ($1, $2, 'node_completed', 0, $3, $3, $4, $4)
-        """,
-        [run_id, seq, <<131, 116, 0, 0, 0, 0>>, now]
-      )
-    end
-
-    defp ensure_graph_version(prefix, tenant_id) do
-      insert_graph_version!("g1", "abc123", prefix, tenant_id)
-    end
-
-    defp insert_graph_version!(
-           graph_id,
-           graph_hash,
-           prefix \\ "public",
-           tenant_id \\ nil
-         ) do
-      TestRepo.query!(
-        """
-        INSERT INTO #{prefix}.docket_graph_versions
-          (tenant_id, graph_id, graph_hash, graph, inserted_at)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT DO NOTHING
-        """,
-        [tenant_id, graph_id, graph_hash, <<131, 106>>, DateTime.utc_now()]
-      )
-    end
-
-    defp uuid, do: Ecto.UUID.dump!(Ecto.UUID.generate())
-
-    # SET LOCAL and EXPLAIN must run on the same pooled connection, so both
-    # happen inside one transaction. Seq scans are disabled because the
-    # planner never picks an index on an empty table otherwise.
-    defp explain(sql) do
-      {:ok, plan} =
-        TestRepo.transaction(fn ->
-          TestRepo.query!("SET LOCAL enable_seqscan = off")
-
-          %{rows: rows} = TestRepo.query!("EXPLAIN #{sql}")
-
-          Enum.map_join(rows, "\n", &List.first/1)
+                receive do
+                  :commit_writer -> :committed
+                after
+                  5_000 -> raise "timed out waiting to commit the v1 insert"
+                end
+              end)
+            end,
+            timeout: 10_000
+          )
         end)
 
-      plan
+      writer_pid = writer.pid
+      assert_receive {:writer_ready, ^writer_pid, writer_backend}, 5_000
+
+      migrator =
+        Task.async(fn ->
+          Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false, migration_lock: false)
+        end)
+
+      send(writer_pid, :observe_migration)
+      assert_receive {:migration_waiting, ^writer_pid, migration_backend}, 5_000
+      refute migration_backend == writer_backend
+
+      send(writer_pid, :commit_writer)
+
+      assert {:ok, :committed} = Task.await(writer, 5_000)
+      assert :ok = Task.await(migrator, 10_000)
+
+      assert TestRepo.query!("SELECT scope_key FROM docket_claim_partitions").rows ==
+               [["tenant-late"]]
     end
 
-    defp tables(schema) do
-      %{rows: rows} =
+    test "a failed transactional v2 upgrade preserves the v1 schema and data" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "run-a")
+
+      assert_raise RuntimeError, "forced v2 rollback", fn ->
+        Ecto.Migrator.up(TestRepo, @failed_v2, FailedUpgradeV2, log: false)
+      end
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
+      assert owned_claim_tables("public") == []
+      assert scope_indexes("public") == []
+      assert function_count("public") == 0
+      assert v1_runs("public") == [["run-a", "tenant-a"]]
+    end
+
+    test "a populated custom-prefix upgrade backfills tenant and tenantless scopes" do
+      :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "run-a", "docket_private")
+      insert_v1_graph_and_run(nil, "run-system", "docket_private")
+
+      :ok = Ecto.Migrator.up(TestRepo, @private_v2, UpgradePrivateV2, log: false)
+
+      assert TestRepo.query!(
+               "SELECT scope_key FROM docket_private.docket_claim_partitions " <>
+                 "ORDER BY scope_key"
+             ).rows == [[""], ["tenant-a"]]
+
+      assert v1_runs("docket_private") ==
+               [["run-a", "tenant-a"], ["run-system", nil]]
+    end
+
+    test "v2 down removes only exact-cap objects and preserves populated v1 data" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "run-a")
+      insert_v1_graph_and_run(nil, "run-system")
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+      :ok = Ecto.Migrator.down(TestRepo, @v2, UpgradeV2, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
+      assert owned_claim_tables("public") == []
+      assert function_count("public") == 0
+      assert v1_runs("public") == [["run-a", "tenant-a"], ["run-system", nil]]
+    end
+
+    test "supports an explicit prefix without cross-schema objects" do
+      :ok = Ecto.Migrator.up(TestRepo, @private, InstallPrivate, log: false)
+
+      assert Enum.sort(owned_claim_tables("docket_private")) ==
+               ["docket_claim_partitions", "docket_claim_policy"]
+
+      assert owned_claim_tables("public") == []
+      assert function_count("docket_private") == 1
+    end
+
+    defp owned_claim_tables(prefix) do
+      TestRepo.query!(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = $1 AND table_name LIKE 'docket_claim_%'
+        ORDER BY table_name
+        """,
+        [prefix]
+      ).rows
+      |> List.flatten()
+    end
+
+    defp function_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_proc
+        JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+        WHERE pg_namespace.nspname = $1 AND proname = 'docket_tenant_fair_claim_v1'
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp scope_indexes(prefix) do
+      TestRepo.query!(
+        """
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = $1 AND indexname LIKE 'docket_runs_scope_%_index'
+        ORDER BY indexname
+        """,
+        [prefix]
+      ).rows
+      |> List.flatten()
+    end
+
+    defp schema_signature(prefix) do
+      columns =
         TestRepo.query!(
           """
-          SELECT table_name FROM information_schema.tables
+          SELECT table_name, column_name, ordinal_position, udt_name, is_nullable,
+                 column_default, is_generated, generation_expression
+          FROM information_schema.columns
           WHERE table_schema = $1 AND table_name LIKE 'docket_%'
+          ORDER BY table_name, ordinal_position
           """,
-          [schema]
-        )
+          [prefix]
+        ).rows
 
-      rows |> List.flatten() |> Enum.sort()
-    end
-
-    defp columns(table) do
-      %{rows: rows} =
+      constraints =
         TestRepo.query!(
           """
-          SELECT column_name FROM information_schema.columns
-          WHERE table_schema = 'public' AND table_name = $1
+          SELECT relation.relname, authority.conname, authority.contype::text,
+                 pg_get_constraintdef(authority.oid, true)
+          FROM pg_constraint AS authority
+          JOIN pg_class AS relation ON relation.oid = authority.conrelid
+          JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = $1 AND relation.relname LIKE 'docket_%'
+          ORDER BY relation.relname, authority.conname
           """,
-          [table]
-        )
+          [prefix]
+        ).rows
 
-      rows |> List.flatten() |> Enum.sort()
-    end
-
-    defp nullable?(table, column) do
-      %{rows: [[answer]]} =
+      indexes =
         TestRepo.query!(
           """
-          SELECT is_nullable FROM information_schema.columns
-          WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+          SELECT tablename, indexname, indexdef
+          FROM pg_indexes
+          WHERE schemaname = $1 AND tablename LIKE 'docket_%'
+          ORDER BY tablename, indexname
           """,
-          [table, column]
-        )
+          [prefix]
+        ).rows
 
-      answer == "YES"
-    end
-
-    defp column_type(table, column) do
-      %{rows: [[data_type]]} =
+      sequences =
         TestRepo.query!(
           """
-          SELECT data_type FROM information_schema.columns
-          WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+          SELECT relation.relname, configuration.seqstart, configuration.seqincrement,
+                 configuration.seqmax, configuration.seqmin, configuration.seqcache,
+                 configuration.seqcycle
+          FROM pg_sequence AS configuration
+          JOIN pg_class AS relation ON relation.oid = configuration.seqrelid
+          JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = $1 AND relation.relname LIKE 'docket_%'
+          ORDER BY relation.relname
           """,
-          [table, column]
-        )
+          [prefix]
+        ).rows
 
-      data_type
-    end
-
-    defp column_default(table, column) do
-      %{rows: [[default]]} =
+      functions =
         TestRepo.query!(
           """
-          SELECT column_default FROM information_schema.columns
-          WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+          SELECT procedure.proname, pg_get_function_identity_arguments(procedure.oid),
+                 pg_get_function_result(procedure.oid), pg_get_functiondef(procedure.oid)
+          FROM pg_proc AS procedure
+          JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+          WHERE namespace.nspname = $1 AND procedure.proname LIKE 'docket_%'
+          ORDER BY procedure.proname
           """,
-          [table, column]
-        )
+          [prefix]
+        ).rows
 
-      default
+      %{
+        columns: normalize_schema(columns, prefix),
+        constraints: normalize_schema(constraints, prefix),
+        indexes: normalize_schema(indexes, prefix),
+        sequences: normalize_schema(sequences, prefix),
+        functions: normalize_schema(functions, prefix)
+      }
     end
 
-    defp indexes(table) do
-      %{rows: rows} =
-        TestRepo.query!(
-          "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' AND tablename = $1",
-          [table]
-        )
+    defp normalize_schema(rows, prefix) do
+      Enum.map(rows, fn row ->
+        Enum.map(row, fn
+          value when is_binary(value) ->
+            value
+            |> String.replace(~s("#{prefix}".), "")
+            |> String.replace("#{prefix}.", "")
 
-      Map.new(rows, fn [name, def] -> {name, def} end)
+          value ->
+            value
+        end)
+      end)
+    end
+
+    defp await_migration_lock_wait!(writer_backend) do
+      deadline = System.monotonic_time(:millisecond) + 5_000
+      poll_migration_lock_wait!(writer_backend, deadline)
+    end
+
+    defp poll_migration_lock_wait!(writer_backend, deadline) do
+      rows =
+        TestRepo.query!(
+          """
+          SELECT pid
+          FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND pid <> $1
+            AND $1 = ANY(pg_blocking_pids(pid))
+          """,
+          [writer_backend]
+        ).rows
+
+      case rows do
+        [[migration_backend] | _rest] -> migration_backend
+        [] -> retry_migration_lock_wait!(writer_backend, deadline)
+      end
+    end
+
+    defp retry_migration_lock_wait!(writer_backend, deadline) do
+      if System.monotonic_time(:millisecond) < deadline do
+        Process.sleep(10)
+        poll_migration_lock_wait!(writer_backend, deadline)
+      else
+        raise "the v2 migration did not wait on the docket_runs table lock"
+      end
+    end
+
+    defp v1_runs(prefix) do
+      TestRepo.query!(~s(SELECT run_id, tenant_id FROM "#{prefix}"."docket_runs" ORDER BY run_id)).rows
+    end
+
+    defp insert_v1_graph_and_run(tenant_id, run_id, prefix \\ "public") do
+      graph_versions = ~s("#{prefix}"."docket_graph_versions")
+      runs = ~s("#{prefix}"."docket_runs")
+
+      TestRepo.query!(
+        """
+        INSERT INTO #{graph_versions}
+          (tenant_id, graph_id, graph_hash, graph, inserted_at)
+        VALUES ($1, 'graph', $2, $3, CURRENT_TIMESTAMP)
+        """,
+        [tenant_id, "hash-#{run_id}", <<1>>]
+      )
+
+      TestRepo.query!(
+        """
+        INSERT INTO #{runs}
+          (run_id, tenant_id, graph_id, graph_hash, status, state,
+           checkpoint_seq, wake_at, inserted_at, started_at, updated_at)
+        VALUES ($1, $2, 'graph', $3, 'running', $4,
+                1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP)
+        """,
+        [run_id, tenant_id, "hash-#{run_id}", <<1>>]
+      )
     end
   end
 end

@@ -46,12 +46,12 @@ CI builds and tests three release gates (`.github/workflows/ci.yml`):
 - **core** — `DOCKET_CORE_ONLY=1`, which drops `ecto_sql`/`postgrex` from
   `deps/0` in `mix.exs` to mirror a core-only host.
 - **live Postgres** — PostgreSQL 13 and 17 exercise migrations, constraints,
-  concurrency, recovery, retention, notification fallback, query plans, and a
-  bounded tenant-fair claim benchmark smoke check.
+  exact-cap concurrency, recovery, retention, and notification fallback.
 
 Every gate compiles with `--warnings-as-errors`. The full and core gates run
 the default suite; the live Postgres gate includes the tests tagged
-`:postgres`. To reproduce the core gate locally:
+`:postgres`. The exploratory TenantFair benchmark is not part of the v0.1
+release gate. To reproduce the core gate locally:
 
 ```sh
 DOCKET_CORE_ONLY=1 mix deps.get
@@ -95,30 +95,3 @@ Override them with the corresponding `DOCKET_TEST_DATABASE_URL`,
 `DOCKET_SHARED_BACKEND_TEST_DATABASE_URL`. PostgreSQL 13 is the
 implementation minimum because claim SQL uses materialized CTEs and the
 built-in `gen_random_uuid()`.
-
-### Tenant-fair claim benchmark
-
-The high-cardinality claim benchmark is an exploratory, source-checkout-only
-tool. It is not part of Docket's packaged runtime and its provisional policy,
-partition, hint, and index DDL does not describe a shipped migration. The
-runner creates an owned scratch schema, installs the real Docket tables there,
-and adds only the benchmark-local provisional objects needed to compare claim
-query shapes. Point it at a database where that schema lifecycle is safe:
-
-```sh
-DOCKET_BENCH_DATABASE_URL=postgres://localhost/docket_bench \
-  mix run bench/postgres/tenant_fair_claim.exs -- --profile smoke --check
-```
-
-PostgreSQL 13 or newer is supported; CI exercises both the minimum (13) and
-reference (17) environments. The larger local profiles are for investigation,
-not routine CI.
-See the [PostgreSQL operations guide](docs/postgres-operations.md#tenant-fair-claim-benchmark)
-for profiles, artifacts, metric definitions, and interpretation constraints.
-
-The CI smoke profile checks deterministic result, cap-safety, bounded
-under-claim, artifact, and coarse plan invariants. Do not add latency,
-percentile, throughput, exact planner-cost, or machine-relative buffer gates to
-CI. Performance comparisons require a controlled database host, the same
-resolved profile and seed, and the environment metadata saved with each
-artifact.

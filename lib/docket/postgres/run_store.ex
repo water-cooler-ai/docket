@@ -40,7 +40,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @behaviour Docket.Backend.RunStore
 
     alias Docket.Postgres.{ClaimPolicy, RunCodec, Storage}
-    alias Docket.Postgres.Schemas.Run
+    alias Docket.Postgres.Schemas.{ClaimPartition, Run}
 
     @type ctx :: module() | %{required(:repo) => module(), optional(:prefix) => String.t() | nil}
 
@@ -57,6 +57,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     shape: the committed run has a positive checkpoint sequence, start and
     update timestamps, `:run_initialized` checkpoint metadata, and an explicit
     first wake.
+
+    Before inserting the run, the same transaction ensures its canonical claim
+    partition exists with inherited, running, version-zero defaults. A
+    concurrent or Admin-created row wins unchanged. Failed inserts and caller
+    rollbacks remove both lifecycle writes; committed partition rows remain
+    dormant indefinitely when their last run is later pruned.
     """
     @impl true
     @spec insert_run(
@@ -67,7 +73,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             DateTime.t()
           ) :: {:ok, Docket.Run.t()} | {:error, term()}
     def insert_run(ctx, owner_scope, run, checkpoint_type, wake_at) do
-      {repo, prefix} = Storage.context!(ctx)
+      _ = Storage.context!(ctx)
       tenant_id = owner_tenant_id!(owner_scope)
 
       with :ok <- validate_initialized_run(run, checkpoint_type, wake_at),
@@ -90,17 +96,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         changeset = Run.changeset(attrs)
 
         if changeset.valid? do
-          case repo.insert(changeset, prefix: prefix) do
-            {:ok, _row} ->
-              notify_due_wake(repo, prefix, wake_at)
-              {:ok, run}
+          Storage.transaction(ctx, fn transaction_ctx ->
+            {transaction_repo, transaction_prefix} = Storage.context!(transaction_ctx)
+            scope_key = tenant_id || ""
 
-            {:error, %Ecto.Changeset{} = changeset} ->
-              insert_error(changeset)
+            :ok = ensure_claim_partition(transaction_repo, transaction_prefix, scope_key)
 
-            {:error, reason} ->
-              {:error, reason}
-          end
+            case transaction_repo.insert(changeset, prefix: transaction_prefix) do
+              {:ok, _row} ->
+                notify_due_wake(transaction_repo, transaction_prefix, wake_at)
+                {:ok, run}
+
+              {:error, %Ecto.Changeset{} = failed_changeset} ->
+                insert_error(failed_changeset)
+
+              {:error, reason} ->
+                {:error, reason}
+            end
+          end)
         else
           {:error, :invalid_run}
         end
@@ -218,11 +231,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           {:ok, %{rows: rows}} ->
             case ClaimPolicy.decode(claim_policy, plan, rows) do
               {:ok, batch, observation} -> {{:ok, batch}, observation}
+              {:error, reason, observation} -> {{:error, reason}, observation}
               {:error, reason} -> {{:error, reason}, nil}
             end
 
           {:error, reason} ->
-            {{:error, reason}, nil}
+            {{:error, normalize_claim_query_error(reason)}, nil}
         end
 
       :ok = ClaimPolicy.observe(claim_policy, plan, decoded_observation, result, started)
@@ -232,6 +246,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def claim_due(_ctx, scope, _policy) do
       raise ArgumentError, "claim_due scope must be :system, got: #{inspect(scope)}"
     end
+
+    defp normalize_claim_query_error(%Postgrex.Error{
+           postgres: %{code: :read_only_sql_transaction}
+         }) do
+      {:claim_policy_unavailable, :read_only_transaction}
+    end
+
+    defp normalize_claim_query_error(%Postgrex.Error{postgres: %{code: :lock_not_available}}) do
+      {:claim_policy_unavailable, :lock_contention}
+    end
+
+    defp normalize_claim_query_error(reason), do: reason
 
     @doc """
     Refreshes the claim timestamp when `claim_token` is still current.
@@ -978,6 +1004,42 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         true ->
           {:error, changeset}
       end
+    end
+
+    # A plain MVCC read sees an already-committed partition without waiting for
+    # an admission transaction's uncommitted update to its current tuple. The
+    # absent case still uses uniqueness arbitration because another first
+    # writer or Admin may materialize the key after this observation.
+    defp ensure_claim_partition(repo, prefix, scope_key) do
+      query =
+        from(partition in ClaimPartition,
+          where: partition.scope_key == ^scope_key,
+          select: 1,
+          limit: 1
+        )
+        |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
+
+      case repo.one(query) do
+        1 -> :ok
+        nil -> insert_claim_partition(repo, prefix, scope_key)
+      end
+    end
+
+    # Supplying only the canonical key is intentional: PostgreSQL owns every
+    # version-zero default. `DO NOTHING` is also load-bearing because an Admin
+    # row may win the read/insert race with overrides, non-running state, or
+    # advanced versions.
+    defp insert_claim_partition(repo, prefix, scope_key) do
+      _ =
+        repo.insert_all(
+          ClaimPartition,
+          [%{scope_key: scope_key}],
+          on_conflict: :nothing,
+          conflict_target: [:scope_key],
+          prefix: prefix
+        )
+
+      :ok
     end
 
     defp emit_claim_operation(operation, started, result, measurements \\ %{}) do

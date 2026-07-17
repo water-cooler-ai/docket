@@ -160,5 +160,37 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert Ecto.Enum.values(Event, :type) == Docket.Event.types()
       end
     end
+
+    describe "exact-cap schemas" do
+      test "bind only the current policy and partition authority" do
+        assert Docket.Postgres.Schemas.ClaimPolicy.__schema__(:source) ==
+                 "docket_claim_policy"
+
+        assert Docket.Postgres.Schemas.ClaimPartition.__schema__(:source) ==
+                 "docket_claim_partitions"
+      end
+
+      test "keep the persisted model minimal" do
+        assert Docket.Postgres.Schemas.ClaimPolicy.__schema__(:fields) ==
+                 [
+                   :id,
+                   :admission_mode,
+                   :max_active,
+                   :policy_version,
+                   :initialized_at,
+                   :updated_at
+                 ]
+
+        assert Docket.Postgres.Schemas.ClaimPartition.__schema__(:fields) ==
+                 [
+                   :scope_key,
+                   :max_active,
+                   :partition_version,
+                   :admission_epoch,
+                   :inserted_at,
+                   :updated_at
+                 ]
+      end
+    end
   end
 end

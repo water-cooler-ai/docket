@@ -155,6 +155,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       set_claims(agent, [
         fn _policy ->
           send(parent, {:claim_worker, self()})
+
+          receive do
+            :monitor_ready -> send(parent, {:claim_worker_monitor_ready, self()})
+          end
+
           Process.sleep(:infinity)
         end
       ])
@@ -162,6 +167,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       dispatcher = start_dispatcher!(agent)
       assert_receive {:claim_worker, worker}
       worker_monitor = Process.monitor(worker)
+      send(worker, :monitor_ready)
+      assert_receive {:claim_worker_monitor_ready, ^worker}
 
       Process.exit(dispatcher, :kill)
 
@@ -402,7 +409,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp dispatcher_opts(agent, overrides) do
-      base_context = %{repo: __MODULE__.Repo, prefix: nil}
+      base_context = %{repo: __MODULE__.Repo, prefix: "public"}
 
       context =
         Map.merge(base_context, %{

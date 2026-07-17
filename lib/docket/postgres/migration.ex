@@ -1,49 +1,11 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.Migration do
     @moduledoc """
-    Creates and versions the tables Docket's Postgres backend owns.
+    Creates and versions the tables owned by Docket's PostgreSQL backend.
 
-    The host application owns a single migration file that delegates here;
-    bumping `version:` (or omitting it to take the latest) applies any
-    steps the database is missing.
-
-    ## Usage
-
-    Generate the host migration:
-
-        $ mix docket.gen.migration
-
-    Or write it by hand:
-
-        defmodule MyApp.Repo.Migrations.AddDocketTables do
-          use Ecto.Migration
-
-          def up, do: Docket.Postgres.Migration.up(version: 1)
-          def down, do: Docket.Postgres.Migration.down(version: 1)
-        end
-
-    Then run it as usual:
-
-        $ mix ecto.migrate
-
-    ## Options
-
-      * `:version` — the target schema version. `up/1` defaults to the newest
-        version; `down/1` defaults to rolling everything back.
-      * `:prefix` — the Postgres schema (namespace) to install the tables
-        into. Defaults to `"public"`.
-      * `:create_schema` — whether `up/1` should `CREATE SCHEMA IF NOT
-        EXISTS` for a non-default `:prefix`. Defaults to `true` whenever
-        `:prefix` is set.
-
-    ## Tables
-
-    Version 1 installs `docket_graph_versions`, `docket_runs`, and
-    `docket_events`, including tenant-scoped graph identity.
-
-    The migrated version is recorded as a `COMMENT` on the `docket_runs`
-    table, so `up/1` and `down/1` are idempotent and only apply the steps
-    the database is actually missing.
+    Version 1 contains durable graphs, runs, and events. Version 2 adds the
+    minimal exact-cap policy and partition authority plus its claim function
+    and supporting indexes. Both steps are ordinary transactional migrations.
     """
 
     use Ecto.Migration
@@ -51,14 +13,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Storage
 
     @initial_version 1
-    @current_version 1
+    @current_version 2
     @default_prefix "public"
 
-    @doc """
-    Migrates the Docket tables up to `:version` (defaults to the newest).
-
-    Must be called from within a host `Ecto.Migration`.
-    """
     @spec up(keyword()) :: :ok
     def up(opts \\ []) when is_list(opts) do
       opts = with_defaults(opts, @current_version)
@@ -75,12 +32,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    @doc """
-    Rolls the Docket tables back down to (and including) `:version`.
-
-    `down(version: 1)` — the default — removes everything.
-    Must be called from within a host `Ecto.Migration`.
-    """
     @spec down(keyword()) :: :ok
     def down(opts \\ []) when is_list(opts) do
       opts = with_defaults(opts, @initial_version)
@@ -93,13 +44,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :ok
     end
 
-    @doc """
-    The schema version currently installed in the database, or `0` when the
-    Docket tables are absent.
-
-    Reads through the migration runner's repo by default; pass `:repo` to
-    query outside of a migration.
-    """
     @spec migrated_version(keyword() | map()) :: non_neg_integer()
     def migrated_version(opts \\ [])
 
@@ -111,9 +55,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       repo = Map.get_lazy(opts, :repo, fn -> repo() end)
 
       query = """
-      SELECT description
+      SELECT obj_description(pg_class.oid, 'pg_class')
       FROM pg_class
-      LEFT JOIN pg_description ON pg_description.objoid = pg_class.oid
       LEFT JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
       WHERE pg_class.relname = 'docket_runs' AND pg_namespace.nspname = $1
       """
@@ -124,12 +67,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    @doc false
-    @spec initial_version() :: pos_integer()
     def initial_version, do: @initial_version
-
-    @doc false
-    @spec current_version() :: pos_integer()
     def current_version, do: @current_version
 
     defp change(range, direction, opts) do
@@ -147,7 +85,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           record_version(opts, last - 1)
 
         {:down, _range} ->
-          # V01's down drops docket_runs, and the version comment goes with it.
           :ok
       end
 

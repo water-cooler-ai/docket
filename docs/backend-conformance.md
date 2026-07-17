@@ -121,11 +121,15 @@ suite and live RunStore suite consume that registry so an implementation cannot
 silently omit either contract. The pure contract verifies policy construction and
 selected-implementation binding, invalid runtime inputs, one data-only
 statement, suite-owned decoded-batch semantics, decoder error normalization,
-bounded observations, and generic success/error telemetry metadata. Each
+the alternate implementation's bounded data-only policy-error variant,
+rejection of its non-data reason, bounded observations, and generic
+success/error telemetry metadata. Each
 implementation fixture only encodes the suite-owned batch as its row format
 and identifies input that its decoder must reject. The RunStore contract uses
 live PostgreSQL to verify one selected plan query, decoded batch return, and
-unchanged query-error return for the same implementations.
+unchanged query-error return for the same implementations except the explicit,
+backend-wide SQLSTATE `25006` normalization to the portable read-only
+transaction error.
 
 The shared matrix complements direct RunStore, transaction, supervised
 dispatcher, manual drain, PostgreSQL claim, fencing, poison, telemetry,

@@ -1,24 +1,10 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Mix.Tasks.Docket.Gen.Migration do
-    @shortdoc "Generates the migration that installs Docket's Postgres tables"
+    @shortdoc "Generates a Docket PostgreSQL migration"
 
     @moduledoc """
-    Generates the host-application migration that installs (and can roll
-    back) Docket's Postgres tables via `Docket.Postgres.Migration`.
-
-        $ mix docket.gen.migration
-        $ mix docket.gen.migration -r MyApp.Repo
-
-    The generated file pins the current installation schema. Commit it with
-    the host application and never edit it after it has been applied. Future
-    schema versions must be installed through a separate upgrade migration.
-
-    ## Options
-
-      * `-r`, `--repo` — the repo to generate the migration for. Defaults to
-        the repos configured under `:ecto_repos`.
-      * `--migrations-path` — the directory to write the migration into.
-        Defaults to the repo's `priv/.../migrations` directory.
+    Generates either a fresh Docket schema migration or the ordinary v1-to-v2
+    exact-cap upgrade.
     """
 
     use Mix.Task
@@ -27,7 +13,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     import Mix.EctoSQL, only: [source_repo_priv: 1]
     import Mix.Generator, only: [create_directory: 1, create_file: 2]
 
-    @switches [migrations_path: :string, repo: [:string, :keep]]
+    @switches [
+      migrations_path: :string,
+      repo: [:string, :keep],
+      upgrade_from_v1: :boolean,
+      prefix: :string
+    ]
     @aliases [r: :repo]
 
     @impl Mix.Task
@@ -36,27 +27,38 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       for repo <- parse_repo(args) do
         ensure_repo(repo, args)
+        path = opts[:migrations_path] || Path.join(source_repo_priv(repo), "migrations")
+        prefix = Keyword.get(opts, :prefix, "public")
 
-        path =
-          opts[:migrations_path] || Path.join(source_repo_priv(repo), "migrations")
+        unless Docket.Postgres.Storage.valid_prefix?(prefix) do
+          Mix.raise("--prefix must be a lowercase identifier up to 63 bytes")
+        end
 
-        file = Path.join(path, "#{timestamp()}_add_docket_tables.exs")
-        module = Module.concat([repo, Migrations, AddDocketTables])
-        version = Docket.Postgres.Migration.current_version()
-        initial_version = Docket.Postgres.Migration.initial_version()
+        {basename, migration_name, version, down_version} =
+          if Keyword.get(opts, :upgrade_from_v1, false) do
+            {"upgrade_docket_to_v2", UpgradeDocketToV2, 2, 2}
+          else
+            {"add_docket_tables", AddDocketTables, Docket.Postgres.Migration.current_version(),
+             Docket.Postgres.Migration.initial_version()}
+          end
 
-        create_directory(path)
+        file = Path.join(path, "#{timestamp()}_#{basename}.exs")
+        module = Module.concat([repo, Migrations, migration_name])
 
-        create_file(file, """
+        content = """
         defmodule #{inspect(module)} do
           use Ecto.Migration
 
-          def up, do: Docket.Postgres.Migration.up(version: #{version})
+          def up,
+            do: Docket.Postgres.Migration.up(version: #{version}, prefix: #{inspect(prefix)})
 
-          def down, do: Docket.Postgres.Migration.down(version: #{initial_version})
+          def down,
+            do: Docket.Postgres.Migration.down(version: #{down_version}, prefix: #{inspect(prefix)})
         end
-        """)
+        """
 
+        create_directory(path)
+        create_file(file, content)
         file
       end
     end

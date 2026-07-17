@@ -36,13 +36,12 @@ when you want to understand *why* the contracts are shaped the way they are.
    - Why the v1.1 reducer contract folds the prior committed value, and the
      rationale behind list-write concatenation, natural zeros, and
      reducer-aware write validation.
-9. `docket-tenant-claim-fairness-design.md`
-   - Locked tenant identity, vocabulary, and ClaimPolicy configuration contract,
-     plus the proposed database-wide caps, dynamic policy, fair partition
-     selection, weighted service, borrowing, telemetry, and rollout.
+9. `docket-exact-cap-contract.md`
+   - The v0.1.0 exact per-owner cap, concurrency, rotation, administration, and
+     stopped-upgrade invariants.
 10. `docket-claim-policy.md`
-    - Implemented phase-0 RunStore-to-ClaimPolicy plan boundary, atomicity rule,
-      instance-level rollout switch, conformance tests, and Legacy rollback.
+    - The RunStore-to-ClaimPolicy boundary and the implemented Legacy and
+      TenantFair engines.
 11. `docket-runtime-design.md`
     - Historical 0.0.1 runtime research and background: goals, alternatives
       considered (Pregel, LangGraph, Temporal), and future design space.

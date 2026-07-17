@@ -16,6 +16,24 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- PostgreSQL run creation now atomically materializes the canonical
+  owner-derived claim partition with an inherited cap and version-zero state.
+  Concurrent first inserts use `ON CONFLICT DO NOTHING`, preserving Admin-owned
+  state and versions. A non-locking existence read keeps established
+  partitions off that uniqueness path, so run creation does not wait behind an
+  admission epoch update. Failed or outer-rolled-back run creation leaves no
+  new partition or wake notification. Dormant partition rows are retained
+  after their last run disappears and are never selected from serialized
+  payload identity.
+- PostgreSQL schema version 2: prefix-local exact-cap policy, partition,
+  ordinary supporting indexes, engine interlock, and TenantFair claim function.
+  Existing scope keys are backfilled transactionally while inserts are blocked.
+  ClaimPolicy implementations receive the additive quoted identifier context.
+- Exact-cap `Docket.Postgres.ClaimPolicy.TenantFair` admission with one persisted
+  default, optional per-owner overrides, concurrent final-slot serialization,
+  count-neutral expired recovery, cap-reduction debt, and bounded cross-owner
+  rotation. The current-state Admin API supports versioned default and override
+  changes without rollout ledgers, audit history, or governance workflows.
 - `Docket.BackendTests`, a source-owned shared ExUnit suite under
   `test/support`. One explicit backend matrix generates identical black-box
   cases for the memory and PostgreSQL bundles; external backend projects can

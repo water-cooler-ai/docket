@@ -1,4 +1,16 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
+  defmodule Docket.Test.TenantFairRunStoreSetup do
+    @moduledoc false
+
+    def prepare!(repo, _implementation_opts) do
+      repo.query!(
+        "INSERT INTO docket_claim_partitions (scope_key) VALUES ('') ON CONFLICT DO NOTHING"
+      )
+
+      :ok
+    end
+  end
+
   defmodule Docket.Test.ClaimPolicyRunStoreTests do
     @moduledoc false
 
@@ -8,6 +20,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       tests =
         Docket.Test.ClaimPolicyMatrix.implementations()
+        |> Enum.filter(&Map.get(&1, :run_store?, true))
         |> Enum.flat_map(&contract_tests(&1, repo, query_event))
 
       quote do
@@ -20,6 +33,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       implementation = spec.implementation
       implementation_opts = spec.options
       query_marker = spec.query_marker
+      run_store_setup = Map.get(spec, :run_store_setup)
+
+      setup_call =
+        if run_store_setup do
+          quote do
+            :ok = unquote(run_store_setup).prepare!(repo, implementation_opts)
+          end
+        else
+          quote do
+            :ok
+          end
+        end
 
       [
         quote do
@@ -33,7 +58,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             run_id =
               "claim-policy-contract-#{System.unique_integer([:positive, :monotonic])}"
 
-            inserted = insert_run!(run_id)
             root = %{repo: repo, prefix: nil}
 
             claim_policy =
@@ -43,6 +67,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               )
 
             context = Map.put(root, :claim_policy, claim_policy)
+            unquote(setup_call)
+
+            inserted = insert_run!(run_id)
             handler = "claim-policy-run-store-#{System.unique_integer([:positive])}"
 
             :telemetry.attach(

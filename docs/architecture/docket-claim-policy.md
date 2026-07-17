@@ -1,183 +1,93 @@
 # PostgreSQL ClaimPolicy boundary
 
-`Docket.Postgres.RunStore.claim_due/3` is the stable PostgreSQL admission
-entrypoint. ClaimPolicy is an internal engine seam behind that entrypoint, not
-an alternate caller-facing store.
+`Docket.Postgres.RunStore.claim_due/3` is the only PostgreSQL admission
+entrypoint. ClaimPolicy is an internal engine seam behind RunStore, not a
+second store API and not a per-call option.
 
-## Final call and ownership direction
+## Ownership
 
-Every production, recovery, manual, and inline admission follows one direction:
+Each backend instance resolves one ClaimPolicy during context construction.
+The dispatcher, manual and inline drains, recovery, and transaction contexts
+reuse that value. RunStore validates portable claim input, executes one
+statement, and returns the decoded result. The implementation owns selection
+SQL, row decoding, poison behavior, and claim observations.
 
-```text
-dispatcher or synchronous drain
-  -> RunStore.claim_due(context, :system, effective_policy)
-    -> resolve the ClaimPolicy already stored in context
-      -> selected implementation builds one data-only plan
-        -> RunStore executes exactly one PostgreSQL statement
-          -> the same selected implementation decodes the rows
-            -> unchanged {:ok, claim_batch} | {:error, reason}
-```
+An implementation supplies:
 
-Admission rejects a bare Repo or `%{repo: repo}` because neither identifies a
-configured backend instance. A runtime instance constructs its configured
-policy once. The root context, dispatcher, manual/inline drain, and every
-transaction-scoped context reuse that exact resolved value; per-call options
-cannot replace it. Runtime startup passes the resolved root context separately
-to `Docket.Backend.child_spec/2`; it is never injected into the backend's
-option keyword list.
+- `init/2` to validate instance options;
+- `build_plan/3` to return a data-only `%ClaimPolicy.Plan{}`;
+- `decode/3` to return a lease/poison batch or bounded policy error; and
+- `observe/5` for implementation-owned telemetry.
 
-RunStore owns only policy-neutral context resolution, one query execution, and
-generic result plumbing. It does not contain candidate SQL, ordering, caps,
-poison rules, row decoding, selection statistics, or implementation-specific
-claim telemetry.
+The plan builder receives quoted table identifiers but no Repo or query
+callback. RunStore executes exactly one top-level PostgreSQL statement and
+always invokes the decoder from the already-selected implementation. Decoder
+and observation failures cannot switch engines.
 
-Before plan construction, the boundary converts `now` to UTC at microsecond
-precision. Every implementation therefore receives a value that can be bound
-directly as `:utc_datetime_usec`, regardless of the caller clock's timezone or
-declared precision; implementations must not depend on the caller's original
-timezone representation.
+## Legacy
 
-## Implementation contract
+`Docket.Postgres.ClaimPolicy.Legacy` preserves the tenant-blind ready/expired
+claim algorithm, demand-one preference, `FOR UPDATE SKIP LOCKED`, claim-token
+installation, expired steals, and maximum-attempt poison behavior in one
+statement.
 
-An implementation declares `@behaviour Docket.Postgres.ClaimPolicy` and
-provides four callbacks:
+Legacy also participates in the minimal engine interlock. It takes a shared
+lock on `docket_claim_policy` and admits only while `admission_mode` is
+`legacy`. A TenantFair mode, a skipped policy lock, a read-only transaction,
+or non-Read-Committed isolation fails closed before run mutation.
 
-- `init/2` validates implementation configuration once per backend instance.
-  It receives the normalized prefix and quoted identifiers, but no Repo or
-  query capability, and returns opaque instance state.
-- `build_plan/3` receives quoted identifiers, the facade-validated portable
-  claim policy, and instance state. It returns one
-  `Docket.Postgres.ClaimPolicy.Plan` without performing database I/O.
-- `decode/3` receives only the rows from that plan's statement, the plan's
-  data-only decoder contract, and instance state. It returns the portable
-  claim batch plus bounded observation data.
-- `observe/5` owns implementation-specific result, selection, attempt, poison,
-  and error observations.
+Legacy remains the default when `claim_policy:` is omitted.
 
-The facade validates that a plan contains one non-empty SQL statement, a
-parameter list, a data-only decoder contract, and bounded data-only observation
-metadata. A plan cannot supply a module or function that changes decoder
-dispatch: decoding remains bound to the implementation selected in the
-backend context. The per-admission builder receives no Repo, RunStore module,
-query function, or executor callback.
+## TenantFair
 
-A decoder exception or invalid return becomes
-`{:error, {:claim_policy_decode_failed, reason}}` rather than escaping the
-portable RunStore result contract. Because the atomic statement may already
-have installed claim tokens, ordinary orphan-TTL recovery remains the safety
-net for such an implementation defect. Observation callbacks are isolated:
-they cannot change an already-decoded result or suppress the facade's generic
-admission event.
-
-Each admission must be one atomic PostgreSQL operation: one RunStore-issued
-client query containing one top-level PostgreSQL statement. No callback
-receives a Repo, backend/storage context, query function, RunStore module, or
-executor callback, and the plan is data-only. The callbacks do receive the
-sanitized plan context documented above. PostgreSQL statements may call
-database functions, and trusted implementation code could obtain a globally
-known Repo on its own, so this is an extension contract rather than a security
-sandbox. The boundary never injects an application-side query capability.
-
-Every implementation is registered once in the source-owned
-`test/support/claim_policy_matrix.ex`; both the focused ClaimPolicy suite and
-the live RunStore suite consume that registry. Each implementation runs the
-same pure contract from `test/support/claim_policy_tests.ex`. The matrix covers policy construction and
-selected-implementation binding, portable input validation, one-statement plan
-shape, exact decoded batch passthrough, decoder failures, bounded observation
-data, and the generic admission telemetry metadata. The source-owned
-`test/support/claim_policy_run_store_tests.ex` integration contract separately
-proves for every registered implementation that RunStore executes one selected
-plan query, returns the complete decoded lease backed by the persisted claim,
-and preserves PostgreSQL error class and metadata.
-Instance-level selection across runtime paths remains covered by the direct
-backend tests.
-
-Both the matrix and its implementation fixtures are test-only; `test` is not
-included in the package allowlist.
-
-## Legacy engine
-
-`Docket.Postgres.ClaimPolicy.Legacy` is the sole owner of the current
-tenant-blind engine. Its plan retains the separate bounded ready and expired
-index scans, materialized CTE fences, `FOR UPDATE SKIP LOCKED`, shared demand
-limit, demand-one preference/fallthrough, multi-demand class progress,
-claim-token installation, expired steal behavior, and max-attempt poison
-mutation in one statement.
-
-Legacy also owns parameter normalization, lease and poison decoding, candidate
-and selection statistics, eligibility ages, fallback and steal accounting,
-attempt/poison events, and the existing
-`[:docket, :postgres, :run_store, :claim]` event. The facade adds exactly one
-`[:docket, :postgres, :claim_policy, :admission]` event identifying the bounded
-selected implementation. No event includes tenant, run, graph, or token
-identity as metric metadata.
-
-## Adding TenantFair
-
-A future `Docket.Postgres.ClaimPolicy.TenantFair` should:
-
-1. validate its instance configuration and required schema compatibility in
-   `init/2`;
-2. construct one atomic fairness statement in `build_plan/3` using only the
-   supplied quoted identifiers and normalized portable policy;
-3. return a data-only decoder and bounded observation contract in its Plan;
-4. decode the unchanged lease/poison batch shape in `decode/3`;
-5. emit bounded engine-specific observations in `observe/5`; and
-6. run the reusable ClaimPolicy contract plus direct, transaction, supervised,
-   manual-drain, concurrency, query-plan, and telemetry suites.
-
-Its locked instance-configuration shape is:
+TenantFair adds exact per-owner caps and bounded cross-owner rotation:
 
 ```elixir
 use Docket,
   backend: Docket.Postgres,
   repo: MyApp.Repo,
   tenant_mode: :required,
-  dispatcher: [concurrency: 100],
   claim_policy: [
     implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-    partition_by: :tenant_id,
-    default_preferred_active: 2,
-    default_max_active: 2,
-    default_weight: 1,
-    borrowing: false
+    default_max_active: 4
   ]
 ```
 
-TenantFair owns validation of those implementation options in `init/2`.
-Fairness configuration does not belong under `:dispatcher`: dispatcher
-concurrency is a per-runtime vehicle ceiling, whereas TenantFair policy is an
-instance-selected PostgreSQL admission engine configuration shared by every
-admission path. The source-owned TenantFair implementation is not present yet;
-the example records the contract for the next slices and must not be used until
-that module and its schema prerequisites ship.
+`default_max_active` is its only implementation option. It bootstraps an unset
+database default; persisted values and partition overrides remain authoritative.
 
-No policy-specific change belongs in RunStore, dispatcher, synchronous drain,
-vehicle, executor, or the portable `Docket.Backend.RunStore` contract. Rolling
-back phase 0 means removing the option or explicitly selecting Legacy; this
-boundary itself adds no migration, index, cap, or tenant-fairness behavior.
+The outer statement discovers a bounded partition page ordered by
+`admission_epoch` and invokes `docket_tenant_fair_claim_v1` once. Inside the
+function, a fresh Read Committed command locks partition authority, counts live
+claims, and selects and mutates rows. Ready admission is limited to available
+capacity; expired steals are count-neutral. Every considered partition
+advances its epoch so a cap-denied head cannot permanently hide later work.
 
-## Rollout and rollback
+See [Exact-cap admission contract](docket-exact-cap-contract.md) for the
+normative invariants and upgrade boundary.
 
-When `:claim_policy` is omitted from an instance, context construction selects
-`Docket.Postgres.ClaimPolicy.Legacy`. This default is resolved once for that
-instance and then preserved in root and transaction contexts. A bare Repo or an
-unresolved `%{repo: repo}` is not an implicit Legacy instance and is rejected
-for admission.
+## Configuration and rollout
 
-Roll out an alternate implementation in stages:
+The engine choice is instance-level, while its cap is database-wide. Do not
+run a mixed deployment that includes binaries predating the `admission_mode`
+interlock.
 
-1. deploy its code and any separately reviewed schema prerequisites while all
-   instances still omit `:claim_policy` and therefore use Legacy;
-2. configure one canary instance with the top-level
-   `claim_policy: [implementation: Module, ...]` option and restart it;
-3. confirm startup accepts the implementation configuration, then monitor the
-   generic admission event by `implementation` and `result` together with that
-   engine's bounded observations; and
-4. expand the same validated instance configuration through the fleet.
+For an existing v1 installation:
 
-The switch is instance-level. Dispatcher, recovery, manual drain, and inline
-drain calls cannot override it. Roll back by restarting affected instances
-after removing `:claim_policy` or explicitly selecting
-`Docket.Postgres.ClaimPolicy.Legacy`. Phase 0 needs no ClaimPolicy migration,
-so rollback restores the legacy engine without a database downgrade.
+1. stop Docket dispatchers and all run writers;
+2. apply the generated transactional v1-to-v2 migration;
+3. deploy one homogeneous application version;
+4. configure every instance for the same engine; and
+5. restart processing.
+
+This stopped upgrade is the v0.1.0 operational contract. Online schema changes,
+fleet attestations, readiness ledgers, activation ceremonies, audited mode
+history, and hot mixed-version rollout are deferred.
+
+## Test contract
+
+The shared ClaimPolicy and live RunStore matrices verify implementation
+selection, one-statement execution, decoded lease persistence, PostgreSQL error
+preservation, transaction behavior, and telemetry. TenantFair adds live tests
+for concurrent final-slot enforcement, cap reduction, expired recovery,
+cross-scope rotation, capped-head progress, and the Legacy interlock.

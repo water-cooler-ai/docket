@@ -28,7 +28,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl true
     def build_plan(
-          %{identifiers: %{runs: table}},
+          %{identifiers: %{runs: table, claim_policy: policy}},
           %{
             now: %DateTime{} = now,
             limit: limit,
@@ -42,7 +42,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       cutoff = DateTime.add(now, -ttl, :millisecond)
 
       %Plan{
-        statement: claim_statement(table),
+        statement: claim_statement(table, policy),
         params: [now, cutoff, limit, max, preference && Atom.to_string(preference)],
         decoder: %{now: now, orphan_ttl_ms: ttl},
         observation: %{demand: limit, preference: preference}
@@ -50,6 +50,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @impl true
+    def decode(
+          [
+            [
+              nil,
+              nil,
+              nil,
+              nil,
+              nil,
+              nil,
+              nil,
+              nil,
+              nil,
+              nil,
+              "__docket_admission_gate__",
+              _now,
+              gate_status,
+              0
+            ]
+          ],
+          _decoder,
+          nil
+        )
+        when gate_status in [-4, -3, -2, -1] do
+      reason =
+        case gate_status do
+          -4 -> :read_only_transaction
+          -3 -> :unsupported_isolation
+          -2 -> :inactive_engine
+          -1 -> :lock_contention
+        end
+
+      {:error, {:claim_policy_unavailable, reason}, %{}}
+    end
+
     def decode(rows, %{now: now, orphan_ttl_ms: orphan_ttl_ms}, nil) do
       {{leases, poisoned}, stats} =
         Enum.reduce(rows, {{[], []}, @empty_claim_stats}, fn
@@ -165,7 +199,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     def observe(
           %{demand: demand, preference: preference},
-          nil,
+          _decoded_observation,
           {:error, _reason},
           duration,
           nil
@@ -187,12 +221,31 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @doc false
-    @spec claim_statement(String.t()) :: String.t()
-    def claim_statement(table) when is_binary(table) do
+    @spec claim_statement(String.t(), String.t()) :: String.t()
+    def claim_statement(table, policy) when is_binary(table) and is_binary(policy) do
       """
-      WITH ready_candidates AS MATERIALIZED (
-        SELECT id, wake_at AS eligible_at
-        FROM #{table}
+      WITH transaction_context AS MATERIALIZED (
+        SELECT current_setting('transaction_isolation') AS isolation,
+               current_setting('transaction_read_only') = 'on' AS read_only
+      ),
+      admission_gate AS MATERIALIZED (
+        SELECT gate.admission_mode
+        FROM transaction_context
+        CROSS JOIN #{policy} AS gate
+        WHERE transaction_context.isolation = 'read committed'
+          AND NOT transaction_context.read_only
+          AND gate.id = 1
+        FOR SHARE SKIP LOCKED
+      ),
+      legacy_authority AS MATERIALIZED (
+        SELECT admission_mode
+        FROM admission_gate
+        WHERE admission_mode = 'legacy'
+      ),
+      ready_candidates AS MATERIALIZED (
+        SELECT runs.id, runs.wake_at AS eligible_at
+        FROM legacy_authority
+        CROSS JOIN #{table} AS runs
         WHERE status = 'running'
           AND poisoned_at IS NULL
           AND claim_token IS NULL
@@ -202,8 +255,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         FOR UPDATE SKIP LOCKED
       ),
       expired_candidates AS MATERIALIZED (
-        SELECT id, claimed_at AS eligible_at
-        FROM #{table}
+        SELECT runs.id, runs.claimed_at AS eligible_at
+        FROM legacy_authority
+        CROSS JOIN #{table} AS runs
         WHERE status = 'running'
           AND poisoned_at IS NULL
           AND claim_token IS NOT NULL
@@ -282,6 +336,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         (SELECT count(*) FROM ready_candidates),
         (SELECT count(*) FROM expired_candidates)
       FROM updated
+      UNION ALL
+      SELECT
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        '__docket_admission_gate__', $1,
+        CASE
+          WHEN transaction_context.read_only THEN -4
+          WHEN transaction_context.isolation <> 'read committed' THEN -3
+          WHEN EXISTS (SELECT 1 FROM admission_gate) THEN -2
+          ELSE -1
+        END,
+        0
+      FROM transaction_context
+      WHERE NOT EXISTS (SELECT 1 FROM legacy_authority)
       ORDER BY run_id
       """
     end
