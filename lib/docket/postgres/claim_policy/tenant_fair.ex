@@ -86,6 +86,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @impl true
+    def decode([["error", "lock_contention" | _tail]], _decoder, %Config{}) do
+      {:error, {:claim_policy_unavailable, :lock_contention}, %{contention_phase: :policy_cursor}}
+    end
+
     def decode([["error", reason | _tail]], _decoder, %Config{}) do
       {:error, {:claim_policy_unavailable, load_error_reason(reason)}, %{}}
     end

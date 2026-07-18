@@ -257,7 +257,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           _kind, _reason -> :ok
         end
 
-      emit_admission(claim_policy.implementation, plan, duration, result)
+      emit_admission(
+        claim_policy.implementation,
+        plan,
+        decoded_observation,
+        duration,
+        result
+      )
+
       :ok
     end
 
@@ -368,7 +375,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp data_only?(_value), do: false
 
-    defp emit_admission(implementation, %Plan{} = plan, duration, result) do
+    defp emit_admission(implementation, %Plan{} = plan, decoded_observation, duration, result) do
       {leases, poisoned} =
         case result do
           {:ok, %{leases: leases, poisoned: poisoned}}
@@ -379,9 +386,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             {0, 0}
         end
 
-      policy_cursor_contention? =
-        implementation == Docket.Postgres.ClaimPolicy.TenantFair and
-          result == {:error, {:claim_policy_unavailable, :lock_contention}}
+      contention_phase = contention_phase(implementation, decoded_observation, result)
 
       :telemetry.execute(
         [:docket, :postgres, :claim_policy, :admission],
@@ -390,14 +395,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           demand: plan.demand,
           leases: leases,
           poisoned: poisoned,
-          contentions: if(policy_cursor_contention?, do: 1, else: 0)
+          contentions: if(contention_phase == :none, do: 0, else: 1)
         },
         %{
           implementation: implementation,
           result: Docket.Telemetry.result_kind(result),
-          contention_phase: if(policy_cursor_contention?, do: :policy_cursor, else: :none)
+          contention_phase: contention_phase
         }
       )
     end
+
+    defp contention_phase(
+           Docket.Postgres.ClaimPolicy.TenantFair,
+           %{contention_phase: :policy_cursor},
+           {:error, {:claim_policy_unavailable, :lock_contention}}
+         ),
+         do: :policy_cursor
+
+    defp contention_phase(_implementation, _decoded_observation, _result), do: :none
   end
 end

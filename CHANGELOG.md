@@ -23,8 +23,9 @@ entries below reflect what has landed so far.
   lock/run-mutation-input ceilings, and bounded poison-safe candidate
   continuation were checked with non-release query-plan experiments. The ring
   is an authoritative eligibility superset rather than a lossy cache, so
-  DCKT-77 repair machinery is not part of the v0.1.0 MVP; admission and
-  executable fairness proof remain in DCKT-78 and DCKT-79. Because no count
+  DCKT-77 repair machinery is not part of the v0.1.0 MVP. TenantFair admission
+  now uses the bounded ring engine described here; executable fairness proof
+  remains in DCKT-79. Because no count
   repair path exists by design, truncating runs or the authoritative schedule
   fails closed instead of bypassing row triggers and silently desynchronizing
   membership.

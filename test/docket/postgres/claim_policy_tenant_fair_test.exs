@@ -245,6 +245,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
       insert_ready("tenant", "policy-lock", @now)
+      policy_before = policy_row()
 
       gate = make_ref()
 
@@ -264,10 +265,86 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, :ok} = Task.await(blocker, 2_000)
 
       assert {:error, {:claim_policy_unavailable, :lock_contention}} = result
+      assert policy_row() == policy_before
       assert live_count("tenant") == 0
+
+      assert [[0, nil, nil]] =
+               TestRepo.query!(
+                 "SELECT admission_epoch, ready_candidate_cursor_at, " <>
+                   "ready_candidate_cursor_id FROM docket_claim_schedule " <>
+                   "JOIN docket_claim_partitions USING (scope_key) " <>
+                   "WHERE scope_key = 'tenant'"
+               ).rows
+
+      assert [[nil, nil, 0]] =
+               TestRepo.query!(
+                 "SELECT claim_token, claimed_at, claim_attempts FROM docket_runs " <>
+                   "WHERE run_id = 'policy-lock'"
+               ).rows
 
       assert_receive {[:docket, :postgres, :claim_policy, :admission], %{contentions: 1},
                       %{contention_phase: :policy_cursor, result: :error}}
+    end
+
+    test "later schedule contention is not attributed to the policy cursor", %{
+      context: context
+    } do
+      handler_id = {__MODULE__, self(), make_ref()}
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:docket, :postgres, :claim_policy, :admission],
+        &Docket.Test.TelemetryRelay.raw/4,
+        parent
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      insert_ready("tenant", "schedule-lock", @now)
+      policy_before = policy_row()
+
+      gate = make_ref()
+
+      blocker =
+        Task.async(fn ->
+          SecondRepo.transaction(fn ->
+            SecondRepo.query!(
+              "SELECT scope_key FROM docket_claim_schedule " <>
+                "WHERE scope_key = 'tenant' FOR UPDATE"
+            )
+
+            send(parent, {gate, :locked})
+            receive do: ({^gate, :release} -> :ok)
+          end)
+        end)
+
+      assert_receive {^gate, :locked}, 2_000
+
+      result = RunStore.claim_due(context, :system, policy(1))
+      send(blocker.pid, {gate, :release})
+      assert {:ok, :ok} = Task.await(blocker, 2_000)
+
+      assert {:error, {:claim_policy_unavailable, :lock_contention}} = result
+      assert policy_row() == policy_before
+
+      assert [[0, nil, nil]] =
+               TestRepo.query!(
+                 "SELECT admission_epoch, ready_candidate_cursor_at, " <>
+                   "ready_candidate_cursor_id FROM docket_claim_schedule " <>
+                   "JOIN docket_claim_partitions USING (scope_key) " <>
+                   "WHERE scope_key = 'tenant'"
+               ).rows
+
+      assert [[nil, nil, 0]] =
+               TestRepo.query!(
+                 "SELECT claim_token, claimed_at, claim_attempts FROM docket_runs " <>
+                   "WHERE run_id = 'schedule-lock'"
+               ).rows
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission], %{contentions: 0},
+                      %{contention_phase: :none, result: :error}}
     end
 
     test "concurrent Legacy and TenantFair admission serializes across the engine switch", %{
@@ -500,6 +577,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ).rows
       |> hd()
       |> hd()
+    end
+
+    defp policy_row do
+      TestRepo.query!(
+        "SELECT admission_mode, max_active, policy_version, initialized_at, updated_at, " <>
+          "scan_ring_position FROM docket_claim_policy WHERE id = 1"
+      ).rows
     end
   end
 end

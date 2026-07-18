@@ -61,7 +61,11 @@ effects require their own stable idempotency scheme.
 The schema-v2 ring engine keeps the generic ClaimPolicy and claim events in the
 catalog above. The admission event reports total duration and a normalized
 `contentions` count; `contention_phase: :policy_cursor` distinguishes bounded
-singleton-cursor pressure without adding identity labels.
+singleton-cursor pressure without adding identity labels. That phase is set
+only when the ring function catches contention while acquiring its singleton
+policy/cursor authority; a later database lock timeout retains the public
+`lock_contention` error but reports `contentions: 0` and
+`contention_phase: :none` because its phase is not proven.
 
 Detailed cursor, visit, disposition, outcome, and epoch evidence is available
 only from the disabled-by-default raw trace result mode used by deterministic
