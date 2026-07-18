@@ -956,7 +956,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  log: false
                )
 
-      assert comment == "3"
+      assert comment == Integer.to_string(Docket.Postgres.Migration.current_version())
     end
 
     defp await_replacement(name, old_pid, attempts \\ 100)

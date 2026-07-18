@@ -3,11 +3,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduledoc """
     Creates and versions the tables owned by Docket's PostgreSQL backend.
 
-    Version 1 contains durable graphs, runs, and events. Version 2 adds the
-    minimal exact-cap policy and partition authority plus its claim function
-    and supporting indexes. Version 3 adds one authoritative unfinished-tenant
-    scheduling table and stores the domain cursor on existing policy authority.
-    Every step is an ordinary transactional migration.
+    Version 1 contains durable graphs, runs, and events. Version 2 adds exact-cap
+    policy and partition authority, the authoritative unfinished-tenant ring,
+    the domain cursor, TenantFair claim function, and supporting indexes. Every
+    step is an ordinary transactional migration.
     """
 
     use Ecto.Migration
@@ -15,7 +14,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Storage
 
     @initial_version 1
-    @current_version 3
+    @current_version 2
     @default_prefix "public"
 
     @spec up(keyword()) :: :ok

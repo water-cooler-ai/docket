@@ -1,12 +1,12 @@
-# TenantFair schema-v3 active-ring decision
+# TenantFair schema-v2 active-ring decision
 
 This document ratifies the DCKT-76 schema and bounded-query inputs for the
-v0.1.0 TenantFair MVP. Schema v3 adds one table: an authoritative
-unfinished-tenant ring; the serialized scan position lives on the existing
-singleton policy row. DCKT-78 must implement the scheduler and DCKT-79 must feed
+v0.1.0 TenantFair MVP. Schema v2 contains the authoritative unfinished-tenant
+ring and stores the serialized scan position on the singleton policy row.
+DCKT-78 implements the scheduler and DCKT-79 must feed
 database-authored traces into the DCKT-75 proof oracle.
 
-Schema v3 does not establish a numeric `L`. A finite lock hold does not bound
+Schema v2 does not establish a numeric `L`. A finite lock hold does not bound
 the number of failed target inspections, and `SKIP LOCKED` alone is not a
 starvation guarantee.
 
@@ -183,10 +183,10 @@ unfinished work is discovered.
 
 ## Migration boundary
 
-Schema v3 is additive on the stopped homogeneous v0.1 development line. The
-migration locks policy, partition authority, then runs; creates and backfills
-missing v2 partition/schedule membership; backfills exact unfinished counts;
-installs lifecycle maintenance; and adds the scan position to the existing
-singleton policy row transactionally. Fresh, v2-to-v3,
-host-v1-to-current, downgrade-to-v2, prefix, rollback, and concurrent-creation
-paths are covered by the PostgreSQL suite.
+Schema v2 is the collapsed stopped-development migration. It locks policy,
+partition authority, then runs; creates and backfills partition/schedule
+membership and exact unfinished counts; installs lifecycle maintenance; and
+creates the singleton scan position transactionally. Fresh, host-v1-to-current,
+downgrade-to-v1, prefix, rollback, and concurrent-creation paths are covered by
+the PostgreSQL suite. Previously recorded unreleased V02/V03 databases are not
+upgrade sources.

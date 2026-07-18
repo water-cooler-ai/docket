@@ -23,6 +23,7 @@ defmodule Docket.TelemetryTest do
       implementation: Docket.Postgres.ClaimPolicy.Legacy,
       claim_policy: Docket.Postgres.ClaimPolicy.Legacy,
       result: :ok,
+      contention_phase: :none,
       source: :scheduled,
       run_id: "run-1",
       tenant_id: "tenant-1",
@@ -32,7 +33,11 @@ defmodule Docket.TelemetryTest do
     assert Docket.Telemetry.metric_metadata(
              [:docket, :postgres, :claim_policy, :admission],
              metadata
-           ) == %{implementation: Docket.Postgres.ClaimPolicy.Legacy, result: :ok}
+           ) == %{
+             implementation: Docket.Postgres.ClaimPolicy.Legacy,
+             result: :ok,
+             contention_phase: :none
+           }
 
     assert Docket.Telemetry.metric_metadata(
              [:docket, :postgres, :dispatcher, :poll],

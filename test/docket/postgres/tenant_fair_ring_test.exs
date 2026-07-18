@@ -1,10 +1,10 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
-  defmodule Docket.Postgres.TenantFairV3Test do
+  defmodule Docket.Postgres.TenantFairRingTest do
     use ExUnit.Case, async: false
 
     @moduletag :postgres
 
-    alias Docket.Postgres.ClaimPolicy.TenantFair.{Budgets, QueryShapes}
+    alias Docket.Postgres.ClaimPolicy.TenantFair.{Budgets, QueryShapes, RingFunction}
     alias Docket.Postgres.TestRepo
 
     @migration_version 20_260_717_000_176
@@ -34,6 +34,49 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                max_run_lock_attempts_per_scan_call: 512,
                max_run_rows_mutated_per_scan_call: 256
              }
+    end
+
+    test "raw trace exposes one deterministic H=1 grant without changing public columns" do
+      seed_runs(1)
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      cutoff = DateTime.add(now, -3_600, :second)
+
+      rows =
+        TestRepo.query!(
+          """
+          SELECT claimed.*
+          FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, true)
+            AS claimed(#{RingFunction.result_definition()})
+          ORDER BY claimed.visit_ordinal, claimed.outcome_ordinal NULLS LAST,
+                   claimed.row_kind
+          """,
+          [now, cutoff, 2, 5, nil, 4]
+        ).rows
+
+      outcomes = Enum.filter(rows, &(hd(&1) == "outcome"))
+      [inspection] = Enum.filter(rows, &(hd(&1) == "inspection"))
+
+      assert length(outcomes) == 2
+      assert Enum.map(outcomes, &Enum.at(&1, 16)) == [1, 1]
+      assert Enum.map(outcomes, &Enum.at(&1, 17)) == [1, 2]
+      assert Enum.at(inspection, 16) == 1
+      assert Enum.at(inspection, 19) == 0
+      assert Enum.at(inspection, 20) == Enum.at(inspection, 21)
+      assert Enum.at(inspection, 22) == "tenant-0001"
+      assert Enum.at(inspection, 23) == "grant"
+      assert Enum.at(inspection, 24) == 2
+      assert Enum.at(inspection, 25) == 1
+
+      assert [[cursor]] =
+               TestRepo.query!("SELECT scan_ring_position FROM docket_claim_policy").rows
+
+      assert cursor == Enum.at(inspection, 20)
+
+      assert [[1]] =
+               TestRepo.query!(
+                 "SELECT admission_epoch FROM docket_claim_partitions " <>
+                   "WHERE scope_key = 'tenant-0001'"
+               ).rows
     end
 
     test "candidate shapes exclude rejected global and hidden-lock discovery" do

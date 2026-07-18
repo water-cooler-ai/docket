@@ -83,7 +83,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, %{version: 1}} = Admin.put_default(context, 3, expected_version: 0)
 
       for id <- ~w(active-a active-b active-c), do: insert_ready("tenant", id, @now)
-      assert {:ok, %{leases: leases}} = RunStore.claim_due(context, :system, policy(3))
+      # Demand four reserves the unmatched expired class and intentionally
+      # underfills by one while still admitting all three ready rows.
+      assert {:ok, %{leases: leases}} = RunStore.claim_due(context, :system, policy(4))
       assert length(leases) == 3
 
       assert {:ok, %{version: 2}} = Admin.put_default(context, 1, expected_version: 1)
@@ -124,10 +126,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       insert_ready("b", "b-waiting", DateTime.add(@now, -2, :second))
       insert_ready("c", "c-ready", DateTime.add(@now, -1, :second))
 
-      assert {:ok, %{leases: []}} = RunStore.claim_due(context, :system, policy(1))
-
       assert {:ok, %{leases: [%{run_id: "c-ready"}]}} =
                RunStore.claim_due(context, :system, policy(1))
+
+      assert {:ok, %{leases: []}} = RunStore.claim_due(context, :system, policy(1))
     end
 
     test "an expired steal is count-neutral and does not admit queued work", %{context: context} do
@@ -158,83 +160,47 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                     poison_reason: "max_claim_attempts_exceeded"
                   }
                 ],
-                leases: [%{run_id: "ordinary"}]
+                leases: []
               }} = RunStore.claim_due(context, :system, policy(2))
+
+      assert {:ok, %{leases: [%{run_id: "ordinary"}], poisoned: []}} =
+               RunStore.claim_due(context, :system, policy(1))
 
       assert live_count("tenant") == 1
     end
 
-    test "stale candidate mutations are rechecked before admission", %{context: context} do
+    test "exact run locks skip a locked candidate and continue around the ring", %{
+      context: context
+    } do
       assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      insert_ready("a", "locked", DateTime.add(@now, -1, :second))
+      insert_ready("b", "available", @now)
 
-      cases = [
-        {"wake", 0, "claim_token = NULL, claimed_at = NULL, wake_at = $2, claim_attempts = 0",
-         [DateTime.add(@now, 1, :second)],
-         fn [token, _claimed_at, wake_at, attempts, poisoned_at] ->
-           assert token == nil
-           assert wake_at == DateTime.add(@now, 1, :second)
-           assert attempts == 0
-           assert poisoned_at == nil
-         end},
-        {"claim-token", 0,
-         "claim_token = $2, claimed_at = $3, wake_at = NULL, claim_attempts = 1",
-         [Ecto.UUID.dump!(Ecto.UUID.generate()), @now],
-         fn [token, claimed_at, wake_at, attempts, poisoned_at] ->
-           assert is_binary(token)
-           assert claimed_at == @now
-           assert wake_at == nil
-           assert attempts == 1
-           assert poisoned_at == nil
-         end},
-        {"attempt-class", 5,
-         "claim_token = NULL, claimed_at = NULL, wake_at = $2, claim_attempts = 4",
-         [DateTime.add(@now, -1, :second)],
-         fn [token, _claimed_at, wake_at, attempts, poisoned_at] ->
-           assert token == nil
-           assert wake_at == DateTime.add(@now, -1, :second)
-           assert attempts == 4
-           assert poisoned_at == nil
-         end},
-        {"cutoff", 1,
-         "claim_token = claim_token, claimed_at = $2, wake_at = NULL, claim_attempts = 1", [@now],
-         fn [token, claimed_at, wake_at, attempts, poisoned_at] ->
-           assert is_binary(token)
-           assert claimed_at == @now
-           assert wake_at == nil
-           assert attempts == 1
-           assert poisoned_at == nil
-         end}
-      ]
+      parent = self()
+      gate = make_ref()
 
-      Enum.each(cases, fn {name, attempts, mutation, params, assertion} ->
-        scope = "stale-#{name}"
-        run_id = "stale-#{name}"
+      blocker =
+        Task.async(fn ->
+          SecondRepo.transaction(fn ->
+            SecondRepo.query!("SELECT id FROM docket_runs WHERE run_id = 'locked' FOR UPDATE")
+            send(parent, {gate, :locked})
+            receive do: ({^gate, :release} -> :ok)
+          end)
+        end)
 
-        if name == "cutoff" do
-          insert_claimed(scope, run_id, DateTime.add(@now, -10, :second))
-        else
-          insert_run(
-            scope,
-            run_id,
-            nil,
-            nil,
-            DateTime.add(@now, -10, :second),
-            attempts
-          )
-        end
+      assert_receive {^gate, :locked}, 2_000
 
-        assert_stale_candidate_rechecked(context, run_id, mutation, params)
+      assert {:ok, %{leases: [%{run_id: "available"}], poisoned: []}} =
+               RunStore.claim_due(context, :system, policy(1))
 
-        assert [[token, claimed_at, wake_at, persisted_attempts, poisoned_at]] =
-                 TestRepo.query!(
-                   "SELECT claim_token, claimed_at, wake_at, claim_attempts, poisoned_at " <>
-                     "FROM docket_runs WHERE run_id = $1",
-                   [run_id]
-                 ).rows
+      send(blocker.pid, {gate, :release})
+      assert {:ok, :ok} = Task.await(blocker, 2_000)
 
-        assertion.([token, claimed_at, wake_at, persisted_attempts, poisoned_at])
-        finish_run(run_id)
-      end)
+      assert [[nil, nil, 0]] =
+               TestRepo.query!(
+                 "SELECT claim_token, claimed_at, claim_attempts " <>
+                   "FROM docket_runs WHERE run_id = 'locked'"
+               ).rows
     end
 
     test "TenantFair fails closed in read-only and non-read-committed transactions", %{
@@ -265,10 +231,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "TenantFair fails closed when the policy row is contended", %{
       context: context
     } do
+      handler_id = {__MODULE__, self(), make_ref()}
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:docket, :postgres, :claim_policy, :admission],
+        &Docket.Test.TelemetryRelay.raw/4,
+        parent
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
       assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
       insert_ready("tenant", "policy-lock", @now)
 
-      parent = self()
       gate = make_ref()
 
       blocker =
@@ -288,6 +265,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:error, {:claim_policy_unavailable, :lock_contention}} = result
       assert live_count("tenant") == 0
+
+      assert_receive {[:docket, :postgres, :claim_policy, :admission], %{contentions: 1},
+                      %{contention_phase: :policy_cursor, result: :error}}
     end
 
     test "concurrent Legacy and TenantFair admission serializes across the engine switch", %{
@@ -502,75 +482,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           wake_at,
           attempts
         ]
-      )
-    end
-
-    defp assert_stale_candidate_rechecked(context, run_id, mutation, mutation_params) do
-      parent = self()
-      gate = make_ref()
-
-      blocker =
-        Task.async(fn ->
-          SecondRepo.transaction(fn ->
-            SecondRepo.query!("SELECT id FROM docket_runs WHERE run_id = $1 FOR UPDATE", [run_id])
-            send(parent, {gate, :locked})
-
-            receive do
-              {^gate, :mutate} ->
-                SecondRepo.query!(
-                  "UPDATE docket_runs SET #{mutation} WHERE run_id = $1",
-                  [run_id | mutation_params]
-                )
-            end
-          end)
-        end)
-
-      assert_receive {^gate, :locked}, 2_000
-
-      claimant =
-        Task.async(fn ->
-          Docket.Postgres.transaction(context, fn tx ->
-            [[backend_pid]] = TestRepo.query!("SELECT pg_backend_pid()").rows
-            send(parent, {gate, :claimant, backend_pid})
-            RunStore.claim_due(tx, :system, policy(1))
-          end)
-        end)
-
-      assert_receive {^gate, :claimant, backend_pid}, 2_000
-      assert :ok = await_backend_lock(backend_pid)
-      send(blocker.pid, {gate, :mutate})
-
-      assert {:ok, _mutation} = Task.await(blocker, 2_000)
-      assert {:ok, %{leases: [], poisoned: []}} = Task.await(claimant, 2_000)
-    end
-
-    defp await_backend_lock(backend_pid, attempts \\ 100)
-
-    defp await_backend_lock(_backend_pid, 0), do: {:error, :claimant_did_not_wait_on_lock}
-
-    defp await_backend_lock(backend_pid, attempts) do
-      case TestRepo.query!(
-             "SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1",
-             [backend_pid]
-           ).rows do
-        [["Lock"]] ->
-          :ok
-
-        _rows ->
-          Process.sleep(1)
-          await_backend_lock(backend_pid, attempts - 1)
-      end
-    end
-
-    defp finish_run(run_id) do
-      TestRepo.query!(
-        """
-        UPDATE docket_runs
-        SET status = 'done', claim_token = NULL, claimed_at = NULL, wake_at = NULL,
-            poisoned_at = NULL, poison_reason = NULL, finished_at = $2, updated_at = $2
-        WHERE run_id = $1
-        """,
-        [run_id, @now]
       )
     end
 

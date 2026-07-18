@@ -8,14 +8,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @v1 20_260_716_000_101
     @v2 20_260_716_000_102
-    @v3 20_260_716_000_103
-    @private 20_260_716_000_104
-    @private_v1 20_260_716_000_105
-    @private_v2 20_260_716_000_106
-    @private_v3 20_260_716_000_107
-    @failed_v2 20_260_716_000_108
-    @failed_v3 20_260_716_000_109
-    @host_v1_to_current 20_260_716_000_110
+    @private 20_260_716_000_103
+    @private_v1 20_260_716_000_104
+    @private_v2 20_260_716_000_105
+    @failed_v2 20_260_716_000_106
+    @host_v1_to_current 20_260_716_000_107
 
     defmodule InstallV1 do
       use Ecto.Migration
@@ -27,12 +24,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       use Ecto.Migration
       def up, do: Docket.Postgres.Migration.up(version: 2)
       def down, do: Docket.Postgres.Migration.down(version: 2)
-    end
-
-    defmodule UpgradeV3 do
-      use Ecto.Migration
-      def up, do: Docket.Postgres.Migration.up(version: 3)
-      def down, do: Docket.Postgres.Migration.down(version: 3)
     end
 
     defmodule InstallPrivate do
@@ -53,12 +44,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down(prefix: "docket_private", version: 2)
     end
 
-    defmodule UpgradePrivateV3 do
-      use Ecto.Migration
-      def up, do: Docket.Postgres.Migration.up(prefix: "docket_private", version: 3)
-      def down, do: Docket.Postgres.Migration.down(prefix: "docket_private", version: 3)
-    end
-
     defmodule FailedUpgradeV2 do
       use Ecto.Migration
 
@@ -71,22 +56,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: :ok
     end
 
-    defmodule FailedUpgradeV3 do
-      use Ecto.Migration
-
-      def up do
-        Docket.Postgres.Migration.up(version: 3)
-        flush()
-        raise "forced v3 rollback"
-      end
-
-      def down, do: :ok
-    end
-
     defmodule HostV1ToCurrent do
       use Ecto.Migration
-      def up, do: Docket.Postgres.Migration.up(version: 3)
-      def down, do: Docket.Postgres.Migration.down(version: 3)
+      def up, do: Docket.Postgres.Migration.up(version: 2)
+      def down, do: Docket.Postgres.Migration.down(version: 2)
     end
 
     setup do
@@ -97,21 +70,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :ok
     end
 
-    test "fresh v2 installs only current policy and partition authority" do
+    test "fresh current v2 installs cap authority, unfinished ring, cursor, and functions" do
       :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
 
       assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
 
-      assert Enum.sort(owned_claim_tables("public")) ==
-               ["docket_claim_partitions", "docket_claim_policy"]
+      assert Enum.sort(owned_claim_tables("public")) == current_claim_tables()
 
-      assert [[1, "legacy", nil, 0, nil]] =
+      assert [[1, "legacy", nil, 0, 0, nil]] =
                TestRepo.query!(
-                 "SELECT id, admission_mode, max_active, policy_version, initialized_at " <>
+                 "SELECT id, admission_mode, max_active, policy_version, " <>
+                   "scan_ring_position, initialized_at " <>
                    "FROM docket_claim_policy"
                ).rows
 
-      assert function_count("public") == 1
+      assert TestRepo.query!("SELECT count(*) FROM docket_claim_schedule").rows == [[0]]
+      assert tenant_fair_function_count("public") == 1
+      assert membership_function_count("public") == 1
+      assert membership_trigger_count("public") == 1
+      assert activity_function_count("public") == 1
+      assert activity_trigger_count("public") == 1
+      assert run_truncate_guard_trigger_count("public") == 1
+      assert schedule_truncate_guard_trigger_count("public") == 1
 
       assert Enum.sort(scope_indexes("public")) ==
                [
@@ -121,26 +101,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ]
     end
 
-    test "fresh v3 installs one authoritative unfinished ring and policy cursor" do
-      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
-
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 3
-
-      assert Enum.sort(owned_claim_tables("public")) == current_claim_tables()
-
-      assert [[0]] = TestRepo.query!("SELECT scan_ring_position FROM docket_claim_policy").rows
-
-      assert TestRepo.query!("SELECT count(*) FROM docket_claim_schedule").rows == [[0]]
-      assert function_count("public") == 1
-      assert membership_function_count("public") == 1
-      assert membership_trigger_count("public") == 1
-      assert activity_function_count("public") == 1
-      assert activity_trigger_count("public") == 1
-      assert run_truncate_guard_trigger_count("public") == 1
-      assert schedule_truncate_guard_trigger_count("public") == 1
-    end
-
-    test "ordinary v1-to-v2 upgrade backfills existing scopes transactionally" do
+    test "v1-to-current backfills cap partitions and unfinished-ring membership transactionally" do
       :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
 
       insert_v1_graph_and_run("tenant-a", "run-a")
@@ -150,32 +111,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert TestRepo.query!("SELECT scope_key FROM docket_claim_partitions ORDER BY scope_key").rows ==
                [[""], ["tenant-a"]]
-    end
-
-    test "populated v2-to-v3 backfills one authoritative unfinished row per partition" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
-      insert_v1_graph_and_run("tenant-a", "run-a")
-      insert_v1_graph_and_run(nil, "run-system")
-      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
-
-      TestRepo.query!(
-        "UPDATE docket_claim_partitions " <>
-          "SET max_active = 7, partition_version = 4, admission_epoch = 9 " <>
-          "WHERE scope_key = 'tenant-a'"
-      )
-
-      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
 
       assert TestRepo.query!(
                "SELECT scope_key, unfinished_count " <>
                  "FROM docket_claim_schedule ORDER BY scope_key"
              ).rows == [["", 1], ["tenant-a", 1]]
-
-      assert [[7, 4, 9]] =
-               TestRepo.query!(
-                 "SELECT max_active, partition_version, admission_epoch " <>
-                   "FROM docket_claim_partitions WHERE scope_key = 'tenant-a'"
-               ).rows
 
       assert [[2, 2, 2]] =
                TestRepo.query!(
@@ -184,40 +124,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ).rows
     end
 
-    test "v3 repairs schema-valid v2 runs whose partition row is missing" do
+    test "current schema exposes one unversioned TenantFair claim function" do
       :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
-      insert_v1_graph_and_run("tenant-a", "run-a")
+      assert tenant_fair_function_catalog("public") == []
+
       :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
 
-      TestRepo.query!("DELETE FROM docket_claim_partitions WHERE scope_key = 'tenant-a'")
-      assert TestRepo.query!("SELECT count(*) FROM docket_claim_partitions").rows == [[0]]
-
-      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
-
-      assert TestRepo.query!("SELECT scope_key, unfinished_count FROM docket_claim_schedule").rows ==
-               [["tenant-a", 1]]
+      assert tenant_fair_function_catalog("public") == [
+               [
+                 "docket_tenant_fair_claim",
+                 "timestamp with time zone, timestamp with time zone, integer, integer, text, integer, boolean"
+               ]
+             ]
     end
 
     test "host v1-to-current and fresh-current paths have equivalent schemas" do
-      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
-      fresh = schema_signature("public")
-
-      :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
-      insert_v1_graph_and_run("tenant-a", "run-a", "docket_private")
-      :ok = Ecto.Migrator.up(TestRepo, @private_v3, UpgradePrivateV3, log: false)
-
-      assert Docket.Postgres.Migration.migrated_version(
-               repo: TestRepo,
-               prefix: "docket_private"
-             ) == 3
-
-      assert schema_signature("docket_private") == fresh
-
-      assert TestRepo.query!("SELECT scope_key FROM docket_private.docket_claim_schedule").rows ==
-               [["tenant-a"]]
-    end
-
-    test "fresh v2 and a populated v1-to-v2 upgrade have equivalent schemas" do
       :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
       fresh = schema_signature("public")
 
@@ -225,13 +146,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       insert_v1_graph_and_run("tenant-a", "run-a", "docket_private")
       :ok = Ecto.Migrator.up(TestRepo, @private_v2, UpgradePrivateV2, log: false)
 
+      assert Docket.Postgres.Migration.migrated_version(
+               repo: TestRepo,
+               prefix: "docket_private"
+             ) == 2
+
       assert schema_signature("docket_private") == fresh
 
-      assert TestRepo.query!("SELECT scope_key FROM docket_private.docket_claim_partitions").rows ==
+      assert TestRepo.query!("SELECT scope_key FROM docket_private.docket_claim_schedule").rows ==
                [["tenant-a"]]
     end
 
-    test "database constraints reject invalid exact-cap authority" do
+    test "current v2 constraints reject invalid cap, cursor, and ring authority" do
       :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
 
       rejected = [
@@ -258,10 +184,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ).rows
 
       assert TestRepo.query!("SELECT count(*) FROM docket_claim_partitions").rows == [[0]]
-    end
-
-    test "v3 constraints reject duplicate, orphan, and invalid cursor state" do
-      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
 
       TestRepo.query!(
         "INSERT INTO docket_claim_partitions (scope_key) VALUES ('tenant'), ('tenant-2')"
@@ -364,36 +286,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
       assert owned_claim_tables("public") == []
       assert scope_indexes("public") == []
-      assert function_count("public") == 0
+      assert tenant_fair_function_count("public") == 0
       assert v1_runs("public") == [["run-a", "tenant-a"]]
-    end
-
-    test "a failed transactional v3 upgrade preserves the populated v2 schema" do
-      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
-
-      TestRepo.query!(
-        "INSERT INTO docket_claim_partitions " <>
-          "(scope_key, max_active, partition_version, admission_epoch) " <>
-          "VALUES ('tenant', 4, 7, 11)"
-      )
-
-      before = schema_signature("public")
-
-      assert_raise RuntimeError, "forced v3 rollback", fn ->
-        Ecto.Migrator.up(TestRepo, @failed_v3, FailedUpgradeV3, log: false)
-      end
-
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
-      assert schema_signature("public") == before
-
-      assert Enum.sort(owned_claim_tables("public")) ==
-               ["docket_claim_partitions", "docket_claim_policy"]
-
-      assert [["tenant", 4, 7, 11]] =
-               TestRepo.query!(
-                 "SELECT scope_key, max_active, partition_version, admission_epoch " <>
-                   "FROM docket_claim_partitions"
-               ).rows
     end
 
     test "a populated custom-prefix upgrade backfills tenant and tenantless scopes" do
@@ -408,11 +302,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  "ORDER BY scope_key"
              ).rows == [[""], ["tenant-a"]]
 
+      assert TestRepo.query!(
+               "SELECT scope_key, unfinished_count " <>
+                 "FROM docket_private.docket_claim_schedule ORDER BY scope_key"
+             ).rows == [["", 1], ["tenant-a", 1]]
+
       assert v1_runs("docket_private") ==
                [["run-a", "tenant-a"], ["run-system", nil]]
     end
 
-    test "v2 down removes only exact-cap objects and preserves populated v1 data" do
+    test "v2 down removes current authority and the claim function while preserving v1 data" do
       :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a")
       insert_v1_graph_and_run(nil, "run-system")
@@ -421,59 +320,27 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
       assert owned_claim_tables("public") == []
-      assert function_count("public") == 0
+      assert tenant_fair_function_count("public") == 0
       assert v1_runs("public") == [["run-a", "tenant-a"], ["run-system", nil]]
     end
 
-    test "v3 down removes only fairness objects and preserves exact-cap v2 state" do
-      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
-
-      TestRepo.query!(
-        "INSERT INTO docket_claim_partitions " <>
-          "(scope_key, max_active, partition_version, admission_epoch) " <>
-          "VALUES ('tenant', 5, 3, 12)"
-      )
-
-      :ok = Ecto.Migrator.down(TestRepo, @v3, UpgradeV3, log: false)
-
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
-
-      assert Enum.sort(owned_claim_tables("public")) ==
-               ["docket_claim_partitions", "docket_claim_policy"]
-
-      assert [["tenant", 5, 3, 12]] =
-               TestRepo.query!(
-                 "SELECT scope_key, max_active, partition_version, admission_epoch " <>
-                   "FROM docket_claim_partitions"
-               ).rows
-
-      assert function_count("public") == 1
-      assert membership_function_count("public") == 0
-      assert membership_trigger_count("public") == 0
-      assert activity_function_count("public") == 0
-      assert activity_trigger_count("public") == 0
-      assert run_truncate_guard_trigger_count("public") == 0
-      assert schedule_truncate_guard_trigger_count("public") == 0
-    end
-
-    test "host v1-to-current rollback target removes only v3 and lands on v2" do
+    test "host v1-to-current rollback target returns to v1" do
       :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a")
 
       :ok = Ecto.Migrator.up(TestRepo, @host_v1_to_current, HostV1ToCurrent, log: false)
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 3
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
 
       :ok = Ecto.Migrator.down(TestRepo, @host_v1_to_current, HostV1ToCurrent, log: false)
 
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
       assert v1_runs("public") == [["run-a", "tenant-a"]]
-
-      assert Enum.sort(owned_claim_tables("public")) ==
-               ["docket_claim_partitions", "docket_claim_policy"]
+      assert owned_claim_tables("public") == []
+      assert tenant_fair_function_catalog("public") == []
     end
 
     test "cursor, epoch, and run state share one transaction boundary" do
-      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
       TestRepo.query!("INSERT INTO docket_claim_partitions (scope_key) VALUES ('tenant')")
 
       [[position]] =
@@ -519,7 +386,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "concurrent first partition creation materializes one immutable ring position" do
-      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
 
       results =
         1..8
@@ -557,7 +424,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                [["prefix-tenant"]]
 
       assert owned_claim_tables("public") == []
-      assert function_count("docket_private") == 1
+      assert tenant_fair_function_count("docket_private") == 1
       assert run_truncate_guard_trigger_count("docket_private") == 1
       assert schedule_truncate_guard_trigger_count("docket_private") == 1
     end
@@ -583,18 +450,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> List.flatten()
     end
 
-    defp function_count(prefix) do
+    defp tenant_fair_function_count(prefix) do
       TestRepo.query!(
         """
         SELECT count(*)::integer
         FROM pg_proc
         JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
-        WHERE pg_namespace.nspname = $1 AND proname = 'docket_tenant_fair_claim_v1'
+        WHERE pg_namespace.nspname = $1 AND proname = 'docket_tenant_fair_claim'
         """,
         [prefix]
       ).rows
       |> hd()
       |> hd()
+    end
+
+    defp tenant_fair_function_catalog(prefix) do
+      TestRepo.query!(
+        """
+        SELECT procedure.proname, pg_get_function_identity_arguments(procedure.oid)
+        FROM pg_proc AS procedure
+        JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+        WHERE namespace.nspname = $1
+          AND procedure.proname LIKE 'docket_tenant_fair_claim%'
+        ORDER BY procedure.proname
+        """,
+        [prefix]
+      ).rows
     end
 
     defp membership_function_count(prefix) do

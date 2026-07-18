@@ -16,7 +16,7 @@ entries below reflect what has landed so far.
 
 ### Added
 
-- PostgreSQL schema version 3 adds one prefix-local TenantFair scheduling table
+- PostgreSQL schema version 2 adds one prefix-local TenantFair scheduling table
   with an exact trigger-maintained count of nonterminal runs per tenant and
   stores the serialized scan position on the existing policy row. Fixed `S =
   32`, `Q = 8`, exact-key
@@ -37,7 +37,7 @@ entries below reflect what has landed so far.
   new partition or wake notification. Dormant partition rows are retained
   after their last run disappears and are never selected from serialized
   payload identity.
-- PostgreSQL schema version 2: prefix-local exact-cap policy, partition,
+- The same schema version includes the prefix-local exact-cap policy, partition,
   ordinary supporting indexes, engine interlock, and TenantFair claim function.
   Existing scope keys are backfilled transactionally while inserts are blocked.
   ClaimPolicy implementations receive the additive quoted identifier context.

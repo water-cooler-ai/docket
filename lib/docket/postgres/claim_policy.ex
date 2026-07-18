@@ -379,17 +379,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             {0, 0}
         end
 
+      policy_cursor_contention? =
+        implementation == Docket.Postgres.ClaimPolicy.TenantFair and
+          result == {:error, {:claim_policy_unavailable, :lock_contention}}
+
       :telemetry.execute(
         [:docket, :postgres, :claim_policy, :admission],
         %{
           duration: duration,
           demand: plan.demand,
           leases: leases,
-          poisoned: poisoned
+          poisoned: poisoned,
+          contentions: if(policy_cursor_contention?, do: 1, else: 0)
         },
         %{
           implementation: implementation,
-          result: Docket.Telemetry.result_kind(result)
+          result: Docket.Telemetry.result_kind(result),
+          contention_phase: if(policy_cursor_contention?, do: :policy_cursor, else: :none)
         }
       )
     end
