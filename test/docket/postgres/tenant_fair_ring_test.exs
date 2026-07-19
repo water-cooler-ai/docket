@@ -8,34 +8,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.TestRepo
 
     @migration_version 20_260_717_000_176
-    @trace_columns [
-      :row_kind,
-      :error_reason,
-      :run_id,
-      :tenant_id,
-      :graph_id,
-      :graph_hash,
-      :checkpoint_seq,
-      :claim_token,
-      :claimed_at,
-      :claim_attempt,
-      :poisoned_at,
-      :poison_reason,
-      :work_class,
-      :eligible_at,
-      :call_token,
-      :transaction_id,
-      :visit_ordinal,
-      :outcome_ordinal,
-      :demand,
-      :cursor_before,
-      :cursor_after,
-      :ring_position,
-      :scope_key,
-      :disposition,
-      :outcome_count,
-      :epoch_delta
-    ]
+    @trace_columns RingFunction.result_columns() |> Keyword.keys()
 
     defmodule InstallDocket do
       use Ecto.Migration

@@ -124,6 +124,84 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    test "database windows reject churn, rollback, and instrumentation gaps" do
+      window = database_window()
+      opts = database_opts()
+
+      churned =
+        Map.put(window, :ring_snapshots, [
+          [{10, "low"}],
+          [{20, "low"}]
+        ])
+
+      assert_raise ArgumentError, ~r/changed its frozen ring/, fn ->
+        FairRotationOracle.assert_database_trace!(churned, opts)
+      end
+
+      rolled_back = put_in(window, [:calls, Access.at(0), :committed], false)
+
+      assert_raise ArgumentError, ~r/rolled-back call/, fn ->
+        FairRotationOracle.assert_database_trace!(rolled_back, opts)
+      end
+
+      instrumentation_gap =
+        update_in(window, [:calls, Access.at(0), :rows, Access.at(0)], fn inspection ->
+          %{inspection | outcome_count: 0}
+        end)
+
+      assert_raise ArgumentError, ~r/outcomes without inspection evidence/, fn ->
+        FairRotationOracle.assert_database_trace!(instrumentation_gap, opts)
+      end
+    end
+
+    defp database_window do
+      identity = %{
+        call_token: "call-1",
+        transaction_id: 1,
+        demand: 1,
+        visit_ordinal: 1
+      }
+
+      inspection =
+        Map.merge(identity, %{
+          row_kind: "inspection",
+          cursor_before: 0,
+          cursor_after: 10,
+          ring_position: 10,
+          scope_key: "low",
+          disposition: "grant",
+          outcome_count: 1,
+          epoch_delta: 1
+        })
+
+      outcome =
+        Map.merge(identity, %{
+          row_kind: "outcome",
+          outcome_ordinal: 1
+        })
+
+      %{
+        calls: [%{rows: [inspection, outcome], committed: true}],
+        ring_snapshots: [[{10, "low"}], [{10, "low"}]],
+        policy_snapshots: [%{engine: :tenant_fair}, %{engine: :tenant_fair}],
+        epoch_snapshots: [%{"low" => 0}, %{"low" => 1}],
+        target_admissible_before_calls: [true],
+        repair_active: false,
+        instrumentation_complete: true
+      }
+    end
+
+    defp database_opts do
+      [
+        target: "low",
+        cohort: ["low"],
+        ring: [{10, "low"}],
+        scan_budget: 1,
+        quantum: 1,
+        lock_failures: 0
+      ]
+    end
+
     defp event(
            call,
            ordinal,

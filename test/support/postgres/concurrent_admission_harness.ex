@@ -11,6 +11,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       @unsuccessful_dispositions [:lock_skip, :cap_denied, :stale, :empty]
 
+      @database_dispositions %{
+        "grant" => :grant,
+        "partition_lock_skip" => :lock_skip,
+        "lock_miss" => :lock_skip,
+        "denied" => :cap_denied,
+        "cap_debt_denial" => :cap_denied,
+        "stale" => :stale,
+        "empty_page" => :empty
+      }
+
+      @database_outcome_dispositions [
+        "admitted_reacquisition",
+        "expired_recovery",
+        "queued_promotion"
+      ]
+
       @doc false
       def bounds!(opts) when is_list(opts) do
         target = Keyword.fetch!(opts, :target)
@@ -68,7 +84,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         assert_cursor!(through_target_call, bounds.ring)
         assert_call_budgets!(through_target_call, bounds.scan_budget)
-        assert_events!(window, cohort, bounds.quantum)
+        ring_population = bounds.ring |> Enum.map(&elem(&1, 1)) |> MapSet.new()
+        assert_events!(through_target_call, ring_population, bounds.quantum)
+        assert_grants_within_cohort!(window, cohort)
         assert_rounds!(window, target)
 
         target_failures =
@@ -99,6 +117,241 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           observed_other_outcomes: other_outcomes,
           observed_scan_calls: scan_calls
         })
+      end
+
+      @doc false
+      def assert_database_trace!(window, opts) when is_map(window) and is_list(opts) do
+        calls = Map.get(window, :calls)
+
+        unless is_list(calls) and calls != [] do
+          fail!("database fairness window must contain at least one call")
+        end
+
+        bounds = bounds!(opts)
+        qualify_database_window!(window, calls, bounds.ring)
+        assert_unique_call_tokens!(calls)
+
+        events =
+          calls
+          |> Enum.with_index(1)
+          |> Enum.flat_map(fn {call, call_ordinal} ->
+            normalize_database_call!(call, call_ordinal)
+          end)
+
+        assert_epoch_evidence!(events, Map.fetch!(window, :epoch_snapshots), length(calls))
+        result = assert_trace!(events, opts)
+        Map.put(result, :observed_database_calls, length(calls))
+      end
+
+      defp qualify_database_window!(window, calls, frozen_ring) do
+        ring_snapshots = Map.get(window, :ring_snapshots)
+
+        unless is_list(ring_snapshots) and length(ring_snapshots) == length(calls) + 1 do
+          fail!("database fairness window requires one ring snapshot at every call boundary")
+        end
+
+        unless Enum.all?(ring_snapshots, &(&1 == frozen_ring)) do
+          fail!("database fairness window changed its frozen ring")
+        end
+
+        policy_snapshots = Map.get(window, :policy_snapshots)
+
+        unless is_list(policy_snapshots) and length(policy_snapshots) == length(calls) + 1 do
+          fail!("database fairness window requires one policy snapshot at every call boundary")
+        end
+
+        unless length(Enum.uniq(policy_snapshots)) == 1 do
+          fail!("database fairness window changed its policy or engine")
+        end
+
+        unless Enum.all?(policy_snapshots, &match?(%{engine: :tenant_fair}, &1)) do
+          fail!("database fairness window did not use the TenantFair engine")
+        end
+
+        epoch_snapshots = Map.get(window, :epoch_snapshots)
+
+        unless is_list(epoch_snapshots) and length(epoch_snapshots) == length(calls) + 1 and
+                 Enum.all?(epoch_snapshots, &is_map/1) do
+          fail!("database fairness window requires one epoch snapshot at every call boundary")
+        end
+
+        epoch_keys = Enum.map(epoch_snapshots, &(Map.keys(&1) |> Enum.sort()))
+
+        unless length(Enum.uniq(epoch_keys)) == 1 do
+          fail!("database fairness window changed its epoch authority population")
+        end
+
+        target_admissible = Map.get(window, :target_admissible_before_calls)
+
+        unless is_list(target_admissible) and length(target_admissible) == length(calls) and
+                 Enum.all?(target_admissible, &(&1 == true)) do
+          fail!("fair-rotation target was not continuously admissible through its grant")
+        end
+
+        if Map.get(window, :repair_active, false) do
+          fail!("database fairness window cannot include repair")
+        end
+
+        unless Map.get(window, :instrumentation_complete) == true do
+          fail!("database fairness window has an instrumentation gap")
+        end
+      end
+
+      defp assert_epoch_evidence!(events, snapshots, call_count) do
+        Enum.each(1..call_count, fn call ->
+          before = Enum.at(snapshots, call - 1)
+          after_snapshot = Enum.at(snapshots, call)
+
+          expected =
+            events
+            |> Enum.filter(&(&1.call == call and &1.disposition == :grant))
+            |> Enum.frequencies_by(& &1.partition)
+
+          actual =
+            Map.new(before, fn {partition, epoch_before} ->
+              epoch_after = Map.fetch!(after_snapshot, partition)
+
+              unless is_integer(epoch_before) and is_integer(epoch_after) and
+                       epoch_after >= epoch_before do
+                fail!("database fairness window has invalid epoch evidence")
+              end
+
+              {partition, epoch_after - epoch_before}
+            end)
+
+          expected_for_population =
+            Map.new(actual, fn {partition, _delta} ->
+              {partition, Map.get(expected, partition, 0)}
+            end)
+
+          unless actual == expected_for_population do
+            fail!("database fairness window observed an unrecorded or misaccounted grant")
+          end
+        end)
+      end
+
+      defp assert_unique_call_tokens!(calls) do
+        call_tokens =
+          Enum.map(calls, fn
+            %{rows: [row | _rows]} -> Map.get(row, :call_token)
+            _call -> nil
+          end)
+
+        unless Enum.uniq(call_tokens) == call_tokens do
+          fail!("database fairness window contains a duplicate call identity")
+        end
+      end
+
+      defp normalize_database_call!(%{rows: rows, committed: true}, call_ordinal)
+           when is_list(rows) and rows != [] do
+        if Enum.any?(rows, &(Map.get(&1, :row_kind) == "error")) do
+          fail!("database fairness window contains an errored call")
+        end
+
+        call_tokens = rows |> Enum.map(&Map.get(&1, :call_token)) |> Enum.uniq()
+        transaction_ids = rows |> Enum.map(&Map.get(&1, :transaction_id)) |> Enum.uniq()
+        demands = rows |> Enum.map(&Map.get(&1, :demand)) |> Enum.uniq()
+
+        unless length(call_tokens) == 1 and hd(call_tokens) != nil do
+          fail!("database fairness call has missing or inconsistent call identity")
+        end
+
+        unless length(transaction_ids) == 1 and hd(transaction_ids) != nil do
+          fail!("database fairness call has missing or inconsistent transaction identity")
+        end
+
+        unless length(demands) == 1 and is_integer(hd(demands)) and hd(demands) > 0 do
+          fail!("database fairness call has missing or inconsistent demand")
+        end
+
+        inspections = Enum.filter(rows, &(Map.get(&1, :row_kind) == "inspection"))
+        outcomes = Enum.filter(rows, &(Map.get(&1, :row_kind) == "outcome"))
+
+        unless length(inspections) + length(outcomes) == length(rows) do
+          fail!("database fairness call contains an unknown trace row")
+        end
+
+        if inspections == [] do
+          fail!("database fairness call contains no inspection evidence")
+        end
+
+        outcome_counts = Enum.map(inspections, &Map.get(&1, :outcome_count))
+
+        unless Enum.all?(outcome_counts, &(is_integer(&1) and &1 >= 0)) do
+          fail!("database fairness call has an invalid inspection outcome count")
+        end
+
+        unless Enum.sum(outcome_counts) == length(outcomes) do
+          fail!("database fairness call has outcomes without inspection evidence")
+        end
+
+        Enum.map(inspections, fn inspection ->
+          visit_ordinal = Map.get(inspection, :visit_ordinal)
+          visit_outcomes = Enum.filter(outcomes, &(Map.get(&1, :visit_ordinal) == visit_ordinal))
+          outcome_count = Map.get(inspection, :outcome_count)
+
+          unless outcome_count == length(visit_outcomes) do
+            fail!("database fairness inspection outcome count does not match its outcome rows")
+          end
+
+          outcome_ordinals = Enum.map(visit_outcomes, &Map.get(&1, :outcome_ordinal))
+          expected_ordinals = if outcome_count == 0, do: [], else: Enum.to_list(1..outcome_count)
+
+          unless Enum.sort(outcome_ordinals) == expected_ordinals do
+            fail!("database fairness visit has non-contiguous outcome ordinals")
+          end
+
+          Enum.each(visit_outcomes, fn outcome ->
+            matching_fields? =
+              Map.get(outcome, :scope_key) == Map.get(inspection, :scope_key) and
+                Map.get(outcome, :cursor_before) == Map.get(inspection, :cursor_before) and
+                Map.get(outcome, :cursor_after) == Map.get(inspection, :cursor_after) and
+                Map.get(outcome, :ring_position) == Map.get(inspection, :ring_position) and
+                Map.get(outcome, :disposition) in @database_outcome_dispositions
+
+            unless matching_fields? do
+              fail!("database fairness outcome does not match its inspection")
+            end
+          end)
+
+          unless Map.get(inspection, :ring_position) == Map.get(inspection, :cursor_after) do
+            fail!("database fairness inspection ring position does not match its cursor")
+          end
+
+          disposition = Map.get(inspection, :disposition)
+
+          normalized_disposition =
+            Map.get(@database_dispositions, disposition) ||
+              fail!("unknown database fairness disposition: #{inspect(disposition)}")
+
+          %{
+            call: call_ordinal,
+            ordinal: visit_ordinal,
+            cursor_before: Map.get(inspection, :cursor_before),
+            cursor_after: Map.get(inspection, :cursor_after),
+            demand: hd(demands),
+            partition: Map.get(inspection, :scope_key),
+            disposition: normalized_disposition,
+            outcomes: outcome_count,
+            epoch_delta: Map.get(inspection, :epoch_delta),
+            committed: true
+          }
+        end)
+        |> tap(fn _events ->
+          run_ids = Enum.map(outcomes, &Map.get(&1, :run_id))
+
+          unless Enum.all?(run_ids, &is_binary/1) and Enum.uniq(run_ids) == run_ids do
+            fail!("database fairness call has missing or duplicate outcome run identities")
+          end
+        end)
+      end
+
+      defp normalize_database_call!(%{committed: false}, _call_ordinal) do
+        fail!("database fairness window contains a rolled-back call")
+      end
+
+      defp normalize_database_call!(call, _call_ordinal) do
+        fail!("invalid database fairness call: #{inspect(call)}")
       end
 
       defp normalize_event!(
@@ -271,6 +524,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end)
 
         :ok
+      end
+
+      defp assert_grants_within_cohort!(events, cohort) do
+        Enum.each(events, fn event ->
+          if event.disposition == :grant and not MapSet.member?(cohort, event.partition) do
+            fail!("partition outside the frozen cohort received a grant")
+          end
+        end)
       end
 
       defp assert_at_most!(observed, bound, _label) when observed <= bound, do: :ok

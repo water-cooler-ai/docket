@@ -169,13 +169,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       scope_key: "text",
       disposition: "text",
       outcome_count: "integer",
-      epoch_delta: "bigint"
+      epoch_delta: "bigint",
+      ready_structural_count: "integer",
+      expired_structural_count: "integer",
+      attempt_set_count: "integer",
+      exact_lock_attempt_count: "integer",
+      locked_count: "integer",
+      mutation_input_count: "integer"
     ]
 
     def name, do: @name
     def identity_arguments, do: @identity_arguments
     def lock_timeout_ms, do: @lock_timeout_ms
     def public_result_columns, do: @public_result_columns
+    def result_columns, do: @public_result_columns ++ @internal_result_columns
 
     def result_definition do
       Enum.map_join(@public_result_columns ++ @internal_result_columns, ",\n        ", fn {name,
@@ -237,6 +244,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         p_default_max ALIAS FOR $6;
         p_trace ALIAS FOR $7;
         v_prior_lock_timeout text := current_setting('lock_timeout');
+        v_barrier_lock_timeout text;
         v_call_token uuid := pg_catalog.gen_random_uuid();
         v_transaction_id bigint := pg_catalog.txid_current();
         v_default_max integer;
@@ -260,9 +268,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         v_attempt_admitted boolean[] := ARRAY[]::boolean[];
         v_attempt_queue_ordinals integer[] := ARRAY[]::integer[];
         v_locked_ids bigint[] := ARRAY[]::bigint[];
+        v_ready_page_count integer;
+        v_expired_page_count integer;
         v_grant_limit integer;
         v_grant_count integer;
         v_rechecked_count integer;
+        v_mutation_input_count integer;
         v_disposition text;
         v_next_queue_ordinal integer;
         v_candidate_counted boolean;
@@ -284,7 +295,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             NULL::timestamp with time zone, NULL::text, NULL::text,
             NULL::timestamp with time zone, v_call_token, v_transaction_id,
             NULL::integer, NULL::integer, p_demand, NULL::bigint, NULL::bigint,
-            NULL::bigint, NULL::text, 'transaction_mode'::text, 0::integer, 0::bigint;
+            NULL::bigint, NULL::text, 'transaction_mode'::text, 0::integer, 0::bigint,
+            NULL::integer, NULL::integer, NULL::integer, NULL::integer,
+            NULL::integer, NULL::integer;
           RETURN;
         END IF;
 
@@ -295,7 +308,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             NULL::timestamp with time zone, NULL::text, NULL::text,
             NULL::timestamp with time zone, v_call_token, v_transaction_id,
             NULL::integer, NULL::integer, p_demand, NULL::bigint, NULL::bigint,
-            NULL::bigint, NULL::text, 'transaction_mode'::text, 0::integer, 0::bigint;
+            NULL::bigint, NULL::text, 'transaction_mode'::text, 0::integer, 0::bigint,
+            NULL::integer, NULL::integer, NULL::integer, NULL::integer,
+            NULL::integer, NULL::integer;
           RETURN;
         END IF;
 
@@ -332,7 +347,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               NULL::timestamp with time zone, NULL::text, NULL::text,
               NULL::timestamp with time zone, v_call_token, v_transaction_id,
               NULL::integer, NULL::integer, p_demand, NULL::bigint, NULL::bigint,
-              NULL::bigint, NULL::text, 'policy_cursor'::text, 0::integer, 0::bigint;
+              NULL::bigint, NULL::text, 'policy_cursor'::text, 0::integer, 0::bigint,
+              NULL::integer, NULL::integer, NULL::integer, NULL::integer,
+              NULL::integer, NULL::integer;
             RETURN;
         END;
 
@@ -397,6 +414,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           v_visit_outcome_ordinal := 0;
           v_grant_count := 0;
           v_rechecked_count := 0;
+          v_mutation_input_count := 0;
+          v_ready_page_count := 0;
+          v_expired_page_count := 0;
+          v_attempt_ids := ARRAY[]::bigint[];
+          v_attempt_classes := ARRAY[]::text[];
+          v_attempt_poisons := ARRAY[]::boolean[];
+          v_attempt_admitted := ARRAY[]::boolean[];
+          v_attempt_queue_ordinals := ARRAY[]::integer[];
+          v_locked_ids := ARRAY[]::bigint[];
           v_disposition := 'partition_lock_skip';
 
           SELECT scope_key, COALESCE(max_active, v_default_max) AS max_active
@@ -521,10 +547,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    COALESCE(array_agg(chosen.admitted ORDER BY chosen.attempt_ordinal),
                             ARRAY[]::boolean[]),
                    COALESCE(array_agg(chosen.queue_ordinal ORDER BY chosen.attempt_ordinal),
-                            ARRAY[]::integer[])
+                            ARRAY[]::integer[]),
+                   (SELECT count(*)::integer FROM ready_page),
+                   (SELECT count(*)::integer FROM expired_page)
             INTO v_attempt_ids, v_attempt_classes, v_attempt_poisons,
-                 v_attempt_admitted, v_attempt_queue_ordinals
+                 v_attempt_admitted, v_attempt_queue_ordinals,
+                 v_ready_page_count, v_expired_page_count
             FROM chosen;
+
+            -- Trace-only deterministic mutation barrier for the DCKT-79
+            -- discovery-to-lock stale-recheck proof. Production calls always
+            -- pass p_trace=false, and trace callers must explicitly opt in
+            -- through a transaction-local custom setting.
+            IF p_trace AND
+               current_setting('docket.trace_candidate_barrier', true) = 'on' THEN
+              v_barrier_lock_timeout := current_setting('lock_timeout');
+              PERFORM set_config('lock_timeout', '5s', true);
+              PERFORM pg_catalog.pg_advisory_xact_lock(790079);
+              PERFORM set_config('lock_timeout', v_barrier_lock_timeout, true);
+            END IF;
 
             SELECT COALESCE(array_agg(locked.id ORDER BY locked.ordinality), ARRAY[]::bigint[])
             INTO v_locked_ids
@@ -681,6 +722,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               INTO v_updated;
 
               IF FOUND THEN
+                v_mutation_input_count := v_mutation_input_count + 1;
                 v_grant_count := v_grant_count + 1;
                 v_visit_outcome_ordinal := v_visit_outcome_ordinal + 1;
                 v_remaining := v_remaining - 1;
@@ -726,7 +768,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                     WHEN v_candidate.work_class = 'expired' THEN 'expired_recovery'
                     WHEN v_candidate.admitted THEN 'admitted_reacquisition'
                     ELSE 'queued_promotion'
-                  END::text, NULL::integer, NULL::bigint;
+                  END::text, NULL::integer, NULL::bigint,
+                  NULL::integer, NULL::integer, NULL::integer, NULL::integer,
+                  NULL::integer, NULL::integer;
               END IF;
             END LOOP;
 
@@ -758,7 +802,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               v_visit.visit_ordinal::integer, NULL::integer, p_demand,
               v_visit_cursor_before, v_cursor, v_visit.ring_position::bigint,
               v_visit.scope_key::text, v_disposition, v_grant_count,
-              CASE WHEN v_grant_count > 0 THEN 1::bigint ELSE 0::bigint END;
+              CASE WHEN v_grant_count > 0 THEN 1::bigint ELSE 0::bigint END,
+              COALESCE(v_ready_page_count, 0), COALESCE(v_expired_page_count, 0),
+              COALESCE(cardinality(v_attempt_ids), 0),
+              COALESCE(cardinality(v_attempt_ids), 0),
+              COALESCE(cardinality(v_locked_ids), 0), v_mutation_input_count;
           END IF;
         END LOOP;
 

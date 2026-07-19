@@ -47,7 +47,10 @@ when you want to understand *why* the contracts are shaped the way they are.
 11. `docket-claim-policy.md`
     - The RunStore-to-ClaimPolicy boundary and the implemented Legacy and
       TenantFair engines.
-12. `docket-runtime-design.md`
+12. `docket-tenant-fair-proof-suite.md`
+    - The DCKT-79 executable-evidence stack that builds DCKT-49 bounded-bypass
+      qualification on the DCKT-47 exact-cap invariants.
+13. `docket-runtime-design.md`
     - Historical 0.0.1 runtime research and background: goals, alternatives
       considered (Pregel, LangGraph, Temporal), and future design space.
 
