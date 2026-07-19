@@ -349,15 +349,13 @@ re-execution, not a partial durable moment.
 
 ## Exact per-owner caps and TenantFair schema state
 
-Schema version 2 adds the policy and partition authority used by
-`Docket.Postgres.ClaimPolicy.TenantFair`. Schema version 3 adds its unique
-scheduling ring, exact trigger-maintained unfinished-run count, global scan
-cursor, and bounded-query constants. The unfinished ring is an authoritative
-superset of current eligibility, so future timers and parked running work may
-consume an unsuccessful inspection without becoming invisible. The admission
-engine remains on the provisional v2 mechanics until DCKT-78; schema presence
-alone is not a fairness proof. Enable TenantFair consistently across the
-fleet:
+Schema version 2 contains the policy and partition authority used by
+`Docket.Postgres.ClaimPolicy.TenantFair`, its unique scheduling ring, exact
+trigger-maintained unfinished-run count, global scan cursor, claim function,
+and fixed admission budgets. The unfinished ring is an
+authoritative superset of current eligibility, so future timers and parked
+running work may consume an unsuccessful inspection without becoming
+invisible. Enable TenantFair consistently across the fleet:
 
 ```elixir
 claim_policy: [
@@ -401,25 +399,17 @@ mix ecto.migrate -r MyApp.Repo
 
 Stop dispatchers and all Docket run writers before the upgrade, deploy one
 homogeneous binary version, migrate, and restart. The migration locks the runs
-table against inserts while it backfills owner partitions. The current binary
-requires schema version 3. The generated v1 upgrade keeps version 2 as its
-immediate rollback point. Online migrations, readiness ledgers, fleet
+table against inserts while it backfills owner partitions and schedule rows.
+The current binary requires schema version 2. Rolling back the generated v1
+upgrade removes V02 and returns to schema version 1. Online migrations,
+readiness ledgers, fleet
 attestations, and audited activation are intentionally outside the v0.1.0
 contract.
 
-Fresh installations generated without `--upgrade-from-v1` install all three
-schema versions in one host migration. A stopped schema-v2 development host
-uses:
-
-```sh
-mix docket.gen.migration -r MyApp.Repo --upgrade-from-v2
-mix ecto.migrate -r MyApp.Repo
-```
-
-DCKT-68's development-only version-2 schema is not an upgrade source. This
-cleanup rewrites v2 before the 0.1.0 release; recreate any local/test database
-that already applied that development migration, or roll it back using the
-matching DCKT-68 code first.
+Fresh installations generated without `--upgrade-from-v1` install V01 and V02
+in one host migration. Earlier unreleased V02/V03 development schemas are not
+upgrade sources; recreate those local/test databases, or roll them back using
+their matching historical code before applying the collapsed V02.
 
 ## Operational inspection
 

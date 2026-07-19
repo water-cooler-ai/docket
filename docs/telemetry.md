@@ -21,7 +21,7 @@ labels. Claim tokens are never emitted.
 | `[:docket, :postgres, :dispatcher, :shutdown]` | `duration`, `vehicles_remaining` | `result` |
 | `[:docket, :postgres, :notification]` | `count` | `result` |
 | `[:docket, :postgres, :run_store, :claim]` | duration, candidate/selection ages and counts, `demand`, `leases`, `poisoned`, `steals`, `claim_attempts` | `preference`, `fallback`, `result` |
-| `[:docket, :postgres, :claim_policy, :admission]` | `duration`, `demand`, `leases`, `poisoned` | `implementation`, `result` |
+| `[:docket, :postgres, :claim_policy, :admission]` | `duration`, `demand`, `leases`, `poisoned`, `contentions` | `implementation`, `result`, `contention_phase` |
 | `[:docket, :postgres, :claim, :attempt]` | `count`, `claim_attempts` | `result` |
 | `[:docket, :postgres, :claim, :poisoned]` | `count` | `reason` |
 | `[:docket, :postgres, :claim, :operation]` | `duration`, optionally `matched` | `operation`, `result` |
@@ -58,46 +58,22 @@ effects require their own stable idempotency scheme.
 
 ## Fair-rotation evidence boundary
 
-The provisional schema-v2 admission engine emits only the generic ClaimPolicy
-and claim events in the catalog above, even when running on schema v3. It does
-not expose the cursor, visit, grant, or service-epoch evidence needed to prove
-the DCKT-75 bounded-bypass contract. Its query duration and the existing
-TenantFair timing score are not substitutes for that evidence.
+The schema-v2 ring engine keeps the generic ClaimPolicy and claim events in the
+catalog above. The admission event reports total duration and a normalized
+`contentions` count; `contention_phase: :policy_cursor` distinguishes bounded
+singleton-cursor pressure without adding identity labels. That phase is set
+only when the ring function catches contention while acquiring its singleton
+policy/cursor authority; a later database lock timeout retains the public
+`lock_contention` error but reports `contentions: 0` and
+`contention_phase: :none` because its phase is not proven.
 
-Schema v3 installs the durable state and fixed budgets but does not yet change
-the current generic admission telemetry. DCKT-78 must keep the generic event
-and add one bounded, identity-free fair-rotation observation whose aggregate
-measurements cover:
-
-- configured inspection budget `S` and grant outcome limit `Q`;
-- scan pages, unfinished-ring visits inspected, cursor advances, and wraps;
-- partition locks, lock skips, grants, leases, poison outcomes, and total
-  outcomes;
-- cap-denied, stale, and empty visits;
-- unfinished-ring membership transitions and explicit work-budget exhaustion; and
-- `admission_epoch` advances.
-
-For every available committed observation:
-
-```text
-outcomes = leases + poisoned
-outcomes <= Q * grants
-grants <= locked visits
-admission_epoch advances = grants
-cursor advances = unfinished-ring positions inspected
-```
-
-A denial, stale/empty visit, or lock skip contributes no grant and no service-
-epoch advance. A statement that fails before scan authority, or later rolls
-back with its caller, supplies no committed cursor/grant evidence. Operational
-attempt telemetry may still describe such work, so collectors must not
-silently treat attempt counts as durable proof.
-
-Metadata remains bounded enums such as implementation, result, and observation
-availability. Tenant ID, raw `scope_key`, run or graph identity, cursor token,
-and claim token are forbidden as ordinary metric labels. Per-target bypass
-requires an identity-bearing, database-ordered trace in the deterministic test
-or trusted inspection plane; aggregate telemetry cannot reconstruct it.
+Detailed cursor, visit, disposition, outcome, and epoch evidence is available
+only from the disabled-by-default raw trace result mode used by deterministic
+tests and trusted inspection. Production passes trace off and filters those
+rows before the unchanged public decoder. Tenant ID, raw `scope_key`, run or
+graph identity, call token, cursor token, and claim token are forbidden as
+ordinary metric labels. DCKT-79 owns full trace qualification and the
+per-target bounded-bypass proof; aggregate telemetry cannot reconstruct it.
 
 The normative populations, units, formulas, exclusions, and Legacy control are
 in the [exact-cap and fair-rotation admission contract](architecture/docket-exact-cap-contract.md).

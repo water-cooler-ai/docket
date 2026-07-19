@@ -23,7 +23,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           implementation: Docket.Postgres.ClaimPolicy.TenantFair,
           options: [default_max_active: 2],
           fixture: Docket.Test.TenantFairClaimPolicyContract,
-          query_marker: "WITH eligible_partitions AS MATERIALIZED",
+          query_marker: "docket_tenant_fair_claim",
           run_store_setup: Docket.Test.TenantFairRunStoreSetup
         }
       ]

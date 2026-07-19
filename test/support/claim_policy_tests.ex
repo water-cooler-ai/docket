@@ -399,22 +399,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           assert_receive {[:docket, :postgres, :claim_policy, :admission], success_measurements,
                           %{
                             implementation: @claim_policy_implementation,
-                            result: :ok
+                            result: :ok,
+                            contention_phase: :none
                           } = success_metadata}
 
           assert success_metadata == %{
                    implementation: @claim_policy_implementation,
-                   result: :ok
+                   result: :ok,
+                   contention_phase: :none
                  }
 
           assert %{
                    demand: 7,
                    duration: success_duration,
                    leases: success_leases,
-                   poisoned: success_poisoned
+                   poisoned: success_poisoned,
+                   contentions: 0
                  } = success_measurements
 
-          assert map_size(success_measurements) == 4
+          assert map_size(success_measurements) == 5
           assert is_integer(success_duration) and success_duration >= 0
           assert success_leases == length(expected_batch.leases)
           assert success_poisoned == length(expected_batch.poisoned)
@@ -449,18 +452,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           assert_receive {[:docket, :postgres, :claim_policy, :admission], error_measurements,
                           %{
                             implementation: @claim_policy_implementation,
-                            result: :error
+                            result: :error,
+                            contention_phase: :none
                           } = error_metadata}
 
           assert error_metadata == %{
                    implementation: @claim_policy_implementation,
-                   result: :error
+                   result: :error,
+                   contention_phase: :none
                  }
 
-          assert %{demand: 7, duration: error_duration, leases: 0, poisoned: 0} =
+          assert %{demand: 7, duration: error_duration, leases: 0, poisoned: 0, contentions: 0} =
                    error_measurements
 
-          assert map_size(error_measurements) == 4
+          assert map_size(error_measurements) == 5
           assert is_integer(error_duration) and error_duration >= 0
 
           if @claim_policy_fixture.detailed_observation?() do

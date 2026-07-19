@@ -1,11 +1,9 @@
 # Exact-cap and fair-rotation admission contract
 
 This document records the PostgreSQL TenantFair guarantees for Docket v0.1.0.
-The exact-cap sections describe the implemented schema-v2 safety boundary. The
-fair-rotation sections freeze the stronger DCKT-75 contract that schema v3 and
-the later admission implementation must satisfy. Schema v2 does not yet satisfy
-that fairness proof: it globally groups eligible runs and advances
-`admission_epoch` after unsuccessful visits.
+The exact-cap sections describe the schema-v2 safety boundary. The
+fair-rotation sections freeze the stronger DCKT-75 contract implemented by the
+schema-v2 ring admission engine and qualified further by DCKT-79.
 
 The contract intentionally excludes online rollout, governance, audit,
 reporting, weighted service, preferred share, and borrowing. Those are
@@ -43,8 +41,7 @@ domain; it is neither a wildcard nor a separate scheduling class.
   rolled-back run creation leaves no partition behind.
 - Schema-v2 bounded discovery rotates every considered partition, including a
   cap-denied one, so a full scope cannot permanently pin a later eligible scope
-  under continued polling. This is a qualitative progress property, not the
-  schema-v3 bounded-bypass proof.
+  under continued polling. DCKT-79 owns the full bounded-bypass qualification.
 - Partition authority is locked before run rows. Live count, scope, ready or
   expired class, wake/cutoff, attempt class, claim state, and capacity are
   freshly rechecked before mutation.
@@ -206,7 +203,7 @@ processing-time, physical-execution, or unconditional starvation guarantee.
 ## Service accounting and cursor separation
 
 `admission_epoch` is outcome-backed service evidence, not the scan cursor and
-not an ordering substitute for the round/no-repeat invariant. In schema v3 it
+not an ordering substitute for the round/no-repeat invariant. In schema v2 it
 advances exactly once per committed nonempty grant, regardless of whether the
 grant returned one outcome or `Q` outcomes. It does not advance for denial,
 staleness, cap rejection, emptiness, lock skip, error, or rollback.
@@ -250,7 +247,7 @@ and benchmark duration cannot order concurrent grants.
 
 The current `FairRotationOracle` helper is the pure numeric scaffold: it checks
 cursor continuity, per-call demand/budget use, nonempty grants, epoch deltas,
-round/no-repeat, and the three bounds. Schema-v3 integration work must feed it
+round/no-repeat, and the three bounds. DCKT-79 integration work must feed it
 database-authored traces and separately prove exact unfinished-count
 maintenance, fixed ring membership, admissibility fixtures, and the inherited
 live safety/class invariants.
@@ -316,14 +313,13 @@ database that applied that earlier development migration must be recreated, or
 rolled back with matching old code before adopting the rewritten migration. No
 released v2 database uses that discarded shape.
 
-Schema version 3 is the additive DCKT-76 migration. It installs the unique
-scheduling ring with an exact trigger-maintained unfinished-run count and adds
-the scan position to the existing policy row without weakening schema-v2
-safety. The current
-binary requires schema version 3; version 2 is its immediate rollback point
-and version 1 remains the older host upgrade waypoint. The ratified constants,
+Schema version 2 is the collapsed DCKT-76/DCKT-78 migration. It installs the
+unique scheduling ring with an exact trigger-maintained unfinished-run count,
+the scan position, and the TenantFair claim function without weakening
+exact-cap safety. The current binary requires schema version 2 and rolling V02
+back returns to version 1. The ratified constants,
 query shapes, and non-release diagnostic boundary are in
-[TenantFair schema-v3 active-ring decision](docket-tenant-fair-schema-v3.md).
+[TenantFair schema-v2 active-ring decision](docket-tenant-fair-schema-v2.md).
 
 The supported upgrade remains stopped and homogeneous. Online migration and
 readiness, governance, audit/evidence platforms, enterprise rollout,

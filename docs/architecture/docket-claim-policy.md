@@ -40,8 +40,8 @@ Legacy remains the default when `claim_policy:` is omitted.
 
 ## TenantFair
 
-TenantFair adds exact per-owner caps. Schema v3 and its replacement claim
-function must add the frozen bounded-bypass rotation contract:
+TenantFair adds exact per-owner caps and the schema-v2 ring function implements
+the frozen bounded-bypass rotation contract:
 
 ```elixir
 use Docket,
@@ -57,22 +57,16 @@ use Docket,
 `default_max_active` is its only implementation option. It bootstraps an unset
 database default; persisted values and partition overrides remain authoritative.
 
-The current schema-v2 statement discovers a bounded result page only after a
-global eligible-run grouping, orders it by `admission_epoch`, and invokes
-`docket_tenant_fair_claim_v1` once. Inside the function, a fresh Read Committed
-command locks partition authority, counts live claims, and selects and mutates
-rows. Ready admission is limited to available capacity and expired steals are
-count-neutral. Schema v2 advances every considered partition's epoch, including
-cap-denied and empty visits. That mechanism is exact-cap-safe but is not the
-DCKT-75 fairness proof.
+The current statement invokes `docket_tenant_fair_claim` once. Under the
+serialized policy cursor it materializes a bounded positive-ring walk, attempts
+partition authority, freezes bounded exact run IDs, and rechecks them before
+mutation. Ready admission is limited to available capacity and expired steals
+are count-neutral. Two progress rules remain separate:
 
-Schema v3 installs the state from which DCKT-78 must enforce two separate
-progress rules:
-
-- DCKT-78 must advance the domain-global circular scan cursor for every
+- the engine advances the domain-global circular scan cursor for every
   committed unfinished-ring visit, including lock skip, denial, dormancy, and
   emptiness; and
-- DCKT-78 must advance partition `admission_epoch` exactly once only for a
+- it advances partition `admission_epoch` exactly once only for a
   committed nonempty grant; the epoch must never drive scan traversal.
 
 DCKT-78 must linearize the cursor across independent pollers and enforce the
@@ -110,10 +104,11 @@ This stopped upgrade is the v0.1.0 operational contract. Online schema changes,
 fleet attestations, readiness ledgers, activation ceremonies, audited mode
 history, and hot mixed-version rollout are deferred.
 
-An existing schema-v2 development installation uses `--upgrade-from-v2` and
-can roll that host migration back to v2. See
-[TenantFair schema-v3 active-ring decision](docket-tenant-fair-schema-v3.md)
-for the additive objects and evidence boundary.
+The current stopped-development migration collapses all TenantFair authority
+and ring state into schema V02. Previously recorded unreleased V02/V03
+databases must be recreated or rolled back with matching historical code. See
+[TenantFair schema-v2 active-ring decision](docket-tenant-fair-schema-v2.md)
+for the objects and evidence boundary.
 
 ## Test contract
 
@@ -122,7 +117,7 @@ selection, one-statement execution, decoded lease persistence, PostgreSQL error
 preservation, transaction behavior, and telemetry. TenantFair adds live tests
 for concurrent final-slot enforcement, cap reduction, expired recovery,
 cross-scope rotation, capped-head progress, and the Legacy interlock. The
-schema-v3 suite must additionally prove linearized cursor traversal, no-repeat
+schema-v2 ring suite must additionally prove linearized cursor traversal, no-repeat
 rounds, lock/empty target failures, the bounded-bypass formulas, outcome-backed
 epochs, the deterministic Legacy counterexample, and every inherited safety
 invariant.

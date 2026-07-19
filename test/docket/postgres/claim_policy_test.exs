@@ -53,9 +53,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                3
              ]
 
-      assert plan.statement =~ "WITH eligible_partitions AS MATERIALIZED"
-      assert plan.statement =~ "admission_epoch"
-      assert plan.statement =~ "docket_tenant_fair_claim_v1"
+      assert plan.statement =~ "docket_tenant_fair_claim"
+      assert plan.statement =~ "false"
+      assert plan.statement =~ "WHERE claimed.row_kind IN ('outcome', 'error')"
+      assert plan.statement =~ "ORDER BY claimed.visit_ordinal"
+      refute plan.statement =~ "eligible_partitions"
     end
 
     test "rejects unknown implementations and invalid runtime input" do

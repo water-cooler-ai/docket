@@ -5,12 +5,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     The configured default cap only bootstraps an uninitialized database. Once
     persisted, the default and tenant overrides are managed through `Admin`.
+
+    ## Responsibility boundary
+
+    `RingFunction` owns the database-side scheduling state machine: cursor and
+    partition authority, ring traversal, bounded candidate discovery, exact row
+    locking, authoritative rechecks, run mutation, continuation persistence,
+    and service-epoch accounting.
+
+    This module remains the application-side `ClaimPolicy` implementation. It:
+
+    * validates the configured bootstrap cap through `Config`;
+    * normalizes runtime timestamps and derives the expired-claim cutoff;
+    * builds one data-only `ClaimPolicy.Plan` with the six semantic bind values;
+    * resolves the prefix-qualified claim function installed by the migration;
+    * decodes the unchanged fourteen public columns into leases and poisoned
+      results; and
+    * emits bounded claim, poison, steal, age, duration, and contention
+      observations after execution.
+
+    `SQL` is the narrow wrapper between these two sides. It invokes the claim function with raw
+    tracing disabled, removes internal inspection rows and columns, and orders
+    public outcomes by the function's visit and outcome ordinals. `RunStore`
+    remains the sole executor of the resulting plan, while `Admin` is the
+    separate API for persisted default and per-scope cap state.
+
+    In other words, `RingFunction` decides and transactionally applies *which
+    runs are admitted*; this module handles configuration, invocation, public
+    decoding, and observability around that decision.
     """
 
     @behaviour Docket.Postgres.ClaimPolicy
 
     alias Docket.Postgres.ClaimPolicy.Plan
-    alias Docket.Postgres.ClaimPolicy.TenantFair.{Config, Function, SQL}
+    alias Docket.Postgres.ClaimPolicy.TenantFair.{Config, RingFunction, SQL}
     alias Docket.Postgres.Storage
 
     @empty_stats %{
@@ -28,7 +56,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl true
     def build_plan(
-          %{prefix: prefix, identifiers: %{runs: runs, claim_partitions: partitions}},
+          %{prefix: prefix},
           %{
             now: %DateTime{} = now,
             limit: limit,
@@ -40,10 +68,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ) do
       now = normalize_database_datetime(now)
       cutoff = DateTime.add(now, -ttl, :millisecond)
-      function = Storage.qualified_table(prefix, Function.name())
+      function = Storage.qualified_table(prefix, RingFunction.name())
 
       %Plan{
-        statement: SQL.statement(runs, partitions, function),
+        statement: SQL.statement(function),
         params: [
           now,
           cutoff,
@@ -58,6 +86,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @impl true
+    def decode([["error", "lock_contention" | _tail]], _decoder, %Config{}) do
+      {:error, {:claim_policy_unavailable, :lock_contention}, %{contention_phase: :policy_cursor}}
+    end
+
     def decode([["error", reason | _tail]], _decoder, %Config{}) do
       {:error, {:claim_policy_unavailable, load_error_reason(reason)}, %{}}
     end
@@ -218,6 +250,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp load_error_reason("read_only_transaction"), do: :read_only_transaction
     defp load_error_reason("unsupported_isolation"), do: :unsupported_isolation
+    defp load_error_reason("lock_contention"), do: :lock_contention
     defp load_error_reason(_reason), do: :unavailable
 
     defp owner_scope(nil), do: :tenantless

@@ -16,15 +16,16 @@ entries below reflect what has landed so far.
 
 ### Added
 
-- PostgreSQL schema version 3 adds one prefix-local TenantFair scheduling table
+- PostgreSQL schema version 2 adds one prefix-local TenantFair scheduling table
   with an exact trigger-maintained count of nonterminal runs per tenant and
   stores the serialized scan position on the existing policy row. Fixed `S =
   32`, `Q = 8`, exact-key
   lock/run-mutation-input ceilings, and bounded poison-safe candidate
   continuation were checked with non-release query-plan experiments. The ring
   is an authoritative eligibility superset rather than a lossy cache, so
-  DCKT-77 repair machinery is not part of the v0.1.0 MVP; admission and
-  executable fairness proof remain in DCKT-78 and DCKT-79. Because no count
+  DCKT-77 repair machinery is not part of the v0.1.0 MVP. TenantFair admission
+  now uses the bounded ring engine described here; executable fairness proof
+  remains in DCKT-79. Because no count
   repair path exists by design, truncating runs or the authoritative schedule
   fails closed instead of bypassing row triggers and silently desynchronizing
   membership.
@@ -37,7 +38,7 @@ entries below reflect what has landed so far.
   new partition or wake notification. Dormant partition rows are retained
   after their last run disappears and are never selected from serialized
   payload identity.
-- PostgreSQL schema version 2: prefix-local exact-cap policy, partition,
+- The same schema version includes the prefix-local exact-cap policy, partition,
   ordinary supporting indexes, engine interlock, and TenantFair claim function.
   Existing scope keys are backfilled transactionally while inserts are blocked.
   ClaimPolicy implementations receive the additive quoted identifier context.
