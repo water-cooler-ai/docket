@@ -304,70 +304,53 @@ can't be expressed with `path`/`equals`/`all`/`any`.
 
 ---
 
-## Theme 9 — Tenant-partitioned claim fairness (v0.1.1 follow-up)
+## Theme 9 — TenantFair follow-up work
 
-The detailed implementation plan, including dynamic per-tenant policy,
-weighted service, strict ceilings, and non-preemptive borrowing, remains a
-post-v0.1 design area. The smaller shipped invariant is documented in
-[`architecture/docket-exact-cap-contract.md`](architecture/docket-exact-cap-contract.md).
-
-Add moderate multi-tenant fairness to the shared durable dispatcher without
-preempting node execution or weakening claim fencing. A global dispatcher
-concurrency limit still bounds all active vehicles, while a database-wide
-partition limit bounds how many sticky logical runs one tenant may have
-admitted at once:
+The TenantFair claim policy is the single shipped PostgreSQL tenant scheduler.
+Its sticky queued admission design is documented in
+[`architecture/docket-tenant-fair.md`](architecture/docket-tenant-fair.md) and
+its exact distributed-cap and fairness obligations in
+[`architecture/docket-exact-cap-contract.md`](architecture/docket-exact-cap-contract.md):
 
 ```elixir
 dispatcher: [concurrency: 100],
 claim_policy: [
   implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-  partition_by: :tenant_id,
-  default_preferred_active: 2,
-  default_max_active_runs: 4,
-  default_weight: 1,
-  borrowing: true
+  default_max_active_runs: 4
 ]
 ```
 
-These names are locked by the tenant-fairness contract. The TenantFair module and its
-schema are later delivery slices; this example does not describe currently
-available behavior. The intended behavior is:
+The fixed design is:
 
-- Claim selection is fair across eligible tenant partitions and stable within
-  a tenant by wake time and run ID. A tenant with a deep backlog must not hide
-  another tenant's first eligible run.
+- Claim selection is fair across eligible tenant partitions and FIFO-stable
+  within each tenant.
 - `max_active_runs` is an absolute ceiling enforced across every dispatcher sharing
-  the database and prefix, not independently per BEAM node. Acquisition
-  remains atomic and compatible with the existing token, sequence fence,
-  expiry, poison, and `FOR UPDATE SKIP LOCKED` paths.
-- With `borrowing: false`, a tenant stops at `preferred_active`. With borrowing
-  enabled, one tenant may consume otherwise-idle capacity up to `max_active_runs`,
-  but new admissions prefer tenants below their preferred threshold as
-  capacity turns over. Preferred capacity is not reserved or guaranteed.
-  Borrowing improves utilization; it must not turn into a permanent
-  reservation.
-- Tenantless runs form their own partition. Product tiers may resolve to
-  different numeric limits for each tenant, but a tier is not itself a
-  partition key. Future keys such as project or account remain out of scope
-  until tenant partitioning proves the storage and scheduling contract.
+  the database and prefix, not independently per BEAM node.
+- Tenantless runs form their own partition, and Admin may set numeric per-tenant
+  cap overrides.
+
+Follow-up scope is limited to administration, observability, and operational
+hardening of this path. Weighted service, preferred capacity, borrowing, TTL
+slot expiry, and alternate admission modes are not parallel TenantFair designs.
 
 This is deliberately separate from the two existing vehicle mechanisms:
 
 - **Drain budgets provide run-level time slicing.** A vehicle may retain its
   claim for another superstep while both its moment and elapsed budgets remain.
   Once either budget is exhausted, the in-flight superstep finishes, and its
-  commit atomically advances the run, releases the claim, and records an
-  immediate wake. Nothing is preempted halfway through a superstep.
+  commit atomically advances the run, releases its transient claim while
+  retaining admission, and records an immediate wake. Nothing is preempted
+  halfway through a superstep.
 - **Finite attempt deadlines bound claim residency.** Runtime-owned activation
   processes are terminated at their effective timeout; fencing rejects stale
   results after crash recovery or steal.
 
 Together, the partition limit prevents one tenant's collection of runs from
-occupying the fleet, while the drain budget prevents one continuously runnable
-run from occupying a tenant's allotment indefinitely. This is moderate
-fairness, not a promise of strict round robin, bounded queue latency, weighted
-fair queuing, or equal resource usage: one superstep may contain substantially
-more parallel node work than another.
+occupying the fleet, while the drain budget gives other admitted runs execution
+opportunities without transferring sticky admission to later queued runs. This
+is moderate fairness, not a promise of strict round robin, bounded queue
+latency, weighted fair queuing, or equal resource usage: one superstep may
+contain substantially more parallel node work than another.
 
 ### Storage and pooling constraints
 
@@ -379,7 +362,7 @@ more parallel node work than another.
   processes, database queues, or telemetry labels.
 - Measure claim latency, rows scanned, pool checkout time, and claim/commit
   throughput with many partitions, one hot partition, and mixed ready/expired
-  claims. Bursting must not amplify polling or notification churn.
+  claims.
 - Any denormalized partition counters must be recoverable from authoritative
   admitted-run markers and remain correct across crash, expiry, steal, cancellation,
   terminal commit, and poison recovery. Avoid counters if the claim query can
@@ -387,15 +370,15 @@ more parallel node work than another.
 
 ### Required tests
 
-- Multiple dispatchers cannot exceed a tenant's non-burst limit under
+- Multiple dispatchers cannot exceed a tenant's configured admission cap under
   concurrent claims.
 - A tenant with thousands of eligible runs cannot block another tenant's first
   run from being claimed.
-- Spare capacity is usable in burst mode and returns to competing tenants after
-  current supersteps reach their normal commit boundaries.
-- Claim expiry, steal, retry parking, terminal commits, and vehicle crashes
-  release partition capacity exactly once without leaking or double-counting
-  slots.
+- Cooperative yields, claim expiry, steal, and vehicle crashes retain logical
+  admission and allow the same run to reacquire ahead of later queued runs.
+- External waits, future scheduling, terminal commits, poisoning, and
+  interruption release admission exactly once so the FIFO head can be promoted
+  without leaking or double-counting slots.
 - Tenant partitioning changes scheduling only; existing tenant scope checks
   continue to prevent cross-tenant reads and mutations.
 

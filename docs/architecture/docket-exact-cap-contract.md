@@ -1,9 +1,9 @@
 # Exact-cap and fair-rotation admission contract
 
 This document records the PostgreSQL TenantFair guarantees for Docket v0.1.0.
-The exact-cap sections describe the schema-v3 sticky-admission safety boundary. The
-fair-rotation sections freeze the stronger DCKT-75 contract implemented by the
-schema-v2 ring and revised by schema V3's admitted/queued model.
+The exact-cap sections describe sticky-admission safety, and the fair-rotation
+sections freeze the stronger DCKT-75 contract implemented by the same claim
+policy.
 
 The contract intentionally excludes online rollout, governance, audit,
 reporting, weighted service, preferred share, and borrowing. Those are
@@ -213,9 +213,7 @@ staleness, cap rejection, emptiness, lock skip, error, or rollback.
 The logically independent scan cursor is stored on the existing singleton
 claim-policy row and advances for every committed inspection. Cursor movement,
 any grant's `admission_epoch` increment, and its run outcomes are in the same
-transaction; rollback persists none of them. The schema-v2 behavior that
-advances `admission_epoch` after every considered locked partition is
-provisional and must be replaced, not reinterpreted as v0.1 fairness evidence.
+transaction; rollback persists none of them.
 
 ## Conditional frozen-trace separation from Legacy
 
@@ -304,12 +302,11 @@ or borrowing in v0.1.0.
 
 ## Migration boundary
 
-Schema version 2 installs the policy row, partition table, unfinished ring,
-ordinary supporting indexes, and original claim function. Schema version 3
-adds `tenant_admitted_at`, backfills healthy claimed rows from `claimed_at`,
-adds admitted/queued partial indexes, and atomically replaces the claim
-function. Ready unclaimed rows remain queued; an over-cap backfill becomes
-debt without preemption.
+Schema version 2 installs the complete claim policy: policy and partition
+authority, unfinished ring, `tenant_admitted_at`, admitted/queued partial
+indexes, lifecycle triggers, and the sole claim function. The stopped host
+upgrade backfills healthy claimed rows from `claimed_at`; ready unclaimed rows
+remain queued, and an over-cap backfill becomes debt without preemption.
 
 The exact-cap cleanup rewrote the unreleased DCKT-68 version-2 migration rather
 than adding a conversion for its discarded development schema. A local or test
@@ -317,16 +314,11 @@ database that applied that earlier development migration must be recreated, or
 rolled back with matching old code before adopting the rewritten migration. No
 released v2 database uses that discarded shape.
 
-Schema version 2 is the collapsed DCKT-76/DCKT-78 migration. It installs the
-unique scheduling ring with an exact trigger-maintained unfinished-run count,
-the scan position, and the TenantFair claim function without weakening
-exact-cap safety. The current binary requires schema version 3. Rolling V03
-back recreates the V2 claim function and removes only sticky-admission state;
-rolling the complete fresh migration back removes all Docket objects. The ratified constants,
-query shapes, and non-release diagnostic boundary are in
-[TenantFair schema-v2 active-ring decision](docket-tenant-fair-schema-v2.md).
-The V3 lifetime and FIFO rules are in
-[TenantFair schema-v3 sticky admission](docket-tenant-fair-schema-v3.md).
+The current binary requires schema version 2. Rolling the host upgrade back
+returns to host schema V1; rolling a complete fresh migration back removes all
+Docket objects. The ratified constants, query shapes, admission lifetime, FIFO
+rules, and research lineage are in
+[TenantFair claim policy](docket-tenant-fair.md).
 
 The supported upgrade remains stopped and homogeneous. Online migration and
 readiness, governance, audit/evidence platforms, enterprise rollout,

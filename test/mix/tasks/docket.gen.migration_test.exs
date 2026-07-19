@@ -36,7 +36,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                "defmodule Docket.Postgres.TestRepo.Migrations.AddDocketTables do"
 
       assert content =~ "use Ecto.Migration"
-      assert content =~ "Docket.Postgres.Migration.up(version: 3, prefix: \"public\")"
+      assert content =~ "Docket.Postgres.Migration.up(version: 2, prefix: \"public\")"
       assert content =~ "Docket.Postgres.Migration.down(version: 1, prefix: \"public\")"
 
       # The generated file must at least parse.
@@ -54,52 +54,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ])
 
       assert Path.dirname(file) == @tmp_path
-      assert Path.basename(file) =~ ~r/^\d{14}_upgrade_docket_to_v3\.exs$/
+      assert Path.basename(file) =~ ~r/^\d{14}_upgrade_docket_to_v2\.exs$/
 
       content = File.read!(file)
 
       assert content =~
-               "defmodule Docket.Postgres.TestRepo.Migrations.UpgradeDocketToV3 do"
+               "defmodule Docket.Postgres.TestRepo.Migrations.UpgradeDocketToV2 do"
 
-      assert content =~ "Docket.Postgres.Migration.up(version: 3, prefix: \"public\")"
+      assert content =~ "Docket.Postgres.Migration.up(version: 2, prefix: \"public\")"
       assert content =~ "Docket.Postgres.Migration.down(version: 2, prefix: \"public\")"
       refute content =~ "down(version: 1,"
       assert {:ok, _ast} = Code.string_to_quoted(content)
-    end
-
-    test "generates an explicit additive v2-to-v3 upgrade" do
-      [file] =
-        Mix.Tasks.Docket.Gen.Migration.run([
-          "-r",
-          "Docket.Postgres.TestRepo",
-          "--migrations-path",
-          @tmp_path,
-          "--upgrade-from-v2"
-        ])
-
-      assert Path.basename(file) =~ ~r/^\d{14}_upgrade_docket_v2_to_v3\.exs$/
-
-      content = File.read!(file)
-
-      assert content =~
-               "defmodule Docket.Postgres.TestRepo.Migrations.UpgradeDocketV2ToV3 do"
-
-      assert content =~ "Docket.Postgres.Migration.up(version: 3, prefix: \"public\")"
-      assert content =~ "Docket.Postgres.Migration.down(version: 3, prefix: \"public\")"
-      assert {:ok, _ast} = Code.string_to_quoted(content)
-    end
-
-    test "rejects selecting both upgrade sources" do
-      assert_raise Mix.Error, ~r/choose at most one/, fn ->
-        Mix.Tasks.Docket.Gen.Migration.run([
-          "-r",
-          "Docket.Postgres.TestRepo",
-          "--migrations-path",
-          @tmp_path,
-          "--upgrade-from-v1",
-          "--upgrade-from-v2"
-        ])
-      end
     end
 
     test "rejects unsafe prefixes" do

@@ -8,10 +8,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     ## Responsibility boundary
 
-    `RingFunctionV3` owns the database-side scheduling state machine: cursor and
+    `RingFunction` owns the database-side scheduling state machine: cursor and
     partition authority, ring traversal, bounded candidate discovery, exact row
-    locking, authoritative rechecks, run mutation, continuation persistence,
-    and service-epoch accounting.
+    locking, authoritative rechecks, run mutation, and service-epoch
+    accounting.
 
     This module remains the application-side `ClaimPolicy` implementation. It:
 
@@ -30,7 +30,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     remains the sole executor of the resulting plan, while `Admin` is the
     separate API for persisted default and per-scope cap state.
 
-    In other words, `RingFunctionV3` decides and transactionally applies *which
+    In other words, `RingFunction` decides and transactionally applies *which
     runs are admitted*; this module handles configuration, invocation, public
     decoding, and observability around that decision.
     """
@@ -38,7 +38,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @behaviour Docket.Postgres.ClaimPolicy
 
     alias Docket.Postgres.ClaimPolicy.Plan
-    alias Docket.Postgres.ClaimPolicy.TenantFair.{Config, RingFunctionV3, SQL}
+    alias Docket.Postgres.ClaimPolicy.TenantFair.{Config, RingFunction, SQL}
     alias Docket.Postgres.Storage
 
     @empty_stats %{
@@ -72,7 +72,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ) do
       now = normalize_database_datetime(now)
       cutoff = DateTime.add(now, -ttl, :millisecond)
-      function = Storage.qualified_table(prefix, RingFunctionV3.name())
+      function = Storage.qualified_table(prefix, RingFunction.name())
 
       %Plan{
         statement: SQL.statement(function),

@@ -59,7 +59,7 @@ effects require their own stable idempotency scheme.
 
 ## Fair-rotation evidence boundary
 
-The schema-v3 sticky-admission engine keeps the generic ClaimPolicy and claim events in the
+The TenantFair sticky-admission engine keeps the generic ClaimPolicy and claim events in the
 catalog above. The admission event reports total duration and a normalized
 `contentions` count; `contention_phase: :policy_cursor` distinguishes bounded
 singleton-cursor pressure without adding identity labels. That phase is set

@@ -103,7 +103,11 @@ Graph publication and run creation are separate boundaries:
 
 This example uses the default `tenant_mode: :none`. With
 `tenant_mode: :required`, pass the same non-empty binary `tenant_id` to
-`save_graph`, `start_run`, and every graph/run/event read or signal.
+`save_graph`, `start_run`, and every graph/run/event read or signal. Required
+PostgreSQL tenancy also requires the sole
+`Docket.Postgres.ClaimPolicy.TenantFair` policy and an explicit
+`default_max_active_runs`; see
+[`docket-tenant-fair.md`](docket-tenant-fair.md).
 
 `save_graph/2` validates the graph, snapshots schema defaults, computes its
 private hash, and stores the immutable effective document. Concurrent saves of
@@ -249,6 +253,8 @@ At the facade, `tenant_mode: :none` selects tenantless access and
 `tenant_mode: :required` requires a non-empty `tenant_id`. Omitting a tenant
 never becomes an unscoped read. Docket provides storage isolation, while the
 host application remains responsible for deciding who may act for a tenant.
+For PostgreSQL, required tenancy uses TenantFair with an explicit
+`default_max_active_runs`; there is no alternate tenant scheduler.
 
 ## Migrations
 

@@ -149,6 +149,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       Docket.Runtime.Config.validate_instance!(opts)
       reject_top_level_vehicle!(opts)
       validate_tenant_mode!(opts)
+      validate_tenant_claim_policy!(opts, context)
       validate_testing!(opts)
       validate_wall_clock!(opts)
       reject_nested_wall_clocks!(opts)
@@ -183,6 +184,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       actual = Migration.migrated_version(repo: repo, prefix: prefix)
 
       validate_schema_version!(expected, actual, prefix)
+      validate_schema_shape!(Migration.current_shape?(repo, prefix), prefix)
     end
 
     # Inline/manual work runs through the test process's checked-out Sandbox
@@ -215,6 +217,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               end
 
             validate_schema_version!(Migration.current_version(), actual, prefix)
+
+            current_shape =
+              case Postgrex.query(connection, Migration.current_shape_query(), [prefix]) do
+                {:ok, %{rows: [[true]]}} -> true
+                _missing_or_unexpected -> false
+              end
+
+            validate_schema_shape!(current_shape, prefix)
           after
             GenServer.stop(connection)
           end
@@ -232,6 +242,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 "#{inspect(prefix)}; stop all Docket writers, run the generated migration, " <>
                 "and restart one homogeneous application version"
       end
+    end
+
+    defp validate_schema_shape!(true, _prefix), do: :ok
+
+    defp validate_schema_shape!(false, prefix) do
+      raise ArgumentError,
+            "Docket.Postgres found schema version #{Migration.current_version()} in prefix " <>
+              "#{inspect(prefix)}, but its structure does not match the current Docket schema; " <>
+              "recreate the unreleased development schema from the current generated migration"
     end
 
     defp children(opts, name, context) do
@@ -481,6 +500,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         mode ->
           raise ArgumentError, ":tenant_mode must be :none or :required, got: #{inspect(mode)}"
       end
+    end
+
+    defp validate_tenant_claim_policy!(opts, context) do
+      if Keyword.get(opts, :tenant_mode, :none) == :required do
+        implementation = context |> ClaimPolicy.resolve() |> ClaimPolicy.implementation()
+
+        unless implementation == Docket.Postgres.ClaimPolicy.TenantFair do
+          raise ArgumentError,
+                ":tenant_mode :required requires the TenantFair claim policy with " <>
+                  ":default_max_active_runs configured"
+        end
+      end
+
+      :ok
     end
 
     defp validate_testing!(opts) do

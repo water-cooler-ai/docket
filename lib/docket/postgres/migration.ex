@@ -5,17 +5,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     Version 1 contains durable graphs, runs, and events. Version 2 adds exact-cap
     policy and partition authority, the authoritative unfinished-tenant ring,
-    the domain cursor, TenantFair claim function, and supporting indexes.
-    Version 3 replaces transient claim caps with sticky logical-run admission.
-    Every step is an ordinary transactional migration.
+    sticky logical-run admission, the domain cursor, the sole TenantFair claim
+    function, and supporting indexes. Every step is an ordinary transactional
+    migration.
     """
 
     use Ecto.Migration
 
+    alias Docket.Postgres.ClaimPolicy.TenantFair.RingFunction
     alias Docket.Postgres.Storage
 
     @initial_version 1
-    @current_version 3
+    @current_version 2
     @default_prefix "public"
 
     @spec up(keyword()) :: :ok
@@ -71,6 +72,44 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     def initial_version, do: @initial_version
     def current_version, do: @current_version
+
+    @doc false
+    @spec current_shape_query() :: String.t()
+    def current_shape_query do
+      identity_arguments = RingFunction.identity_arguments()
+
+      """
+      SELECT
+        EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = $1
+            AND table_name = 'docket_runs'
+            AND column_name = 'tenant_admitted_at'
+        )
+        AND (
+          SELECT
+            count(*) = 1
+            AND count(*) FILTER (
+              WHERE pg_get_function_identity_arguments(pg_proc.oid) = '#{identity_arguments}'
+            ) = 1
+          FROM pg_proc
+          JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+          WHERE pg_namespace.nspname = $1
+            AND pg_proc.proname = '#{RingFunction.name()}'
+            AND pg_proc.prokind = 'f'
+        )
+      """
+    end
+
+    @doc false
+    @spec current_shape?(module(), String.t()) :: boolean()
+    def current_shape?(repo, prefix) do
+      case repo.query(current_shape_query(), [prefix], log: false) do
+        {:ok, %{rows: [[true]]}} -> true
+        _missing_or_unexpected -> false
+      end
+    end
 
     defp change(range, direction, opts) do
       for version <- range do

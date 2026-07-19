@@ -20,20 +20,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         SELECT next.ring_position,
                next.scope_key,
                next.unfinished_count,
-               next.ready_candidate_cursor_at,
-               next.ready_candidate_cursor_id,
                1::integer AS visit_ordinal,
                next.wrap_delta::bigint AS wrap_count
         FROM LATERAL (
           SELECT option.ring_position,
                  option.scope_key,
                  option.unfinished_count,
-                 option.ready_candidate_cursor_at,
-                 option.ready_candidate_cursor_id,
                  option.wrap_delta
           FROM (
             (SELECT ring_position, scope_key, unfinished_count,
-                    ready_candidate_cursor_at, ready_candidate_cursor_id,
                     0::integer AS wrap_delta
              FROM #{schedule}
              WHERE unfinished_count > 0 AND ring_position > $1
@@ -41,7 +36,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              LIMIT 1)
             UNION ALL
             (SELECT ring_position, scope_key, unfinished_count,
-                    ready_candidate_cursor_at, ready_candidate_cursor_id,
                     1::integer AS wrap_delta
              FROM #{schedule}
              WHERE unfinished_count > 0 AND ring_position <= $1
@@ -57,8 +51,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         SELECT next.ring_position,
                next.scope_key,
                next.unfinished_count,
-               next.ready_candidate_cursor_at,
-               next.ready_candidate_cursor_id,
                inspected.visit_ordinal + 1,
                inspected.wrap_count + next.wrap_delta
         FROM inspected
@@ -66,12 +58,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           SELECT option.ring_position,
                  option.scope_key,
                  option.unfinished_count,
-                 option.ready_candidate_cursor_at,
-                 option.ready_candidate_cursor_id,
                  option.wrap_delta
           FROM (
             (SELECT ring_position, scope_key, unfinished_count,
-                    ready_candidate_cursor_at, ready_candidate_cursor_id,
                     0::integer AS wrap_delta
              FROM #{schedule}
              WHERE unfinished_count > 0 AND ring_position > inspected.ring_position
@@ -79,7 +68,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              LIMIT 1)
             UNION ALL
             (SELECT ring_position, scope_key, unfinished_count,
-                    ready_candidate_cursor_at, ready_candidate_cursor_id,
                     1::integer AS wrap_delta
              FROM #{schedule}
              WHERE unfinished_count > 0 AND ring_position <= inspected.ring_position
@@ -91,9 +79,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ) AS next
         WHERE inspected.visit_ordinal < #{budget}
       )
-      SELECT ring_position, scope_key, unfinished_count,
-             ready_candidate_cursor_at, ready_candidate_cursor_id,
-             visit_ordinal, wrap_count
+      SELECT ring_position, scope_key, unfinished_count, visit_ordinal, wrap_count
       FROM inspected
       ORDER BY visit_ordinal
       """
@@ -103,73 +89,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc """
     Returns an exact-partition structural candidate page bounded by `K`.
 
-    DCKT-78 must combine the ready and expired pages on their at-most `2K`
-    relation, apply class reservation and attempt/cap rules, then lock only the
-    selected exact IDs. The authoritative rechecks remain under run locks.
+    The claim function combines the candidate pages on their bounded relation,
+    applies class reservation and admission rules, then locks only the selected
+    exact IDs. The authoritative rechecks remain under run locks.
     """
-    def run_candidates(runs, :ready) when is_binary(runs) do
-      candidate_page(runs, :ready)
+    def run_candidates(runs, :admitted_ready) when is_binary(runs) do
+      candidate_page(runs, :admitted_ready)
+    end
+
+    def run_candidates(runs, :queued_ready) when is_binary(runs) do
+      candidate_page(runs, :queued_ready)
     end
 
     def run_candidates(runs, :expired) when is_binary(runs) do
       candidate_page(runs, :expired)
-    end
-
-    @doc """
-    Continues one exact-partition candidate walk after a zero-outcome page.
-
-    `$1` is scope, `$2` is the class time threshold, and `$3/$4` are the last
-    inspected eligible time and run ID. The two keyset halves return at most
-    `K` rows across one wrap. DCKT-78 uses this continuation for capped ready
-    work so ordinary rows cannot permanently hide a later poison row; normal
-    below-cap selection still uses `run_candidates/2` from the oldest head.
-    """
-    def rotating_run_candidates(runs, :ready) when is_binary(runs) do
-      budget = Budgets.run_lock_attempts()
-      class = :ready
-      {predicate, eligible_column, due_operator} = candidate_parts(:ready)
-
-      """
-      WITH after_cursor AS MATERIALIZED (
-        SELECT candidate.id,
-               candidate.#{eligible_column} AS eligible_at,
-               candidate.claim_attempts,
-               '#{class}'::text AS work_class,
-               false AS wrapped
-        FROM #{runs} AS candidate
-        WHERE #{predicate}
-          AND candidate.scope_key = $1
-          AND candidate.#{eligible_column} #{due_operator} $2
-          AND (candidate.#{eligible_column}, candidate.id) > ($3, $4)
-        ORDER BY candidate.#{eligible_column}, candidate.id
-        LIMIT #{budget}
-      ),
-      residual AS MATERIALIZED (
-        SELECT GREATEST(#{budget} - count(*)::integer, 0) AS remaining
-        FROM after_cursor
-      ),
-      wrapped AS MATERIALIZED (
-        SELECT candidate.id,
-               candidate.#{eligible_column} AS eligible_at,
-               candidate.claim_attempts,
-               '#{class}'::text AS work_class,
-               true AS wrapped
-        FROM #{runs} AS candidate
-        WHERE #{predicate}
-          AND candidate.scope_key = $1
-          AND candidate.#{eligible_column} #{due_operator} $2
-          AND (candidate.#{eligible_column}, candidate.id) <= ($3, $4)
-        ORDER BY candidate.#{eligible_column}, candidate.id
-        LIMIT (SELECT remaining FROM residual)
-      )
-      SELECT id, eligible_at, claim_attempts, work_class, wrapped
-      FROM after_cursor
-      UNION ALL
-      SELECT id, eligible_at, claim_attempts, work_class, wrapped
-      FROM wrapped
-      ORDER BY wrapped, eligible_at, id
-      """
-      |> String.trim()
     end
 
     @doc "Locks the one domain-global scan cursor without skipping it."
@@ -239,14 +172,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> String.trim()
     end
 
-    defp candidate_parts(:ready) do
+    defp candidate_parts(:admitted_ready) do
       {"candidate.status = 'running' AND candidate.poisoned_at IS NULL AND " <>
-         "candidate.claim_token IS NULL AND candidate.wake_at IS NOT NULL", "wake_at", "<="}
+         "candidate.tenant_admitted_at IS NOT NULL AND candidate.claim_token IS NULL AND " <>
+         "candidate.wake_at IS NOT NULL", "wake_at", "<="}
+    end
+
+    defp candidate_parts(:queued_ready) do
+      {"candidate.status = 'running' AND candidate.poisoned_at IS NULL AND " <>
+         "candidate.tenant_admitted_at IS NULL AND candidate.claim_token IS NULL AND " <>
+         "candidate.wake_at IS NOT NULL", "wake_at", "<="}
     end
 
     defp candidate_parts(:expired) do
       {"candidate.status = 'running' AND candidate.poisoned_at IS NULL AND " <>
-         "candidate.claim_token IS NOT NULL", "claimed_at", "<"}
+         "candidate.tenant_admitted_at IS NOT NULL AND candidate.claim_token IS NOT NULL",
+       "claimed_at", "<"}
     end
 
     defp candidate_page(runs, class) do

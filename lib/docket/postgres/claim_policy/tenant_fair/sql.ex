@@ -7,15 +7,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     This wrapper fixes trace to `false`, filters out internal inspection rows,
     projects the stable fourteen decoder columns, and imposes deterministic
     visit/outcome ordering. It contains no discovery or scheduling policy; that
-    work belongs to `RingFunctionV3` inside the same database statement.
+    work belongs to `RingFunction` inside the same database statement.
     """
 
-    alias Docket.Postgres.ClaimPolicy.TenantFair.RingFunctionV3
+    alias Docket.Postgres.ClaimPolicy.TenantFair.RingFunction
 
     def statement(function) when is_binary(function) do
       """
       SELECT
-        #{RingFunctionV3.public_projection()}
+        #{RingFunction.public_projection()}
       FROM #{function}(
         $1,
         $2,
@@ -23,10 +23,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         $4,
         $5,
         $6,
-        false,
-        3
+        false
       ) AS claimed(
-        #{RingFunctionV3.result_definition()}
+        #{RingFunction.result_definition()}
       )
       WHERE claimed.row_kind IN ('outcome', 'error')
       ORDER BY claimed.visit_ordinal NULLS FIRST,

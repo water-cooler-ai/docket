@@ -41,9 +41,9 @@ backend that owns persistence, scheduling, recovery, and signals.
 
    For a non-`public` PostgreSQL schema, edit both directions of the generated
    migration to pass the same `prefix:` configured on the Docket facade.
-   The generated fresh migration installs schema V3. Existing schema-V1 or
-   schema-V2 Docket installations instead use `--upgrade-from-v1` or
-   `--upgrade-from-v2`; stop every Docket writer before either upgrade. The
+   The generated fresh migration installs the current schema. Existing
+   schema-V1 Docket installations instead use `--upgrade-from-v1`; stop every
+   Docket writer before the upgrade. The
    runtime refuses to start backend children when the recorded schema version
    does not match the current library.
 

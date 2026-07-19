@@ -15,7 +15,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Test.Fixtures.Graphs
 
     @migration_version 20_260_711_000_025
-    @v2_migration_version 20_260_719_000_081
+    @v1_migration_version 20_260_719_000_081
+    @wrong_shape_migration_version 20_260_719_000_082
     @pruner [
       interval_ms: :timer.hours(1),
       event_retention_ms: :timer.hours(24 * 30),
@@ -30,11 +31,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down()
     end
 
-    defmodule InstallDocketV2 do
+    defmodule InstallDocketV1 do
       use Ecto.Migration
 
-      def up, do: Docket.Postgres.Migration.up(prefix: "docket_v2", version: 2)
-      def down, do: Docket.Postgres.Migration.down(prefix: "docket_v2", version: 2)
+      def up, do: Docket.Postgres.Migration.up(prefix: "docket_v1", version: 1)
+      def down, do: Docket.Postgres.Migration.down(prefix: "docket_v1", version: 1)
+    end
+
+    defmodule InstallDocketWrongShape do
+      use Ecto.Migration
+
+      def up, do: Docket.Postgres.Migration.up(prefix: "docket_wrong_shape", version: 1)
+      def down, do: Docket.Postgres.Migration.down(prefix: "docket_wrong_shape", version: 1)
     end
 
     defmodule FixedClock do
@@ -112,6 +120,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         backend: Docket.Postgres,
         repo: TestRepo,
         tenant_mode: :required,
+        claim_policy: [
+          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+          default_max_active_runs: 1
+        ],
         notifier: :none,
         dispatcher: [concurrency: 1, poll_interval_ms: 60_000],
         pruner: @pruner
@@ -259,6 +271,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       TestRepo.delete_all(Event)
       TestRepo.delete_all(Run)
+      TestRepo.query!("UPDATE docket_claim_policy SET admission_mode = 'legacy' WHERE id = 1")
       TestRepo.delete_all(GraphVersion)
       Docket.Postgres.GraphCache.clear()
       on_exit(&Docket.Postgres.GraphCache.clear/0)
@@ -335,7 +348,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       context = Docket.Postgres.context(opts)
 
-      assert_raise ArgumentError, ~r/requires schema version 3, found 0/, fn ->
+      assert_raise ArgumentError, ~r/requires schema version 2, found 0/, fn ->
         Docket.Postgres.init({opts, context})
       end
     end
@@ -949,11 +962,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           pruner: @pruner
         )
       end
+
+      assert_raise ArgumentError,
+                   ~r/tenant_mode :required requires the TenantFair claim policy/,
+                   fn ->
+                     postgres_init(
+                       name: __MODULE__.TenantLegacyPolicy,
+                       repo: TestRepo,
+                       tenant_mode: :required,
+                       notifier: :none,
+                       pruner: @pruner
+                     )
+                   end
     end
 
     test "startup fails closed against an older schema" do
       :ok =
-        Ecto.Migrator.up(TestRepo, @v2_migration_version, InstallDocketV2,
+        Ecto.Migrator.up(TestRepo, @v1_migration_version, InstallDocketV1,
           log: false,
           migration_lock: false
         )
@@ -961,14 +986,42 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       opts = [
         name: __MODULE__.OldSchema,
         repo: TestRepo,
-        prefix: "docket_v2",
+        prefix: "docket_v1",
         testing: :manual,
         notifier: :none
       ]
 
       context = Docket.Postgres.context(opts)
 
-      assert_raise ArgumentError, ~r/requires schema version 3, found 2/, fn ->
+      assert_raise ArgumentError, ~r/requires schema version 2, found 1/, fn ->
+        Docket.Postgres.init({opts, context})
+      end
+    end
+
+    test "startup fails closed when the version marker masks an obsolete schema shape" do
+      :ok =
+        Ecto.Migrator.up(TestRepo, @wrong_shape_migration_version, InstallDocketWrongShape,
+          log: false,
+          migration_lock: false
+        )
+
+      TestRepo.query!(
+        ~s(COMMENT ON TABLE "docket_wrong_shape"."docket_runs" IS '2'),
+        [],
+        log: false
+      )
+
+      opts = [
+        name: __MODULE__.WrongShape,
+        repo: TestRepo,
+        prefix: "docket_wrong_shape",
+        testing: :manual,
+        notifier: :none
+      ]
+
+      context = Docket.Postgres.context(opts)
+
+      assert_raise ArgumentError, ~r/structure does not match the current Docket schema/, fn ->
         Docket.Postgres.init({opts, context})
       end
     end

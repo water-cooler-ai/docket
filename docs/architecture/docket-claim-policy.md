@@ -36,13 +36,14 @@ lock on `docket_claim_policy` and admits only while `admission_mode` is
 `legacy`. A TenantFair mode, a skipped policy lock, a read-only transaction,
 or non-Read-Committed isolation fails closed before run mutation.
 
-Legacy remains the default when `claim_policy:` is omitted.
+Legacy remains the default for `tenant_mode: :none` when `claim_policy:` is
+omitted. PostgreSQL `tenant_mode: :required` rejects Legacy and requires the
+TenantFair implementation with an explicit cap.
 
 ## TenantFair
 
-TenantFair adds sticky per-owner logical-run admission. Schema V2 supplies the
-unfinished-tenant ring; schema V3 adds the admission marker and replaces the
-ring function while preserving the frozen bounded-bypass rotation contract:
+TenantFair is the sole tenant scheduling path. It combines the authoritative
+unfinished-tenant ring with sticky per-owner logical-run admission:
 
 ```elixir
 use Docket,
@@ -72,11 +73,11 @@ terminal transitions release it. Two progress rules remain separate:
 - it advances partition `admission_epoch` exactly once only for a
   committed nonempty grant; the epoch must never drive scan traversal.
 
-DCKT-78 must linearize the cursor across independent pollers and enforce the
-round/no-repeat rule: between target inspections, another partition may
+The claim function linearizes the cursor across independent pollers and
+enforces the round/no-repeat rule: between target inspections, another partition may
 receive at most one grant. A grant must return between one and the ratified
 `Q` outcomes; a zero-outcome locked visit is an unsuccessful inspection.
-TenantFair partition order will supersede Legacy global age-first order while
+TenantFair partition order supersedes Legacy global age-first order while
 preserving the portable ready/expired reservation, demand-one
 preference/fallback, poison, and stable within-choice age/ID behavior.
 
@@ -107,11 +108,10 @@ This stopped upgrade is the v0.1.0 operational contract. Online schema changes,
 fleet attestations, readiness ledgers, activation ceremonies, audited mode
 history, and hot mixed-version rollout are deferred.
 
-Schema V02 contains TenantFair authority and ring state. Schema V03 is an
-additive, stopped migration from transient claim caps to sticky admitted-run
-caps. See [TenantFair schema-v2 active-ring decision](docket-tenant-fair-schema-v2.md)
-for the ring and [TenantFair schema-v3 sticky admission](docket-tenant-fair-schema-v3.md)
-for the admission lifetime and migration boundary.
+The current schema contains the complete TenantFair authority, ring, admission
+marker, lifecycle triggers, indexes, and sole claim function. See
+[TenantFair claim policy](docket-tenant-fair.md) for the scheduling and
+admission lifetime contract.
 
 ## Test contract
 

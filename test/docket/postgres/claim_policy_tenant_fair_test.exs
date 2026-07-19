@@ -481,10 +481,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert policy_row() == policy_before
       assert live_count("tenant") == 0
 
-      assert [[0, nil, nil]] =
+      assert [[0]] =
                TestRepo.query!(
-                 "SELECT admission_epoch, ready_candidate_cursor_at, " <>
-                   "ready_candidate_cursor_id FROM docket_claim_schedule " <>
+                 "SELECT admission_epoch FROM docket_claim_schedule " <>
                    "JOIN docket_claim_partitions USING (scope_key) " <>
                    "WHERE scope_key = 'tenant'"
                ).rows
@@ -499,7 +498,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                       %{contention_phase: :policy_cursor, result: :error}}
     end
 
-    test "later schedule contention is not attributed to the policy cursor", %{
+    test "schedule membership reads do not create a second claim lock path", %{
       context: context
     } do
       handler_id = {__MODULE__, self(), make_ref()}
@@ -539,25 +538,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       send(blocker.pid, {gate, :release})
       assert {:ok, :ok} = Task.await(blocker, 2_000)
 
-      assert {:error, {:claim_policy_unavailable, :lock_contention}} = result
-      assert policy_row() == policy_before
+      assert {:ok, %{leases: [%{run_id: "schedule-lock"}], poisoned: []}} = result
+      assert policy_row() != policy_before
 
-      assert [[0, nil, nil]] =
+      assert [[1]] =
                TestRepo.query!(
-                 "SELECT admission_epoch, ready_candidate_cursor_at, " <>
-                   "ready_candidate_cursor_id FROM docket_claim_schedule " <>
+                 "SELECT admission_epoch FROM docket_claim_schedule " <>
                    "JOIN docket_claim_partitions USING (scope_key) " <>
                    "WHERE scope_key = 'tenant'"
                ).rows
 
-      assert [[nil, nil, 0]] =
+      assert [[token, @now, 1]] =
                TestRepo.query!(
                  "SELECT claim_token, claimed_at, claim_attempts FROM docket_runs " <>
                    "WHERE run_id = 'schedule-lock'"
                ).rows
 
+      refute is_nil(token)
+
       assert_receive {[:docket, :postgres, :claim_policy, :admission], %{contentions: 0},
-                      %{contention_phase: :none, result: :error}}
+                      %{contention_phase: :none, result: :ok}}
     end
 
     test "TenantFair admits tenantless work", %{context: context} do

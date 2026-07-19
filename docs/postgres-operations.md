@@ -51,8 +51,9 @@ Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
 ```
 
 This setup uses polling and tenantless storage. Removing `notifier: :none`
-enables LISTEN/NOTIFY; changing to `tenant_mode: :required` requires the same
-authorized non-empty binary tenant ID on every run, read, and signal call.
+enables LISTEN/NOTIFY. Changing to `tenant_mode: :required` also requires the
+TenantFair claim policy with an explicit `default_max_active_runs`, plus the
+same authorized non-empty binary tenant ID on every run, read, and signal call.
 
 ## Persistence and transaction ownership
 
@@ -277,7 +278,7 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `backend:` | required | Use the complete `Docket.Postgres` bundle. |
 | `prefix:` | `public` | Must match both directions of the generated migration. |
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
-| `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` | Internal instance-level admission rollout switch. Implementations are validated before startup and cannot be selected per call. |
+| `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` for `tenant_mode: :none` | Required PostgreSQL tenancy must select `Docket.Postgres.ClaimPolicy.TenantFair`; implementations are validated before startup and cannot be selected per call. |
 | `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
 | `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
 | `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
@@ -349,11 +350,11 @@ re-execution, not a partial durable moment.
 
 ## Exact per-owner caps and TenantFair schema state
 
-Schema version 2 contains the policy, partition authority, unfinished ring,
-and scan cursor used by
-`Docket.Postgres.ClaimPolicy.TenantFair`, its unique scheduling ring, exact
-trigger-maintained unfinished-run count, and fixed admission budgets. Schema
-version 3 adds sticky logical-run admission and the current claim function. The unfinished ring is an
+Schema version 2 contains the complete
+`Docket.Postgres.ClaimPolicy.TenantFair` design: policy and partition
+authority, the unique unfinished ring, exact trigger-maintained unfinished-run
+count, scan cursor, sticky logical-run admission, fixed budgets, and sole claim
+function. The unfinished ring is an
 authoritative superset of current eligibility, so future timers and parked
 running work may consume an unsuccessful inspection without becoming
 invisible. Enable TenantFair consistently across the fleet:
@@ -403,17 +404,15 @@ mix ecto.migrate -r MyApp.Repo
 Stop dispatchers and all Docket run writers before the upgrade, deploy one
 homogeneous binary version, migrate, and restart. The migration locks the runs
 table against inserts while it backfills owner partitions and schedule rows.
-The current binary requires schema version 3 and checks it before starting
-backend children. A landed V2 installation generates its additive migration
-with `--upgrade-from-v2`. Rolling back that migration recreates the V2 claim
-function and removes V3 admission state. Rolling back a generated v1 upgrade
-removes V03 and V02 and returns to schema version 1. Online migrations,
+The current binary requires schema version 2 and checks it before starting
+backend children. Rolling back a generated host-schema-V1 upgrade removes the
+TenantFair schema and returns to schema version 1. Online migrations,
 readiness ledgers, fleet
 attestations, and audited activation are intentionally outside the v0.1.0
 contract.
 
-Fresh installations generated without an upgrade flag install V01, V02, and
-V03 in one host migration. Use the same explicit prefix in both migration
+Fresh installations generated without an upgrade flag install V01 and V02 in
+one host migration. Use the same explicit prefix in both migration
 directions and runtime configuration.
 
 ## Operational inspection
