@@ -5,6 +5,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduletag :postgres
 
     alias Docket.Postgres.ClaimPolicy.TenantFair.{RingFunction, RingFunctionV3}
+    alias Docket.Postgres.RunStore
     alias Docket.Postgres.TestRepo
 
     @v1 20_260_716_000_101
@@ -17,6 +18,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @v3 20_260_719_000_108
     @private_v3 20_260_719_000_109
     @failed_v3 20_260_719_000_110
+    @fresh_current 20_260_719_000_111
 
     defmodule InstallV1 do
       use Ecto.Migration
@@ -86,7 +88,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defmodule HostV1ToCurrent do
       use Ecto.Migration
-      def up, do: Docket.Postgres.Migration.up(version: 2)
+      def up, do: Docket.Postgres.Migration.up(version: 3)
       def down, do: Docket.Postgres.Migration.down(version: 2)
     end
 
@@ -226,6 +228,38 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert_function_abi_missing!("public", :v2)
     end
 
+    test "Legacy poison clears a V3-backfilled admission marker" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "legacy-poison")
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET claim_token = '00000000-0000-0000-0000-000000000009'::uuid,
+          claimed_at = CURRENT_TIMESTAMP - interval '2 minutes',
+          wake_at = NULL,
+          claim_attempts = 5
+      WHERE run_id = 'legacy-poison'
+      """)
+
+      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+
+      assert {:ok, %{leases: [], poisoned: [%{run_id: "legacy-poison"}]}} =
+               RunStore.claim_due(Docket.Postgres.context(repo: TestRepo), :system, %{
+                 now: DateTime.utc_now(),
+                 limit: 1,
+                 orphan_ttl_ms: 1_000,
+                 max_claim_attempts: 5,
+                 preference: :expired
+               })
+
+      assert [[nil, true]] =
+               TestRepo.query!("""
+               SELECT tenant_admitted_at, poisoned_at IS NOT NULL
+               FROM docket_runs WHERE run_id = 'legacy-poison'
+               """).rows
+    end
+
     test "custom-prefix v3 upgrade and down restore the v2 function ABI" do
       :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
       insert_v1_graph_and_run(nil, "tenantless-live", "docket_private")
@@ -309,19 +343,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "host v1-to-current and fresh-current paths have equivalent schemas" do
-      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
-      fresh = schema_signature("public")
-
       :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a", "docket_private")
-      :ok = Ecto.Migrator.up(TestRepo, @private_v2, UpgradePrivateV2, log: false)
+      :ok = Ecto.Migrator.up(TestRepo, @private_v3, UpgradePrivateV3, log: false)
 
       assert Docket.Postgres.Migration.migrated_version(
                repo: TestRepo,
                prefix: "docket_private"
-             ) == 2
+             ) == 3
 
-      assert schema_signature("docket_private") == fresh
+      upgraded = schema_signature("docket_private")
+
+      :ok = Ecto.Migrator.up(TestRepo, @fresh_current, UpgradeV3, log: false)
+      assert schema_signature("public") == upgraded
 
       assert TestRepo.query!("SELECT scope_key FROM docket_private.docket_claim_schedule").rows ==
                [["tenant-a"]]
@@ -499,7 +533,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       insert_v1_graph_and_run("tenant-a", "run-a")
 
       :ok = Ecto.Migrator.up(TestRepo, @host_v1_to_current, HostV1ToCurrent, log: false)
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 3
 
       :ok = Ecto.Migrator.down(TestRepo, @host_v1_to_current, HostV1ToCurrent, log: false)
 

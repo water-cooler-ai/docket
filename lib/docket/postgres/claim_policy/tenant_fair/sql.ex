@@ -7,7 +7,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     This wrapper fixes trace to `false`, filters out internal inspection rows,
     projects the stable fourteen decoder columns, and imposes deterministic
     visit/outcome ordering. It contains no discovery or scheduling policy; that
-    work belongs to `RingFunction` inside the same database statement.
+    work belongs to `RingFunctionV3` inside the same database statement.
     """
 
     alias Docket.Postgres.ClaimPolicy.TenantFair.RingFunctionV3

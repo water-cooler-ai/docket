@@ -322,6 +322,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                SandboxInlineHost.resolve_interrupt(waiting.id, interrupt_id, "sandbox-approved")
     end
 
+    test "SQL Sandbox testing startup fails closed against a missing schema" do
+      :ok = Ecto.Adapters.SQL.Sandbox.checkout(SandboxRepo)
+
+      opts = [
+        name: __MODULE__.MissingSandboxSchema,
+        repo: SandboxRepo,
+        prefix: "docket_missing_schema",
+        testing: :manual,
+        notifier: :none
+      ]
+
+      context = Docket.Postgres.context(opts)
+
+      assert_raise ArgumentError, ~r/requires schema version 3, found 0/, fn ->
+        Docket.Postgres.init({opts, context})
+      end
+    end
+
     test "manual testing advances only through bounded drain_runs" do
       start_supervised!(ManualHost)
       assert {:ok, reference} = ManualHost.save_graph(Graphs.minimal_linear())

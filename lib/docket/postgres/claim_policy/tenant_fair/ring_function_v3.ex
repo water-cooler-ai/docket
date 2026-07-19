@@ -41,8 +41,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     ## Policy and partition authority
 
     The function requires a writable Read Committed transaction. It preserves
-    a lower caller `lock_timeout`; otherwise it limits policy-cursor acquisition
-    to 250 ms.
+    a lower caller `lock_timeout`; otherwise it limits lock waits throughout
+    the function to 250 ms.
 
     It initializes the persisted default cap if necessary, switches the
     singleton policy to TenantFair, and holds that row `FOR UPDATE`. That lock
@@ -88,12 +88,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     slot remains while a class is still unserved, the other class cannot consume
     it; the call may therefore intentionally return one fewer outcome.
 
-    The frozen attempt set always orders admitted work before promotion, then
-    applies class reservation and demand-one preference. Queued rows retain
-    exact `(wake_at, id)` FIFO order even when a later queued row is poison.
-    The function locks only those exact IDs with `FOR UPDATE SKIP LOCKED`. A
-    skipped or stale ID is not replaced by structural row 17 or any ID outside
-    the frozen set during that visit.
+    The frozen attempt set first retains each unserved class head when demand
+    is at least two, so either class cannot disappear at the `K` truncation,
+    then prefers admitted work and applies demand-one preference. Mutation
+    still orders admitted work before promotion. Queued rows retain exact
+    `(wake_at, id)` FIFO order even when a later queued row is poison. The
+    function locks only those exact IDs with `FOR UPDATE SKIP LOCKED`. A skipped
+    or stale ID is not replaced by structural row 17 or any ID outside the
+    frozen set during that visit.
 
     After locking, every row is rechecked against the frozen scope, ready or
     expired class, poison class, running/poisoned state, claim state, wake or
@@ -520,11 +522,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             prioritized AS MATERIALIZED (
               SELECT ranked.*,
                      row_number() OVER (ORDER BY
-                       CASE WHEN admitted THEN 0 ELSE 1 END,
                        CASE WHEN p_demand >= 2 AND class_rank = 1 AND
                            (work_class = 'ready' AND NOT v_served_ready OR
                             work_class = 'expired' AND NOT v_served_expired)
                          THEN 0 ELSE 1 END,
+                       CASE WHEN admitted THEN 0 ELSE 1 END,
                        CASE WHEN p_demand = 1 AND class_rank = 1 THEN 0 ELSE 1 END,
                        CASE WHEN p_demand = 1 AND work_class = p_preference THEN 0 ELSE 1 END,
                        queue_ordinal NULLS FIRST,

@@ -171,11 +171,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp validate_schema_version!(%{repo: repo} = context, opts) do
       if Keyword.get(opts, :testing) in @testing_modes and
            repo.config()[:pool] == Ecto.Adapters.SQL.Sandbox do
-        # Inline/manual tests deliberately execute through the caller's
-        # checked-out Sandbox connection. Backend init runs in a child process
-        # that cannot borrow that connection until after it has started, so a
-        # startup query here would deadlock a single-connection test pool.
-        :ok
+        validate_sandbox_schema_version!(context)
       else
         validate_schema_version!(context)
       end
@@ -186,6 +182,50 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       expected = Migration.current_version()
       actual = Migration.migrated_version(repo: repo, prefix: prefix)
 
+      validate_schema_version!(expected, actual, prefix)
+    end
+
+    # Inline/manual work runs through the test process's checked-out Sandbox
+    # connection, which the backend child cannot borrow during its own init.
+    # Schema identity is global rather than transaction-local, so validate it
+    # through one short independent connection instead of weakening startup.
+    defp validate_sandbox_schema_version!(%{repo: repo, prefix: prefix}) do
+      connection_options =
+        repo.config()
+        |> Keyword.drop([:name, :pool, :pool_size])
+        |> Keyword.put(:sync_connect, true)
+
+      case Postgrex.start_link(connection_options) do
+        {:ok, connection} ->
+          try do
+            query = """
+            SELECT obj_description(pg_class.oid, 'pg_class')
+            FROM pg_class
+            LEFT JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+            WHERE pg_class.relname = 'docket_runs' AND pg_namespace.nspname = $1
+            """
+
+            actual =
+              case Postgrex.query(connection, query, [prefix]) do
+                {:ok, %{rows: [[version]]}} when is_binary(version) ->
+                  String.to_integer(version)
+
+                _missing_or_uncommented ->
+                  0
+              end
+
+            validate_schema_version!(Migration.current_version(), actual, prefix)
+          after
+            GenServer.stop(connection)
+          end
+
+        {:error, reason} ->
+          raise ArgumentError,
+                "Docket.Postgres could not validate its SQL Sandbox schema: #{inspect(reason)}"
+      end
+    end
+
+    defp validate_schema_version!(expected, actual, prefix) do
       if actual != expected do
         raise ArgumentError,
               "Docket.Postgres requires schema version #{expected}, found #{actual} in prefix " <>

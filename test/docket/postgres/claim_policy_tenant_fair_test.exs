@@ -302,6 +302,29 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                TestRepo.query!("SELECT claim_token FROM docket_runs WHERE run_id = 'queued'").rows
     end
 
+    test "class reservation keeps a queued-ready head inside K behind deep admitted expired work",
+         %{
+           context: context
+         } do
+      assert {:ok, %{version: 1}} = Admin.put_default(context, 100, expected_version: 0)
+
+      for index <- 1..40 do
+        insert_claimed(
+          "tenant",
+          "expired-#{String.pad_leading(to_string(index), 2, "0")}",
+          DateTime.add(@now, -10, :second)
+        )
+      end
+
+      insert_ready("tenant", "queued", DateTime.add(@now, -5, :second))
+
+      assert {:ok, %{leases: [expired, %{run_id: "queued"}], poisoned: []}} =
+               RunStore.claim_due(context, :system, policy(2))
+
+      assert String.starts_with?(expired.run_id, "expired-")
+      assert length(admitted_run_ids("tenant")) == 41
+    end
+
     test "poison makes progress without consuming the tenant cap", %{context: context} do
       assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
       insert_run("tenant", "poison", nil, nil, DateTime.add(@now, -2, :second), 5)
@@ -323,6 +346,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                RunStore.claim_due(context, :system, policy(1))
 
       assert live_count("tenant") == 1
+    end
+
+    test "admitted poison releases a slot consumed by the queued head in the same visit", %{
+      context: context
+    } do
+      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      insert_ready("tenant", "admitted-poison", DateTime.add(@now, -2, :second))
+      insert_ready("tenant", "queued", DateTime.add(@now, -1, :second))
+
+      TestRepo.query!(
+        "UPDATE docket_runs SET tenant_admitted_at = $2, claim_attempts = 5 " <>
+          "WHERE run_id = $1",
+        ["admitted-poison", @now]
+      )
+
+      assert {:ok,
+              %{
+                poisoned: [%{run_id: "admitted-poison"}],
+                leases: [%{run_id: "queued"}]
+              }} = RunStore.claim_due(context, :system, policy(3))
+
+      assert [["queued"]] = admitted_run_ids("tenant")
+
+      assert [[1]] =
+               TestRepo.query!(
+                 "SELECT admission_epoch FROM docket_claim_partitions " <>
+                   "WHERE scope_key = 'tenant'"
+               ).rows
+
+      assert [[nil, true]] =
+               TestRepo.query!(
+                 "SELECT tenant_admitted_at, poisoned_at IS NOT NULL " <>
+                   "FROM docket_runs WHERE run_id = 'admitted-poison'"
+               ).rows
     end
 
     test "exact run locks skip a locked candidate and continue around the ring", %{

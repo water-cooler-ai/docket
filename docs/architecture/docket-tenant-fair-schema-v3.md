@@ -92,3 +92,28 @@ The runtime checks the recorded schema version before starting backend
 children. Mixed lifecycle writers and online Legacy-to-TenantFair cutover are
 not supported protocols; stop the fleet rather than relying on compatibility
 aliases or dual writes.
+
+## Research lineage
+
+The sticky release model is informed by [Solid Queue concurrency
+controls](https://github.com/rails/solid_queue/blob/98af3c9e6d1740afbf1df34958c38e36c634b046/README.md#concurrency-controls):
+its [claimed-execution release
+path](https://github.com/rails/solid_queue/blob/98af3c9e6d1740afbf1df34958c38e36c634b046/app/models/solid_queue/claimed_execution.rb#L65-L84)
+returns the same job to ready without releasing its concurrency semaphore.
+Solid Queue does not supply Docket's strict FIFO, no-TTL residency, or bounded
+ring theorem; those are Docket contracts.
+
+[Oban Pro Smart Engine global
+partitioning](https://oban.pro/docs/pro/Oban.Pro.Engines.Smart.html#module-global-partitioning)
+is precedent for cluster-wide per-tenant partitions and fair partition
+selection. Oban limits executing jobs and may burst; Docket instead caps sticky
+logical run identities and provides no borrowing mode.
+
+PostgreSQL documents that [`SKIP LOCKED` produces an inconsistent queue-like
+view](https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE)
+and that successive commands in [Read
+Committed](https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED)
+receive fresh snapshots. Docket infers—not PostgreSQL—that `SKIP LOCKED` alone
+provides neither FIFO nor a structural work bound. The frozen exact-ID set,
+contiguous queue ordinal, older-head recheck, and partition authority supply
+those additional guarantees.

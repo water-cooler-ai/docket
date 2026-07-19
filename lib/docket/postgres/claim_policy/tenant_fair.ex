@@ -8,7 +8,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     ## Responsibility boundary
 
-    `RingFunction` owns the database-side scheduling state machine: cursor and
+    `RingFunctionV3` owns the database-side scheduling state machine: cursor and
     partition authority, ring traversal, bounded candidate discovery, exact row
     locking, authoritative rechecks, run mutation, continuation persistence,
     and service-epoch accounting.
@@ -30,7 +30,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     remains the sole executor of the resulting plan, while `Admin` is the
     separate API for persisted default and per-scope cap state.
 
-    In other words, `RingFunction` decides and transactionally applies *which
+    In other words, `RingFunctionV3` decides and transactionally applies *which
     runs are admitted*; this module handles configuration, invocation, public
     decoding, and observability around that decision.
     """
