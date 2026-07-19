@@ -56,10 +56,10 @@ fairness — run once per entry in the `claim_policies` registry
 (`bench/support/scorecard/config.ex`) and carry the policy name in the
 scenario column, e.g. `60% hot tenant @16 [legacy]`. Each entry's config is
 passed straight through as the runtime's `claim_policy` backend option. The
-v0.1 registry intentionally holds only the default Legacy implementation.
-TenantFair correctness is covered by deterministic PostgreSQL tests, not by a
-release benchmark gate. Adding TenantFair scorecard rows is post-v0.1
-performance work and must not be treated as correctness evidence.
+registry includes both Legacy and TenantFair. The TenantFair benchmark cap is
+set above the largest frozen-backlog fixture because claim efficiency retains
+claims by design; deterministic PostgreSQL tests, rather than scorecard rows,
+remain the sticky-cap correctness evidence.
 
 Interpretation caveats:
 

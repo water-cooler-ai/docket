@@ -41,6 +41,11 @@ backend that owns persistence, scheduling, recovery, and signals.
 
    For a non-`public` PostgreSQL schema, edit both directions of the generated
    migration to pass the same `prefix:` configured on the Docket facade.
+   The generated fresh migration installs the current schema. Existing
+   schema-V1 Docket installations instead use `--upgrade-from-v1`; stop every
+   Docket writer before the upgrade. The
+   runtime refuses to start backend children when the recorded schema version
+   does not match the current library.
 
 4. Publish each unchanged graph with `save_graph/2` and retain its `GraphRef`.
 5. Replace `run` with `start_run`, and replace `get_run` with `fetch_run` or

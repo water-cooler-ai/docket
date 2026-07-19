@@ -4,6 +4,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
+    alias Docket.Postgres.ClaimPolicy.TenantFair.RingFunction
+    alias Docket.Postgres.RunStore
     alias Docket.Postgres.TestRepo
 
     @v1 20_260_716_000_101
@@ -13,6 +15,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @private_v2 20_260_716_000_105
     @failed_v2 20_260_716_000_106
     @host_v1_to_current 20_260_716_000_107
+    @fresh_current 20_260_719_000_111
 
     defmodule InstallV1 do
       use Ecto.Migration
@@ -95,9 +98,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert Enum.sort(scope_indexes("public")) ==
                [
-                 "docket_runs_scope_expired_index",
-                 "docket_runs_scope_live_index",
-                 "docket_runs_scope_ready_index"
+                 "docket_runs_scope_admitted_expired_index",
+                 "docket_runs_scope_admitted_index",
+                 "docket_runs_scope_admitted_ready_index",
+                 "docket_runs_scope_queued_ready_index"
                ]
     end
 
@@ -138,10 +142,138 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              ]
     end
 
-    test "host v1-to-current and fresh-current paths have equivalent schemas" do
-      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
-      fresh = schema_signature("public")
+    test "v1-to-current backfills healthy claims, leaves ready rows queued, and preserves over-cap debt" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "claimed-a")
+      insert_v1_graph_and_run("tenant-a", "claimed-b")
+      insert_v1_graph_and_run("tenant-a", "queued")
 
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET claim_token = CASE run_id
+            WHEN 'claimed-a' THEN '00000000-0000-0000-0000-000000000001'::uuid
+            WHEN 'claimed-b' THEN '00000000-0000-0000-0000-000000000002'::uuid
+          END,
+          claimed_at = CURRENT_TIMESTAMP - CASE run_id
+            WHEN 'claimed-a' THEN interval '2 seconds'
+            ELSE interval '1 second'
+          END,
+          wake_at = NULL,
+          claim_attempts = 1
+      WHERE run_id IN ('claimed-a', 'claimed-b')
+      """)
+
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      TestRepo.query!("""
+      UPDATE docket_claim_policy
+      SET max_active = 1, policy_version = 1,
+          initialized_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      """)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+
+      assert [
+               ["claimed-a", true, true],
+               ["claimed-b", true, true],
+               ["queued", false, false]
+             ] ==
+               TestRepo.query!("""
+               SELECT run_id, claim_token IS NOT NULL, tenant_admitted_at IS NOT NULL
+               FROM docket_runs
+               ORDER BY run_id
+               """).rows
+
+      assert [[2, 1]] =
+               TestRepo.query!("""
+               SELECT count(*) FILTER (WHERE tenant_admitted_at IS NOT NULL)::integer,
+                      greatest(count(*) FILTER (WHERE tenant_admitted_at IS NOT NULL) - 1, 0)::integer
+               FROM docket_runs
+               WHERE scope_key = 'tenant-a' AND status = 'running' AND poisoned_at IS NULL
+               """).rows
+
+      assert tenant_fair_function_catalog("public") == [
+               ["docket_tenant_fair_claim", RingFunction.identity_arguments()]
+             ]
+
+      assert_function_abi_works!("public")
+    end
+
+    test "Legacy poison clears a backfilled admission marker" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "legacy-poison")
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET claim_token = '00000000-0000-0000-0000-000000000009'::uuid,
+          claimed_at = CURRENT_TIMESTAMP - interval '2 minutes',
+          wake_at = NULL,
+          claim_attempts = 5
+      WHERE run_id = 'legacy-poison'
+      """)
+
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      assert {:ok, %{leases: [], poisoned: [%{run_id: "legacy-poison"}]}} =
+               RunStore.claim_due(Docket.Postgres.context(repo: TestRepo), :system, %{
+                 now: DateTime.utc_now(),
+                 limit: 1,
+                 orphan_ttl_ms: 1_000,
+                 max_claim_attempts: 5,
+                 preference: :expired
+               })
+
+      assert [[nil, true]] =
+               TestRepo.query!("""
+               SELECT tenant_admitted_at, poisoned_at IS NOT NULL
+               FROM docket_runs WHERE run_id = 'legacy-poison'
+               """).rows
+    end
+
+    test "custom-prefix current upgrade and down return to v1" do
+      :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
+      insert_v1_graph_and_run(nil, "tenantless-live", "docket_private")
+
+      TestRepo.query!("""
+      UPDATE docket_private.docket_runs
+      SET claim_token = '00000000-0000-0000-0000-000000000003'::uuid,
+          claimed_at = CURRENT_TIMESTAMP, wake_at = NULL, claim_attempts = 1
+      WHERE run_id = 'tenantless-live'
+      """)
+
+      :ok = Ecto.Migrator.up(TestRepo, @private_v2, UpgradePrivateV2, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(
+               repo: TestRepo,
+               prefix: "docket_private"
+             ) == 2
+
+      assert [["tenantless-live", true]] =
+               TestRepo.query!("""
+               SELECT run_id, tenant_admitted_at IS NOT NULL
+               FROM docket_private.docket_runs
+               """).rows
+
+      assert tenant_fair_function_catalog("docket_private") == [
+               ["docket_tenant_fair_claim", RingFunction.identity_arguments()]
+             ]
+
+      assert_function_abi_works!("docket_private")
+
+      :ok = Ecto.Migrator.down(TestRepo, @private_v2, UpgradePrivateV2, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(
+               repo: TestRepo,
+               prefix: "docket_private"
+             ) == 1
+
+      refute column_exists?("docket_private", "docket_runs", "tenant_admitted_at")
+
+      assert tenant_fair_function_catalog("docket_private") == []
+    end
+
+    test "host v1-to-current and fresh-current paths have equivalent schemas" do
       :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a", "docket_private")
       :ok = Ecto.Migrator.up(TestRepo, @private_v2, UpgradePrivateV2, log: false)
@@ -151,7 +283,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                prefix: "docket_private"
              ) == 2
 
-      assert schema_signature("docket_private") == fresh
+      upgraded = schema_signature("docket_private")
+
+      :ok = Ecto.Migrator.up(TestRepo, @fresh_current, UpgradeV2, log: false)
+      assert schema_signature("public") == upgraded
 
       assert TestRepo.query!("SELECT scope_key FROM docket_private.docket_claim_schedule").rows ==
                [["tenant-a"]]
@@ -199,8 +334,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         "UPDATE docket_claim_policy SET scan_ring_position = -1 WHERE id = 1",
         "UPDATE docket_claim_schedule SET unfinished_count = -1 WHERE scope_key = 'tenant'",
         "UPDATE docket_claim_schedule SET unfinished_count = 1 WHERE scope_key = 'tenant'",
-        "UPDATE docket_claim_schedule SET ready_candidate_cursor_id = 1 " <>
-          "WHERE scope_key = 'tenant'",
         "INSERT INTO docket_claim_schedule (scope_key) VALUES ('orphan')",
         "INSERT INTO docket_claim_schedule (scope_key, ring_position) OVERRIDING SYSTEM VALUE " <>
           "VALUES ('tenant-2', #{ring_position})",
@@ -476,6 +609,31 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """,
         [prefix]
       ).rows
+    end
+
+    defp assert_function_abi_works!(prefix) do
+      function = ~s("#{prefix}"."docket_tenant_fair_claim")
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      assert %Postgrex.Result{} =
+               TestRepo.query!(
+                 "SELECT count(*) FROM #{function}($1, $2, $3, $4, $5, $6, false) " <>
+                   "AS claimed(#{RingFunction.result_definition()})",
+                 [now, DateTime.add(now, -3_600, :second), 1, 5, nil, 4]
+               )
+    end
+
+    defp column_exists?(prefix, table, column) do
+      TestRepo.query!(
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
+        )
+        """,
+        [prefix, table, column]
+      ).rows == [[true]]
     end
 
     defp membership_function_count(prefix) do

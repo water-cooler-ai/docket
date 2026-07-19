@@ -36,12 +36,14 @@ lock on `docket_claim_policy` and admits only while `admission_mode` is
 `legacy`. A TenantFair mode, a skipped policy lock, a read-only transaction,
 or non-Read-Committed isolation fails closed before run mutation.
 
-Legacy remains the default when `claim_policy:` is omitted.
+Legacy remains the default for `tenant_mode: :none` when `claim_policy:` is
+omitted. PostgreSQL `tenant_mode: :required` rejects Legacy and requires the
+TenantFair implementation with an explicit cap.
 
 ## TenantFair
 
-TenantFair adds exact per-owner caps and the schema-v2 ring function implements
-the frozen bounded-bypass rotation contract:
+TenantFair is the sole tenant scheduling path. It combines the authoritative
+unfinished-tenant ring with sticky per-owner logical-run admission:
 
 ```elixir
 use Docket,
@@ -50,18 +52,20 @@ use Docket,
   tenant_mode: :required,
   claim_policy: [
     implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-    default_max_active: 4
+    default_max_active_runs: 4
   ]
 ```
 
-`default_max_active` is its only implementation option. It bootstraps an unset
+`default_max_active_runs` is its only implementation option. It bootstraps an unset
 database default; persisted values and partition overrides remain authoritative.
 
 The current statement invokes `docket_tenant_fair_claim` once. Under the
 serialized policy cursor it materializes a bounded positive-ring walk, attempts
 partition authority, freezes bounded exact run IDs, and rechecks them before
-mutation. Ready admission is limited to available capacity and expired steals
-are count-neutral. Two progress rules remain separate:
+mutation. It serves already-admitted ready or expired work before promoting the
+oldest due queued run. Cooperative vehicle release and expired steals retain
+the logical admission; future scheduling, external waiting, poison, and
+terminal transitions release it. Two progress rules remain separate:
 
 - the engine advances the domain-global circular scan cursor for every
   committed unfinished-ring visit, including lock skip, denial, dormancy, and
@@ -69,11 +73,11 @@ are count-neutral. Two progress rules remain separate:
 - it advances partition `admission_epoch` exactly once only for a
   committed nonempty grant; the epoch must never drive scan traversal.
 
-DCKT-78 must linearize the cursor across independent pollers and enforce the
-round/no-repeat rule: between target inspections, another partition may
+The claim function linearizes the cursor across independent pollers and
+enforces the round/no-repeat rule: between target inspections, another partition may
 receive at most one grant. A grant must return between one and the ratified
 `Q` outcomes; a zero-outcome locked visit is an unsuccessful inspection.
-TenantFair partition order will supersede Legacy global age-first order while
+TenantFair partition order supersedes Legacy global age-first order while
 preserving the portable ready/expired reservation, demand-one
 preference/fallback, poison, and stable within-choice age/ID behavior.
 
@@ -104,20 +108,19 @@ This stopped upgrade is the v0.1.0 operational contract. Online schema changes,
 fleet attestations, readiness ledgers, activation ceremonies, audited mode
 history, and hot mixed-version rollout are deferred.
 
-The current stopped-development migration collapses all TenantFair authority
-and ring state into schema V02. Previously recorded unreleased V02/V03
-databases must be recreated or rolled back with matching historical code. See
-[TenantFair schema-v2 active-ring decision](docket-tenant-fair-schema-v2.md)
-for the objects and evidence boundary.
+The current schema contains the complete TenantFair authority, ring, admission
+marker, lifecycle triggers, indexes, and sole claim function. See
+[TenantFair claim policy](docket-tenant-fair.md) for the scheduling and
+admission lifetime contract.
 
 ## Test contract
 
 The shared ClaimPolicy and live RunStore matrices verify implementation
 selection, one-statement execution, decoded lease persistence, PostgreSQL error
 preservation, transaction behavior, and telemetry. TenantFair adds live tests
-for concurrent final-slot enforcement, cap reduction, expired recovery,
-cross-scope rotation, capped-head progress, and the Legacy interlock. The
-schema-v2 ring suite must additionally prove linearized cursor traversal, no-repeat
+for concurrent final-slot enforcement, cap reduction, sticky yield/reclaim,
+FIFO promotion, expired recovery, cross-scope rotation, capped-head progress,
+and the Legacy interlock. The ring suite must additionally prove linearized cursor traversal, no-repeat
 rounds, lock/empty target failures, the bounded-bypass formulas, outcome-backed
 epochs, the deterministic Legacy counterexample, and every inherited safety
 invariant.

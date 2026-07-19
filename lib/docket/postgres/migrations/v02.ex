@@ -76,6 +76,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       execute("LOCK TABLE #{partitions} IN SHARE ROW EXCLUSIVE MODE")
       execute("LOCK TABLE #{runs} IN SHARE ROW EXCLUSIVE MODE")
 
+      execute("ALTER TABLE #{runs} ADD COLUMN tenant_admitted_at timestamptz NULL")
+
+      execute("""
+      UPDATE #{runs}
+      SET tenant_admitted_at = claimed_at
+      WHERE status = 'running'
+        AND poisoned_at IS NULL
+        AND claim_token IS NOT NULL
+      """)
+
+      execute("""
+      ALTER TABLE #{runs}
+      ADD CONSTRAINT docket_runs_tenant_admission_shape_check CHECK (
+        tenant_admitted_at IS NULL OR (status = 'running' AND poisoned_at IS NULL)
+      )
+      """)
+
       execute("""
       INSERT INTO #{partitions} (scope_key)
       SELECT DISTINCT scope_key FROM #{runs}
@@ -83,22 +100,33 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       """)
 
       execute("""
-      CREATE INDEX docket_runs_scope_ready_index
+      CREATE INDEX docket_runs_scope_admitted_index
+      ON #{runs} (scope_key)
+      WHERE status = 'running' AND poisoned_at IS NULL AND
+            tenant_admitted_at IS NOT NULL
+      """)
+
+      execute("""
+      CREATE INDEX docket_runs_scope_admitted_ready_index
       ON #{runs} (scope_key, wake_at, id)
       WHERE status = 'running' AND poisoned_at IS NULL AND
-            claim_token IS NULL AND wake_at IS NOT NULL
+            tenant_admitted_at IS NOT NULL AND claim_token IS NULL AND
+            wake_at IS NOT NULL
       """)
 
       execute("""
-      CREATE INDEX docket_runs_scope_live_index
-      ON #{runs} (scope_key, id)
-      WHERE status = 'running' AND poisoned_at IS NULL AND claim_token IS NOT NULL
+      CREATE INDEX docket_runs_scope_queued_ready_index
+      ON #{runs} (scope_key, wake_at, id)
+      WHERE status = 'running' AND poisoned_at IS NULL AND
+            tenant_admitted_at IS NULL AND claim_token IS NULL AND
+            wake_at IS NOT NULL
       """)
 
       execute("""
-      CREATE INDEX docket_runs_scope_expired_index
+      CREATE INDEX docket_runs_scope_admitted_expired_index
       ON #{runs} (scope_key, claimed_at, id)
-      WHERE status = 'running' AND poisoned_at IS NULL AND claim_token IS NOT NULL
+      WHERE status = 'running' AND poisoned_at IS NULL AND
+            tenant_admitted_at IS NOT NULL AND claim_token IS NOT NULL
       """)
 
       execute("""
@@ -106,27 +134,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         scope_key text PRIMARY KEY,
         ring_position bigint GENERATED ALWAYS AS IDENTITY NOT NULL UNIQUE,
         unfinished_count bigint NOT NULL DEFAULT 0,
-        ready_candidate_cursor_at timestamptz NULL,
-        ready_candidate_cursor_id bigint NULL,
         inserted_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
         CONSTRAINT docket_claim_schedule_partition_fkey
           FOREIGN KEY (scope_key) REFERENCES #{partitions} (scope_key) ON DELETE CASCADE,
         CONSTRAINT docket_claim_schedule_position_check CHECK (ring_position > 0),
-        CONSTRAINT docket_claim_schedule_unfinished_count_check CHECK (unfinished_count >= 0),
-        CONSTRAINT docket_claim_schedule_ready_candidate_cursor_check CHECK (
-          (ready_candidate_cursor_at IS NULL) = (ready_candidate_cursor_id IS NULL)
-        )
+        CONSTRAINT docket_claim_schedule_unfinished_count_check CHECK (unfinished_count >= 0)
       )
       """)
 
       execute("""
       CREATE INDEX docket_claim_schedule_unfinished_ring_index
       ON #{schedule} (ring_position)
-      INCLUDE (
-        scope_key, unfinished_count,
-        ready_candidate_cursor_at, ready_candidate_cursor_id
-      )
+      INCLUDE (scope_key, unfinished_count)
       WHERE unfinished_count > 0
       """)
 
@@ -340,11 +360,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       execute("DROP TABLE IF EXISTS #{schedule}")
 
       execute(
-        "DROP INDEX IF EXISTS #{qualified_table(prefix, "docket_runs_scope_expired_index")}"
+        "DROP INDEX IF EXISTS #{qualified_table(prefix, "docket_runs_scope_admitted_expired_index")}"
       )
 
-      execute("DROP INDEX IF EXISTS #{qualified_table(prefix, "docket_runs_scope_live_index")}")
-      execute("DROP INDEX IF EXISTS #{qualified_table(prefix, "docket_runs_scope_ready_index")}")
+      execute(
+        "DROP INDEX IF EXISTS #{qualified_table(prefix, "docket_runs_scope_queued_ready_index")}"
+      )
+
+      execute(
+        "DROP INDEX IF EXISTS #{qualified_table(prefix, "docket_runs_scope_admitted_ready_index")}"
+      )
+
+      execute(
+        "DROP INDEX IF EXISTS #{qualified_table(prefix, "docket_runs_scope_admitted_index")}"
+      )
+
+      execute("ALTER TABLE #{runs} DROP CONSTRAINT docket_runs_tenant_admission_shape_check")
+      execute("ALTER TABLE #{runs} DROP COLUMN tenant_admitted_at")
       execute("DROP TABLE IF EXISTS #{qualified_table(prefix, "docket_claim_partitions")}")
       execute("DROP TABLE IF EXISTS #{qualified_table(prefix, "docket_claim_policy")}")
     end

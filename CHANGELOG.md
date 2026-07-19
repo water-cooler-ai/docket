@@ -16,19 +16,18 @@ entries below reflect what has landed so far.
 
 ### Added
 
-- PostgreSQL schema version 2 adds one prefix-local TenantFair scheduling table
-  with an exact trigger-maintained count of nonterminal runs per tenant and
-  stores the serialized scan position on the existing policy row. Fixed `S =
-  32`, `Q = 8`, exact-key
-  lock/run-mutation-input ceilings, and bounded poison-safe candidate
-  continuation were checked with non-release query-plan experiments. The ring
-  is an authoritative eligibility superset rather than a lossy cache, so
-  DCKT-77 repair machinery is not part of the v0.1.0 MVP. TenantFair admission
-  now uses the bounded ring engine described here; executable fairness proof
-  remains in DCKT-79. Because no count
-  repair path exists by design, truncating runs or the authoritative schedule
-  fails closed instead of bypassing row triggers and silently desynchronizing
-  membership.
+- PostgreSQL schema version 2 adds the complete TenantFair claim policy: an
+  authoritative trigger-maintained unfinished-tenant ring, bounded
+  cross-tenant traversal, and sticky logical-run admission. FIFO promotion and
+  fresh admitted-count checks enforce `max_active_runs`; cooperative yield,
+  reacquisition, refresh, and expired steal retain admission, while future
+  scheduling, external waiting, interruption, poison, and terminal transitions
+  release it. The stopped migration backfills healthy claims, installs the
+  admitted/queued indexes and sole claim function, supports custom prefixes
+  and rollback to host schema V1, and makes old-schema startup fail closed.
+  Required PostgreSQL tenancy now requires TenantFair with an explicit
+  `default_max_active_runs`; Admin results use `max_active_runs` and expose
+  token-free queue/admission/debt counts.
 - PostgreSQL run creation now atomically materializes the canonical
   owner-derived claim partition with an inherited cap and version-zero state.
   Concurrent first inserts use `ON CONFLICT DO NOTHING`, preserving Admin-owned
@@ -42,9 +41,10 @@ entries below reflect what has landed so far.
   ordinary supporting indexes, engine interlock, and TenantFair claim function.
   Existing scope keys are backfilled transactionally while inserts are blocked.
   ClaimPolicy implementations receive the additive quoted identifier context.
-- Exact-cap `Docket.Postgres.ClaimPolicy.TenantFair` admission with one persisted
+- TenantFair admission with one persisted
   default, optional per-owner overrides, concurrent final-slot serialization,
-  count-neutral expired recovery, cap-reduction debt, and bounded cross-owner
+  sticky logical-run residency, count-neutral expired recovery,
+  cap-reduction debt, and bounded cross-owner
   rotation. The current-state Admin API supports versioned default and override
   changes without rollout ledgers, audit history, or governance workflows.
 - `Docket.BackendTests`, a source-owned shared ExUnit suite under

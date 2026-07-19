@@ -261,8 +261,10 @@ report the retained window, while `latest_seq` is the run's latest committed
 event sequence regardless of retention, so a fully pruned history is detectable
 as `latest_seq > 0` with `latest_available_seq == nil`.
 
-For multi-tenant applications, configure `tenant_mode: :required` and pass a
-non-empty `tenant_id` to every run, read, and signal call. See the
+For multi-tenant PostgreSQL applications, configure `tenant_mode: :required`,
+select `Docket.Postgres.ClaimPolicy.TenantFair` with an explicit
+`default_max_active_runs`, and pass a non-empty `tenant_id` to every run, read,
+and signal call. See the
 [parent-application example](examples/parent-app-integration.md). To enable the
 LISTEN/NOTIFY latency fast path, remove `notifier: :none`; deployments behind
 PgBouncer transaction or statement pooling must give the notifier a direct or

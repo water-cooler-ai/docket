@@ -1,9 +1,9 @@
 # Exact-cap and fair-rotation admission contract
 
 This document records the PostgreSQL TenantFair guarantees for Docket v0.1.0.
-The exact-cap sections describe the schema-v2 safety boundary. The
-fair-rotation sections freeze the stronger DCKT-75 contract implemented by the
-schema-v2 ring admission engine and qualified further by DCKT-79.
+The exact-cap sections describe sticky-admission safety, and the fair-rotation
+sections freeze the stronger DCKT-75 contract implemented by the same claim
+policy.
 
 The contract intentionally excludes online rollout, governance, audit,
 reporting, weighted service, preferred share, and borrowing. Those are
@@ -12,11 +12,12 @@ post-MVP concerns.
 ## Authority and scope
 
 The cap applies independently to each owner scope: `:tenantless` maps to the
-empty scope key and `{:tenant, tenant_id}` maps to that tenant ID. A live claim
-is a healthy `running` row with a non-null claim token. The effective cap is a
+empty scope key and `{:tenant, tenant_id}` maps to that tenant ID. An admitted
+run is a healthy `running` row with non-null `tenant_admitted_at`; its claim
+token may be present or absent. The effective `max_active_runs` cap is a
 partition override when present, otherwise the persisted default.
 
-The database is authoritative. `default_max_active` in application config is
+The database is authoritative. `default_max_active_runs` in application config is
 used only to initialize an unset persisted default. Later changes go through
 `Docket.Postgres.ClaimPolicy.Admin`.
 
@@ -28,22 +29,24 @@ domain; it is neither a wildcard nor a separate scheduling class.
 
 ## Exact-cap invariants
 
-- Additive ready claims never make a scope's live count exceed its effective
-  cap, including with concurrent callers from independent Repo pools.
-- Recovering an expired claim replaces an existing live claim and is therefore
-  count-neutral. It must not create an extra ready slot.
-- Lowering a cap below the current live count creates admission debt. Existing
-  work continues, but no new ready claim is admitted until the count is below
-  the new cap.
-- Poison resolution remains possible at the cap, consumes one unit of demand,
-  and does not install a claim token.
+- Promotion is the only null-to-non-null admission transition. A fresh indexed
+  count under partition authority must prove `admitted_count < max_active_runs`
+  before the oldest due queued row is promoted.
+- `live_claim_count <= admitted_run_count`. Reacquiring an admitted-ready run
+  and stealing an expired admitted claim are admission-count-neutral.
+- Lowering a cap below the admitted count creates non-preemptive debt. Existing
+  admissions remain reclaimable, but no queued row is promoted until the count
+  falls below the new cap.
+- Poisoning an admitted run clears its admission. An unadmitted poison candidate
+  must be the FIFO queue head and requires a free admission slot.
 - Every run creation transaction atomically creates its owner partition. A
   rolled-back run creation leaves no partition behind.
 - Schema-v2 bounded discovery rotates every considered partition, including a
   cap-denied one, so a full scope cannot permanently pin a later eligible scope
   under continued polling. DCKT-79 owns the full bounded-bypass qualification.
-- Partition authority is locked before run rows. Live count, scope, ready or
-  expired class, wake/cutoff, attempt class, claim state, and capacity are
+- Partition authority is locked before run rows. Admitted count, scope,
+  admission tier, FIFO queue position, ready or expired class, wake/cutoff,
+  attempt class, claim state, and capacity are
   freshly rechecked before mutation.
 - Admission runs only in a writable Read Committed transaction. Unsupported
   isolation, read-only transactions, engine-interlock conflict, and required
@@ -55,7 +58,7 @@ domain; it is neither a wildcard nor a separate scheduling class.
 
 The one-statement rule is a client boundary, not a single-snapshot rule. The
 prefix-qualified `VOLATILE` function locks partition authority in one internal
-command and obtains a fresh Read Committed snapshot for live count and run
+command and obtains a fresh Read Committed snapshot for admitted count and run
 mutation in a later command. Partition locking serializes the final-slot
 decision across callers.
 
@@ -90,12 +93,11 @@ Target continuous admissibility means that at each target mutation opportunity a
 least one row survives the authoritative rechecks and is permitted by the
 existing rules:
 
-- an ordinary ready claim requires fresh live count below the effective cap;
-- an ordinary expired steal is count-neutral and remains permitted at the cap;
-- a ready or expired poison outcome remains permitted at the cap and installs
-  no token; and
-- cap debt excludes ordinary ready work but not an otherwise valid steal or
-  poison outcome.
+- admitted-ready reacquisition and an admitted expired steal remain permitted
+  at the cap because neither creates a logical admission;
+- queued promotion requires fresh admitted count below the effective cap and
+  the authoritative FIFO head; and
+- cap debt excludes queued promotion but not otherwise-valid admitted work.
 
 A transient partition or run lock does not make the target inadmissible. Lock
 and mutation contention is accounted for by `L` below rather than hidden by
@@ -117,9 +119,9 @@ wording, not a change to the round/no-repeat invariant or any formula below.
 - A **grant** is one committed acquisition of partition authority followed by
   `1..Q` committed lease or poison outcomes from that partition. A zero-outcome
   locked visit is not a grant.
-- An **outcome** is one returned and committed ready lease, expired replacement
-  lease, ready poison, or expired poison. Poison counts toward `Q` and caller
-  demand but creates no live claim.
+- An **outcome** is one returned and committed admitted-ready lease, queued
+  promotion lease, expired admitted replacement lease, or poison. Poison counts
+  toward `Q` and caller demand but creates no claim.
 - A **qualifying scan call** is a successfully committed TenantFair statement
   that owns and advances the domain cursor. Calls that fail before cursor
   authority, fail closed, or later roll back contribute no scan, inspection,
@@ -211,9 +213,7 @@ staleness, cap rejection, emptiness, lock skip, error, or rollback.
 The logically independent scan cursor is stored on the existing singleton
 claim-policy row and advances for every committed inspection. Cursor movement,
 any grant's `admission_epoch` increment, and its run outcomes are in the same
-transaction; rollback persists none of them. The schema-v2 behavior that
-advances `admission_epoch` after every considered locked partition is
-provisional and must be replaced, not reinterpreted as v0.1 fairness evidence.
+transaction; rollback persists none of them.
 
 ## Conditional frozen-trace separation from Legacy
 
@@ -302,10 +302,11 @@ or borrowing in v0.1.0.
 
 ## Migration boundary
 
-Schema version 2 installs the policy row, partition table, ordinary supporting
-indexes, and exact-cap claim function in one host-owned transactional
-migration. During the v1-to-v2 migration, the runs table is locked against
-concurrent inserts while existing scope keys are backfilled.
+Schema version 2 installs the complete claim policy: policy and partition
+authority, unfinished ring, `tenant_admitted_at`, admitted/queued partial
+indexes, lifecycle triggers, and the sole claim function. The stopped host
+upgrade backfills healthy claimed rows from `claimed_at`; ready unclaimed rows
+remain queued, and an over-cap backfill becomes debt without preemption.
 
 The exact-cap cleanup rewrote the unreleased DCKT-68 version-2 migration rather
 than adding a conversion for its discarded development schema. A local or test
@@ -313,13 +314,11 @@ database that applied that earlier development migration must be recreated, or
 rolled back with matching old code before adopting the rewritten migration. No
 released v2 database uses that discarded shape.
 
-Schema version 2 is the collapsed DCKT-76/DCKT-78 migration. It installs the
-unique scheduling ring with an exact trigger-maintained unfinished-run count,
-the scan position, and the TenantFair claim function without weakening
-exact-cap safety. The current binary requires schema version 2 and rolling V02
-back returns to version 1. The ratified constants,
-query shapes, and non-release diagnostic boundary are in
-[TenantFair schema-v2 active-ring decision](docket-tenant-fair-schema-v2.md).
+The current binary requires schema version 2. Rolling the host upgrade back
+returns to host schema V1; rolling a complete fresh migration back removes all
+Docket objects. The ratified constants, query shapes, admission lifetime, FIFO
+rules, and research lineage are in
+[TenantFair claim policy](docket-tenant-fair.md).
 
 The supported upgrade remains stopped and homogeneous. Online migration and
 readiness, governance, audit/evidence platforms, enterprise rollout,

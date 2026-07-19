@@ -51,8 +51,9 @@ Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
 ```
 
 This setup uses polling and tenantless storage. Removing `notifier: :none`
-enables LISTEN/NOTIFY; changing to `tenant_mode: :required` requires the same
-authorized non-empty binary tenant ID on every run, read, and signal call.
+enables LISTEN/NOTIFY. Changing to `tenant_mode: :required` also requires the
+TenantFair claim policy with an explicit `default_max_active_runs`, plus the
+same authorized non-empty binary tenant ID on every run, read, and signal call.
 
 ## Persistence and transaction ownership
 
@@ -277,7 +278,7 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `backend:` | required | Use the complete `Docket.Postgres` bundle. |
 | `prefix:` | `public` | Must match both directions of the generated migration. |
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
-| `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` | Internal instance-level admission rollout switch. Implementations are validated before startup and cannot be selected per call. |
+| `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` for `tenant_mode: :none` | Required PostgreSQL tenancy must select `Docket.Postgres.ClaimPolicy.TenantFair`; implementations are validated before startup and cannot be selected per call. |
 | `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
 | `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
 | `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
@@ -349,10 +350,11 @@ re-execution, not a partial durable moment.
 
 ## Exact per-owner caps and TenantFair schema state
 
-Schema version 2 contains the policy and partition authority used by
-`Docket.Postgres.ClaimPolicy.TenantFair`, its unique scheduling ring, exact
-trigger-maintained unfinished-run count, global scan cursor, claim function,
-and fixed admission budgets. The unfinished ring is an
+Schema version 2 contains the complete
+`Docket.Postgres.ClaimPolicy.TenantFair` design: policy and partition
+authority, the unique unfinished ring, exact trigger-maintained unfinished-run
+count, scan cursor, sticky logical-run admission, fixed budgets, and sole claim
+function. The unfinished ring is an
 authoritative superset of current eligibility, so future timers and parked
 running work may consume an unsuccessful inspection without becoming
 invisible. Enable TenantFair consistently across the fleet:
@@ -360,7 +362,7 @@ invisible. Enable TenantFair consistently across the fleet:
 ```elixir
 claim_policy: [
   implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-  default_max_active: 4
+  default_max_active_runs: 4
 ]
 ```
 
@@ -384,9 +386,11 @@ alias Docket.Postgres.ClaimPolicy.Admin
   )
 ```
 
-Reducing a cap below the current live count does not terminate claims. It
-creates debt and blocks additive ready claims until completions bring the live
-count below the new cap. Expired lease recovery remains count-neutral.
+`effective` includes token-free `queued`, `admitted_ready`,
+`admitted_claimed`, and `debt` counts. Reducing a cap below the current
+admitted-run count does not preempt work. It blocks FIFO queue promotion until
+admission releases bring the count below the new cap. Immediate cooperative
+yield and expired lease recovery retain admission and remain count-neutral.
 
 ### Existing v1 installations
 
@@ -400,16 +404,16 @@ mix ecto.migrate -r MyApp.Repo
 Stop dispatchers and all Docket run writers before the upgrade, deploy one
 homogeneous binary version, migrate, and restart. The migration locks the runs
 table against inserts while it backfills owner partitions and schedule rows.
-The current binary requires schema version 2. Rolling back the generated v1
-upgrade removes V02 and returns to schema version 1. Online migrations,
+The current binary requires schema version 2 and checks it before starting
+backend children. Rolling back a generated host-schema-V1 upgrade removes the
+TenantFair schema and returns to schema version 1. Online migrations,
 readiness ledgers, fleet
 attestations, and audited activation are intentionally outside the v0.1.0
 contract.
 
-Fresh installations generated without `--upgrade-from-v1` install V01 and V02
-in one host migration. Earlier unreleased V02/V03 development schemas are not
-upgrade sources; recreate those local/test databases, or roll them back using
-their matching historical code before applying the collapsed V02.
+Fresh installations generated without an upgrade flag install V01 and V02 in
+one host migration. Use the same explicit prefix in both migration
+directions and runtime configuration.
 
 ## Operational inspection
 

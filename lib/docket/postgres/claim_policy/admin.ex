@@ -1,7 +1,8 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.ClaimPolicy.Admin do
     @moduledoc """
-    Minimal current-state administration for exact-cap admission.
+    Minimal current-state administration and token-free inspection for
+    max-active-run admission.
 
     Updates are compare-and-set when `:expected_version` is supplied. Policy
     history, actors, receipts, legal holds, and export workflows are outside
@@ -11,9 +12,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Storage
 
     @type policy :: %{
-            required(:max_active) => pos_integer() | nil,
+            required(:max_active_runs) => pos_integer() | nil,
             required(:version) => non_neg_integer(),
-            required(:updated_at) => DateTime.t()
+            required(:updated_at) => DateTime.t(),
+            optional(:admission_mode) => :legacy | :tenant_fair
+          }
+
+    @type effective_policy :: %{
+            required(:owner_scope) => Docket.Backend.owner_scope(),
+            required(:max_active_runs) => pos_integer(),
+            required(:source) => :default | :override,
+            required(:default_version) => non_neg_integer(),
+            required(:override_version) => non_neg_integer(),
+            required(:queued) => non_neg_integer(),
+            required(:admitted_ready) => non_neg_integer(),
+            required(:admitted_claimed) => non_neg_integer(),
+            required(:debt) => non_neg_integer()
           }
 
     @spec get_default(Docket.Backend.ctx()) :: {:ok, policy()} | {:error, term()}
@@ -28,7 +42,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {:ok,
          %{
            admission_mode: String.to_existing_atom(mode),
-           max_active: maximum,
+           max_active_runs: maximum,
            version: version,
            updated_at: updated_at
          }}
@@ -37,13 +51,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @spec put_default(Docket.Backend.ctx(), pos_integer(), keyword()) ::
             {:ok, policy()} | {:error, :stale | term()}
-    def put_default(context, max_active, opts \\ []) do
-      with :ok <- validate_cap(max_active),
+    def put_default(context, max_active_runs, opts \\ []) do
+      with :ok <- validate_cap(max_active_runs),
            {:ok, expected_version} <- expected_version(opts),
            {:ok, control} <- control(context) do
         Storage.transaction(control.context, fn transaction_context ->
           {repo, _prefix} = Storage.context!(transaction_context)
-          {where, params} = cas_clause(expected_version, [max_active])
+          {where, params} = cas_clause(expected_version, [max_active_runs])
 
           case repo.query(
                  """
@@ -58,7 +72,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  params
                ) do
             {:ok, %{rows: [[maximum, version, updated_at]]}} ->
-              {:ok, %{max_active: maximum, version: version, updated_at: updated_at}}
+              {:ok, %{max_active_runs: maximum, version: version, updated_at: updated_at}}
 
             {:ok, %{rows: []}} ->
               {:error, :stale}
@@ -77,9 +91,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             keyword()
           ) ::
             {:ok, policy()} | {:error, :stale | term()}
-    def put_override(context, owner_scope, max_active, opts \\ []) do
+    def put_override(context, owner_scope, max_active_runs, opts \\ []) do
       with {:ok, scope_key} <- scope_key(owner_scope),
-           :ok <- validate_cap(max_active),
+           :ok <- validate_cap(max_active_runs),
            {:ok, expected_version} <- expected_version(opts),
            {:ok, control} <- control(context) do
         Storage.transaction(control.context, fn transaction_context ->
@@ -91,7 +105,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                      "ON CONFLICT (scope_key) DO NOTHING",
                    [scope_key]
                  ) do
-            {where, params} = cas_clause(expected_version, [max_active, scope_key], 3)
+            {where, params} = cas_clause(expected_version, [max_active_runs, scope_key], 3)
 
             case repo.query(
                    """
@@ -105,7 +119,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    params
                  ) do
               {:ok, %{rows: [[maximum, version, updated_at]]}} ->
-                {:ok, %{max_active: maximum, version: version, updated_at: updated_at}}
+                {:ok, %{max_active_runs: maximum, version: version, updated_at: updated_at}}
 
               {:ok, %{rows: []}} ->
                 {:error, :stale}
@@ -140,7 +154,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  params
                ) do
             {:ok, %{rows: [[maximum, version, updated_at]]}} ->
-              {:ok, %{max_active: maximum, version: version, updated_at: updated_at}}
+              {:ok, %{max_active_runs: maximum, version: version, updated_at: updated_at}}
 
             {:ok, %{rows: []}} ->
               {:error, :stale}
@@ -152,32 +166,75 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    @doc "Returns effective policy plus aggregate, token-free admission state."
     @spec get_effective(Docket.Backend.ctx(), Docket.Backend.owner_scope()) ::
-            {:ok, map()} | {:error, :not_initialized | term()}
+            {:ok, effective_policy()} | {:error, :not_initialized | term()}
     def get_effective(context, owner_scope) do
       with {:ok, scope_key} <- scope_key(owner_scope),
            {:ok, control} <- control(context),
-           {:ok, %{rows: [[default_max, default_version, override_max, override_version]]}} <-
+           {:ok,
+            %{
+              rows: [
+                [
+                  default_max,
+                  default_version,
+                  override_max,
+                  override_version,
+                  queued,
+                  admitted_ready,
+                  admitted_claimed,
+                  admitted_total
+                ]
+              ]
+            }} <-
              control.repo.query(
                """
                SELECT policy.max_active, policy.policy_version,
-                      partitions.max_active, COALESCE(partitions.partition_version, 0)
+                      partitions.max_active, COALESCE(partitions.partition_version, 0),
+                      count(*) FILTER (
+                        WHERE runs.status = 'running' AND runs.poisoned_at IS NULL AND
+                              runs.tenant_admitted_at IS NULL AND runs.claim_token IS NULL AND
+                              runs.wake_at <= CURRENT_TIMESTAMP
+                      )::bigint AS queued,
+                      count(*) FILTER (
+                        WHERE runs.status = 'running' AND runs.poisoned_at IS NULL AND
+                              runs.tenant_admitted_at IS NOT NULL AND
+                              runs.claim_token IS NULL AND runs.wake_at <= CURRENT_TIMESTAMP
+                      )::bigint AS admitted_ready,
+                      count(*) FILTER (
+                        WHERE runs.status = 'running' AND runs.poisoned_at IS NULL AND
+                              runs.tenant_admitted_at IS NOT NULL AND
+                              runs.claim_token IS NOT NULL
+                      )::bigint AS admitted_claimed,
+                      count(*) FILTER (
+                        WHERE runs.status = 'running' AND runs.poisoned_at IS NULL AND
+                              runs.tenant_admitted_at IS NOT NULL
+                      )::bigint AS admitted_total
                FROM #{control.policy} AS policy
                LEFT JOIN #{control.partitions} AS partitions ON partitions.scope_key = $1
+               LEFT JOIN #{control.runs} AS runs ON runs.scope_key = $1
                WHERE policy.id = 1
+               GROUP BY policy.max_active, policy.policy_version,
+                        partitions.max_active, partitions.partition_version
                """,
                [scope_key]
              ) do
         if is_nil(default_max) do
           {:error, :not_initialized}
         else
+          max_active_runs = override_max || default_max
+
           {:ok,
            %{
              owner_scope: owner_scope,
-             max_active: override_max || default_max,
+             max_active_runs: max_active_runs,
              source: if(is_nil(override_max), do: :default, else: :override),
              default_version: default_version,
-             override_version: override_version
+             override_version: override_version,
+             queued: queued,
+             admitted_ready: admitted_ready,
+             admitted_claimed: admitted_claimed,
+             debt: max(admitted_total - max_active_runs, 0)
            }}
         end
       end
@@ -193,7 +250,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
            repo: repo,
            context: Map.put(%{repo: repo}, :prefix, prefix),
            policy: Storage.qualified_table(prefix, "docket_claim_policy"),
-           partitions: Storage.qualified_table(prefix, "docket_claim_partitions")
+           partitions: Storage.qualified_table(prefix, "docket_claim_partitions"),
+           runs: Storage.qualified_table(prefix, "docket_runs")
          }}
       rescue
         exception -> {:error, exception}
@@ -234,7 +292,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp validate_cap(value) when is_integer(value) and value > 0 and value <= 2_147_483_647,
       do: :ok
 
-    defp validate_cap(_value), do: {:error, :invalid_max_active}
+    defp validate_cap(_value), do: {:error, :invalid_max_active_runs}
 
     defp scope_key(:tenantless), do: {:ok, ""}
 

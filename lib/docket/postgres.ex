@@ -41,6 +41,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ClaimPolicy,
       EventStore,
       GraphStore,
+      Migration,
       Notifier,
       Pruner,
       RunStore,
@@ -148,6 +149,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       Docket.Runtime.Config.validate_instance!(opts)
       reject_top_level_vehicle!(opts)
       validate_tenant_mode!(opts)
+      validate_tenant_claim_policy!(opts, context)
       validate_testing!(opts)
       validate_wall_clock!(opts)
       reject_nested_wall_clocks!(opts)
@@ -156,6 +158,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       dispatcher = effective_dispatcher(opts)
       validate_dispatcher!(dispatcher)
       _resolved_claim_policy = ClaimPolicy.resolve(context)
+      validate_schema_version!(context, opts)
       execution = effective_execution(opts)
       vehicle = effective_vehicle(Keyword.get(opts, :vehicle, []))
       validate_vehicle!(vehicle)
@@ -164,6 +167,90 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       children = children(opts, name, context)
 
       Supervisor.init(children, strategy: :one_for_one)
+    end
+
+    defp validate_schema_version!(%{repo: repo} = context, opts) do
+      if Keyword.get(opts, :testing) in @testing_modes and
+           repo.config()[:pool] == Ecto.Adapters.SQL.Sandbox do
+        validate_sandbox_schema_version!(context)
+      else
+        validate_schema_version!(context)
+      end
+    end
+
+    defp validate_schema_version!(context) do
+      {repo, prefix} = Storage.context!(context)
+      expected = Migration.current_version()
+      actual = Migration.migrated_version(repo: repo, prefix: prefix)
+
+      validate_schema_version!(expected, actual, prefix)
+      validate_schema_shape!(Migration.current_shape?(repo, prefix), prefix)
+    end
+
+    # Inline/manual work runs through the test process's checked-out Sandbox
+    # connection, which the backend child cannot borrow during its own init.
+    # Schema identity is global rather than transaction-local, so validate it
+    # through one short independent connection instead of weakening startup.
+    defp validate_sandbox_schema_version!(%{repo: repo, prefix: prefix}) do
+      connection_options =
+        repo.config()
+        |> Keyword.drop([:name, :pool, :pool_size])
+        |> Keyword.put(:sync_connect, true)
+
+      case Postgrex.start_link(connection_options) do
+        {:ok, connection} ->
+          try do
+            query = """
+            SELECT obj_description(pg_class.oid, 'pg_class')
+            FROM pg_class
+            LEFT JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+            WHERE pg_class.relname = 'docket_runs' AND pg_namespace.nspname = $1
+            """
+
+            actual =
+              case Postgrex.query(connection, query, [prefix]) do
+                {:ok, %{rows: [[version]]}} when is_binary(version) ->
+                  String.to_integer(version)
+
+                _missing_or_uncommented ->
+                  0
+              end
+
+            validate_schema_version!(Migration.current_version(), actual, prefix)
+
+            current_shape =
+              case Postgrex.query(connection, Migration.current_shape_query(), [prefix]) do
+                {:ok, %{rows: [[true]]}} -> true
+                _missing_or_unexpected -> false
+              end
+
+            validate_schema_shape!(current_shape, prefix)
+          after
+            GenServer.stop(connection)
+          end
+
+        {:error, reason} ->
+          raise ArgumentError,
+                "Docket.Postgres could not validate its SQL Sandbox schema: #{inspect(reason)}"
+      end
+    end
+
+    defp validate_schema_version!(expected, actual, prefix) do
+      if actual != expected do
+        raise ArgumentError,
+              "Docket.Postgres requires schema version #{expected}, found #{actual} in prefix " <>
+                "#{inspect(prefix)}; stop all Docket writers, run the generated migration, " <>
+                "and restart one homogeneous application version"
+      end
+    end
+
+    defp validate_schema_shape!(true, _prefix), do: :ok
+
+    defp validate_schema_shape!(false, prefix) do
+      raise ArgumentError,
+            "Docket.Postgres found schema version #{Migration.current_version()} in prefix " <>
+              "#{inspect(prefix)}, but its structure does not match the current Docket schema; " <>
+              "recreate the unreleased development schema from the current generated migration"
     end
 
     defp children(opts, name, context) do
@@ -413,6 +500,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         mode ->
           raise ArgumentError, ":tenant_mode must be :none or :required, got: #{inspect(mode)}"
       end
+    end
+
+    defp validate_tenant_claim_policy!(opts, context) do
+      if Keyword.get(opts, :tenant_mode, :none) == :required do
+        implementation = context |> ClaimPolicy.resolve() |> ClaimPolicy.implementation()
+
+        unless implementation == Docket.Postgres.ClaimPolicy.TenantFair do
+          raise ArgumentError,
+                ":tenant_mode :required requires the TenantFair claim policy with " <>
+                  ":default_max_active_runs configured"
+        end
+      end
+
+      :ok
     end
 
     defp validate_testing!(opts) do

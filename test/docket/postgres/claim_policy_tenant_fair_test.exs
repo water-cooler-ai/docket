@@ -103,6 +103,48 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                RunStore.claim_due(context, :system, policy(1))
     end
 
+    test "cap increase promotes the oldest queued run without replacing the admitted cohort", %{
+      context: context
+    } do
+      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      insert_ready("tenant", "first", DateTime.add(@now, -3, :second))
+      insert_ready("tenant", "second", DateTime.add(@now, -2, :second))
+      insert_ready("tenant", "third", DateTime.add(@now, -1, :second))
+
+      assert {:ok, %{leases: [%{run_id: "first"}]}} =
+               RunStore.claim_due(context, :system, policy(1))
+
+      assert {:ok, %{version: 2}} = Admin.put_default(context, 2, expected_version: 1)
+
+      assert {:ok, %{leases: [%{run_id: "second"}]}} =
+               RunStore.claim_due(context, :system, policy(1))
+
+      assert [["first"], ["second"]] = admitted_run_ids("tenant")
+    end
+
+    test "demand and candidate pages larger than cap preserve the cap-ten oldest identities", %{
+      context: context
+    } do
+      assert {:ok, %{version: 1}} = Admin.put_default(context, 10, expected_version: 0)
+
+      for index <- 1..100 do
+        insert_ready(
+          "tenant",
+          "run-#{String.pad_leading(to_string(index), 3, "0")}",
+          DateTime.add(@now, index - 101, :microsecond)
+        )
+      end
+
+      assert {:ok, %{leases: leases}} = RunStore.claim_due(context, :system, policy(50))
+      assert length(leases) == 10
+
+      expected = for index <- 1..10, do: ["run-#{String.pad_leading(to_string(index), 3, "0")}"]
+      assert admitted_run_ids("tenant") == expected
+
+      assert {:ok, %{leases: []}} = RunStore.claim_due(context, :system, policy(50))
+      assert admitted_run_ids("tenant") == expected
+    end
+
     test "demand-one discovery rotates from a deep tenant to another tenant", %{context: context} do
       assert {:ok, %{version: 1}} = Admin.put_default(context, 4, expected_version: 0)
       insert_ready("a", "a-1", DateTime.add(@now, -3, :second))
@@ -115,6 +157,106 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, %{leases: [%{owner_scope: {:tenant, "b"}}]}} =
                RunStore.claim_due(context, :system, policy(1))
+    end
+
+    test "an admitted run remains sticky across an immediate cooperative release", %{
+      context: context
+    } do
+      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      insert_ready("tenant", "first", DateTime.add(@now, -2, :second))
+      insert_ready("tenant", "second", DateTime.add(@now, -1, :second))
+
+      assert {:ok, %{leases: [%{run_id: "first"} = first]}} =
+               RunStore.claim_due(context, :system, policy(1))
+
+      TestRepo.query!(
+        """
+        UPDATE docket_runs
+        SET claim_token = NULL, claimed_at = NULL, wake_at = $3
+        WHERE run_id = $1 AND claim_token = $2
+        """,
+        [first.run_id, Ecto.UUID.dump!(first.claim_token), @now]
+      )
+
+      assert {:ok, %{leases: [%{run_id: "first"} = first_again]}} =
+               RunStore.claim_due(context, :system, policy(1))
+
+      TestRepo.query!(
+        """
+        UPDATE docket_runs
+        SET claim_token = NULL, claimed_at = NULL, tenant_admitted_at = NULL,
+            wake_at = $3
+        WHERE run_id = $1 AND claim_token = $2
+        """,
+        [
+          first_again.run_id,
+          Ecto.UUID.dump!(first_again.claim_token),
+          DateTime.add(@now, 1, :hour)
+        ]
+      )
+
+      assert {:ok, %{leases: [%{run_id: "second"}]}} =
+               RunStore.claim_due(context, :system, policy(1))
+    end
+
+    test "two pollers keep a cap-two cohort sticky ahead of a deep backlog", %{
+      context: context,
+      second_context: second_context
+    } do
+      assert {:ok, %{version: 1}} = Admin.put_default(context, 2, expected_version: 0)
+
+      for index <- 1..100 do
+        insert_ready("tenant", "queued-#{String.pad_leading(to_string(index), 3, "0")}", @now)
+      end
+
+      assert {:ok, %{leases: [first]}} = RunStore.claim_due(context, :system, policy(1))
+      assert {:ok, %{leases: [second]}} = RunStore.claim_due(second_context, :system, policy(1))
+      assert Enum.sort([first.run_id, second.run_id]) == ["queued-001", "queued-002"]
+
+      leases =
+        Enum.reduce(1..3, [first, second], fn _cycle, current ->
+          Enum.each(current, fn lease ->
+            TestRepo.query!(
+              """
+              UPDATE docket_runs
+              SET claim_token = NULL, claimed_at = NULL, wake_at = $3
+              WHERE run_id = $1 AND claim_token = $2
+              """,
+              [lease.run_id, Ecto.UUID.dump!(lease.claim_token), @now]
+            )
+          end)
+
+          assert {:ok, %{leases: [left]}} =
+                   RunStore.claim_due(second_context, :system, policy(1))
+
+          assert {:ok, %{leases: [right]}} =
+                   RunStore.claim_due(context, :system, policy(1))
+
+          assert Enum.sort([left.run_id, right.run_id]) == ["queued-001", "queued-002"]
+          [left, right]
+        end)
+
+      first = Enum.find(leases, &(&1.run_id == "queued-001"))
+
+      TestRepo.query!(
+        """
+        UPDATE docket_runs
+        SET claim_token = NULL, claimed_at = NULL, tenant_admitted_at = NULL,
+            wake_at = $3
+        WHERE run_id = $1 AND claim_token = $2
+        """,
+        [first.run_id, Ecto.UUID.dump!(first.claim_token), DateTime.add(@now, 1, :hour)]
+      )
+
+      assert {:ok, %{leases: [%{run_id: "queued-003"}]}} =
+               RunStore.claim_due(second_context, :system, policy(1))
+
+      assert [["queued-002"], ["queued-003"]] =
+               TestRepo.query!("""
+               SELECT run_id FROM docket_runs
+               WHERE scope_key = 'tenant' AND tenant_admitted_at IS NOT NULL
+               ORDER BY run_id
+               """).rows
     end
 
     test "capped heads rotate so a later eligible tenant makes progress", %{context: context} do
@@ -146,6 +288,43 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                TestRepo.query!("SELECT claim_token FROM docket_runs WHERE run_id = 'queued'").rows
     end
 
+    test "admitted expired work outranks a ready-preferred queued promotion", %{context: context} do
+      assert {:ok, %{version: 1}} = Admin.put_default(context, 2, expected_version: 0)
+      insert_claimed("tenant", "expired", DateTime.add(@now, -10, :second))
+      insert_ready("tenant", "queued", DateTime.add(@now, -5, :second))
+
+      preferred = %{policy(1) | preference: :ready}
+
+      assert {:ok, %{leases: [%{run_id: "expired", claim_attempt: 2}]}} =
+               RunStore.claim_due(context, :system, preferred)
+
+      assert [[nil]] =
+               TestRepo.query!("SELECT claim_token FROM docket_runs WHERE run_id = 'queued'").rows
+    end
+
+    test "class reservation keeps a queued-ready head inside K behind deep admitted expired work",
+         %{
+           context: context
+         } do
+      assert {:ok, %{version: 1}} = Admin.put_default(context, 100, expected_version: 0)
+
+      for index <- 1..40 do
+        insert_claimed(
+          "tenant",
+          "expired-#{String.pad_leading(to_string(index), 2, "0")}",
+          DateTime.add(@now, -10, :second)
+        )
+      end
+
+      insert_ready("tenant", "queued", DateTime.add(@now, -5, :second))
+
+      assert {:ok, %{leases: [expired, %{run_id: "queued"}], poisoned: []}} =
+               RunStore.claim_due(context, :system, policy(2))
+
+      assert String.starts_with?(expired.run_id, "expired-")
+      assert length(admitted_run_ids("tenant")) == 41
+    end
+
     test "poison makes progress without consuming the tenant cap", %{context: context} do
       assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
       insert_run("tenant", "poison", nil, nil, DateTime.add(@now, -2, :second), 5)
@@ -167,6 +346,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                RunStore.claim_due(context, :system, policy(1))
 
       assert live_count("tenant") == 1
+    end
+
+    test "admitted poison releases a slot consumed by the queued head in the same visit", %{
+      context: context
+    } do
+      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      insert_ready("tenant", "admitted-poison", DateTime.add(@now, -2, :second))
+      insert_ready("tenant", "queued", DateTime.add(@now, -1, :second))
+
+      TestRepo.query!(
+        "UPDATE docket_runs SET tenant_admitted_at = $2, claim_attempts = 5 " <>
+          "WHERE run_id = $1",
+        ["admitted-poison", @now]
+      )
+
+      assert {:ok,
+              %{
+                poisoned: [%{run_id: "admitted-poison"}],
+                leases: [%{run_id: "queued"}]
+              }} = RunStore.claim_due(context, :system, policy(3))
+
+      assert [["queued"]] = admitted_run_ids("tenant")
+
+      assert [[1]] =
+               TestRepo.query!(
+                 "SELECT admission_epoch FROM docket_claim_partitions " <>
+                   "WHERE scope_key = 'tenant'"
+               ).rows
+
+      assert [[nil, true]] =
+               TestRepo.query!(
+                 "SELECT tenant_admitted_at, poisoned_at IS NOT NULL " <>
+                   "FROM docket_runs WHERE run_id = 'admitted-poison'"
+               ).rows
     end
 
     test "exact run locks skip a locked candidate and continue around the ring", %{
@@ -268,10 +481,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert policy_row() == policy_before
       assert live_count("tenant") == 0
 
-      assert [[0, nil, nil]] =
+      assert [[0]] =
                TestRepo.query!(
-                 "SELECT admission_epoch, ready_candidate_cursor_at, " <>
-                   "ready_candidate_cursor_id FROM docket_claim_schedule " <>
+                 "SELECT admission_epoch FROM docket_claim_schedule " <>
                    "JOIN docket_claim_partitions USING (scope_key) " <>
                    "WHERE scope_key = 'tenant'"
                ).rows
@@ -286,7 +498,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                       %{contention_phase: :policy_cursor, result: :error}}
     end
 
-    test "later schedule contention is not attributed to the policy cursor", %{
+    test "schedule membership reads do not create a second claim lock path", %{
       context: context
     } do
       handler_id = {__MODULE__, self(), make_ref()}
@@ -326,72 +538,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       send(blocker.pid, {gate, :release})
       assert {:ok, :ok} = Task.await(blocker, 2_000)
 
-      assert {:error, {:claim_policy_unavailable, :lock_contention}} = result
-      assert policy_row() == policy_before
+      assert {:ok, %{leases: [%{run_id: "schedule-lock"}], poisoned: []}} = result
+      assert policy_row() != policy_before
 
-      assert [[0, nil, nil]] =
+      assert [[1]] =
                TestRepo.query!(
-                 "SELECT admission_epoch, ready_candidate_cursor_at, " <>
-                   "ready_candidate_cursor_id FROM docket_claim_schedule " <>
+                 "SELECT admission_epoch FROM docket_claim_schedule " <>
                    "JOIN docket_claim_partitions USING (scope_key) " <>
                    "WHERE scope_key = 'tenant'"
                ).rows
 
-      assert [[nil, nil, 0]] =
+      assert [[token, @now, 1]] =
                TestRepo.query!(
                  "SELECT claim_token, claimed_at, claim_attempts FROM docket_runs " <>
                    "WHERE run_id = 'schedule-lock'"
                ).rows
 
+      refute is_nil(token)
+
       assert_receive {[:docket, :postgres, :claim_policy, :admission], %{contentions: 0},
-                      %{contention_phase: :none, result: :error}}
-    end
-
-    test "concurrent Legacy and TenantFair admission serializes across the engine switch", %{
-      context: context,
-      second_context: second_context
-    } do
-      legacy_context = Docket.Postgres.context(repo: SecondRepo)
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
-      insert_ready("tenant", "engine-a", DateTime.add(@now, -1, :second))
-      insert_ready("tenant", "engine-b", @now)
-
-      parent = self()
-      gate = make_ref()
-
-      tasks =
-        for caller_context <- [legacy_context, second_context] do
-          Task.async(fn ->
-            send(parent, {gate, :ready})
-            receive do: ({^gate, :go} -> :ok)
-            RunStore.claim_due(caller_context, :system, policy(1))
-          end)
-        end
-
-      for _ <- tasks, do: assert_receive({^gate, :ready}, 2_000)
-      Enum.each(tasks, &send(&1.pid, {gate, :go}))
-      results = Enum.map(tasks, &Task.await(&1, 5_000))
-
-      leases =
-        Enum.flat_map(results, fn
-          {:ok, %{leases: leases}} ->
-            leases
-
-          {:error, {:claim_policy_unavailable, reason}}
-          when reason in [:inactive_engine, :lock_contention] ->
-            []
-        end)
-
-      assert length(leases) == 1
-      assert live_count("tenant") == 1
-
-      if Enum.at(results, 1) == {:error, {:claim_policy_unavailable, :lock_contention}} do
-        assert {:ok, %{leases: []}} =
-                 RunStore.claim_due(second_context, :system, policy(1))
-      end
-
-      assert {:error, {:claim_policy_unavailable, :inactive_engine}} =
-               RunStore.claim_due(legacy_context, :system, policy(1))
+                      %{contention_phase: :none, result: :ok}}
     end
 
     test "TenantFair admits tenantless work", %{context: context} do
@@ -465,13 +631,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                Docket.Postgres.ClaimPolicy.TenantFair
     end
 
-    defp tenant_fair_context(repo, default_max_active, opts \\ []) do
+    defp tenant_fair_context(repo, default_max_active_runs, opts \\ []) do
       opts =
         opts
         |> Keyword.put(:repo, repo)
         |> Keyword.put(:claim_policy,
           implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-          default_max_active: default_max_active
+          default_max_active_runs: default_max_active_runs
         )
 
       Docket.Postgres.context(opts)
@@ -492,6 +658,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """
         UPDATE docket_runs
         SET status = 'done', claim_token = NULL, claimed_at = NULL,
+            tenant_admitted_at = NULL,
             finished_at = $3, updated_at = $3
         WHERE run_id = $1 AND claim_token = $2
         """,
@@ -543,10 +710,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """
         INSERT INTO #{runs}
           (run_id, tenant_id, graph_id, graph_hash, status, state,
-           checkpoint_seq, claim_token, claimed_at, wake_at, claim_attempts,
+           checkpoint_seq, claim_token, claimed_at, tenant_admitted_at,
+           wake_at, claim_attempts,
            inserted_at, started_at, updated_at)
         VALUES ($1, $2, 'graph', $3, 'running', $4,
-                7, $5, $6, $7, $8,
+                7, $5, $6, $6, $7, $8,
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         [
@@ -577,6 +745,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ).rows
       |> hd()
       |> hd()
+    end
+
+    defp admitted_run_ids(scope_key) do
+      TestRepo.query!(
+        "SELECT run_id FROM docket_runs WHERE scope_key = $1 " <>
+          "AND tenant_admitted_at IS NOT NULL ORDER BY wake_at, id",
+        [scope_key]
+      ).rows
     end
 
     defp policy_row do

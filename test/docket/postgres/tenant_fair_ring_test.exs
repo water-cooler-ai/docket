@@ -78,21 +78,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           ORDER BY claimed.visit_ordinal, claimed.outcome_ordinal NULLS LAST,
                    claimed.row_kind
           """,
-          [now, cutoff, 2, 5, nil, 4]
+          [now, cutoff, 1, 5, nil, 4]
         ).rows
 
       outcomes = Enum.filter(rows, &(hd(&1) == "outcome"))
       [inspection] = Enum.filter(rows, &(hd(&1) == "inspection"))
 
-      assert length(outcomes) == 2
-      assert Enum.map(outcomes, &Enum.at(&1, 16)) == [1, 1]
-      assert Enum.map(outcomes, &Enum.at(&1, 17)) == [1, 2]
+      assert length(outcomes) == 1
+      assert Enum.map(outcomes, &Enum.at(&1, 16)) == [1]
+      assert Enum.map(outcomes, &Enum.at(&1, 17)) == [1]
       assert Enum.at(inspection, 16) == 1
       assert Enum.at(inspection, 19) == 0
       assert Enum.at(inspection, 20) == Enum.at(inspection, 21)
       assert Enum.at(inspection, 22) == "tenant-0001"
       assert Enum.at(inspection, 23) == "grant"
-      assert Enum.at(inspection, 24) == 2
+      assert Enum.at(inspection, 24) == 1
       assert Enum.at(inspection, 25) == 1
 
       assert [[cursor]] =
@@ -105,6 +105,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  "SELECT admission_epoch FROM docket_claim_partitions " <>
                    "WHERE scope_key = 'tenant-0001'"
                ).rows
+    end
+
+    test "TenantFair installs one unversioned seven-argument claim ABI" do
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      assert [[RingFunction.identity_arguments()]] ==
+               TestRepo.query!("""
+               SELECT pg_get_function_identity_arguments(procedure.oid)
+               FROM pg_proc AS procedure
+               JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+               WHERE namespace.nspname = current_schema()
+                 AND procedure.proname = 'docket_tenant_fair_claim'
+               """).rows
+
+      assert_raise Postgrex.Error, ~r/docket_tenant_fair_claim.*does not exist/s, fn ->
+        TestRepo.query!(
+          """
+          SELECT claimed.*
+          FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, false, 3)
+            AS claimed(#{RingFunction.result_definition()})
+          """,
+          [now, DateTime.add(now, -60, :second), 1, 5, nil, 1]
+        )
+      end
     end
 
     test "installed function never substitutes K+1 when all first-K exact locks miss" do
@@ -181,7 +205,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ).rows
     end
 
-    test "installed function skips a partial exact-lock miss within one frozen attempt set" do
+    test "installed function never bypasses a locked queued FIFO head" do
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       seed_scope("partial", 10)
 
@@ -220,23 +244,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert_receive {:first_locked, blocker_pid}, 2_000
 
-      [outcome] =
-        raw_claim!(now, demand: 1, default_max: 10)
-        |> Enum.filter(&(&1.row_kind == "outcome"))
-
-      assert %{run_id: "partial-2", visit_ordinal: 1, outcome_ordinal: 1} = outcome
+      assert raw_claim!(now, demand: 1, default_max: 10)
+             |> Enum.filter(&(&1.row_kind == "outcome")) == []
 
       send(blocker_pid, :release)
       assert Task.await(blocker, 2_000) == {:ok, :released}
 
+      [outcome] =
+        raw_claim!(now, demand: 1, default_max: 10)
+        |> Enum.filter(&(&1.row_kind == "outcome"))
+
+      assert %{run_id: "partial-1", outcome_ordinal: 1} = outcome
+
       assert [[nil, nil, 0]] =
                TestRepo.query!(
                  "SELECT claim_token, claimed_at, claim_attempts FROM docket_runs " <>
-                   "WHERE run_id = 'partial-1'"
+                   "WHERE run_id = 'partial-2'"
                ).rows
     end
 
-    test "expired service preserves capped ready continuation across K pages in one call" do
+    test "capped FIFO never rotates to a deep unadmitted poison" do
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       seed_scope("deep", 1)
 
@@ -244,11 +271,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """
         INSERT INTO docket_runs
           (run_id, tenant_id, graph_id, graph_hash, status, state,
-           checkpoint_seq, claim_token, claimed_at, claim_attempts,
+           checkpoint_seq, claim_token, claimed_at, tenant_admitted_at, claim_attempts,
            inserted_at, started_at, updated_at)
         VALUES
           ('deep-live', 'deep', 'graph', 'hash', 'running', decode('01', 'hex'),
-           1, pg_catalog.gen_random_uuid(), $1::timestamptz - interval '2 hours', 1,
+           1, pg_catalog.gen_random_uuid(), $1::timestamptz - interval '2 hours',
+           $1::timestamptz - interval '2 hours', 1,
            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         [now]
@@ -274,27 +302,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       outcomes = Enum.filter(rows, &(&1.row_kind == "outcome"))
       inspections = Enum.filter(rows, &(&1.row_kind == "inspection"))
 
-      assert Enum.map(outcomes, & &1.work_class) == ["expired", "ready"]
-      assert Enum.map(outcomes, & &1.visit_ordinal) == [1, 3]
-
-      outcome = List.last(outcomes)
-
-      assert %{
-               run_id: "deep-33",
-               claim_token: nil,
-               work_class: "ready",
-               visit_ordinal: 3,
-               poison_reason: "max_claim_attempts_exceeded"
-             } = outcome
-
-      assert Enum.map(inspections, & &1.disposition) == ["grant", "empty_page", "grant"]
-      assert Enum.map(inspections, & &1.epoch_delta) == [1, 0, 1]
-
-      assert [[nil, nil]] =
-               TestRepo.query!(
-                 "SELECT ready_candidate_cursor_at, ready_candidate_cursor_id " <>
-                   "FROM docket_claim_schedule WHERE scope_key = 'deep'"
-               ).rows
+      assert Enum.map(outcomes, & &1.work_class) == ["expired"]
+      assert Enum.map(outcomes, & &1.visit_ordinal) == [1]
+      assert Enum.any?(inspections, &(&1.disposition == "cap_debt_denial"))
+      assert Enum.sum(Enum.map(inspections, & &1.epoch_delta)) == 1
 
       assert [[32]] =
                TestRepo.query!(
@@ -303,7 +314,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    "AND claim_token IS NULL AND poisoned_at IS NULL AND claim_attempts = 0"
                ).rows
 
-      assert [[2]] =
+      assert [[1]] =
                TestRepo.query!(
                  "SELECT admission_epoch FROM docket_claim_partitions " <>
                    "WHERE scope_key = 'deep'"
@@ -452,11 +463,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """
         INSERT INTO docket_runs
           (run_id, tenant_id, graph_id, graph_hash, status, state,
-           checkpoint_seq, claim_token, claimed_at, claim_attempts,
+           checkpoint_seq, claim_token, claimed_at, tenant_admitted_at, claim_attempts,
            inserted_at, started_at, updated_at)
         VALUES
           ('expired-1', 'expired', 'graph', 'hash', 'running', decode('01', 'hex'),
-           1, pg_catalog.gen_random_uuid(), $1::timestamptz - interval '2 hours', 1,
+           1, pg_catalog.gen_random_uuid(), $1::timestamptz - interval '2 hours',
+           $1::timestamptz - interval '2 hours', 1,
            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         [now]
@@ -476,7 +488,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         raw_claim!(now, demand: 3, default_max: 10)
         |> Enum.filter(&(&1.row_kind == "outcome"))
 
-      assert Enum.map(outcomes, & &1.work_class) == ["ready", "ready", "expired"]
+      assert Enum.map(outcomes, & &1.work_class) == ["queued_ready", "queued_ready", "expired"]
       assert Enum.map(outcomes, & &1.visit_ordinal) == [1, 1, 2]
 
       assert [[nil]] =
@@ -514,11 +526,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """
         INSERT INTO docket_runs
           (run_id, tenant_id, graph_id, graph_hash, status, state,
-           checkpoint_seq, claim_token, claimed_at, claim_attempts,
+           checkpoint_seq, claim_token, claimed_at, tenant_admitted_at, claim_attempts,
            inserted_at, started_at, updated_at)
         VALUES
           ('expired-poison', $1, 'graph', 'hash', 'running', decode('01', 'hex'),
-           1, pg_catalog.gen_random_uuid(), $2::timestamptz - interval '2 hours', 5,
+           1, pg_catalog.gen_random_uuid(), $2::timestamptz - interval '2 hours',
+           $2::timestamptz - interval '2 hours', 5,
            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         [expired_poison, now]
@@ -542,7 +555,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Enum.map(outcomes, & &1.run_id) ==
                ["ready-before", "expired-poison", "ready-after"]
 
-      assert Enum.map(outcomes, & &1.work_class) == ["ready", "expired", "ready"]
+      assert Enum.map(outcomes, & &1.work_class) == ["queued_ready", "expired", "queued_ready"]
       assert Enum.map(outcomes, & &1.visit_ordinal) == [1, 2, 3]
 
       assert %{claim_token: nil, poison_reason: "max_claim_attempts_exceeded"} =
@@ -578,7 +591,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       inspections = Enum.filter(rows, &(&1.row_kind == "inspection"))
 
       assert length(outcomes) == 1
-      assert hd(outcomes).work_class == "ready"
+      assert hd(outcomes).work_class == "queued_ready"
       assert length(inspections) == Budgets.scan_inspections()
 
       assert [[1]] =
@@ -591,15 +604,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       schedule = ~s("docket_claim_schedule")
       runs = ~s("docket_runs")
       scan = QueryShapes.scan_positions(schedule)
-      ready_candidates = QueryShapes.run_candidates(runs, :ready)
+      admitted_ready_candidates = QueryShapes.run_candidates(runs, :admitted_ready)
+      queued_ready_candidates = QueryShapes.run_candidates(runs, :queued_ready)
       expired_candidates = QueryShapes.run_candidates(runs, :expired)
-      rotating_ready = QueryShapes.rotating_run_candidates(runs, :ready)
 
       for statement <- [
             scan,
-            ready_candidates,
-            expired_candidates,
-            rotating_ready
+            admitted_ready_candidates,
+            queued_ready_candidates,
+            expired_candidates
           ] do
         refute statement =~ ";"
         refute statement =~ "DISTINCT ON"
@@ -611,13 +624,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert scan =~ "WHERE unfinished_count > 0"
       assert scan =~ "visit_ordinal < 32"
-      assert ready_candidates =~ "candidate.scope_key = $1"
-      assert ready_candidates =~ "LIMIT 16"
+      assert admitted_ready_candidates =~ "candidate.tenant_admitted_at IS NOT NULL"
+      assert admitted_ready_candidates =~ "LIMIT 16"
+      assert queued_ready_candidates =~ "candidate.tenant_admitted_at IS NULL"
+      assert queued_ready_candidates =~ "LIMIT 16"
       assert expired_candidates =~ "candidate.scope_key = $1"
       assert expired_candidates =~ "LIMIT 16"
-      assert rotating_ready =~ "(candidate.wake_at, candidate.id) > ($3, $4)"
-      assert rotating_ready =~ "(candidate.wake_at, candidate.id) <= ($3, $4)"
-
       exact_lock = QueryShapes.exact_run_lock_attempts(runs)
       assert exact_lock =~ "unnest(($1::bigint[])[1:16])"
       assert exact_lock =~ "LIMIT 16"
@@ -646,12 +658,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ).rows
 
       assert length(rows) == Budgets.scan_inspections()
-      assert Enum.map(rows, &Enum.at(&1, 5)) == Enum.to_list(1..Budgets.scan_inspections())
+      assert Enum.map(rows, &Enum.at(&1, 3)) == Enum.to_list(1..Budgets.scan_inspections())
 
       assert rows |> Enum.map(&Enum.at(&1, 1)) |> Enum.uniq() |> Enum.sort() ==
                ["tenant-0001", "tenant-0040"]
 
-      assert rows |> Enum.map(&Enum.at(&1, 6)) |> List.last() == 16
+      assert rows |> Enum.map(&Enum.at(&1, 4)) |> List.last() == 16
 
       TestRepo.query!(
         "UPDATE docket_runs " <>
@@ -668,7 +680,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert length(one_position_rows) == Budgets.scan_inspections()
       assert Enum.uniq(Enum.map(one_position_rows, &Enum.at(&1, 1))) == ["tenant-0001"]
-      assert one_position_rows |> List.last() |> Enum.at(6) == 31
+      assert one_position_rows |> List.last() |> Enum.at(4) == 31
     end
 
     test "unfinished counts follow nonterminal state atomically and protect membership" do
@@ -804,94 +816,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                "SELECT unfinished_count FROM docket_claim_schedule " <>
                  "WHERE scope_key = 'tenant-0001'"
              ).rows == [[2]]
-    end
-
-    test "persisted ready continuation reaches poison beyond two cap-denied K pages" do
-      now = DateTime.utc_now()
-
-      TestRepo.query!("""
-      INSERT INTO docket_graph_versions
-        (tenant_id, graph_id, graph_hash, graph, inserted_at)
-      VALUES ('deep', 'graph', 'hash', decode('01', 'hex'), CURRENT_TIMESTAMP)
-      """)
-
-      TestRepo.query!("INSERT INTO docket_claim_partitions (scope_key) VALUES ('deep')")
-
-      TestRepo.query!(
-        """
-        INSERT INTO docket_runs
-          (run_id, tenant_id, graph_id, graph_hash, status, state,
-           checkpoint_seq, wake_at, claim_attempts,
-           inserted_at, started_at, updated_at)
-        SELECT 'deep-' || series, 'deep', 'graph', 'hash', 'running',
-               decode('01', 'hex'), 1,
-               $1::timestamptz + series * interval '1 microsecond',
-               CASE WHEN series = 33 THEN 5 ELSE 0 END,
-               CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-        FROM generate_series(1, 33) AS series
-        """,
-        [now]
-      )
-
-      threshold = DateTime.add(now, 60, :second)
-
-      first_page =
-        TestRepo.query!(
-          QueryShapes.run_candidates(~s("docket_runs"), :ready),
-          ["deep", threshold]
-        ).rows
-
-      assert length(first_page) == Budgets.run_lock_attempts()
-      assert Enum.all?(first_page, &(Enum.at(&1, 2) == 0))
-      [last_id, last_eligible_at | _] = first_page |> List.last() |> Enum.take(2)
-
-      TestRepo.query!(
-        """
-        UPDATE docket_claim_schedule
-        SET ready_candidate_cursor_at = $1,
-            ready_candidate_cursor_id = $2
-        WHERE scope_key = 'deep'
-        """,
-        [last_eligible_at, last_id]
-      )
-
-      [[persisted_at, persisted_id]] =
-        TestRepo.query!(
-          "SELECT ready_candidate_cursor_at, ready_candidate_cursor_id " <>
-            "FROM docket_claim_schedule WHERE scope_key = 'deep'"
-        ).rows
-
-      second_page =
-        TestRepo.query!(
-          QueryShapes.rotating_run_candidates(~s("docket_runs"), :ready),
-          ["deep", threshold, persisted_at, persisted_id]
-        ).rows
-
-      assert length(second_page) == Budgets.run_lock_attempts()
-      assert Enum.all?(second_page, &(Enum.at(&1, 2) == 0))
-      [last_id, last_eligible_at | _] = second_page |> List.last() |> Enum.take(2)
-
-      TestRepo.query!(
-        """
-        UPDATE docket_claim_schedule
-        SET ready_candidate_cursor_at = $1,
-            ready_candidate_cursor_id = $2
-        WHERE scope_key = 'deep'
-        """,
-        [last_eligible_at, last_id]
-      )
-
-      continued =
-        TestRepo.query!(
-          QueryShapes.rotating_run_candidates(~s("docket_runs"), :ready),
-          ["deep", threshold, last_eligible_at, last_id]
-        ).rows
-
-      assert length(continued) == Budgets.run_lock_attempts()
-      assert [poison | _] = continued
-      assert Enum.at(poison, 2) == 5
-      assert Enum.at(poison, 4) == false
-      assert Enum.count(continued, &Enum.at(&1, 4)) == 15
     end
 
     test "exact partition authority attempt does not skip to a later partition" do

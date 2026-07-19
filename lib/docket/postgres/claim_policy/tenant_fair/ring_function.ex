@@ -6,8 +6,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     One call accepts a point in time, expired-claim cutoff, requested outcome
     count, poison-attempt threshold, optional ready/expired preference,
-    bootstrap default cap, and trace flag. It returns newly claimed leases,
-    poisoned runs, or a normalized pre-admission error.
+    bootstrap default cap, and trace flag. The function returns newly claimed
+    leases, poisoned runs, or a normalized pre-admission error.
 
     ## Scheduling model
 
@@ -39,8 +39,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     ## Policy and partition authority
 
     The function requires a writable Read Committed transaction. It preserves
-    a lower caller `lock_timeout`; otherwise it limits policy-cursor acquisition
-    to 250 ms.
+    a lower caller `lock_timeout`; otherwise it limits lock waits throughout
+    the function to 250 ms.
 
     It initializes the persisted default cap if necessary, switches the
     singleton policy to TenantFair, and holds that row `FOR UPDATE`. That lock
@@ -52,27 +52,33 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     For every entered visit, the function attempts the exact partition with
     `FOR NO KEY UPDATE SKIP LOCKED`. Under that authority it freshly counts
-    running, unpoisoned rows with claim tokens. The effective cap is the
-    partition override or persisted default; available ready capacity is the
-    nonnegative difference between that cap and the live count.
+    healthy running rows carrying the durable `tenant_admitted_at` marker.
+    The effective cap is the partition override or persisted default;
+    promotion capacity is the nonnegative difference between that cap and the
+    admitted count.
 
     ## Ready and expired candidates
 
-    Ready work is an unclaimed running row whose `wake_at` is due. Admitting an
-    ordinary ready row creates a claim token and consumes one available cap
-    slot. Cap debt blocks ordinary ready work until the live count falls below
-    the effective cap.
+    Ready work is an unclaimed running row whose `wake_at` is due. An admitted
+    ready row already has `tenant_admitted_at` and may reacquire a transient
+    claim at or above the cap. A queued ready row has no marker; its FIFO-head
+    promotion atomically installs both the marker and a claim and requires a
+    free logical-run slot. Cap debt blocks promotion, not reacquisition.
 
     Expired work is a claimed running row whose `claimed_at` precedes the
     cutoff. Replacing its claim token is a count-neutral steal, so ordinary
     expired work remains admissible at or above the cap.
 
     A ready or expired row at the attempt threshold becomes a poison outcome.
-    Poisoning clears scheduling and claim state, returns no claim token, is
-    allowed at the cap, and counts as serving that row's ready or expired class.
+    Poisoning clears scheduling, claim, and admission state and returns no
+    claim token. An admitted poison can therefore retire a cohort member at
+    the cap. A queued poison must itself be the FIFO head and requires a free
+    promotion slot; it never bypasses older ordinary queued work.
 
-    The function reads at most `K = 16` structural ready candidates and 16
-    structural expired candidates for the partition. From their bounded union
+    The function reads a shared page of at most `K = 16` structural ready
+    candidates: admitted-ready rows first, then the oldest queued-ready rows
+    that fit the residual page. It separately reads at most 16 expired
+    candidates. From their bounded union
     it ranks and freezes at most 16 exact run IDs. Demand-one calls put the
     requested class head first and retain the other class as fallback. Calls
     with demand of at least two reserve service for both ready and expired work
@@ -80,33 +86,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     slot remains while a class is still unserved, the other class cannot consume
     it; the call may therefore intentionally return one fewer outcome.
 
-    The frozen attempt set is ordered by class reservation, demand-one
-    preference, poison before ordinary work, eligible time, and run ID. The
+    The frozen attempt set first retains each unserved class head when demand
+    is at least two, so either class cannot disappear at the `K` truncation,
+    then prefers admitted work and applies demand-one preference. Mutation
+    still orders admitted work before promotion. Queued rows retain exact
+    `(wake_at, id)` FIFO order even when a later queued row is poison. The
     function locks only those exact IDs with `FOR UPDATE SKIP LOCKED`. A skipped
     or stale ID is not replaced by structural row 17 or any ID outside the
     frozen set during that visit.
 
     After locking, every row is rechecked against the frozen scope, ready or
     expired class, poison class, running/poisoned state, claim state, wake or
-    cutoff time, and remaining ready capacity. Only rows that still satisfy all
-    authoritative predicates are mutated.
-
-    ## Ready continuation
-
-    A capped partition can contain more than 16 ordinary ready rows before a
-    later ready poison row. Its schedule row therefore stores a ready-candidate
-    continuation tuple.
-
-    Below the cap, ready discovery starts at the oldest row and clears the
-    continuation. At the cap, discovery starts after the effective continuation
-    and wraps once to fill the bounded page. If a capped ready page produces no
-    ready outcome, the function stages its final structural tuple even when an
-    expired outcome was granted. An empty ready page or a committed ready lease
-    or poison outcome stages a clear.
-
-    Continuation state is loaded on a scope's first actual visit and then held
-    in function-local arrays. Repeated visits in the same call use the latest
-    staged value. Only the final decision for each scope is written back.
+    cutoff time, and remaining promotion capacity. Only rows that still satisfy all
+    authoritative predicates are mutated. Queue mutation also requires the
+    next contiguous frozen queue ordinal and an authoritative absence check for
+    an older currently visible unadmitted head. A locked or stale head therefore
+    blocks every later promotion in that visit. TenantFair never rotates queued
+    discovery.
 
     ## Lock and write order
 
@@ -114,10 +110,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
         policy cursor -> partition -> frozen run IDs
 
-    The function never locks a schedule row and then seeks another run.
-    Continuation writes are staged until all visits finish, then flushed before
-    the final policy cursor is persisted. Policy, continuation, run, epoch, and
-    cursor changes are part of the caller's transaction and roll back together.
+    The function never locks a schedule row and then seeks another run. Policy,
+    run, epoch, and cursor changes are part of the caller's transaction and roll
+    back together.
 
     ## Results and trace mode
 
@@ -257,25 +252,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         v_partition record;
         v_candidate record;
         v_updated record;
-        v_live_count bigint;
-        v_ready_slots bigint;
+        v_admitted_count bigint;
+        v_promotion_slots bigint;
         v_attempt_ids bigint[] := ARRAY[]::bigint[];
         v_attempt_classes text[] := ARRAY[]::text[];
         v_attempt_poisons boolean[] := ARRAY[]::boolean[];
+        v_attempt_admitted boolean[] := ARRAY[]::boolean[];
+        v_attempt_queue_ordinals integer[] := ARRAY[]::integer[];
         v_locked_ids bigint[] := ARRAY[]::bigint[];
-        v_ready_page_count integer;
-        v_ready_page_last_at timestamp with time zone;
-        v_ready_page_last_id bigint;
         v_grant_limit integer;
         v_grant_count integer;
         v_rechecked_count integer;
         v_disposition text;
-        v_stage_index integer;
-        v_stage_scopes text[] := ARRAY[]::text[];
-        v_stage_cursor_ats timestamp with time zone[] := ARRAY[]::timestamp with time zone[];
-        v_stage_cursor_ids bigint[] := ARRAY[]::bigint[];
-        v_effective_cursor_at timestamp with time zone;
-        v_effective_cursor_id bigint;
+        v_next_queue_ordinal integer;
+        v_candidate_counted boolean;
       BEGIN
         IF p_now IS NULL OR p_cutoff IS NULL OR p_cutoff > p_now OR
            p_demand IS NULL OR p_demand <= 0 OR
@@ -417,88 +407,70 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
           IF FOUND THEN
             SELECT count(*)::bigint
-            INTO v_live_count
+            INTO v_admitted_count
             FROM #{runs}
             WHERE scope_key = v_partition.scope_key
               AND status = 'running'
               AND poisoned_at IS NULL
-              AND claim_token IS NOT NULL;
+              AND tenant_admitted_at IS NOT NULL;
 
-            v_ready_slots := greatest(v_partition.max_active::bigint - v_live_count, 0);
-            v_stage_index := array_position(v_stage_scopes, v_partition.scope_key);
+            v_promotion_slots := greatest(v_partition.max_active::bigint - v_admitted_count, 0);
 
-            IF v_stage_index IS NULL THEN
-              SELECT ready_candidate_cursor_at, ready_candidate_cursor_id
-              INTO v_effective_cursor_at, v_effective_cursor_id
-              FROM #{schedule}
-              WHERE scope_key = v_partition.scope_key;
-
-              v_stage_scopes := array_append(v_stage_scopes, v_partition.scope_key);
-              v_stage_cursor_ats := array_append(v_stage_cursor_ats, v_effective_cursor_at);
-              v_stage_cursor_ids := array_append(v_stage_cursor_ids, v_effective_cursor_id);
-              v_stage_index := cardinality(v_stage_scopes);
-            ELSE
-              v_effective_cursor_at := v_stage_cursor_ats[v_stage_index];
-              v_effective_cursor_id := v_stage_cursor_ids[v_stage_index];
-            END IF;
-
-            WITH ready_after AS MATERIALIZED (
+            WITH admitted_ready_page AS MATERIALIZED (
               SELECT candidate.id, candidate.wake_at AS eligible_at,
                      candidate.claim_attempts, 'ready'::text AS work_class,
-                     false AS wrapped
+                     true AS admitted, NULL::integer AS queue_ordinal
               FROM #{runs} AS candidate
               WHERE candidate.scope_key = v_partition.scope_key
                 AND candidate.status = 'running'
                 AND candidate.poisoned_at IS NULL
+                AND candidate.tenant_admitted_at IS NOT NULL
                 AND candidate.claim_token IS NULL
                 AND candidate.wake_at IS NOT NULL AND candidate.wake_at <= p_now
-                AND (
-                  v_ready_slots > 0 OR v_effective_cursor_at IS NULL OR
-                  (candidate.wake_at, candidate.id) >
-                    (v_effective_cursor_at, v_effective_cursor_id)
-                )
               ORDER BY candidate.wake_at, candidate.id
               LIMIT #{run_budget}
             ),
             ready_residual AS MATERIALIZED (
               SELECT greatest(#{run_budget} - count(*)::integer, 0) AS remaining
-              FROM ready_after
+              FROM admitted_ready_page
             ),
-            ready_wrapped AS MATERIALIZED (
+            queued_ready_page AS MATERIALIZED (
               SELECT candidate.id, candidate.wake_at AS eligible_at,
                      candidate.claim_attempts, 'ready'::text AS work_class,
-                     true AS wrapped
-              FROM #{runs} AS candidate
-              WHERE v_ready_slots = 0 AND v_effective_cursor_at IS NOT NULL
-                AND candidate.scope_key = v_partition.scope_key
-                AND candidate.status = 'running'
-                AND candidate.poisoned_at IS NULL
-                AND candidate.claim_token IS NULL
-                AND candidate.wake_at IS NOT NULL AND candidate.wake_at <= p_now
-                AND (candidate.wake_at, candidate.id) <=
-                    (v_effective_cursor_at, v_effective_cursor_id)
-              ORDER BY candidate.wake_at, candidate.id
-              LIMIT (SELECT remaining FROM ready_residual)
-            ),
-            ready_page AS MATERIALIZED (
-              SELECT * FROM ready_after
-              UNION ALL
-              SELECT * FROM ready_wrapped
-            ),
-            expired_page AS MATERIALIZED (
-              SELECT candidate.id, candidate.claimed_at AS eligible_at,
-                     candidate.claim_attempts, 'expired'::text AS work_class
+                     false AS admitted,
+                     row_number() OVER (ORDER BY candidate.wake_at, candidate.id)::integer
+                       AS queue_ordinal
               FROM #{runs} AS candidate
               WHERE candidate.scope_key = v_partition.scope_key
                 AND candidate.status = 'running'
                 AND candidate.poisoned_at IS NULL
+                AND candidate.tenant_admitted_at IS NULL
+                AND candidate.claim_token IS NULL
+                AND candidate.wake_at IS NOT NULL AND candidate.wake_at <= p_now
+              ORDER BY candidate.wake_at, candidate.id
+              LIMIT (SELECT remaining FROM ready_residual)
+            ),
+            ready_page AS MATERIALIZED (
+              SELECT * FROM admitted_ready_page
+              UNION ALL
+              SELECT * FROM queued_ready_page
+            ),
+            expired_page AS MATERIALIZED (
+              SELECT candidate.id, candidate.claimed_at AS eligible_at,
+                     candidate.claim_attempts, 'expired'::text AS work_class,
+                     true AS admitted, NULL::integer AS queue_ordinal
+              FROM #{runs} AS candidate
+              WHERE candidate.scope_key = v_partition.scope_key
+                AND candidate.status = 'running'
+                AND candidate.poisoned_at IS NULL
+                AND candidate.tenant_admitted_at IS NOT NULL
                 AND candidate.claim_token IS NOT NULL
                 AND candidate.claimed_at < p_cutoff
               ORDER BY candidate.claimed_at, candidate.id
               LIMIT #{run_budget}
             ),
             candidates AS MATERIALIZED (
-              SELECT id, eligible_at, claim_attempts, work_class FROM ready_page
+              SELECT * FROM ready_page
               UNION ALL
               SELECT * FROM expired_page
             ),
@@ -507,12 +479,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                      candidates.claim_attempts >= p_max_attempts AS poison,
                      row_number() OVER (
                        PARTITION BY candidates.work_class
-                       ORDER BY candidates.eligible_at, candidates.id
+                       ORDER BY
+                         CASE WHEN candidates.work_class = 'ready' AND candidates.admitted
+                           THEN 0
+                           WHEN candidates.work_class = 'ready' THEN 1
+                           ELSE 0 END,
+                         candidates.queue_ordinal NULLS FIRST,
+                         candidates.eligible_at, candidates.id
                      ) AS class_rank
               FROM candidates
-              WHERE candidates.work_class = 'expired'
-                 OR candidates.claim_attempts >= p_max_attempts
-                 OR v_ready_slots > 0
             ),
             prioritized AS MATERIALIZED (
               SELECT ranked.*,
@@ -521,15 +496,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                            (work_class = 'ready' AND NOT v_served_ready OR
                             work_class = 'expired' AND NOT v_served_expired)
                          THEN 0 ELSE 1 END,
+                       CASE WHEN admitted THEN 0 ELSE 1 END,
                        CASE WHEN p_demand = 1 AND class_rank = 1 THEN 0 ELSE 1 END,
                        CASE WHEN p_demand = 1 AND work_class = p_preference THEN 0 ELSE 1 END,
+                       queue_ordinal NULLS FIRST,
                        CASE WHEN poison THEN 0 ELSE 1 END,
                        eligible_at, id
                      ) AS attempt_ordinal
               FROM ranked
             ),
             chosen AS MATERIALIZED (
-              SELECT id, work_class, eligible_at, poison, attempt_ordinal
+              SELECT id, work_class, eligible_at, poison, admitted,
+                     queue_ordinal, attempt_ordinal
               FROM prioritized
               ORDER BY attempt_ordinal
               LIMIT #{run_budget}
@@ -540,23 +518,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                             ARRAY[]::text[]),
                    COALESCE(array_agg(chosen.poison ORDER BY chosen.attempt_ordinal),
                             ARRAY[]::boolean[]),
-                   (SELECT count(*)::integer FROM ready_page),
-                   (SELECT eligible_at FROM ready_page
-                    ORDER BY wrapped DESC, eligible_at DESC, id DESC LIMIT 1),
-                   (SELECT id FROM ready_page
-                    ORDER BY wrapped DESC, eligible_at DESC, id DESC LIMIT 1)
+                   COALESCE(array_agg(chosen.admitted ORDER BY chosen.attempt_ordinal),
+                            ARRAY[]::boolean[]),
+                   COALESCE(array_agg(chosen.queue_ordinal ORDER BY chosen.attempt_ordinal),
+                            ARRAY[]::integer[])
             INTO v_attempt_ids, v_attempt_classes, v_attempt_poisons,
-                 v_ready_page_count,
-                 v_ready_page_last_at, v_ready_page_last_id
+                 v_attempt_admitted, v_attempt_queue_ordinals
             FROM chosen;
-
-            IF v_ready_slots > 0 OR v_ready_page_count = 0 THEN
-              v_stage_cursor_ats[v_stage_index] := NULL;
-              v_stage_cursor_ids[v_stage_index] := NULL;
-            ELSE
-              v_stage_cursor_ats[v_stage_index] := v_ready_page_last_at;
-              v_stage_cursor_ids[v_stage_index] := v_ready_page_last_id;
-            END IF;
 
             SELECT COALESCE(array_agg(locked.id ORDER BY locked.ordinality), ARRAY[]::bigint[])
             INTO v_locked_ids
@@ -570,6 +538,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             ) AS locked;
 
             v_grant_limit := least(#{grant_budget}, v_remaining);
+            v_next_queue_ordinal := 1;
             v_disposition := CASE
               WHEN cardinality(v_attempt_ids) = 0 THEN 'empty_page'
               WHEN cardinality(v_locked_ids) = 0 THEN 'lock_miss'
@@ -580,11 +549,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               WITH locked AS MATERIALIZED (
                 SELECT candidate.*,
                        attempted.work_class,
-                       CASE WHEN candidate.claim_token IS NULL
+                       CASE WHEN attempted.work_class = 'ready'
                          THEN candidate.wake_at ELSE candidate.claimed_at END AS eligible_at,
-                       attempted.poison
-                FROM unnest(v_attempt_ids, v_attempt_classes, v_attempt_poisons)
-                  WITH ORDINALITY AS attempted(id, work_class, poison, ordinality)
+                       attempted.poison, attempted.admitted,
+                       attempted.queue_ordinal
+                FROM unnest(v_attempt_ids, v_attempt_classes, v_attempt_poisons,
+                            v_attempt_admitted, v_attempt_queue_ordinals)
+                  WITH ORDINALITY AS attempted(
+                    id, work_class, poison, admitted, queue_ordinal, ordinality
+                  )
                 JOIN #{runs} AS candidate ON candidate.id = attempted.id
                 WHERE candidate.scope_key = v_partition.scope_key
                   AND candidate.id = ANY(v_locked_ids)
@@ -592,28 +565,37 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                   AND candidate.poisoned_at IS NULL
                   AND attempted.poison = (candidate.claim_attempts >= p_max_attempts)
                   AND (
-                    attempted.work_class = 'ready' AND candidate.claim_token IS NULL AND
+                    attempted.work_class = 'ready' AND
+                    attempted.admitted = (candidate.tenant_admitted_at IS NOT NULL) AND
+                    candidate.claim_token IS NULL AND
                     candidate.wake_at IS NOT NULL AND
                     candidate.wake_at <= p_now OR
-                    attempted.work_class = 'expired' AND candidate.claim_token IS NOT NULL AND
+                    attempted.work_class = 'expired' AND
+                    candidate.tenant_admitted_at IS NOT NULL AND
+                    candidate.claim_token IS NOT NULL AND
                     candidate.claimed_at < p_cutoff
                   )
               ),
               ranked AS (
                 SELECT locked.*,
                        row_number() OVER (
-                         PARTITION BY work_class ORDER BY eligible_at, id
+                         PARTITION BY work_class ORDER BY
+                           CASE WHEN work_class = 'ready' AND admitted THEN 0
+                                WHEN work_class = 'ready' THEN 1 ELSE 0 END,
+                           queue_ordinal NULLS FIRST, eligible_at, id
                        ) AS class_rank
                 FROM locked
               )
               SELECT * FROM ranked
               ORDER BY
+                CASE WHEN admitted THEN 0 ELSE 1 END,
                 CASE WHEN p_demand >= 2 AND class_rank = 1 AND
                     (work_class = 'ready' AND NOT v_served_ready OR
                      work_class = 'expired' AND NOT v_served_expired)
                   THEN 0 ELSE 1 END,
                 CASE WHEN p_demand = 1 AND class_rank = 1 THEN 0 ELSE 1 END,
                 CASE WHEN p_demand = 1 AND work_class = p_preference THEN 0 ELSE 1 END,
+                queue_ordinal NULLS FIRST,
                 CASE WHEN poison THEN 0 ELSE 1 END,
                 eligible_at, id
             LOOP
@@ -626,15 +608,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 CONTINUE;
               END IF;
 
-              IF v_candidate.work_class = 'ready' AND NOT v_candidate.poison AND
-                 v_ready_slots = 0 THEN
+              IF v_candidate.work_class = 'ready' AND NOT v_candidate.admitted AND
+                 v_candidate.queue_ordinal <> v_next_queue_ordinal THEN
                 CONTINUE;
               END IF;
+
+              IF v_candidate.work_class = 'ready' AND NOT v_candidate.admitted AND
+                 v_promotion_slots = 0 THEN
+                CONTINUE;
+              END IF;
+
+              v_candidate_counted := v_candidate.tenant_admitted_at IS NOT NULL;
 
               UPDATE #{runs} AS admitted
               SET claim_token = CASE WHEN v_candidate.poison
                     THEN NULL ELSE pg_catalog.gen_random_uuid() END,
                   claimed_at = CASE WHEN v_candidate.poison THEN NULL ELSE p_now END,
+                  tenant_admitted_at = CASE
+                    WHEN v_candidate.poison THEN NULL
+                    WHEN v_candidate.work_class = 'ready' AND NOT v_candidate.admitted
+                      THEN p_now
+                    ELSE admitted.tenant_admitted_at
+                  END,
                   wake_at = NULL,
                   claim_attempts = CASE WHEN v_candidate.poison
                     THEN admitted.claim_attempts ELSE admitted.claim_attempts + 1 END,
@@ -646,6 +641,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 AND admitted.status = 'running'
                 AND admitted.poisoned_at IS NULL
                 AND (
+                  v_candidate.work_class = 'expired' AND
+                    admitted.tenant_admitted_at IS NOT NULL OR
+                  v_candidate.work_class = 'ready' AND v_candidate.admitted AND
+                    admitted.tenant_admitted_at IS NOT NULL OR
+                  v_candidate.work_class = 'ready' AND NOT v_candidate.admitted AND
+                    admitted.tenant_admitted_at IS NULL
+                )
+                AND (
                   v_candidate.work_class = 'ready' AND admitted.claim_token IS NULL AND
                   admitted.wake_at IS NOT NULL AND admitted.wake_at <= p_now OR
                   v_candidate.work_class = 'expired' AND admitted.claim_token IS NOT NULL AND
@@ -654,6 +657,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 AND (
                   v_candidate.poison AND admitted.claim_attempts >= p_max_attempts OR
                   NOT v_candidate.poison AND admitted.claim_attempts < p_max_attempts
+                )
+                AND (
+                  v_candidate.work_class <> 'ready' OR v_candidate.admitted OR
+                  NOT EXISTS (
+                    SELECT 1
+                    FROM #{runs} AS earlier
+                    WHERE earlier.scope_key = v_partition.scope_key
+                      AND earlier.status = 'running'
+                      AND earlier.poisoned_at IS NULL
+                      AND earlier.tenant_admitted_at IS NULL
+                      AND earlier.claim_token IS NULL
+                      AND earlier.wake_at IS NOT NULL
+                      AND earlier.wake_at <= p_now
+                      AND (earlier.wake_at, earlier.id) <
+                          (admitted.wake_at, admitted.id)
+                  )
                 )
               RETURNING admitted.run_id, admitted.tenant_id, admitted.graph_id,
                         admitted.graph_hash, admitted.checkpoint_seq, admitted.claim_token,
@@ -667,13 +686,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 v_remaining := v_remaining - 1;
                 v_disposition := 'grant';
 
+                IF v_candidate.work_class = 'ready' AND NOT v_candidate.admitted THEN
+                  v_next_queue_ordinal := v_next_queue_ordinal + 1;
+                END IF;
+
+                IF v_candidate.poison AND v_candidate_counted THEN
+                  v_admitted_count := greatest(v_admitted_count - 1, 0);
+                ELSIF v_candidate.work_class = 'ready' AND
+                      NOT v_candidate.admitted AND NOT v_candidate.poison THEN
+                  v_admitted_count := v_admitted_count + 1;
+                END IF;
+                v_promotion_slots :=
+                  greatest(v_partition.max_active::bigint - v_admitted_count, 0);
+
                 IF v_candidate.work_class = 'ready' THEN
                   v_served_ready := true;
-                  v_stage_cursor_ats[v_stage_index] := NULL;
-                  v_stage_cursor_ids[v_stage_index] := NULL;
-                  IF NOT v_candidate.poison THEN
-                    v_ready_slots := v_ready_slots - 1;
-                  END IF;
                 ELSE
                   v_served_expired := true;
                 END IF;
@@ -685,12 +712,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                   v_updated.claimed_at::timestamp with time zone,
                   v_updated.claim_attempts::integer,
                   v_updated.poisoned_at::timestamp with time zone,
-                  v_updated.poison_reason::text, v_candidate.work_class::text,
+                  v_updated.poison_reason::text,
+                  CASE
+                    WHEN v_candidate.work_class = 'expired' THEN 'expired'
+                    WHEN v_candidate.admitted THEN 'admitted_ready'
+                    ELSE 'queued_ready'
+                  END::text,
                   v_candidate.eligible_at::timestamp with time zone,
                   v_call_token, v_transaction_id, v_visit.visit_ordinal::integer,
                   v_visit_outcome_ordinal, p_demand, v_visit_cursor_before, v_cursor,
                   v_visit.ring_position::bigint, v_visit.scope_key::text,
-                  'grant'::text, NULL::integer, NULL::bigint;
+                  CASE
+                    WHEN v_candidate.work_class = 'expired' THEN 'expired_recovery'
+                    WHEN v_candidate.admitted THEN 'admitted_reacquisition'
+                    ELSE 'queued_promotion'
+                  END::text, NULL::integer, NULL::bigint;
               END IF;
             END LOOP;
 
@@ -699,6 +735,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 WHEN cardinality(v_attempt_ids) = 0 THEN 'empty_page'
                 WHEN cardinality(v_locked_ids) = 0 THEN 'lock_miss'
                 WHEN v_rechecked_count = 0 THEN 'stale'
+                WHEN v_promotion_slots = 0 AND false = ANY(v_attempt_admitted)
+                  THEN 'cap_debt_denial'
                 ELSE 'denied'
               END;
             END IF;
@@ -723,16 +761,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               CASE WHEN v_grant_count > 0 THEN 1::bigint ELSE 0::bigint END;
           END IF;
         END LOOP;
-
-        IF cardinality(v_stage_scopes) > 0 THEN
-          UPDATE #{schedule} AS persisted
-          SET ready_candidate_cursor_at = staged.cursor_at,
-              ready_candidate_cursor_id = staged.cursor_id,
-              updated_at = p_now
-          FROM unnest(v_stage_scopes, v_stage_cursor_ats, v_stage_cursor_ids)
-            AS staged(scope_key, cursor_at, cursor_id)
-          WHERE persisted.scope_key = staged.scope_key;
-        END IF;
 
         IF v_inspections > 0 THEN
           UPDATE #{policy}

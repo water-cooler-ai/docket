@@ -14,6 +14,10 @@ defmodule MyApp.Docket do
     repo: MyApp.Repo,
     backend: Docket.Postgres,
     tenant_mode: :required,
+    claim_policy: [
+      implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+      default_max_active_runs: 4
+    ],
     checkpoint_observers: [MyApp.DocketProjection],
     pruner: [
       interval_ms: :timer.hours(1),

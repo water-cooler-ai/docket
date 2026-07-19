@@ -289,6 +289,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               CASE WHEN runs.claim_attempts < $4 THEN gen_random_uuid() ELSE NULL END,
             claimed_at =
               CASE WHEN runs.claim_attempts < $4 THEN $1 ELSE NULL END,
+            tenant_admitted_at =
+              CASE WHEN runs.claim_attempts < $4 THEN runs.tenant_admitted_at ELSE NULL END,
             wake_at = NULL,
             claim_attempts =
               CASE

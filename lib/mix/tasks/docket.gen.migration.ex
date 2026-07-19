@@ -40,7 +40,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {basename, migration_name, version, down_version} =
           case from_v1? do
             true ->
-              {"upgrade_docket_to_v2", UpgradeDocketToV2, current_version, current_version}
+              {"upgrade_docket_to_v2", UpgradeDocketToV2, current_version, 2}
 
             false ->
               {"add_docket_tables", AddDocketTables, current_version,

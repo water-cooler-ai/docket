@@ -86,6 +86,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             latest_checkpoint_type: checkpoint_type,
             claim_token: nil,
             claimed_at: nil,
+            tenant_admitted_at: nil,
             wake_at: wake_at,
             claim_attempts: 0,
             claim_abandons: 0,
@@ -316,7 +317,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     A missing or stale token changes nothing. A matching release never changes
     `checkpoint_seq`, `claim_attempts`, or the committed run's `updated_at`;
-    it only clears claim authority and restores `wake_at`.
+    it clears claim authority and restores `wake_at` while retaining any
+    durable tenant admission.
     """
     @impl true
     @spec release_claim(
@@ -406,6 +408,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             set: [
               claim_token: nil,
               claimed_at: nil,
+              tenant_admitted_at: nil,
               claim_attempts: dynamic([run], fragment("GREATEST(? - 1, 0)", run.claim_attempts)),
               claim_abandons: dynamic([run], run.claim_abandons + 1),
               wake_at: non_poisoning_wake(policy, retry_at)
@@ -416,6 +419,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       result = if matched == 1, do: {:ok, :rescheduled}, else: {:ok, :stale}
       emit_claim_operation(:abandon, started, result, %{reason: :host_incompatible})
+      maybe_emit_context_admission_release(ctx, matched == 1, :host_incompatible)
       result
     end
 
@@ -451,6 +455,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         set: [
           claim_token: nil,
           claimed_at: nil,
+          tenant_admitted_at: nil,
           claim_attempts: dynamic([run], fragment("GREATEST(? - 1, 0)", run.claim_attempts)),
           claim_abandons:
             dynamic(
@@ -509,6 +514,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       emit_claim_operation(:abandon, started, result, %{})
 
+      maybe_emit_context_admission_release(
+        ctx,
+        result in [{:ok, :rescheduled}, {:ok, :poisoned}],
+        if(result == {:ok, :poisoned}, do: :poison, else: :abandon_backoff)
+      )
+
       if result == {:ok, :poisoned} do
         :telemetry.execute(
           [:docket, :postgres, :claim, :poisoned],
@@ -542,11 +553,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           )
           |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
 
-        updates = commit_updates(attrs, proposal.checkpoint_type, proposal.schedule)
+        updates = commit_updates(attrs, proposal.checkpoint_type, proposal.schedule, :claimed)
 
         case repo.update_all(query, updates, log: false) do
           {1, _} ->
             notify_wake(repo, prefix, proposal.schedule)
+            maybe_emit_admission_release(stored.tenant_admitted_at, proposal.schedule, :claimed)
             {:ok, proposal.run}
 
           {0, _} ->
@@ -616,6 +628,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                        set: [
                          claim_token: nil,
                          claimed_at: nil,
+                         tenant_admitted_at: nil,
                          wake_at: normalize_database_datetime(now),
                          claim_attempts: 0,
                          claim_abandons: 0,
@@ -743,11 +756,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
            {:ok, attrs} <- RunCodec.dump(proposed_run) do
         case repo.update_all(
                scoped_row_query(row, scope, prefix),
-               commit_updates(attrs, checkpoint_type, schedule),
+               commit_updates(attrs, checkpoint_type, schedule, :unclaimed),
                log: false
              ) do
           {1, _} ->
             notify_wake(repo, prefix, schedule)
+            maybe_emit_admission_release(row.tenant_admitted_at, schedule, :unclaimed)
             {:ok, {:committed, opaque}}
 
           {0, _} ->
@@ -809,7 +823,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp schedule_matches_status?(_, _), do: false
 
-    defp commit_updates(attrs, checkpoint_type, schedule) do
+    defp commit_updates(attrs, checkpoint_type, schedule, claim_origin) do
       base = [
         graph_id: attrs.graph_id,
         graph_hash: attrs.graph_hash,
@@ -832,18 +846,31 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           :retain_claim ->
             [wake_at: nil, claimed_at: dynamic([_run], fragment("CURRENT_TIMESTAMP"))]
 
-          {:release_claim, :immediate} ->
+          {:release_claim, :immediate} when claim_origin == :claimed ->
             [
               claim_token: nil,
               claimed_at: nil,
               wake_at: dynamic([_run], fragment("CURRENT_TIMESTAMP"))
             ]
 
+          {:release_claim, :immediate} ->
+            [
+              claim_token: nil,
+              claimed_at: nil,
+              tenant_admitted_at: nil,
+              wake_at: dynamic([_run], fragment("CURRENT_TIMESTAMP"))
+            ]
+
           {:release_claim, {:at, at}} ->
-            [claim_token: nil, claimed_at: nil, wake_at: normalize_database_datetime(at)]
+            [
+              claim_token: nil,
+              claimed_at: nil,
+              tenant_admitted_at: nil,
+              wake_at: normalize_database_datetime(at)
+            ]
 
           {:release_claim, reason} when reason in [:external, :terminal] ->
-            [claim_token: nil, claimed_at: nil, wake_at: nil]
+            [claim_token: nil, claimed_at: nil, tenant_admitted_at: nil, wake_at: nil]
         end
 
       [set: base ++ schedule_updates]
@@ -1047,6 +1074,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         [:docket, :postgres, :claim, :operation],
         Map.put(measurements, :duration, System.monotonic_time() - started),
         %{operation: operation, result: claim_operation_result(result)}
+      )
+    end
+
+    defp maybe_emit_context_admission_release(ctx, released?, reason) do
+      if released? and tenant_fair_context?(ctx), do: emit_admission_release(reason)
+      :ok
+    end
+
+    defp tenant_fair_context?(%{claim_policy: claim_policy}) do
+      ClaimPolicy.implementation(claim_policy) == Docket.Postgres.ClaimPolicy.TenantFair
+    end
+
+    defp tenant_fair_context?(_ctx), do: false
+
+    defp maybe_emit_admission_release(nil, _schedule, _origin), do: :ok
+
+    defp maybe_emit_admission_release(_admitted_at, schedule, origin) do
+      case {origin, schedule} do
+        {:claimed, {:release_claim, {:at, _at}}} -> emit_admission_release(:future)
+        {:claimed, {:release_claim, :external}} -> emit_admission_release(:external)
+        {:claimed, {:release_claim, :terminal}} -> emit_admission_release(:terminal)
+        {:unclaimed, {:release_claim, :immediate}} -> emit_admission_release(:signal)
+        {:unclaimed, {:release_claim, {:at, _at}}} -> emit_admission_release(:future)
+        {:unclaimed, {:release_claim, :external}} -> emit_admission_release(:external)
+        {:unclaimed, {:release_claim, :terminal}} -> emit_admission_release(:terminal)
+        _retained -> :ok
+      end
+    end
+
+    defp emit_admission_release(reason) do
+      :telemetry.execute(
+        [:docket, :postgres, :admission, :release],
+        %{count: 1},
+        %{reason: reason}
       )
     end
 
