@@ -675,6 +675,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "the bundle fixes every capability and assembles poll-only execution plus pruning" do
       Process.register(self(), :docket_backend_observer_relay)
 
+      assert Code.ensure_loaded?(Docket.Postgres)
       assert function_exported?(Docket.Postgres, :transaction, 2)
       refute function_exported?(Docket.Postgres, :storage, 0)
       assert Docket.Postgres.graphs() == Docket.Postgres.GraphStore
