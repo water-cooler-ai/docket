@@ -38,13 +38,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @behaviour Docket.Postgres.ClaimPolicy
 
     alias Docket.Postgres.ClaimPolicy.Plan
-    alias Docket.Postgres.ClaimPolicy.TenantFair.{Config, RingFunction, SQL}
+    alias Docket.Postgres.ClaimPolicy.TenantFair.{Config, RingFunctionV3, SQL}
     alias Docket.Postgres.Storage
 
     @empty_stats %{
       ready_candidates: 0,
       expired_candidates: 0,
       ready_selected: 0,
+      admitted_ready_selected: 0,
+      queued_ready_selected: 0,
+      queued_promotions: 0,
+      admission_releases: 0,
       expired_selected: 0,
       steals: 0,
       ready_oldest_age_ms: 0,
@@ -64,11 +68,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             max_claim_attempts: max,
             preference: preference
           },
-          %Config{default_max_active: default_max_active}
+          %Config{default_max_active_runs: default_max_active_runs}
         ) do
       now = normalize_database_datetime(now)
       cutoff = DateTime.add(now, -ttl, :millisecond)
-      function = Storage.qualified_table(prefix, RingFunction.name())
+      function = Storage.qualified_table(prefix, RingFunctionV3.name())
 
       %Plan{
         statement: SQL.statement(function),
@@ -78,7 +82,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           limit,
           max,
           preference && Atom.to_string(preference),
-          default_max_active
+          default_max_active_runs
         ],
         decoder: %{now: now, orphan_ttl_ms: ttl},
         observation: %{demand: limit, preference: preference}
@@ -199,6 +203,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
       end)
 
+      if stats.admission_releases > 0 do
+        :telemetry.execute(
+          [:docket, :postgres, :admission, :release],
+          %{count: stats.admission_releases},
+          %{reason: :poison}
+        )
+      end
+
       :ok
     end
 
@@ -237,12 +249,33 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               ready_oldest_age_ms: max(stats.ready_oldest_age_ms, age)
           }
 
+        "admitted_ready" ->
+          %{
+            stats
+            | ready_candidates: stats.ready_candidates + 1,
+              ready_selected: stats.ready_selected + 1,
+              admitted_ready_selected: stats.admitted_ready_selected + 1,
+              admission_releases: stats.admission_releases + if(lease?, do: 0, else: 1),
+              ready_oldest_age_ms: max(stats.ready_oldest_age_ms, age)
+          }
+
+        "queued_ready" ->
+          %{
+            stats
+            | ready_candidates: stats.ready_candidates + 1,
+              ready_selected: stats.ready_selected + 1,
+              queued_ready_selected: stats.queued_ready_selected + 1,
+              queued_promotions: stats.queued_promotions + if(lease?, do: 1, else: 0),
+              ready_oldest_age_ms: max(stats.ready_oldest_age_ms, age)
+          }
+
         "expired" ->
           %{
             stats
             | expired_candidates: stats.expired_candidates + 1,
               expired_selected: stats.expired_selected + 1,
               steals: stats.steals + if(lease?, do: 1, else: 0),
+              admission_releases: stats.admission_releases + if(lease?, do: 0, else: 1),
               expired_oldest_age_ms: max(stats.expired_oldest_age_ms, age)
           }
       end

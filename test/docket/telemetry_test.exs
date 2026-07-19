@@ -47,6 +47,11 @@ defmodule Docket.TelemetryTest do
              result: :ok,
              source: :scheduled
            }
+
+    assert Docket.Telemetry.metric_metadata(
+             [:docket, :postgres, :admission, :release],
+             Map.put(metadata, :reason, :terminal)
+           ) == %{reason: :terminal}
   end
 
   test "lifecycle and nested store spans share correlation without leaking it to labels" do

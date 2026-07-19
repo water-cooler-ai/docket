@@ -41,6 +41,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ClaimPolicy,
       EventStore,
       GraphStore,
+      Migration,
       Notifier,
       Pruner,
       RunStore,
@@ -156,6 +157,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       dispatcher = effective_dispatcher(opts)
       validate_dispatcher!(dispatcher)
       _resolved_claim_policy = ClaimPolicy.resolve(context)
+      validate_schema_version!(context, opts)
       execution = effective_execution(opts)
       vehicle = effective_vehicle(Keyword.get(opts, :vehicle, []))
       validate_vehicle!(vehicle)
@@ -164,6 +166,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       children = children(opts, name, context)
 
       Supervisor.init(children, strategy: :one_for_one)
+    end
+
+    defp validate_schema_version!(%{repo: repo} = context, opts) do
+      if Keyword.get(opts, :testing) in @testing_modes and
+           repo.config()[:pool] == Ecto.Adapters.SQL.Sandbox do
+        # Inline/manual tests deliberately execute through the caller's
+        # checked-out Sandbox connection. Backend init runs in a child process
+        # that cannot borrow that connection until after it has started, so a
+        # startup query here would deadlock a single-connection test pool.
+        :ok
+      else
+        validate_schema_version!(context)
+      end
+    end
+
+    defp validate_schema_version!(context) do
+      {repo, prefix} = Storage.context!(context)
+      expected = Migration.current_version()
+      actual = Migration.migrated_version(repo: repo, prefix: prefix)
+
+      if actual != expected do
+        raise ArgumentError,
+              "Docket.Postgres requires schema version #{expected}, found #{actual} in prefix " <>
+                "#{inspect(prefix)}; stop all Docket writers, run the generated migration, " <>
+                "and restart one homogeneous application version"
+      end
     end
 
     defp children(opts, name, context) do

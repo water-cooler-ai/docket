@@ -95,6 +95,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       row = row!(run.id)
       assert row.tenant_id == nil
+      assert row.tenant_admitted_at == nil
       assert row.latest_checkpoint_type == :run_initialized
       assert row.updated_at == @committed_at
 
@@ -754,7 +755,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
 
       first = claim_one(@now)
-      stolen_at = DateTime.add(@now, 10, :second)
+      admitted_at = admit!(run.id, @now).tenant_admitted_at
+
+      assert :ok =
+               RunStore.refresh_claim(TestRepo, :system, run.id, first.claim_token, @now)
+
+      assert row!(run.id).tenant_admitted_at == admitted_at
+
+      stolen_at = DateTime.add(DateTime.utc_now(), 10, :second)
       second = claim_one(stolen_at, orphan_ttl_ms: 1_000)
 
       assert second.run_id == run.id
@@ -766,15 +774,128 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert info.run == run
       assert info.claimed_at == stolen_at
       assert info.claim_attempts == 2
+      assert row!(run.id).tenant_admitted_at == admitted_at
 
       assert {:error, :claim_lost} =
                RunStore.refresh_claim(TestRepo, :system, run.id, first.claim_token, stolen_at)
 
       assert :ok =
+               RunStore.release_claim(TestRepo, :system, run.id, first.claim_token, stolen_at)
+
+      assert row!(run.id).tenant_admitted_at == admitted_at
+
+      assert :ok =
                RunStore.release_claim(TestRepo, :system, run.id, second.claim_token, stolen_at)
 
       assert {:ok, ^run} = RunStore.fetch_run(TestRepo, :system, run.id)
+      assert row!(run.id).tenant_admitted_at == admitted_at
       assert row!(run.id).updated_at == @committed_at
+    end
+
+    test "claimed commits retain admission only while the run remains cooperatively runnable" do
+      handler = "admission-release-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:docket, :postgres, :admission, :release],
+        &Docket.Test.TelemetryRelay.raw/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      insert_run!("cooperative")
+      first = claim_one(@now)
+      admitted_at = admit!("cooperative", @now).tenant_admitted_at
+
+      immediate =
+        initialized_run("cooperative",
+          checkpoint_seq: 8,
+          started_at: @now,
+          updated_at: DateTime.add(@now, 1, :second)
+        )
+
+      assert {:ok, ^immediate} =
+               RunStore.commit(
+                 TestRepo,
+                 :system,
+                 proposal(immediate, first.claim_token, 7, {:release_claim, :immediate})
+               )
+
+      cooperatively_released = row!("cooperative")
+      assert cooperatively_released.claim_token == nil
+      assert cooperatively_released.tenant_admitted_at == admitted_at
+      refute_receive {[:docket, :postgres, :admission, :release], _, _}
+
+      reclaimed_at = DateTime.add(DateTime.utc_now(), 1, :second)
+      reclaimed = claim_one(reclaimed_at)
+      assert reclaimed.run_id == "cooperative"
+      assert row!("cooperative").tenant_admitted_at == admitted_at
+
+      parked_at = DateTime.add(reclaimed_at, 1, :minute)
+
+      parked = %{
+        immediate
+        | checkpoint_seq: 9,
+          updated_at: DateTime.add(immediate.updated_at, 1, :second)
+      }
+
+      assert {:ok, ^parked} =
+               RunStore.commit(
+                 TestRepo,
+                 :system,
+                 proposal(parked, reclaimed.claim_token, 8, {:release_claim, {:at, parked_at}})
+               )
+
+      parked_row = row!("cooperative")
+      assert parked_row.claim_token == nil
+      assert parked_row.wake_at == parked_at
+      assert parked_row.tenant_admitted_at == nil
+      assert_receive {[:docket, :postgres, :admission, :release], %{count: 1}, %{reason: :future}}
+    end
+
+    test "serialized immediate signals revoke claim authority and tenant admission" do
+      handler = "signal-admission-release-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:docket, :postgres, :admission, :release],
+        &Docket.Test.TelemetryRelay.raw/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      insert_run!("signalled")
+      lease = claim_one(@now)
+      assert admit!("signalled", @now).tenant_admitted_at == @now
+
+      assert {:ok, {:committed, :signalled}} =
+               RunStore.mutate_run(TestRepo, :system, "signalled", fn current ->
+                 proposed = %{
+                   current
+                   | checkpoint_seq: current.checkpoint_seq + 1,
+                     updated_at: DateTime.add(current.updated_at, 1, :second)
+                 }
+
+                 {:commit, proposed, :step_committed, {:release_claim, :immediate}, :signalled}
+               end)
+
+      signalled = row!("signalled")
+      assert signalled.claim_token == nil
+      assert signalled.claimed_at == nil
+      assert signalled.tenant_admitted_at == nil
+      assert_receive {[:docket, :postgres, :admission, :release], %{count: 1}, %{reason: :signal}}
+
+      stale = %{
+        initialized_run("signalled", checkpoint_seq: 9, started_at: @now, updated_at: @now)
+        | updated_at: DateTime.add(@now, 2, :second)
+      }
+
+      assert {:error, :stale_fence} =
+               RunStore.commit(TestRepo, :system, proposal(stale, lease.claim_token, 8))
+
+      assert row!("signalled") == signalled
     end
 
     test "commit rejects malformed proposals before lookup and invalid bindings" do
@@ -1527,6 +1648,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       insert_run!("abandon")
       lease = claim_one(@now)
       assert lease.claim_attempt == 1
+      assert admit!("abandon", @now).tenant_admitted_at == @now
 
       before_abandon = row!("abandon")
       abandoned_at = DateTime.add(@now, 1, :second)
@@ -1544,6 +1666,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       abandoned = row!("abandon")
       assert abandoned.claim_token == nil
       assert abandoned.claimed_at == nil
+      assert abandoned.tenant_admitted_at == nil
       assert abandoned.wake_at == retry_at
       assert abandoned.claim_attempts == 0
       assert abandoned.claim_abandons == 1
@@ -1597,6 +1720,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       stolen = claim_one(stolen_at, orphan_ttl_ms: 0)
       assert stolen.claim_token != first.claim_token
 
+      admit!("stale-abandon", @now)
+
       winner = row!("stale-abandon")
       policy = abandon_policy(stolen_at, DateTime.add(stolen_at, 30, :second))
 
@@ -1629,6 +1754,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       committed = row!("stale-abandon")
       assert committed.claim_attempts == 0
       assert committed.claim_token == stolen.claim_token
+      assert committed.tenant_admitted_at == winner.tenant_admitted_at
 
       assert {:ok, :stale} =
                RunStore.abandon_claim(
@@ -1731,6 +1857,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert poisoned.status == :running
       assert poisoned.claim_token == nil
       assert poisoned.claimed_at == nil
+      assert poisoned.tenant_admitted_at == nil
       assert poisoned.wake_at == nil
       assert poisoned.claim_abandons == max
       assert poisoned.poisoned_at == poisoned_at
@@ -1748,6 +1875,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert recovered.claim_abandons == 0
       assert recovered.claim_attempts == 0
       assert recovered.poisoned_at == nil
+      assert recovered.tenant_admitted_at == nil
       assert recovered.wake_at == recovered_at
     end
 
@@ -2308,6 +2436,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       recovered = row!(run.id)
       assert recovered.wake_at == recovered_at
+      assert recovered.tenant_admitted_at == nil
       assert recovered.claim_attempts == 0
       assert recovered.poisoned_at == nil
       assert recovered.poison_reason == nil
@@ -2430,6 +2559,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       attrs
       |> Run.changeset()
+      |> then(fn changeset ->
+        if attrs[:tenant_admitted_at] do
+          Ecto.Changeset.change(changeset, tenant_admitted_at: attrs.tenant_admitted_at)
+        else
+          changeset
+        end
+      end)
       |> TestRepo.insert!(prefix: prefix)
     end
 
@@ -2439,6 +2575,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
 
       TestRepo.one!(query)
+    end
+
+    defp admit!(run_id, admitted_at) do
+      {1, _} =
+        TestRepo.update_all(
+          from(run in Run, where: run.run_id == ^run_id),
+          set: [tenant_admitted_at: admitted_at]
+        )
+
+      row!(run_id)
     end
 
     defp claim_partition(scope_key, prefix \\ nil) do

@@ -24,6 +24,7 @@ labels. Claim tokens are never emitted.
 | `[:docket, :postgres, :claim_policy, :admission]` | `duration`, `demand`, `leases`, `poisoned`, `contentions` | `implementation`, `result`, `contention_phase` |
 | `[:docket, :postgres, :claim, :attempt]` | `count`, `claim_attempts` | `result` |
 | `[:docket, :postgres, :claim, :poisoned]` | `count` | `reason` |
+| `[:docket, :postgres, :admission, :release]` | `count` | `reason` |
 | `[:docket, :postgres, :claim, :operation]` | `duration`, optionally `matched` | `operation`, `result` |
 | `[:docket, :postgres, :claim, :fence_lost]` | `count` | `stage`, `result` |
 | `[:docket, :postgres, :graph_cache, :fetch]` | `duration` | `result` |
@@ -58,7 +59,7 @@ effects require their own stable idempotency scheme.
 
 ## Fair-rotation evidence boundary
 
-The schema-v2 ring engine keeps the generic ClaimPolicy and claim events in the
+The schema-v3 sticky-admission engine keeps the generic ClaimPolicy and claim events in the
 catalog above. The admission event reports total duration and a normalized
 `contentions` count; `contention_phase: :policy_cursor` distinguishes bounded
 singleton-cursor pressure without adding identity labels. That phase is set
@@ -74,6 +75,16 @@ rows before the unchanged public decoder. Tenant ID, raw `scope_key`, run or
 graph identity, call token, cursor token, and claim token are forbidden as
 ordinary metric labels. DCKT-79 owns full trace qualification and the
 per-target bounded-bypass proof; aggregate telemetry cannot reconstruct it.
+
+Aggregate TenantFair outcome observations distinguish queued promotion,
+admitted-ready reacquisition, and expired admitted steal. Cap/debt denial is a
+raw inspection disposition, not a production aggregate: ordinary production
+calls intentionally filter inspection rows before decoding.
+Admission release counts use the bounded reasons `future`, `external`,
+`terminal`, `signal`, `host_incompatible`, `poison`, and `abandon_backoff`;
+they never carry tenant or run identity.
+`Admin.get_effective/2` supplies token-free `queued`, `admitted_ready`,
+`admitted_claimed`, and `debt` counts for trusted operational inspection.
 
 The normative populations, units, formulas, exclusions, and Legacy control are
 in the [exact-cap and fair-rotation admission contract](architecture/docket-exact-cap-contract.md).

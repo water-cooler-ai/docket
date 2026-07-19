@@ -107,6 +107,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             assert is_binary(claim_token)
             assert inserted.run_id == run_id
             assert inserted.claim_token == nil
+            assert inserted.tenant_admitted_at == nil
             assert inserted.claim_attempts == 0
             assert inserted.wake_at == @now
             assert claimed.claim_token == claim_token

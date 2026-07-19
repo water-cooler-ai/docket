@@ -5,8 +5,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     Version 1 contains durable graphs, runs, and events. Version 2 adds exact-cap
     policy and partition authority, the authoritative unfinished-tenant ring,
-    the domain cursor, TenantFair claim function, and supporting indexes. Every
-    step is an ordinary transactional migration.
+    the domain cursor, TenantFair claim function, and supporting indexes.
+    Version 3 replaces transient claim caps with sticky logical-run admission.
+    Every step is an ordinary transactional migration.
     """
 
     use Ecto.Migration
@@ -14,7 +15,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Storage
 
     @initial_version 1
-    @current_version 2
+    @current_version 3
     @default_prefix "public"
 
     @spec up(keyword()) :: :ok

@@ -4,7 +4,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
-    alias Docket.Postgres.ClaimPolicy.TenantFair.{Budgets, QueryShapes, RingFunction}
+    alias Docket.Postgres.ClaimPolicy.TenantFair.{Budgets, QueryShapes, RingFunctionV3}
     alias Docket.Postgres.TestRepo
 
     @migration_version 20_260_717_000_176
@@ -73,26 +73,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         TestRepo.query!(
           """
           SELECT claimed.*
-          FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, true)
-            AS claimed(#{RingFunction.result_definition()})
+          FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, true, 3)
+            AS claimed(#{RingFunctionV3.result_definition()})
           ORDER BY claimed.visit_ordinal, claimed.outcome_ordinal NULLS LAST,
                    claimed.row_kind
           """,
-          [now, cutoff, 2, 5, nil, 4]
+          [now, cutoff, 1, 5, nil, 4]
         ).rows
 
       outcomes = Enum.filter(rows, &(hd(&1) == "outcome"))
       [inspection] = Enum.filter(rows, &(hd(&1) == "inspection"))
 
-      assert length(outcomes) == 2
-      assert Enum.map(outcomes, &Enum.at(&1, 16)) == [1, 1]
-      assert Enum.map(outcomes, &Enum.at(&1, 17)) == [1, 2]
+      assert length(outcomes) == 1
+      assert Enum.map(outcomes, &Enum.at(&1, 16)) == [1]
+      assert Enum.map(outcomes, &Enum.at(&1, 17)) == [1]
       assert Enum.at(inspection, 16) == 1
       assert Enum.at(inspection, 19) == 0
       assert Enum.at(inspection, 20) == Enum.at(inspection, 21)
       assert Enum.at(inspection, 22) == "tenant-0001"
       assert Enum.at(inspection, 23) == "grant"
-      assert Enum.at(inspection, 24) == 2
+      assert Enum.at(inspection, 24) == 1
       assert Enum.at(inspection, 25) == 1
 
       assert [[cursor]] =
@@ -105,6 +105,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  "SELECT admission_epoch FROM docket_claim_partitions " <>
                    "WHERE scope_key = 'tenant-0001'"
                ).rows
+    end
+
+    test "V3 installs only the explicit eight-argument claim ABI" do
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      assert_raise Postgrex.Error, ~r/docket_tenant_fair_claim.*does not exist/s, fn ->
+        TestRepo.query!(
+          """
+          SELECT claimed.*
+          FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, false)
+            AS claimed(#{RingFunctionV3.result_definition()})
+          """,
+          [now, DateTime.add(now, -60, :second), 1, 5, nil, 1]
+        )
+      end
+
+      assert_raise Postgrex.Error, ~r/invalid docket tenant-fair ring function arguments/, fn ->
+        TestRepo.query!(
+          """
+          SELECT claimed.*
+          FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, false, 2)
+            AS claimed(#{RingFunctionV3.result_definition()})
+          """,
+          [now, DateTime.add(now, -60, :second), 1, 5, nil, 1]
+        )
+      end
     end
 
     test "installed function never substitutes K+1 when all first-K exact locks miss" do
@@ -181,7 +207,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ).rows
     end
 
-    test "installed function skips a partial exact-lock miss within one frozen attempt set" do
+    test "installed function never bypasses a locked queued FIFO head" do
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       seed_scope("partial", 10)
 
@@ -220,23 +246,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert_receive {:first_locked, blocker_pid}, 2_000
 
-      [outcome] =
-        raw_claim!(now, demand: 1, default_max: 10)
-        |> Enum.filter(&(&1.row_kind == "outcome"))
-
-      assert %{run_id: "partial-2", visit_ordinal: 1, outcome_ordinal: 1} = outcome
+      assert raw_claim!(now, demand: 1, default_max: 10)
+             |> Enum.filter(&(&1.row_kind == "outcome")) == []
 
       send(blocker_pid, :release)
       assert Task.await(blocker, 2_000) == {:ok, :released}
 
+      [outcome] =
+        raw_claim!(now, demand: 1, default_max: 10)
+        |> Enum.filter(&(&1.row_kind == "outcome"))
+
+      assert %{run_id: "partial-1", outcome_ordinal: 1} = outcome
+
       assert [[nil, nil, 0]] =
                TestRepo.query!(
                  "SELECT claim_token, claimed_at, claim_attempts FROM docket_runs " <>
-                   "WHERE run_id = 'partial-1'"
+                   "WHERE run_id = 'partial-2'"
                ).rows
     end
 
-    test "expired service preserves capped ready continuation across K pages in one call" do
+    test "capped FIFO never rotates to a deep unadmitted poison" do
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       seed_scope("deep", 1)
 
@@ -244,11 +273,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """
         INSERT INTO docket_runs
           (run_id, tenant_id, graph_id, graph_hash, status, state,
-           checkpoint_seq, claim_token, claimed_at, claim_attempts,
+           checkpoint_seq, claim_token, claimed_at, tenant_admitted_at, claim_attempts,
            inserted_at, started_at, updated_at)
         VALUES
           ('deep-live', 'deep', 'graph', 'hash', 'running', decode('01', 'hex'),
-           1, pg_catalog.gen_random_uuid(), $1::timestamptz - interval '2 hours', 1,
+           1, pg_catalog.gen_random_uuid(), $1::timestamptz - interval '2 hours',
+           $1::timestamptz - interval '2 hours', 1,
            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         [now]
@@ -274,21 +304,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       outcomes = Enum.filter(rows, &(&1.row_kind == "outcome"))
       inspections = Enum.filter(rows, &(&1.row_kind == "inspection"))
 
-      assert Enum.map(outcomes, & &1.work_class) == ["expired", "ready"]
-      assert Enum.map(outcomes, & &1.visit_ordinal) == [1, 3]
-
-      outcome = List.last(outcomes)
-
-      assert %{
-               run_id: "deep-33",
-               claim_token: nil,
-               work_class: "ready",
-               visit_ordinal: 3,
-               poison_reason: "max_claim_attempts_exceeded"
-             } = outcome
-
-      assert Enum.map(inspections, & &1.disposition) == ["grant", "empty_page", "grant"]
-      assert Enum.map(inspections, & &1.epoch_delta) == [1, 0, 1]
+      assert Enum.map(outcomes, & &1.work_class) == ["expired"]
+      assert Enum.map(outcomes, & &1.visit_ordinal) == [1]
+      assert Enum.any?(inspections, &(&1.disposition == "cap_debt_denial"))
+      assert Enum.sum(Enum.map(inspections, & &1.epoch_delta)) == 1
 
       assert [[nil, nil]] =
                TestRepo.query!(
@@ -303,7 +322,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    "AND claim_token IS NULL AND poisoned_at IS NULL AND claim_attempts = 0"
                ).rows
 
-      assert [[2]] =
+      assert [[1]] =
                TestRepo.query!(
                  "SELECT admission_epoch FROM docket_claim_partitions " <>
                    "WHERE scope_key = 'deep'"
@@ -452,11 +471,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """
         INSERT INTO docket_runs
           (run_id, tenant_id, graph_id, graph_hash, status, state,
-           checkpoint_seq, claim_token, claimed_at, claim_attempts,
+           checkpoint_seq, claim_token, claimed_at, tenant_admitted_at, claim_attempts,
            inserted_at, started_at, updated_at)
         VALUES
           ('expired-1', 'expired', 'graph', 'hash', 'running', decode('01', 'hex'),
-           1, pg_catalog.gen_random_uuid(), $1::timestamptz - interval '2 hours', 1,
+           1, pg_catalog.gen_random_uuid(), $1::timestamptz - interval '2 hours',
+           $1::timestamptz - interval '2 hours', 1,
            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         [now]
@@ -476,7 +496,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         raw_claim!(now, demand: 3, default_max: 10)
         |> Enum.filter(&(&1.row_kind == "outcome"))
 
-      assert Enum.map(outcomes, & &1.work_class) == ["ready", "ready", "expired"]
+      assert Enum.map(outcomes, & &1.work_class) == ["queued_ready", "queued_ready", "expired"]
       assert Enum.map(outcomes, & &1.visit_ordinal) == [1, 1, 2]
 
       assert [[nil]] =
@@ -514,11 +534,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """
         INSERT INTO docket_runs
           (run_id, tenant_id, graph_id, graph_hash, status, state,
-           checkpoint_seq, claim_token, claimed_at, claim_attempts,
+           checkpoint_seq, claim_token, claimed_at, tenant_admitted_at, claim_attempts,
            inserted_at, started_at, updated_at)
         VALUES
           ('expired-poison', $1, 'graph', 'hash', 'running', decode('01', 'hex'),
-           1, pg_catalog.gen_random_uuid(), $2::timestamptz - interval '2 hours', 5,
+           1, pg_catalog.gen_random_uuid(), $2::timestamptz - interval '2 hours',
+           $2::timestamptz - interval '2 hours', 5,
            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         [expired_poison, now]
@@ -542,7 +563,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Enum.map(outcomes, & &1.run_id) ==
                ["ready-before", "expired-poison", "ready-after"]
 
-      assert Enum.map(outcomes, & &1.work_class) == ["ready", "expired", "ready"]
+      assert Enum.map(outcomes, & &1.work_class) == ["queued_ready", "expired", "queued_ready"]
       assert Enum.map(outcomes, & &1.visit_ordinal) == [1, 2, 3]
 
       assert %{claim_token: nil, poison_reason: "max_claim_attempts_exceeded"} =
@@ -578,7 +599,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       inspections = Enum.filter(rows, &(&1.row_kind == "inspection"))
 
       assert length(outcomes) == 1
-      assert hd(outcomes).work_class == "ready"
+      assert hd(outcomes).work_class == "queued_ready"
       assert length(inspections) == Budgets.scan_inspections()
 
       assert [[1]] =
@@ -1055,8 +1076,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       TestRepo.query!(
         """
         SELECT claimed.*
-        FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, true)
-          AS claimed(#{RingFunction.result_definition()})
+        FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, true, 3)
+          AS claimed(#{RingFunctionV3.result_definition()})
         ORDER BY claimed.visit_ordinal NULLS FIRST,
                  claimed.outcome_ordinal NULLS FIRST,
                  claimed.row_kind

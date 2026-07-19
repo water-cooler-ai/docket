@@ -15,6 +15,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Test.Fixtures.Graphs
 
     @migration_version 20_260_711_000_025
+    @v2_migration_version 20_260_719_000_081
     @pruner [
       interval_ms: :timer.hours(1),
       event_retention_ms: :timer.hours(24 * 30),
@@ -27,6 +28,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       def up, do: Docket.Postgres.Migration.up()
       def down, do: Docket.Postgres.Migration.down()
+    end
+
+    defmodule InstallDocketV2 do
+      use Ecto.Migration
+
+      def up, do: Docket.Postgres.Migration.up(prefix: "docket_v2", version: 2)
+      def down, do: Docket.Postgres.Migration.down(prefix: "docket_v2", version: 2)
     end
 
     defmodule FixedClock do
@@ -178,7 +186,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         notifier: :none,
         claim_policy: [
           implementation: Docket.Test.TenantFairConfigClaimPolicy,
-          default_max_active: 4
+          default_max_active_runs: 4
         ]
     end
 
@@ -198,7 +206,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         pruner: @pruner,
         claim_policy: [
           implementation: Docket.Test.TenantFairConfigClaimPolicy,
-          default_max_active: 4
+          default_max_active_runs: 4
         ]
     end
 
@@ -520,7 +528,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end)
 
       expected = %Docket.Postgres.ClaimPolicy.TenantFair.Config{
-        default_max_active: 4
+        default_max_active_runs: 4
       }
 
       start_supervised!(TenantFairConfigManualHost)
@@ -553,7 +561,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end)
 
       expected = %Docket.Postgres.ClaimPolicy.TenantFair.Config{
-        default_max_active: 4
+        default_max_active_runs: 4
       }
 
       start_supervised!(TenantFairConfigSupervisedHost)
@@ -922,6 +930,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           drain_budget: [max_moments: 1, max_elapsed_ms: 3_000],
           pruner: @pruner
         )
+      end
+    end
+
+    test "startup fails closed against an older schema" do
+      :ok =
+        Ecto.Migrator.up(TestRepo, @v2_migration_version, InstallDocketV2,
+          log: false,
+          migration_lock: false
+        )
+
+      opts = [
+        name: __MODULE__.OldSchema,
+        repo: TestRepo,
+        prefix: "docket_v2",
+        testing: :manual,
+        notifier: :none
+      ]
+
+      context = Docket.Postgres.context(opts)
+
+      assert_raise ArgumentError, ~r/requires schema version 3, found 2/, fn ->
+        Docket.Postgres.init({opts, context})
       end
     end
 

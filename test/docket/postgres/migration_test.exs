@@ -4,6 +4,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
+    alias Docket.Postgres.ClaimPolicy.TenantFair.{RingFunction, RingFunctionV3}
     alias Docket.Postgres.TestRepo
 
     @v1 20_260_716_000_101
@@ -13,6 +14,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @private_v2 20_260_716_000_105
     @failed_v2 20_260_716_000_106
     @host_v1_to_current 20_260_716_000_107
+    @v3 20_260_719_000_108
+    @private_v3 20_260_719_000_109
+    @failed_v3 20_260_719_000_110
 
     defmodule InstallV1 do
       use Ecto.Migration
@@ -24,6 +28,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       use Ecto.Migration
       def up, do: Docket.Postgres.Migration.up(version: 2)
       def down, do: Docket.Postgres.Migration.down(version: 2)
+    end
+
+    defmodule UpgradeV3 do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(version: 3)
+      def down, do: Docket.Postgres.Migration.down(version: 3)
     end
 
     defmodule InstallPrivate do
@@ -44,6 +54,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down(prefix: "docket_private", version: 2)
     end
 
+    defmodule UpgradePrivateV3 do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(prefix: "docket_private", version: 3)
+      def down, do: Docket.Postgres.Migration.down(prefix: "docket_private", version: 3)
+    end
+
     defmodule FailedUpgradeV2 do
       use Ecto.Migration
 
@@ -51,6 +67,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         Docket.Postgres.Migration.up(version: 2)
         flush()
         raise "forced v2 rollback"
+      end
+
+      def down, do: :ok
+    end
+
+    defmodule FailedUpgradeV3 do
+      use Ecto.Migration
+
+      def up do
+        Docket.Postgres.Migration.up(version: 3)
+        flush()
+        raise "forced v3 rollback"
       end
 
       def down, do: :ok
@@ -136,6 +164,148 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  "timestamp with time zone, timestamp with time zone, integer, integer, text, integer, boolean"
                ]
              ]
+    end
+
+    test "v2-to-v3 backfills healthy claims, leaves ready rows queued, and preserves over-cap debt" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "claimed-a")
+      insert_v1_graph_and_run("tenant-a", "claimed-b")
+      insert_v1_graph_and_run("tenant-a", "queued")
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      TestRepo.query!("""
+      UPDATE docket_claim_policy
+      SET max_active = 1, policy_version = 1,
+          initialized_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      """)
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET claim_token = CASE run_id
+            WHEN 'claimed-a' THEN '00000000-0000-0000-0000-000000000001'::uuid
+            WHEN 'claimed-b' THEN '00000000-0000-0000-0000-000000000002'::uuid
+          END,
+          claimed_at = CURRENT_TIMESTAMP - CASE run_id
+            WHEN 'claimed-a' THEN interval '2 seconds'
+            ELSE interval '1 second'
+          END,
+          wake_at = NULL,
+          claim_attempts = 1
+      WHERE run_id IN ('claimed-a', 'claimed-b')
+      """)
+
+      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 3
+
+      assert [
+               ["claimed-a", true, true],
+               ["claimed-b", true, true],
+               ["queued", false, false]
+             ] ==
+               TestRepo.query!("""
+               SELECT run_id, claim_token IS NOT NULL, tenant_admitted_at IS NOT NULL
+               FROM docket_runs
+               ORDER BY run_id
+               """).rows
+
+      assert [[2, 1]] =
+               TestRepo.query!("""
+               SELECT count(*) FILTER (WHERE tenant_admitted_at IS NOT NULL)::integer,
+                      greatest(count(*) FILTER (WHERE tenant_admitted_at IS NOT NULL) - 1, 0)::integer
+               FROM docket_runs
+               WHERE scope_key = 'tenant-a' AND status = 'running' AND poisoned_at IS NULL
+               """).rows
+
+      assert tenant_fair_function_catalog("public") == [
+               ["docket_tenant_fair_claim", RingFunctionV3.identity_arguments()]
+             ]
+
+      assert_function_abi_works!("public", :v3)
+      assert_function_abi_missing!("public", :v2)
+    end
+
+    test "custom-prefix v3 upgrade and down restore the v2 function ABI" do
+      :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
+      insert_v1_graph_and_run(nil, "tenantless-live", "docket_private")
+      :ok = Ecto.Migrator.up(TestRepo, @private_v2, UpgradePrivateV2, log: false)
+
+      TestRepo.query!("""
+      UPDATE docket_private.docket_runs
+      SET claim_token = '00000000-0000-0000-0000-000000000003'::uuid,
+          claimed_at = CURRENT_TIMESTAMP, wake_at = NULL, claim_attempts = 1
+      WHERE run_id = 'tenantless-live'
+      """)
+
+      :ok = Ecto.Migrator.up(TestRepo, @private_v3, UpgradePrivateV3, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(
+               repo: TestRepo,
+               prefix: "docket_private"
+             ) == 3
+
+      assert [["tenantless-live", true]] =
+               TestRepo.query!("""
+               SELECT run_id, tenant_admitted_at IS NOT NULL
+               FROM docket_private.docket_runs
+               """).rows
+
+      assert tenant_fair_function_catalog("docket_private") == [
+               ["docket_tenant_fair_claim", RingFunctionV3.identity_arguments()]
+             ]
+
+      assert_function_abi_works!("docket_private", :v3)
+      assert_function_abi_missing!("docket_private", :v2)
+
+      :ok = Ecto.Migrator.down(TestRepo, @private_v3, UpgradePrivateV3, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(
+               repo: TestRepo,
+               prefix: "docket_private"
+             ) == 2
+
+      refute column_exists?("docket_private", "docket_runs", "tenant_admitted_at")
+
+      assert tenant_fair_function_catalog("docket_private") == [
+               ["docket_tenant_fair_claim", RingFunction.identity_arguments()]
+             ]
+
+      assert_function_abi_works!("docket_private", :v2)
+      assert_function_abi_missing!("docket_private", :v3)
+    end
+
+    test "a failed transactional v3 upgrade preserves the v2 schema, ABI, and run state" do
+      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "claimed")
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET claim_token = '00000000-0000-0000-0000-000000000004'::uuid,
+          claimed_at = CURRENT_TIMESTAMP, wake_at = NULL, claim_attempts = 1
+      WHERE run_id = 'claimed'
+      """)
+
+      assert_raise RuntimeError, "forced v3 rollback", fn ->
+        Ecto.Migrator.up(TestRepo, @failed_v3, FailedUpgradeV3, log: false)
+      end
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+      refute column_exists?("public", "docket_runs", "tenant_admitted_at")
+
+      assert [["claimed", true, true]] =
+               TestRepo.query!("""
+               SELECT run_id, claim_token IS NOT NULL, claimed_at IS NOT NULL
+               FROM docket_runs
+               """).rows
+
+      assert tenant_fair_function_catalog("public") == [
+               ["docket_tenant_fair_claim", RingFunction.identity_arguments()]
+             ]
+
+      assert_function_abi_works!("public", :v2)
+      assert_function_abi_missing!("public", :v3)
     end
 
     test "host v1-to-current and fresh-current paths have equivalent schemas" do
@@ -476,6 +646,55 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """,
         [prefix]
       ).rows
+    end
+
+    defp assert_function_abi_works!(prefix, version) do
+      {arguments, definition} = function_abi(version)
+      function = ~s("#{prefix}"."docket_tenant_fair_claim")
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      assert %Postgrex.Result{} =
+               TestRepo.query!(
+                 "SELECT count(*) FROM #{function}(#{arguments}) AS claimed(#{definition})",
+                 [now, DateTime.add(now, -3_600, :second), 1, 5, nil, 4]
+               )
+    end
+
+    defp assert_function_abi_missing!(prefix, version) do
+      {arguments, definition} = function_abi(version)
+      function = ~s("#{prefix}"."docket_tenant_fair_claim")
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      error =
+        assert_raise Postgrex.Error, fn ->
+          TestRepo.query!(
+            "SELECT count(*) FROM #{function}(#{arguments}) AS claimed(#{definition})",
+            [now, DateTime.add(now, -3_600, :second), 1, 5, nil, 4]
+          )
+        end
+
+      assert error.postgres.code == :undefined_function
+    end
+
+    defp function_abi(:v2) do
+      {"$1, $2, $3, $4, $5, $6, false", RingFunction.result_definition()}
+    end
+
+    defp function_abi(:v3) do
+      {"$1, $2, $3, $4, $5, $6, false, 3", RingFunctionV3.result_definition()}
+    end
+
+    defp column_exists?(prefix, table, column) do
+      TestRepo.query!(
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
+        )
+        """,
+        [prefix, table, column]
+      ).rows == [[true]]
     end
 
     defp membership_function_count(prefix) do

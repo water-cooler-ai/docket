@@ -10,12 +10,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     work belongs to `RingFunction` inside the same database statement.
     """
 
-    alias Docket.Postgres.ClaimPolicy.TenantFair.RingFunction
+    alias Docket.Postgres.ClaimPolicy.TenantFair.RingFunctionV3
 
     def statement(function) when is_binary(function) do
       """
       SELECT
-        #{RingFunction.public_projection()}
+        #{RingFunctionV3.public_projection()}
       FROM #{function}(
         $1,
         $2,
@@ -23,9 +23,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         $4,
         $5,
         $6,
-        false
+        false,
+        3
       ) AS claimed(
-        #{RingFunction.result_definition()}
+        #{RingFunctionV3.result_definition()}
       )
       WHERE claimed.row_kind IN ('outcome', 'error')
       ORDER BY claimed.visit_ordinal NULLS FIRST,

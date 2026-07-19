@@ -16,6 +16,16 @@ entries below reflect what has landed so far.
 
 ### Added
 
+- PostgreSQL schema version 3 replaces TenantFair's transient live-claim cap
+  with sticky logical-run admission. `tenant_admitted_at` survives cooperative
+  yield, reacquisition, refresh, and expired steal; future scheduling, external
+  waiting, poison, and terminal transitions release the slot. FIFO promotion
+  and fresh admitted-count checks enforce `max_active_runs`, including
+  non-preemptive cap debt. The stopped migration backfills healthy claims,
+  adds admitted/queued partial indexes, replaces the claim function, supports
+  custom prefixes and V2 downgrade, and makes old-schema startup fail closed.
+  TenantFair configuration is now `default_max_active_runs`; Admin results use
+  `max_active_runs` and expose token-free queue/admission/debt counts.
 - PostgreSQL schema version 2 adds one prefix-local TenantFair scheduling table
   with an exact trigger-maintained count of nonterminal runs per tenant and
   stores the serialized scan position on the existing policy row. Fixed `S =
@@ -42,9 +52,10 @@ entries below reflect what has landed so far.
   ordinary supporting indexes, engine interlock, and TenantFair claim function.
   Existing scope keys are backfilled transactionally while inserts are blocked.
   ClaimPolicy implementations receive the additive quoted identifier context.
-- Exact-cap `Docket.Postgres.ClaimPolicy.TenantFair` admission with one persisted
+- TenantFair admission with one persisted
   default, optional per-owner overrides, concurrent final-slot serialization,
-  count-neutral expired recovery, cap-reduction debt, and bounded cross-owner
+  sticky logical-run residency, count-neutral expired recovery,
+  cap-reduction debt, and bounded cross-owner
   rotation. The current-state Admin API supports versioned default and override
   changes without rollout ledgers, audit history, or governance workflows.
 - `Docket.BackendTests`, a source-owned shared ExUnit suite under

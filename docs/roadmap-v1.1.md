@@ -314,7 +314,8 @@ post-v0.1 design area. The smaller shipped invariant is documented in
 Add moderate multi-tenant fairness to the shared durable dispatcher without
 preempting node execution or weakening claim fencing. A global dispatcher
 concurrency limit still bounds all active vehicles, while a database-wide
-partition limit bounds how many live claims one tenant may hold at once:
+partition limit bounds how many sticky logical runs one tenant may have
+admitted at once:
 
 ```elixir
 dispatcher: [concurrency: 100],
@@ -322,7 +323,7 @@ claim_policy: [
   implementation: Docket.Postgres.ClaimPolicy.TenantFair,
   partition_by: :tenant_id,
   default_preferred_active: 2,
-  default_max_active: 4,
+  default_max_active_runs: 4,
   default_weight: 1,
   borrowing: true
 ]
@@ -335,12 +336,12 @@ available behavior. The intended behavior is:
 - Claim selection is fair across eligible tenant partitions and stable within
   a tenant by wake time and run ID. A tenant with a deep backlog must not hide
   another tenant's first eligible run.
-- `max_active` is an absolute ceiling enforced across every dispatcher sharing
+- `max_active_runs` is an absolute ceiling enforced across every dispatcher sharing
   the database and prefix, not independently per BEAM node. Acquisition
   remains atomic and compatible with the existing token, sequence fence,
   expiry, poison, and `FOR UPDATE SKIP LOCKED` paths.
 - With `borrowing: false`, a tenant stops at `preferred_active`. With borrowing
-  enabled, one tenant may consume otherwise-idle capacity up to `max_active`,
+  enabled, one tenant may consume otherwise-idle capacity up to `max_active_runs`,
   but new admissions prefer tenants below their preferred threshold as
   capacity turns over. Preferred capacity is not reserved or guaranteed.
   Borrowing improves utilization; it must not turn into a permanent
@@ -380,7 +381,7 @@ more parallel node work than another.
   throughput with many partitions, one hot partition, and mixed ready/expired
   claims. Bursting must not amplify polling or notification churn.
 - Any denormalized partition counters must be recoverable from authoritative
-  live claims and remain correct across crash, expiry, steal, cancellation,
+  admitted-run markers and remain correct across crash, expiry, steal, cancellation,
   terminal commit, and poison recovery. Avoid counters if the claim query can
   enforce the limit efficiently from indexed run rows.
 

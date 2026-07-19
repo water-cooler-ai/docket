@@ -349,10 +349,11 @@ re-execution, not a partial durable moment.
 
 ## Exact per-owner caps and TenantFair schema state
 
-Schema version 2 contains the policy and partition authority used by
+Schema version 2 contains the policy, partition authority, unfinished ring,
+and scan cursor used by
 `Docket.Postgres.ClaimPolicy.TenantFair`, its unique scheduling ring, exact
-trigger-maintained unfinished-run count, global scan cursor, claim function,
-and fixed admission budgets. The unfinished ring is an
+trigger-maintained unfinished-run count, and fixed admission budgets. Schema
+version 3 adds sticky logical-run admission and the current claim function. The unfinished ring is an
 authoritative superset of current eligibility, so future timers and parked
 running work may consume an unsuccessful inspection without becoming
 invisible. Enable TenantFair consistently across the fleet:
@@ -360,7 +361,7 @@ invisible. Enable TenantFair consistently across the fleet:
 ```elixir
 claim_policy: [
   implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-  default_max_active: 4
+  default_max_active_runs: 4
 ]
 ```
 
@@ -384,9 +385,11 @@ alias Docket.Postgres.ClaimPolicy.Admin
   )
 ```
 
-Reducing a cap below the current live count does not terminate claims. It
-creates debt and blocks additive ready claims until completions bring the live
-count below the new cap. Expired lease recovery remains count-neutral.
+`effective` includes token-free `queued`, `admitted_ready`,
+`admitted_claimed`, and `debt` counts. Reducing a cap below the current
+admitted-run count does not preempt work. It blocks FIFO queue promotion until
+admission releases bring the count below the new cap. Immediate cooperative
+yield and expired lease recovery retain admission and remain count-neutral.
 
 ### Existing v1 installations
 
@@ -400,16 +403,18 @@ mix ecto.migrate -r MyApp.Repo
 Stop dispatchers and all Docket run writers before the upgrade, deploy one
 homogeneous binary version, migrate, and restart. The migration locks the runs
 table against inserts while it backfills owner partitions and schedule rows.
-The current binary requires schema version 2. Rolling back the generated v1
-upgrade removes V02 and returns to schema version 1. Online migrations,
+The current binary requires schema version 3 and checks it before starting
+backend children. A landed V2 installation generates its additive migration
+with `--upgrade-from-v2`. Rolling back that migration recreates the V2 claim
+function and removes V3 admission state. Rolling back a generated v1 upgrade
+removes V03 and V02 and returns to schema version 1. Online migrations,
 readiness ledgers, fleet
 attestations, and audited activation are intentionally outside the v0.1.0
 contract.
 
-Fresh installations generated without `--upgrade-from-v1` install V01 and V02
-in one host migration. Earlier unreleased V02/V03 development schemas are not
-upgrade sources; recreate those local/test databases, or roll them back using
-their matching historical code before applying the collapsed V02.
+Fresh installations generated without an upgrade flag install V01, V02, and
+V03 in one host migration. Use the same explicit prefix in both migration
+directions and runtime configuration.
 
 ## Operational inspection
 
