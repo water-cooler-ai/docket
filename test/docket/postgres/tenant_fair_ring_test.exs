@@ -65,6 +65,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "raw trace exposes one deterministic H=1 grant without changing public columns" do
+      configure_default!(4)
       seed_runs(1)
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       cutoff = DateTime.add(now, -3_600, :second)
@@ -73,12 +74,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         TestRepo.query!(
           """
           SELECT claimed.*
-          FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, true)
+          FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, true)
             AS claimed(#{RingFunction.result_definition()})
           ORDER BY claimed.visit_ordinal, claimed.outcome_ordinal NULLS LAST,
                    claimed.row_kind
           """,
-          [now, cutoff, 1, 5, nil, 4]
+          [now, cutoff, 1, 5, nil]
         ).rows
 
       outcomes = Enum.filter(rows, &(hd(&1) == "outcome"))
@@ -107,7 +108,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ).rows
     end
 
-    test "TenantFair installs one unversioned seven-argument claim ABI" do
+    test "TenantFair installs one unversioned six-argument claim ABI" do
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
       assert [[RingFunction.identity_arguments()]] ==
@@ -123,7 +124,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         TestRepo.query!(
           """
           SELECT claimed.*
-          FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, false, 3)
+          FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, false)
             AS claimed(#{RingFunction.result_definition()})
           """,
           [now, DateTime.add(now, -60, :second), 1, 5, nil, 1]
@@ -975,19 +976,39 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       max_attempts = Keyword.get(options, :max_attempts, 5)
       preference = Keyword.get(options, :preference)
       default_max = Keyword.fetch!(options, :default_max)
+      configure_default!(default_max)
 
       TestRepo.query!(
         """
         SELECT claimed.*
-        FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, $6, true)
+        FROM docket_tenant_fair_claim($1, $2, $3, $4, $5, true)
           AS claimed(#{RingFunction.result_definition()})
         ORDER BY claimed.visit_ordinal NULLS FIRST,
                  claimed.outcome_ordinal NULLS FIRST,
                  claimed.row_kind
         """,
-        [now, cutoff, demand, max_attempts, preference, default_max]
+        [now, cutoff, demand, max_attempts, preference]
       ).rows
       |> Enum.map(fn row -> Map.new(Enum.zip(@trace_columns, row)) end)
+    end
+
+    defp configure_default!(maximum) do
+      context =
+        Docket.Postgres.context(
+          repo: TestRepo,
+          claim_policy: [
+            implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+            default_max_active_runs: maximum
+          ]
+        )
+
+      claim_policy = Docket.Postgres.ClaimPolicy.resolve(context)
+
+      assert :ok =
+               Docket.Postgres.ClaimPolicy.configure(claim_policy, context, fn statement,
+                                                                               params ->
+                 TestRepo.query(statement, params, log: false)
+               end)
     end
 
     defp seed_runs(count) do

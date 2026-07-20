@@ -271,7 +271,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       TestRepo.delete_all(Event)
       TestRepo.delete_all(Run)
-      TestRepo.query!("UPDATE docket_claim_policy SET admission_mode = 'legacy' WHERE id = 1")
+
+      TestRepo.query!("""
+      UPDATE docket_claim_policy
+      SET admission_mode = 'legacy', max_active = NULL, policy_version = 0,
+          scan_ring_position = 0, initialized_at = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      """)
+
       TestRepo.delete_all(GraphVersion)
       Docket.Postgres.GraphCache.clear()
       on_exit(&Docket.Postgres.GraphCache.clear/0)
@@ -1026,8 +1033,55 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    test "TenantFair startup idempotently persists configured defaults before children" do
+      opts = [
+        name: __MODULE__.TenantFairStartup,
+        repo: TestRepo,
+        tenant_mode: :required,
+        claim_policy: [
+          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+          default_max_active_runs: 2
+        ],
+        testing: :manual,
+        notifier: :none
+      ]
+
+      assert {:ok, _supervisor_spec} = postgres_init(opts)
+
+      assert [["tenant_fair", 2, 1, initialized_at]] = policy_configuration()
+      assert %DateTime{} = initialized_at
+
+      assert {:ok, %{version: 1}} =
+               Docket.Postgres.ClaimPolicy.Admin.put_override(
+                 Docket.Postgres.context(repo: TestRepo),
+                 {:tenant, "preserved"},
+                 1,
+                 expected_version: 0
+               )
+
+      assert {:ok, _supervisor_spec} = postgres_init(opts)
+      assert [["tenant_fair", 2, 1, ^initialized_at]] = policy_configuration()
+
+      changed_opts = put_in(opts, [:claim_policy, :default_max_active_runs], 4)
+      assert {:ok, _supervisor_spec} = postgres_init(changed_opts)
+      assert [["tenant_fair", 4, 2, ^initialized_at]] = policy_configuration()
+
+      assert [["preserved", 1, 1]] =
+               TestRepo.query!(
+                 "SELECT scope_key, max_active, partition_version " <>
+                   "FROM docket_claim_partitions WHERE scope_key = 'preserved'"
+               ).rows
+    end
+
     defp postgres_init(opts) do
       Docket.Postgres.init({opts, Docket.Postgres.context(opts)})
+    end
+
+    defp policy_configuration do
+      TestRepo.query!(
+        "SELECT admission_mode, max_active, policy_version, initialized_at " <>
+          "FROM docket_claim_policy WHERE id = 1"
+      ).rows
     end
 
     test "storage remains exactly the current versioned schema" do

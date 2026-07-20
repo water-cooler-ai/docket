@@ -3,8 +3,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduledoc """
     Database-authoritative exact-cap admission with bounded cross-tenant rotation.
 
-    The configured default cap only bootstraps an uninitialized database. Once
-    persisted, the default and tenant overrides are managed through
+    Backend startup persists the configured default cap before starting any
+    dispatcher or worker. Repeated startup with the same cap is idempotent;
+    changing the configured cap updates the database on the next homogeneous
+    deployment. Per-owner overrides remain runtime-managed through
     `Docket.Postgres.ClaimPolicy.Admin`.
 
     ## Responsibility boundary
@@ -17,9 +19,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     This module is the application-side `Docket.Postgres.ClaimPolicy`
     implementation. It:
 
-    * validates the configured bootstrap cap;
+    * validates and persists the configured default cap at backend startup;
     * normalizes runtime timestamps and derives the expired-claim cutoff;
-    * builds one data-only `Docket.Postgres.ClaimPolicy.Plan` with the six
+    * builds one data-only `Docket.Postgres.ClaimPolicy.Plan` with the five
       semantic bind values;
     * resolves the prefix-qualified claim function installed by the migration;
     * decodes the unchanged fourteen public columns into leases and poisoned
@@ -57,6 +59,37 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def init(options, _context), do: Config.new(options)
 
     @impl true
+    def configure(
+          %{prefix: prefix},
+          %Config{default_max_active_runs: default_max_active_runs},
+          query
+        ) do
+      policy = Storage.qualified_table(prefix, "docket_claim_policy")
+
+      statement = """
+      INSERT INTO #{policy}
+        (id, admission_mode, max_active, policy_version, initialized_at, updated_at)
+      VALUES (1, 'tenant_fair', $1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ON CONFLICT (id) DO UPDATE
+      SET admission_mode = 'tenant_fair',
+          max_active = EXCLUDED.max_active,
+          policy_version = #{policy}.policy_version + 1,
+          initialized_at = COALESCE(#{policy}.initialized_at, CURRENT_TIMESTAMP),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE #{policy}.admission_mode IS DISTINCT FROM 'tenant_fair'
+         OR #{policy}.max_active IS DISTINCT FROM EXCLUDED.max_active
+         OR #{policy}.initialized_at IS NULL
+      RETURNING admission_mode, max_active, policy_version, initialized_at
+      """
+
+      case query.(statement, [default_max_active_runs]) do
+        {:ok, %{rows: rows}} when length(rows) in 0..1 -> :ok
+        {:error, reason} -> {:error, reason}
+        other -> {:error, {:unexpected_startup_configuration_result, other}}
+      end
+    end
+
+    @impl true
     def build_plan(
           %{prefix: prefix},
           %{
@@ -66,7 +99,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             max_claim_attempts: max,
             preference: preference
           },
-          %Config{default_max_active_runs: default_max_active_runs}
+          %Config{}
         ) do
       now = normalize_database_datetime(now)
       cutoff = DateTime.add(now, -ttl, :millisecond)
@@ -79,8 +112,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           cutoff,
           limit,
           max,
-          preference && Atom.to_string(preference),
-          default_max_active_runs
+          preference && Atom.to_string(preference)
         ],
         decoder: %{now: now, orphan_ttl_ms: ttl},
         observation: %{demand: limit, preference: preference}
@@ -282,6 +314,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp load_error_reason("read_only_transaction"), do: :read_only_transaction
     defp load_error_reason("unsupported_isolation"), do: :unsupported_isolation
     defp load_error_reason("lock_contention"), do: :lock_contention
+    defp load_error_reason("not_initialized"), do: :not_initialized
+    defp load_error_reason("inactive_engine"), do: :inactive_engine
+    defp load_error_reason("malformed_policy"), do: :malformed
     defp load_error_reason(_reason), do: :unavailable
 
     defp owner_scope(nil), do: :tenantless

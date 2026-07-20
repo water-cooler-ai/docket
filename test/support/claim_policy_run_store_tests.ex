@@ -2,7 +2,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Test.TenantFairRunStoreSetup do
     @moduledoc false
 
-    def prepare!(repo, _implementation_opts) do
+    def prepare!(repo, implementation_opts) do
+      context =
+        Docket.Postgres.context(
+          repo: repo,
+          claim_policy:
+            [implementation: Docket.Postgres.ClaimPolicy.TenantFair] ++ implementation_opts
+        )
+
+      claim_policy = Docket.Postgres.ClaimPolicy.resolve(context)
+
+      :ok =
+        Docket.Postgres.ClaimPolicy.configure(claim_policy, context, fn statement, params ->
+          repo.query(statement, params, log: false)
+        end)
+
       repo.query!(
         "INSERT INTO docket_claim_partitions (scope_key) VALUES ('') ON CONFLICT DO NOTHING"
       )

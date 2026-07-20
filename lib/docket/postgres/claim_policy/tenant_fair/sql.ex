@@ -22,7 +22,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         $3,
         $4,
         $5,
-        $6,
         false
       ) AS claimed(
         #{RingFunction.result_definition()}

@@ -137,7 +137,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert tenant_fair_function_catalog("public") == [
                [
                  "docket_tenant_fair_claim",
-                 "timestamp with time zone, timestamp with time zone, integer, integer, text, integer, boolean"
+                 "timestamp with time zone, timestamp with time zone, integer, integer, text, boolean"
                ]
              ]
     end
@@ -617,9 +617,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert %Postgrex.Result{} =
                TestRepo.query!(
-                 "SELECT count(*) FROM #{function}($1, $2, $3, $4, $5, $6, false) " <>
+                 "SELECT count(*) FROM #{function}($1, $2, $3, $4, $5, false) " <>
                    "AS claimed(#{RingFunction.result_definition()})",
-                 [now, DateTime.add(now, -3_600, :second), 1, 5, nil, 4]
+                 [now, DateTime.add(now, -3_600, :second), 1, 5, nil]
                )
     end
 

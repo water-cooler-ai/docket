@@ -287,7 +287,7 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `prefix:` | `public` | Must match both directions of the generated migration. |
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
 | `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` for `tenant_mode: :none` | Required PostgreSQL tenancy must select `Docket.Postgres.ClaimPolicy.TenantFair`; implementations are validated before startup and cannot be selected per call. |
-| `claim_policy.default_max_active_runs` | required by TenantFair | Bootstrap cap in `1..2_147_483_647`. The persisted default and per-scope overrides are authoritative after initialization. |
+| `claim_policy.default_max_active_runs` | required by TenantFair | Desired persisted default in `1..2_147_483_647`. Startup reconciles this field before dispatchers start; per-scope overrides are never reconciled from config. |
 | `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
 | `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
 | `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
@@ -382,8 +382,13 @@ claim_policy: [
 ]
 ```
 
-The configured value initializes an unset database default. Thereafter use the
-administration API:
+After schema validation and before dispatchers start, each TenantFair instance
+atomically persists the configured value and active engine. Repeated startup
+with the same homogeneous configuration is idempotent. Changing the option on a
+deployment updates the centralized default automatically.
+
+The database remains live authority while the application runs. Use the Admin
+API for runtime changes and per-owner overrides:
 
 ```elixir
 alias Docket.Postgres.ClaimPolicy.Admin
@@ -403,6 +408,12 @@ context = Docket.Postgres.context(repo: MyApp.Repo, prefix: "public")
     expected_version: override.version
   )
 ```
+
+An Admin change to the default remains live until another default change or
+application startup. The next startup restores the configured
+`default_max_active_runs`; per-owner overrides always survive reconciliation.
+All instances sharing the database and prefix must deploy the same value.
+Mixed independently deployed configurations are unsupported in v0.1.
 
 `effective` includes token-free `queued`, `admitted_ready`,
 `admitted_claimed`, and `debt` counts. Reducing a cap below the current
