@@ -7,6 +7,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.ClaimPolicy.TenantFair.{Budgets, RingFunction}
     alias Docket.Postgres.{RunStore, TestRepo}
     alias Docket.Test.ConcurrentAdmissionHarness.FairRotationOracle
+    alias Docket.Test.FairRotationTargetWitness
 
     @migration_version 20_260_719_000_179
     @now ~U[2026-07-19 12:00:00.000000Z]
@@ -735,6 +736,58 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert result.observed_scan_calls == 1
     end
 
+    test "database target witness counts admission markers instead of transient tokens" do
+      assert raw_tenant_fair_claim!() == []
+      insert_ready_scope("target")
+      insert_claimed_run("target", "target-live")
+
+      TestRepo.query!(
+        "UPDATE docket_claim_partitions SET max_active = 1 WHERE scope_key = 'target'"
+      )
+
+      witness = target_witness()
+      assert witness["admitted_count"] == 1
+      refute witness["queued_promotion"]
+      refute witness["eligible"]
+
+      TestRepo.query!(
+        "UPDATE docket_runs SET tenant_admitted_at = NULL WHERE run_id = 'target-live'"
+      )
+
+      witness = target_witness()
+      assert witness["admitted_count"] == 0
+      assert witness["queued_promotion"]
+      assert witness["eligible"]
+    end
+
+    test "database target witness rejects markerless expired ordinary and poison rows" do
+      assert raw_tenant_fair_claim!() == []
+      insert_ready_scope("target")
+
+      TestRepo.query!(
+        """
+        UPDATE docket_runs
+        SET wake_at = NULL,
+            claim_token = pg_catalog.gen_random_uuid(),
+            claimed_at = $1,
+            tenant_admitted_at = NULL,
+            claim_attempts = 1
+        WHERE run_id = 'run-target'
+        """,
+        [DateTime.add(@now, -7_200, :second)]
+      )
+
+      witness = target_witness()
+      refute witness["expired"]
+      refute witness["eligible"]
+
+      TestRepo.query!("UPDATE docket_runs SET claim_attempts = 5 WHERE run_id = 'run-target'")
+
+      witness = target_witness()
+      refute witness["expired_poison"]
+      refute witness["eligible"]
+    end
+
     test "a poison grant remains bounded before the admissible target" do
       assert raw_tenant_fair_claim!() == []
       insert_ready_scope("poison")
@@ -1144,34 +1197,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp target_admissible? do
-      TestRepo.query!(
-        """
-        SELECT
-          EXISTS (
-            SELECT 1
-            FROM docket_runs
-            WHERE scope_key = 'target'
-              AND status = 'running'
-              AND poisoned_at IS NULL
-              AND claim_token IS NULL
-              AND wake_at <= $1
-          )
-          AND (
-            SELECT count(*)
-            FROM docket_runs
-            WHERE scope_key = 'target'
-              AND status = 'running'
-              AND poisoned_at IS NULL
-              AND claim_token IS NOT NULL
-          ) < (
-            SELECT COALESCE(partition.max_active, policy.max_active)
-            FROM docket_claim_partitions AS partition
-            CROSS JOIN docket_claim_policy AS policy
-            WHERE partition.scope_key = 'target' AND policy.id = 1
-          )
-        """,
-        [@now]
-      ).rows == [[true]]
+      target_witness()["eligible"]
+    end
+
+    defp target_witness do
+      FairRotationTargetWitness.read!(
+        TestRepo,
+        "target",
+        @now,
+        DateTime.add(@now, -3_600, :second),
+        5
+      )
     end
 
     defp policy do

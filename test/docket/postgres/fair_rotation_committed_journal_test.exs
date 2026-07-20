@@ -8,7 +8,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.ClaimPolicy.TenantFair.{Budgets, RingFunction}
     alias Docket.Postgres.TestRepo
     alias Docket.Test.ConcurrentAdmissionHarness.FairRotationOracle
-    alias Docket.Test.FairRotationProofJournal
+    alias Docket.Test.{FairRotationProofJournal, FairRotationTargetWitness}
 
     @migration_version 20_260_719_000_279
     @prefixed_migration_version 20_260_719_000_280
@@ -146,6 +146,96 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert_raise ArgumentError, ~r/target admissibility changed/, fn ->
         FairRotationProofJournal.verify!(TestRepo, window, lock_failures: 0)
       end
+    end
+
+    test "target witness counts sticky admission markers rather than live claim tokens" do
+      seed_scope_authority("target", 1)
+      insert_claimed("target", "target-live", @now, 1)
+      insert_ready("target", "target-queued", DateTime.add(@now, -60, :second), 0)
+
+      witness = target_witness()
+      assert witness["admitted_count"] == 1
+      refute witness["queued_promotion"]
+      refute witness["eligible"]
+
+      TestRepo.query!(
+        "UPDATE docket_runs SET tenant_admitted_at = NULL WHERE run_id = 'target-live'"
+      )
+
+      witness = target_witness()
+      assert witness["admitted_count"] == 0
+      assert witness["queued_promotion"]
+      assert witness["eligible"]
+    end
+
+    test "target witness requires sticky admission for expired ordinary and poison work" do
+      seed_scope_authority("target", 1)
+      insert_claimed("target", "target-expired", DateTime.add(@now, -7_200, :second), 1)
+
+      assert target_witness()["expired"]
+
+      TestRepo.query!(
+        "UPDATE docket_runs SET tenant_admitted_at = NULL WHERE run_id = 'target-expired'"
+      )
+
+      witness = target_witness()
+      refute witness["expired"]
+      refute witness["eligible"]
+
+      TestRepo.query!("UPDATE docket_runs SET claim_attempts = 5 WHERE run_id = 'target-expired'")
+
+      witness = target_witness()
+      refute witness["expired_poison"]
+      refute witness["eligible"]
+    end
+
+    test "target witness classifies only the authoritative queued FIFO head" do
+      seed_scope_authority("target", 2)
+      insert_ready("target", "target-head", DateTime.add(@now, -120, :second), 5)
+      insert_ready("target", "target-later", DateTime.add(@now, -60, :second), 0)
+
+      witness = target_witness()
+      refute witness["queued_promotion"]
+      assert witness["queued_poison_promotion"]
+      refute witness["ready"]
+      assert witness["ready_poison"]
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET claim_attempts = CASE run_id
+        WHEN 'target-head' THEN 0
+        WHEN 'target-later' THEN 5
+      END
+      WHERE run_id IN ('target-head', 'target-later')
+      """)
+
+      witness = target_witness()
+      assert witness["queued_promotion"]
+      refute witness["queued_poison_promotion"]
+      assert witness["ready"]
+      refute witness["ready_poison"]
+    end
+
+    test "target witness separates admitted poison from queued poison at a full cap" do
+      seed_scope_authority("target", 1)
+      insert_claimed("target", "target-live", @now, 1)
+      insert_ready("target", "target-poison", DateTime.add(@now, -60, :second), 5)
+
+      witness = target_witness()
+      refute witness["admitted_ready_poison"]
+      refute witness["queued_poison_promotion"]
+      refute witness["eligible"]
+
+      TestRepo.query!(
+        "UPDATE docket_runs SET tenant_admitted_at = $1 WHERE run_id = 'target-poison'",
+        [@now]
+      )
+
+      witness = target_witness()
+      assert witness["admitted_count"] == 2
+      assert witness["admitted_ready_poison"]
+      refute witness["queued_poison_promotion"]
+      assert witness["eligible"]
     end
 
     test "ring join then leave is rejected despite restoring the original ring" do
@@ -345,6 +435,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp open_window(target) do
       FairRotationProofJournal.open_window!(TestRepo, target, @now, @cutoff, 5)
+    end
+
+    defp target_witness(scope \\ "target") do
+      FairRotationTargetWitness.read!(TestRepo, scope, @now, @cutoff, 5)
     end
 
     defp seed_target_form(:ready) do

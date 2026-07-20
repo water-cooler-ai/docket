@@ -3,7 +3,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduledoc false
 
     alias Docket.Postgres.ClaimPolicy.TenantFair.{Budgets, RingFunction}
-    alias Docket.Test.FairRotationAdversarialVerifier
+    alias Docket.Test.{FairRotationAdversarialVerifier, FairRotationTargetWitness}
 
     @result_definition RingFunction.result_definition()
 
@@ -773,48 +773,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ) RETURNS jsonb
       LANGUAGE sql VOLATILE
       AS $proof$
-        WITH authority AS (
-          SELECT COALESCE(partition.max_active, policy.max_active)::bigint AS cap,
-                 (SELECT count(*)
-                  FROM docket_runs AS live
-                  WHERE live.scope_key = p_scope
-                    AND live.status = 'running'
-                    AND live.poisoned_at IS NULL
-                    AND live.claim_token IS NOT NULL) AS live_count
-          FROM docket_claim_partitions AS partition
-          CROSS JOIN docket_claim_policy AS policy
-          WHERE partition.scope_key = p_scope AND policy.id = 1
-        ), classes AS (
-          SELECT
-            EXISTS (SELECT 1 FROM docket_runs, authority
-              WHERE scope_key = p_scope AND status = 'running' AND poisoned_at IS NULL
-                AND claim_token IS NULL AND wake_at <= p_now
-                AND claim_attempts < p_max_attempts AND live_count < cap) AS ready,
-            EXISTS (SELECT 1 FROM docket_runs
-              WHERE scope_key = p_scope AND status = 'running' AND poisoned_at IS NULL
-                AND claim_token IS NOT NULL AND claimed_at < p_cutoff
-                AND claim_attempts < p_max_attempts) AS expired,
-            EXISTS (SELECT 1 FROM docket_runs
-              WHERE scope_key = p_scope AND status = 'running' AND poisoned_at IS NULL
-                AND claim_token IS NULL AND wake_at <= p_now
-                AND claim_attempts >= p_max_attempts) AS ready_poison,
-            EXISTS (SELECT 1 FROM docket_runs
-              WHERE scope_key = p_scope AND status = 'running' AND poisoned_at IS NULL
-                AND claim_token IS NOT NULL AND claimed_at < p_cutoff
-                AND claim_attempts >= p_max_attempts) AS expired_poison,
-            (SELECT cap FROM authority) AS cap,
-            (SELECT live_count FROM authority) AS live_count
-        )
-        SELECT jsonb_build_object(
-          'eligible', ready OR expired OR ready_poison OR expired_poison,
-          'ready', ready,
-          'expired', expired,
-          'ready_poison', ready_poison,
-          'expired_poison', expired_poison,
-          'cap', cap,
-          'live_count', live_count
-        )
-        FROM classes
+        #{FairRotationTargetWitness.query("p_scope", "p_now", "p_cutoff", "p_max_attempts")}
       $proof$
       """
     end
