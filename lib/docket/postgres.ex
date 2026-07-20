@@ -162,7 +162,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       validate_nested!(Keyword.get(opts, :vehicle, []), :vehicle)
       dispatcher = effective_dispatcher(opts)
       validate_dispatcher!(dispatcher)
-      _resolved_claim_policy = ClaimPolicy.resolve(context)
+      resolved_claim_policy = ClaimPolicy.resolve(context)
       validate_schema_version!(context, opts)
       execution = effective_execution(opts)
       vehicle = effective_vehicle(Keyword.get(opts, :vehicle, []))
@@ -170,6 +170,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       validate_runtime_limits!(dispatcher, execution, vehicle)
 
       children = children(opts, name, context)
+      configure_claim_policy!(context, resolved_claim_policy, opts)
 
       Supervisor.init(children, strategy: :one_for_one)
     end
@@ -256,6 +257,53 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             "Docket.Postgres found schema version #{Migration.current_version()} in prefix " <>
               "#{inspect(prefix)}, but its structure does not match the current Docket schema; " <>
               "recreate the unreleased development schema from the current generated migration"
+    end
+
+    defp configure_claim_policy!(context, claim_policy, opts) do
+      if ClaimPolicy.configures_on_startup?(claim_policy) do
+        %{repo: repo} = context
+
+        result =
+          if Keyword.get(opts, :testing) in @testing_modes and
+               repo.config()[:pool] == Ecto.Adapters.SQL.Sandbox do
+            configure_sandbox_claim_policy(context, claim_policy)
+          else
+            ClaimPolicy.configure(claim_policy, context, fn statement, params ->
+              repo.query(statement, params, log: false)
+            end)
+          end
+
+        case result do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            raise ArgumentError,
+                  "Docket.Postgres could not persist its configured claim policy before " <>
+                    "startup: #{inspect(reason)}"
+        end
+      end
+    end
+
+    defp configure_sandbox_claim_policy(%{repo: repo} = context, claim_policy) do
+      connection_options =
+        repo.config()
+        |> Keyword.drop([:name, :pool, :pool_size])
+        |> Keyword.put(:sync_connect, true)
+
+      case Postgrex.start_link(connection_options) do
+        {:ok, connection} ->
+          try do
+            ClaimPolicy.configure(claim_policy, context, fn statement, params ->
+              Postgrex.query(connection, statement, params)
+            end)
+          after
+            GenServer.stop(connection)
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
 
     defp children(opts, name, context) do

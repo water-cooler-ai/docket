@@ -22,9 +22,14 @@ use Docket,
 ```
 
 `default_max_active_runs` is a required integer in `1..2_147_483_647`. It
-initializes an unset database default; the persisted default and per-scope
-overrides are authoritative afterward. The engine is selected once per backend
-instance, not per claim call.
+is a configured persisted field. After schema validation and before backend
+children start, every homogeneous TenantFair instance synchronizes the
+singleton policy row. First startup initializes it; changing the configured
+value updates it on the next deployment. Restarting with unchanged config is a
+no-op, so a runtime default change survives until the Elixir option changes.
+Per-scope overrides are durable runtime state and are never synchronized from
+application configuration. Independently deployed configurations sharing one
+domain are unsupported in v0.1.
 
 Legacy remains the omitted-policy default only for `tenant_mode: :none`. It is
 tenant-blind and never creates admission markers. Required tenancy rejects
@@ -350,7 +355,7 @@ dynamic membership, other class/demand mixes, latency, or throughput.
 
 Schema version 2 installs the engine's policy and partition
 authority, stable unfinished ring, marker and partial indexes, lifecycle
-triggers, serialized cursor, and the sole seven-argument claim function.
+triggers, serialized cursor, and the sole six-argument claim function.
 
 The stopped V1-to-V2 upgrade backfills `tenant_admitted_at = claimed_at` only
 for healthy claimed rows. Unclaimed rows remain queued; an over-cap tenant
@@ -364,10 +369,13 @@ The supported rollout is stopped and homogeneous:
 1. stop every Docket dispatcher and run writer;
 2. apply the generated transactional migration;
 3. deploy one homogeneous application version and engine configuration; and
-4. restart processing.
+4. restart processing; TenantFair persists its configured default before
+   starting dispatchers.
 
 Startup requires schema version 2 plus the validated marker-column and sole
-seven-argument function-signature shape.
+six-argument function-signature shape. Claim traffic only reads and verifies
+the initialized active policy under its existing policy lock; it never
+initializes the default or switches engines.
 Online migration, mixed old binaries, readiness ledgers, activation ceremonies,
 and audited mode history are outside v0.1.0.
 A binary that predates the engine interlock cannot be made safe by new database

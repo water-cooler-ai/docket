@@ -80,9 +80,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert Enum.sort(owned_claim_tables("public")) == current_claim_tables()
 
-      assert [[1, "legacy", nil, 0, 0, nil]] =
+      assert [[1, "legacy", nil, nil, 0, 0, nil]] =
                TestRepo.query!(
-                 "SELECT id, admission_mode, max_active, policy_version, " <>
+                 "SELECT id, admission_mode, max_active, configured_max_active, " <>
+                   "policy_version, " <>
                    "scan_ring_position, initialized_at " <>
                    "FROM docket_claim_policy"
                ).rows
@@ -137,7 +138,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert tenant_fair_function_catalog("public") == [
                [
                  "docket_tenant_fair_claim",
-                 "timestamp with time zone, timestamp with time zone, integer, integer, text, integer, boolean"
+                 "timestamp with time zone, timestamp with time zone, integer, integer, text, boolean"
                ]
              ]
     end
@@ -299,6 +300,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         "UPDATE docket_claim_policy SET admission_mode = 'invalid' WHERE id = 1",
         "UPDATE docket_claim_policy SET max_active = 0, policy_version = 1, " <>
           "initialized_at = CURRENT_TIMESTAMP WHERE id = 1",
+        "UPDATE docket_claim_policy SET configured_max_active = 0 WHERE id = 1",
         "UPDATE docket_claim_policy SET policy_version = -1 WHERE id = 1",
         "INSERT INTO docket_claim_partitions (scope_key, max_active) VALUES ('bad-cap', 0)",
         "INSERT INTO docket_claim_partitions (scope_key, partition_version) " <>
@@ -312,9 +314,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert error.postgres.code == :check_violation
       end)
 
-      assert [["legacy", nil, 0, nil]] =
+      assert [["legacy", nil, nil, 0, nil]] =
                TestRepo.query!(
-                 "SELECT admission_mode, max_active, policy_version, initialized_at " <>
+                 "SELECT admission_mode, max_active, configured_max_active, policy_version, " <>
+                   "initialized_at " <>
                    "FROM docket_claim_policy"
                ).rows
 
@@ -617,9 +620,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert %Postgrex.Result{} =
                TestRepo.query!(
-                 "SELECT count(*) FROM #{function}($1, $2, $3, $4, $5, $6, false) " <>
+                 "SELECT count(*) FROM #{function}($1, $2, $3, $4, $5, false) " <>
                    "AS claimed(#{RingFunction.result_definition()})",
-                 [now, DateTime.add(now, -3_600, :second), 1, 5, nil, 4]
+                 [now, DateTime.add(now, -3_600, :second), 1, 5, nil]
                )
     end
 

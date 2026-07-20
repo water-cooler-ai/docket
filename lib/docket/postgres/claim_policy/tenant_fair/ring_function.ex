@@ -5,9 +5,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     admission engine.
 
     One call accepts a point in time, expired-claim cutoff, requested outcome
-    count, poison-attempt threshold, optional ready/expired preference,
-    bootstrap default cap, and trace flag. The function returns newly claimed
-    leases, poisoned runs, or a normalized pre-admission error.
+    count, poison-attempt threshold, optional ready/expired preference, and
+    trace flag. The function returns newly claimed leases, poisoned runs, or a
+    normalized pre-admission error.
 
     ## Scheduling model
 
@@ -42,13 +42,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     a lower caller `lock_timeout`; otherwise it limits lock waits throughout
     the function to 250 ms.
 
-    It initializes the persisted default cap if necessary, switches the
-    singleton policy to TenantFair, and holds that row `FOR UPDATE`. That lock
-    serializes committed cursor movement and remains held until the surrounding
-    transaction ends. A timeout during this narrow initialization/cursor phase
-    rolls the phase back and returns `lock_contention` without inspecting a
-    partition or changing policy, schedules, epochs, or runs. Later errors are
-    raised so the entire statement aborts.
+    It locks the singleton policy row, verifies that backend startup persisted
+    an initialized TenantFair default, and never changes the cap or active
+    engine. That lock serializes committed cursor movement and remains held
+    until the surrounding transaction ends. A timeout during this narrow
+    readiness/cursor phase returns `lock_contention` without inspecting a
+    partition or changing policy, schedules, epochs, or runs. Later errors
+    abort the statement.
 
     For every entered visit, the function attempts the exact partition with
     `FOR NO KEY UPDATE SKIP LOCKED`. Under that authority it freshly counts
@@ -134,7 +134,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Storage
 
     @name "docket_tenant_fair_claim"
-    @identity_arguments "timestamp with time zone, timestamp with time zone, integer, integer, text, integer, boolean"
+    @identity_arguments "timestamp with time zone, timestamp with time zone, integer, integer, text, boolean"
     @lock_timeout_ms 250
 
     @public_result_columns [
@@ -197,7 +197,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         integer,
         integer,
         text,
-        integer,
         boolean
       )
       RETURNS SETOF record
@@ -231,12 +230,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         p_demand ALIAS FOR $3;
         p_max_attempts ALIAS FOR $4;
         p_preference ALIAS FOR $5;
-        p_default_max ALIAS FOR $6;
-        p_trace ALIAS FOR $7;
+        p_trace ALIAS FOR $6;
         v_prior_lock_timeout text := current_setting('lock_timeout');
         v_call_token uuid := pg_catalog.gen_random_uuid();
         v_transaction_id bigint;
         v_default_max integer;
+        v_policy_mode text;
+        v_policy_version bigint;
+        v_initialized_at timestamp with time zone;
         v_cursor_before bigint;
         v_cursor bigint;
         v_visit_cursor_before bigint;
@@ -267,7 +268,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         IF p_now IS NULL OR p_cutoff IS NULL OR p_cutoff > p_now OR
            p_demand IS NULL OR p_demand <= 0 OR
            p_max_attempts IS NULL OR p_max_attempts <= 0 OR
-           p_default_max IS NULL OR p_default_max <= 0 OR
            p_trace IS NULL OR
            p_preference IS NOT NULL AND p_preference NOT IN ('ready', 'expired') THEN
           RAISE EXCEPTION 'invalid docket tenant-fair ring function arguments'
@@ -306,21 +306,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         END IF;
 
         BEGIN
-          UPDATE #{policy}
-          SET max_active = p_default_max,
-              admission_mode = 'tenant_fair',
-              policy_version = policy_version + 1,
-              initialized_at = COALESCE(initialized_at, p_now),
-              updated_at = p_now
-          WHERE id = 1 AND max_active IS NULL;
-
-          UPDATE #{policy}
-          SET admission_mode = 'tenant_fair',
-              updated_at = p_now
-          WHERE id = 1 AND admission_mode <> 'tenant_fair';
-
-          SELECT max_active, scan_ring_position
-          INTO v_default_max, v_cursor_before
+          SELECT admission_mode, max_active, policy_version, initialized_at,
+                 scan_ring_position
+          INTO v_policy_mode, v_default_max, v_policy_version, v_initialized_at,
+               v_cursor_before
           FROM #{policy}
           WHERE id = 1
           FOR UPDATE;
@@ -337,9 +326,39 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             RETURN;
         END;
 
-        IF v_default_max IS NULL OR v_cursor_before IS NULL THEN
-          RAISE EXCEPTION 'docket claim policy is not initialized'
-            USING ERRCODE = '55000';
+        IF v_policy_mode = 'legacy' AND v_default_max IS NULL AND
+           v_policy_version = 0 AND v_initialized_at IS NULL THEN
+          PERFORM set_config('lock_timeout', v_prior_lock_timeout, true);
+          RETURN QUERY SELECT 'error'::text, 'not_initialized'::text,
+            NULL::text, NULL::text, NULL::text, NULL::text, NULL::bigint,
+            NULL::uuid, NULL::timestamp with time zone, NULL::integer,
+            NULL::timestamp with time zone, NULL::text, NULL::text,
+            NULL::timestamp with time zone, v_call_token, v_transaction_id,
+            NULL::integer, NULL::integer, p_demand, NULL::bigint, NULL::bigint,
+            NULL::bigint, NULL::text, 'policy_readiness'::text, 0::integer, 0::bigint;
+          RETURN;
+        ELSIF v_policy_mode <> 'tenant_fair' THEN
+          PERFORM set_config('lock_timeout', v_prior_lock_timeout, true);
+          RETURN QUERY SELECT 'error'::text, 'inactive_engine'::text,
+            NULL::text, NULL::text, NULL::text, NULL::text, NULL::bigint,
+            NULL::uuid, NULL::timestamp with time zone, NULL::integer,
+            NULL::timestamp with time zone, NULL::text, NULL::text,
+            NULL::timestamp with time zone, v_call_token, v_transaction_id,
+            NULL::integer, NULL::integer, p_demand, NULL::bigint, NULL::bigint,
+            NULL::bigint, NULL::text, 'policy_readiness'::text, 0::integer, 0::bigint;
+          RETURN;
+        ELSIF v_default_max IS NULL OR v_default_max <= 0 OR
+              v_policy_version IS NULL OR v_policy_version <= 0 OR
+              v_initialized_at IS NULL OR v_cursor_before IS NULL THEN
+          PERFORM set_config('lock_timeout', v_prior_lock_timeout, true);
+          RETURN QUERY SELECT 'error'::text, 'malformed_policy'::text,
+            NULL::text, NULL::text, NULL::text, NULL::text, NULL::bigint,
+            NULL::uuid, NULL::timestamp with time zone, NULL::integer,
+            NULL::timestamp with time zone, NULL::text, NULL::text,
+            NULL::timestamp with time zone, v_call_token, v_transaction_id,
+            NULL::integer, NULL::integer, p_demand, NULL::bigint, NULL::bigint,
+            NULL::bigint, NULL::text, 'policy_readiness'::text, 0::integer, 0::bigint;
+          RETURN;
         END IF;
 
         v_cursor := v_cursor_before;

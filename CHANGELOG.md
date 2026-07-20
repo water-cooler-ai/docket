@@ -21,9 +21,12 @@ project follows [Semantic Versioning](https://semver.org/).
   installs the indexes, engine interlock, and sole claim function, supports
   custom prefixes and rollback to host schema V1, and makes stale schema shapes
   fail closed. Required PostgreSQL tenancy selects TenantFair with an explicit
-  `default_max_active_runs`; the versioned public facade manages the persisted
-  default and per-owner overrides and reports token-free queued, admitted, and
-  debt counts. ClaimPolicy implementations receive the quoted schema
+  `default_max_active_runs`; homogeneous backend startup synchronizes that
+  configured field before dispatchers start, while claim traffic only reads
+  the initialized active policy. Runtime default changes survive restarts until
+  the configured value changes. The versioned public facade manages live
+  defaults and durable per-owner overrides and reports token-free queued,
+  admitted, and debt counts. ClaimPolicy implementations receive the quoted schema
   identifiers needed to build prefix-local plans. See the
   [TenantFair claim policy](docs/architecture/docket-tenant-fair.md).
 - Public TenantFair cap administration through

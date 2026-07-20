@@ -87,6 +87,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             AND table_name = 'docket_runs'
             AND column_name = 'tenant_admitted_at'
         )
+        AND EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = $1
+            AND table_name = 'docket_claim_policy'
+            AND column_name = 'configured_max_active'
+        )
         AND (
           SELECT
             count(*) = 1

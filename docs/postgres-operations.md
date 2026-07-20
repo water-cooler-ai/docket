@@ -287,7 +287,7 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `prefix:` | `public` | Must match both directions of the generated migration. |
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
 | `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` for `tenant_mode: :none` | Required PostgreSQL tenancy must select `Docket.Postgres.ClaimPolicy.TenantFair`; implementations are validated before startup and cannot be selected per call. |
-| `claim_policy.default_max_active_runs` | required by TenantFair | Bootstrap cap in `1..2_147_483_647`. The persisted default and per-scope overrides are authoritative after initialization. |
+| `claim_policy.default_max_active_runs` | required by TenantFair | Configured persisted default in `1..2_147_483_647`. Startup synchronizes it only when the configured value changes; runtime changes otherwise survive restarts, and per-scope overrides are never synchronized from config. |
 | `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
 | `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
 | `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
@@ -382,10 +382,15 @@ claim_policy: [
 ]
 ```
 
-The configured value initializes an unset database default. Thereafter use the
-public administration facade. Authorization belongs to the host application;
-Docket accepts no actor or authorization token and does not persist actor
-identity:
+After schema validation and before dispatchers start, each TenantFair instance
+atomically synchronizes the configured default and active engine. Changing the
+option on a deployment updates the centralized default. Restarting with
+unchanged config is a no-op, so runtime default changes survive ordinary
+restarts. Per-owner overrides are never synchronized from config.
+
+Use the public administration facade for runtime changes. Authorization belongs
+to the host application; Docket accepts no actor or authorization token and does
+not persist actor identity:
 
 ```elixir
 def update_tenant_cap(actor, tenant_id, max_active_runs, expected_version) do
@@ -429,6 +434,11 @@ validation errors are `:invalid_max_active_runs`, `:invalid_owner_scope`,
 `:invalid_expected_version`, and `:invalid_options`; inspection before default
 initialization returns `:not_initialized`, and a persisted cap under a dormant
 Legacy engine returns `:inactive_engine` rather than an effective policy.
+
+A runtime default change remains live across restarts until a deployment
+changes `default_max_active_runs`. All instances sharing the database and prefix
+must deploy the same value. Mixed independently deployed configurations are
+unsupported in v0.1.
 
 `effective` includes token-free `queued`, `admitted_ready`,
 `admitted_claimed`, and `debt` counts. Reducing a cap below the current

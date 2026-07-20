@@ -19,6 +19,7 @@ An implementation supplies:
 - `decode/3` to return a lease/poison batch or bounded policy error; and
 - `observe/5` for implementation-owned telemetry.
 
+The optional startup configuration callback receives a narrow query executor.
 The plan builder receives quoted table identifiers but no Repo or query
 callback. RunStore executes exactly one top-level PostgreSQL statement and
 always invokes the decoder from the already-selected implementation. Decoder
@@ -43,14 +44,17 @@ TenantFair implementation with an explicit cap.
 ## TenantFair
 
 `Docket.Postgres.ClaimPolicy.TenantFair` is the sole required-tenancy engine.
-It invokes the prefix-local claim function once; the function owns sticky
+Backend startup synchronizes its configured default before children start, then it
+invokes the prefix-local claim function once; the function owns sticky
 admission, bounded ring traversal, locking, mutation, and cursor/epoch
-accounting. Its complete contract is the
+accounting while treating the persisted policy as live authority. Runtime
+default changes survive restarts until the configured value changes. Its complete contract is the
 [TenantFair claim policy](docket-tenant-fair.md).
 
-Engine choice is instance-level. Deployments must not mix binaries that predate
-the `admission_mode` interlock. Stopped-upgrade commands and operational
-inspection are in the [PostgreSQL operations guide](../postgres-operations.md).
+Engine choice is instance-level. All instances sharing a domain must use one
+homogeneous version and TenantFair configuration. Deployments must not mix
+binaries that predate the `admission_mode` interlock. Operational details are
+in the [PostgreSQL operations guide](../postgres-operations.md).
 
 ## Test contract
 
