@@ -455,26 +455,16 @@ The repository includes implementation-level evidence for:
 - fresh/populated/prefix/rollback/concurrent-creation migration paths in
   [`migration_test.exs`](../../test/docket/postgres/migration_test.exs).
 
-A separate validation-only proof harness is not part of the release artifact.
-It adds the formula oracle, committed journal, qualified-window matrix, Legacy
-comparison, falsification controls, and stale-snapshot mutant used to validate
-this contract externally.
+Additional validation may use a separate test-only proof harness with a formula
+oracle, committed journal, qualified-window matrix, Legacy comparison,
+falsification controls, and stale-snapshot mutant. That harness is deliberately
+outside the package and is not a prerequisite for using the supported runtime.
 
-That validation is not yet qualifying. Its target-admissibility witness counts
-live `claim_token` rows instead of healthy non-null `tenant_admitted_at`
-identities. Its ordinary-ready predicate does not distinguish admitted
-reacquisition from queued promotion or prove the FIFO head; its expired and
-expired-poison predicates do not require an admission marker; and its
-ready-poison predicate does not distinguish admitted poison from queued poison
-requiring FIFO head plus a free slot. The database-proof helper repeats the
-token-based classification. The test-only witnesses must be corrected and the
-full validation matrix rerun; the validation harness does not need to ship with
-the package.
-
-The release also requires the ordinary, core-only, PostgreSQL 13, and
-PostgreSQL 17 matrices to remain green, with PostgreSQL 17 repeating the
-deterministic adversarial cases across multiple ExUnit seeds. Timing, randomized
-soak, or scenario count cannot compensate for missing correctness evidence.
+Release coverage combines the implementation-level evidence above with the
+ordinary, core-only, PostgreSQL 13, and PostgreSQL 17 matrices. PostgreSQL 17
+repeats the deterministic adversarial cases across multiple ExUnit seeds.
+Timing, randomized soak, or scenario count cannot substitute for correctness
+evidence.
 
 ## Design lineage
 
