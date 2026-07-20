@@ -231,6 +231,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         notifier: :none
     end
 
+    defmodule SandboxTenantFairHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: SandboxRepo,
+        prefix: "public",
+        tenant_mode: :required,
+        claim_policy: [
+          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+          default_max_active_runs: 5
+        ],
+        testing: :manual,
+        notifier: :none
+    end
+
     defmodule ObserverInlineHost do
       use Docket,
         backend: Docket.Postgres,
@@ -267,6 +281,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       stop_host(TenantFairConfigManualHost)
       stop_host(TenantFairConfigSupervisedHost)
       stop_host(SandboxInlineHost)
+      stop_host(SandboxTenantFairHost)
       stop_host(ObserverInlineHost)
 
       TestRepo.delete_all(Event)
@@ -359,6 +374,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert_raise ArgumentError, ~r/requires schema version 2, found 0/, fn ->
         Docket.Postgres.init({opts, context})
       end
+    end
+
+    test "TenantFair startup policy synchronization rolls back with its SQL Sandbox owner" do
+      owner = Ecto.Adapters.SQL.Sandbox.start_owner!(SandboxRepo, shared: true)
+      on_exit(fn -> if Process.alive?(owner), do: Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
+
+      assert [["legacy", nil, nil, 0]] = sandbox_policy()
+
+      start_supervised!(SandboxTenantFairHost)
+
+      assert [["tenant_fair", 5, 5, 1]] = sandbox_policy()
+
+      stop_host(SandboxTenantFairHost)
+      :ok = Ecto.Adapters.SQL.Sandbox.stop_owner(owner)
+
+      next_owner = Ecto.Adapters.SQL.Sandbox.start_owner!(SandboxRepo, shared: true)
+
+      on_exit(fn ->
+        if Process.alive?(next_owner), do: Ecto.Adapters.SQL.Sandbox.stop_owner(next_owner)
+      end)
+
+      assert [["legacy", nil, nil, 0]] = sandbox_policy()
     end
 
     test "manual testing advances only through bounded drain_runs" do
@@ -1091,6 +1128,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       TestRepo.query!(
         "SELECT admission_mode, max_active, configured_max_active, policy_version, " <>
           "initialized_at " <>
+          "FROM docket_claim_policy WHERE id = 1"
+      ).rows
+    end
+
+    defp sandbox_policy do
+      SandboxRepo.query!(
+        "SELECT admission_mode, max_active, configured_max_active, policy_version " <>
           "FROM docket_claim_policy WHERE id = 1"
       ).rows
     end

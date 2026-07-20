@@ -170,7 +170,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       validate_runtime_limits!(dispatcher, execution, vehicle)
 
       children = children(opts, name, context)
-      configure_claim_policy!(context, resolved_claim_policy, opts)
+      configure_claim_policy!(context, resolved_claim_policy)
 
       Supervisor.init(children, strategy: :one_for_one)
     end
@@ -259,19 +259,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               "recreate the unreleased development schema from the current generated migration"
     end
 
-    defp configure_claim_policy!(context, claim_policy, opts) do
+    defp configure_claim_policy!(context, claim_policy) do
       if ClaimPolicy.configures_on_startup?(claim_policy) do
         %{repo: repo} = context
 
         result =
-          if Keyword.get(opts, :testing) in @testing_modes and
-               repo.config()[:pool] == Ecto.Adapters.SQL.Sandbox do
-            configure_sandbox_claim_policy(context, claim_policy)
-          else
-            ClaimPolicy.configure(claim_policy, context, fn statement, params ->
-              repo.query(statement, params, log: false)
-            end)
-          end
+          ClaimPolicy.configure(claim_policy, context, fn statement, params ->
+            repo.query(statement, params, log: false)
+          end)
 
         case result do
           :ok ->
@@ -282,27 +277,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                   "Docket.Postgres could not persist its configured claim policy before " <>
                     "startup: #{inspect(reason)}"
         end
-      end
-    end
-
-    defp configure_sandbox_claim_policy(%{repo: repo} = context, claim_policy) do
-      connection_options =
-        repo.config()
-        |> Keyword.drop([:name, :pool, :pool_size])
-        |> Keyword.put(:sync_connect, true)
-
-      case Postgrex.start_link(connection_options) do
-        {:ok, connection} ->
-          try do
-            ClaimPolicy.configure(claim_policy, context, fn statement, params ->
-              Postgrex.query(connection, statement, params)
-            end)
-          after
-            GenServer.stop(connection)
-          end
-
-        {:error, reason} ->
-          {:error, reason}
       end
     end
 
