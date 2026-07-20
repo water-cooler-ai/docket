@@ -437,6 +437,8 @@ the package page.
 - [TenantFair claim policy](docs/architecture/docket-tenant-fair.md) — the
   shipped state model, exact-cap and fair-rotation contract, release evidence,
   rollout boundary, and explicit nonclaims.
+- [Future roadmap](docs/future-roadmap.md) — project-wide future features,
+  improvements, investigations, and research.
 - [Telemetry](docs/telemetry.md) and [benchmarks](docs/benchmarks.md) —
   operational signals and non-oracle regression measurements.
 - [examples/llm-node.md](examples/llm-node.md) — a generic, configurable LLM

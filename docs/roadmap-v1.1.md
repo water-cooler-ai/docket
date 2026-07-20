@@ -316,7 +316,8 @@ admission model: safer public administration, aggregate observability, and
 regression tooling. Weighted or preferred service, borrowing, reclaim,
 preemption, TTL slot expiry, dynamic-population guarantees, and alternate
 schedulers require separate future contracts. They are not implicit TenantFair
-features.
+features. Cross-release ideas live in the general
+[future roadmap](future-roadmap.md).
 
 ---
 
