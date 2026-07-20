@@ -425,7 +425,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:error, {:claim_policy_unavailable, :read_only_transaction}} =
                Docket.Postgres.transaction(context, fn tx ->
                  TestRepo.query!("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY")
-                 RunStore.claim_due(tx, :system, policy(1))
+
+                 assert [[nil]] =
+                          TestRepo.query!("SELECT pg_catalog.txid_current_if_assigned()").rows
+
+                 result = RunStore.claim_due(tx, :system, policy(1))
+
+                 assert [[nil]] =
+                          TestRepo.query!("SELECT pg_catalog.txid_current_if_assigned()").rows
+
+                 result
                end)
 
       assert {:error, {:claim_policy_unavailable, :unsupported_isolation}} =

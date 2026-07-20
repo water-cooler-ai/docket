@@ -238,7 +238,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         p_trace ALIAS FOR $7;
         v_prior_lock_timeout text := current_setting('lock_timeout');
         v_call_token uuid := pg_catalog.gen_random_uuid();
-        v_transaction_id bigint := pg_catalog.txid_current();
+        v_transaction_id bigint;
         v_default_max integer;
         v_cursor_before bigint;
         v_cursor bigint;
@@ -298,6 +298,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             NULL::bigint, NULL::text, 'transaction_mode'::text, 0::integer, 0::bigint;
           RETURN;
         END IF;
+
+        -- txid_current() assigns an XID, so keep it after the transaction-mode
+        -- guards to let hot-standby misroutes return a normalized error row.
+        v_transaction_id := pg_catalog.txid_current();
 
         IF v_prior_lock_timeout = '0' OR
            v_prior_lock_timeout::interval > interval '#{@lock_timeout_ms} milliseconds' THEN
