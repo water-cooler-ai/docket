@@ -1,11 +1,5 @@
 # PostgreSQL TenantFair claim policy
 
-This is the single canonical TenantFair document for Docket v0.1.0. It owns
-the shipped state model, exact sticky cap, bounded ring scheduler, formal
-fixed-window fairness contract, migration boundary, observability limits, and
-release evidence. Other documents should summarize only what their audience
-needs and link here for the contract.
-
 TenantFair provides exact per-owner logical-run admission plus conditional
 bounded cross-partition rotation. It does not promise completion order,
 wall-clock latency, CPU or resource equality, strict round robin, dynamic-
@@ -413,7 +407,7 @@ The scorecard currently expands a Legacy variant for a required-tenancy
 TenantFair scenario; startup correctly rejects that combination. It is a known
 invalid benchmark row and is not runnable release evidence.
 
-## Release evidence and current blocker
+## Correctness evidence
 
 Correctness evidence is database-authored and layered:
 
@@ -444,7 +438,7 @@ duration, and asserted `committed` flags are never proof. Falsification tests
 must reject fabricated/reordered/omitted evidence, sticky-cap safety mutants,
 scheduler/work-budget mutants, and trace-only behavior changes.
 
-The release branch carries implementation-level evidence for:
+The repository includes implementation-level evidence for:
 
 - ring, cursor, class, budget, and epoch mechanics in
   [`tenant_fair_ring_test.exs`](../../test/docket/postgres/tenant_fair_ring_test.exs);
@@ -474,8 +468,8 @@ expired-poison predicates do not require an admission marker; and its
 ready-poison predicate does not distinguish admitted poison from queued poison
 requiring FIFO head plus a free slot. The database-proof helper repeats the
 token-based classification. The test-only witnesses must be corrected and the
-full validation matrix rerun; the validation harness does not need to ship in
-the release branch.
+full validation matrix rerun; the validation harness does not need to ship with
+the package.
 
 The release also requires the ordinary, core-only, PostgreSQL 13, and
 PostgreSQL 17 matrices to remain green, with PostgreSQL 17 repeating the

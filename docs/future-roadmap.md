@@ -127,7 +127,7 @@ must not introduce partition/run lock cycles.
 
 ## Related focused roadmaps
 
-- [v1.1 composability and ergonomics roadmap](roadmap-v1.1.md) tracks work
+- [v0.1.1 composability and ergonomics roadmap](roadmap-v0.1.1.md) tracks work
   already organized around that release theme.
 
 ## Entry template

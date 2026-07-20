@@ -3,7 +3,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduledoc """
     Creates and versions the tables owned by Docket's PostgreSQL backend.
 
-    Version 1 contains durable graphs, runs, and events. Version 2 adds exact-cap
+    Schema version 1 contains durable graphs, runs, and events. Version 2 adds exact-cap
     policy and partition authority, the authoritative unfinished-tenant ring,
     sticky logical-run admission, the domain cursor, the sole TenantFair claim
     function, and supporting indexes. Every step is an ordinary transactional

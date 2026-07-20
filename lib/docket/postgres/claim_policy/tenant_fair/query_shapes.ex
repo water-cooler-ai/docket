@@ -156,8 +156,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc """
     Bounds the exact mutation input to `Q` rows.
 
-    DCKT-78 owns the authoritative class/cap/state recheck and final update;
-    this shape fixes the maximum row input it may mutate for one grant.
+    The claim function performs the class, cap, and state recheck before its
+    final update; this shape fixes the maximum row input for one grant.
     """
     def mutation_ids do
       outcomes = Budgets.grant_outcomes()

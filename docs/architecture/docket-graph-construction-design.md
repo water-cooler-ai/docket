@@ -14,15 +14,9 @@ Related documents:
 - `docs/architecture/docket-runtime-design.md`
 - `docs/architecture/docket-compiler-design.md`
 
-Implementation note: this document owns the detailed graph document and
-compiler construction decisions; concrete APIs are canonical in the module
-docs under `lib/docket/`.
-
 ## 1. Executive Summary
 
-This document designs Docket's public graph construction layer.
-
-The key naming decision is:
+The public graph construction layer uses three types:
 
 ```text
 Docket.Graph is the canonical, user-facing graph.
@@ -278,7 +272,7 @@ keys before publication, while its effective published graph uses strings.
 Host-facing docs should state the rule of thumb: treat open content (config,
 metadata, policies, defaults) as string-keyed data on both write and read.
 
-Public node IDs are stable and meaningful in v1, so the durable encoding hashes
+Public node IDs are stable and meaningful in v0.1, so the durable encoding hashes
 node and edge references directly. A node name or label change is considered a
 graph content change.
 
@@ -325,7 +319,7 @@ it does not have; identity belongs only to the effective graph at `save_graph`.
 
 ### 6.2 ID Rules
 
-All IDs stored in `Docket.Graph` are binaries in v1.
+All IDs stored in `Docket.Graph` are binaries in v0.1.
 
 This includes graph IDs, input IDs, field IDs, output IDs, node IDs, edge IDs,
 branch group names, and any graph references that point at those records. Graph
@@ -334,7 +328,7 @@ editing helpers accept binary IDs. Non-bang helpers return
 terms; bang helpers raise `Docket.Graph.Error`. Docket must not create atoms from
 graph IDs or from user-supplied strings.
 
-Canonical v1 public IDs are non-empty binaries that match:
+Canonical v0.1 public IDs are non-empty binaries that match:
 
 ```text
 ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
@@ -374,7 +368,7 @@ list of source node IDs. They lower through the same `edge:<edge_id>` runtime
 channel family as simple edges, though the runtime channel may use barrier/all
 semantics internally.
 
-Branches do not create branch-specific runtime channels in v1. Branch groups
+Branches do not create branch-specific runtime channels in v0.1. Branch groups
 are node-local metadata that name outgoing guarded edge records, and each
 branch arm activates through the same `edge:<edge_id>` channel format as any
 other edge. The node ID plus branch group name remains useful for editing,
@@ -477,8 +471,8 @@ defmodule Docket.Node do
 end
 ```
 
-`{:await, term()}` is reserved for post-v1 late-completion protocols and is
-unsupported in v1: the dispatcher treats it as a permanent node failure.
+`{:await, term()}` is reserved for post-v0.1 late-completion protocols and is
+unsupported in v0.1: the dispatcher treats it as a permanent node failure.
 
 `config_schema/0` returns the schema for node-instance configuration. The
 compiler validates user-provided config and applies defaults. The normalized
@@ -1103,7 +1097,7 @@ metadata over outgoing guarded edge records. Lowering keeps the guarded edge
 records and generated `edge:<edge_id>` activation channels as the execution
 surface. The Runtime does not need to know whether an edge appears in a branch
 group; the lowering map can keep the source node ID, branch group name, and edge
-IDs available for diagnostics and runtime overlays. v1 does not generate
+IDs available for diagnostics and runtime overlays. v0.1 does not generate
 separate branch activation channels.
 
 ## 16. Diagnostics And Runtime Verification
@@ -1286,7 +1280,7 @@ Compilation then attaches normal edges, waiting edges, and branches to the
 runtime graph. At runtime, the compiled Pregel graph exposes channels such as
 state channels, start/activation channels, branch-specific channels, and
 barrier-like channels for waits. Docket should follow that separation of public
-intent from runtime lowering without copying LangGraph's exact API; in Docket v1,
+intent from runtime lowering without copying LangGraph's exact API; in Docket v0.1,
 branch activation is represented by guarded `edge:<edge_id>` channels.
 
 The useful lowering pattern is:
@@ -1324,7 +1318,7 @@ simple updates to canonical `Docket.Graph` values:
 ```
 
 LangGraph's migration guidance also supports keeping active runs pinned to the
-host graph artifact they started with. Docket should keep the simple v1 rule,
+host graph artifact they started with. Docket should keep the simple v0.1 rule,
 expressed in terms of Docket's content fingerprint:
 
 ```text
@@ -1338,9 +1332,9 @@ Sources:
 - https://docs.langchain.com/oss/python/langgraph/pregel
 - https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/graph/state.py
 
-## 22. Resolved v1 Graph Construction Scope
+## 22. Resolved v0.1 Graph Construction Scope
 
-Resolved v1 graph construction scope:
+Resolved v0.1 graph construction scope:
 
 1. `Docket.Graph` as the canonical public graph document.
 2. One functional graph editing API for both build-time pipes and realtime UI
@@ -1354,8 +1348,8 @@ Resolved v1 graph construction scope:
    `compile/2`.
 7. Internal `Docket.Runtime.Graph` materialization returned by `compile/2`.
 8. Runtime overlay mapping from events/channels back to public IDs.
-9. WaterCooler/sequential workflow compatibility compiler remains post-v1. It
-   should compile through `Docket.Graph` when added, but it is not part of the v1
+9. WaterCooler/sequential workflow compatibility compiler remains post-v0.1. It
+   should compile through `Docket.Graph` when added, but it is not part of the v0.1
    implementation gate.
 
 ## 23. Resolved Decisions
@@ -1369,7 +1363,7 @@ Resolved v1 graph construction scope:
    node-local metadata over outgoing guarded edge IDs. The compiler normalizes
    those records into runtime activation channels, guards, and barrier
    semantics, so the Runtime only consumes `Docket.Runtime.Graph`.
-3. Collaborative editing revisions are out of scope for v1 and remain
+3. Collaborative editing revisions are out of scope for v0.1 and remain
    host-owned.
 4. The internal executable graph is named `Docket.Runtime.Graph`, with
    `Docket.Runtime.Graph.Node`, `Docket.Runtime.Graph.Channel`, and

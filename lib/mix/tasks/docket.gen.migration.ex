@@ -3,7 +3,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @shortdoc "Generates a Docket PostgreSQL migration"
 
     @moduledoc """
-    Generates a fresh Docket schema migration or a host v1-to-current upgrade.
+    Generates a fresh Docket schema migration or a host schema-V1-to-current
+    upgrade.
     """
 
     use Mix.Task

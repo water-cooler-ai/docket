@@ -1,10 +1,9 @@
 # Parent App Integration Example
 
-This example connects durable Docket runs to app-owned users, accounts, and
-workflow rows without making the parent application a second persistence
-driver.
+Durable Docket runs can reference app-owned users, accounts, and workflow rows
+without making the parent application a second persistence driver.
 
-> **Status:** this is the v0.1.0 production integration API.
+> **Status:** v0.1.0 production integration API.
 
 ## Configure one backend
 

@@ -461,7 +461,7 @@ defmodule Docket.Graph.Compiler.Validation do
     end
   end
 
-  # v1 compatibility: same type; enum outputs must accept every source value;
+  # v0.1 compatibility: same type; enum outputs must accept every source value;
   # list outputs with a declared item must accept the source's items.
   defp compatible_schemas?(%Schema{type: :enum} = source, %Schema{type: :enum} = output) do
     MapSet.subset?(MapSet.new(source.values), MapSet.new(output.values))
@@ -498,7 +498,7 @@ defmodule Docket.Graph.Compiler.Validation do
     end
   end
 
-  # 9.5: the v1 node policy surface defined by the runtime ("timeout_ms",
+  # 9.5: the v0.1 node policy surface defined by the runtime ("timeout_ms",
   # "retry", reserved "on_error"). The rules live in Policies so the compiler
   # and plan-time validation cannot drift apart.
   defp validate_node_policies(id, %Graph.Node{policies: policies}) do
@@ -545,7 +545,7 @@ defmodule Docket.Graph.Compiler.Validation do
           [
             error(
               :unsupported_node_implementation,
-              "node #{inspect(id)} implementation is not supported in v1; module implementations must use call/3, got #{inspect(implementation)}",
+              "node #{inspect(id)} implementation is not supported in v0.1; module implementations must use call/3, got #{inspect(implementation)}",
               path: [:nodes, id, :implementation],
               public_id: id
             )
@@ -555,7 +555,7 @@ defmodule Docket.Graph.Compiler.Validation do
           [
             error(
               :unsupported_node_implementation,
-              "node #{inspect(id)} implementation type is not supported in v1, got #{inspect(implementation)}",
+              "node #{inspect(id)} implementation type is not supported in v0.1, got #{inspect(implementation)}",
               path: [:nodes, id, :implementation],
               public_id: id
             )

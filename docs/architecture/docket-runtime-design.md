@@ -7,17 +7,10 @@ Release note: resident per-run process and host-checkpoint sections are
 `0.0.1` history, superseded for v0.1.0 production. The PostgreSQL backend guide
 and module docs describe the current backend-owned lifecycle.
 
-Implementation note: this document records the research basis, mental
-model, goals, and alternatives considered for the runtime. Concrete
-structs and APIs are canonical in code under `lib/docket/` and in
-`docket-graph-execution-contract-design.md` and `docket-compiler-design.md`;
-where an earlier draft sketched a struct, this document now points at the real
-module instead.
-
 ## 1. Executive Summary
 
-This document proposes a standalone Elixir library for durable, graph-based
-workflow execution inspired by Pregel, Apache Beam, LangGraph, Temporal,
+Docket is a standalone Elixir library for durable, graph-based workflow
+execution inspired by Pregel, Apache Beam, LangGraph, Temporal,
 Flink, Timely Dataflow, and OTP.
 
 The library is not WaterCooler-specific. WaterCooler would be the first
@@ -263,7 +256,7 @@ Sources:
 3. Do not make every graph node an OTP process.
 4. Do not hide persistence behind global process state.
 5. Do not make PubSub the durable message log.
-6. Do not require distributed BEAM clustering in v1.
+6. Do not require distributed BEAM clustering in v0.1.
 7. Do not require one database technology.
 8. Do not prescribe LLM, agent, MCP, or WaterCooler semantics.
 9. Do not solve exactly-once external side effects by magic. The runtime can
@@ -364,7 +357,7 @@ Top-level namespace:
 Docket
 ```
 
-Major v1 modules:
+Major v0.1 modules:
 
 ```text
 Docket.Graph
@@ -380,11 +373,11 @@ Docket.Interrupt
 Docket.Graph.Compiler
 ```
 
-Channels are internal in v1: state fields and edges lower to
+Channels are internal in v0.1: state fields and edges lower to
 `Docket.Runtime.Graph.Channel` records rather than a public channel module.
 
-Post-v1 modules can add first-class telemetry, streaming, timers, and related
-inspection surfaces without changing the v1 execution loop.
+Post-v0.1 modules can add first-class telemetry, streaming, timers, and related
+inspection surfaces without changing the v0.1 execution loop.
 
 Runtime-internal graph modules:
 
@@ -441,15 +434,15 @@ expression indexes if it needs operational queries.
 
 A runtime graph node names the implementation, subscriptions, outgoing edge
 references, executor settings, and normalized config for one lowered public
-node. See `Docket.Runtime.Graph.Node` (`lib/docket/runtime/graph/node.ex`) for
-the canonical struct.
+node. Its fields are defined by `Docket.Runtime.Graph.Node`
+(`lib/docket/runtime/graph/node.ex`).
 
 ### 8.2 Runtime Graph Channel
 
 A runtime graph channel is the lowered storage/activation primitive behind a
-public input, state field, or edge. See `Docket.Runtime.Graph.Channel`
-(`lib/docket/runtime/graph/channel.ex`) for the canonical struct; v1 channel
-types are `:last_value`, `:ephemeral`, and `:barrier`.
+public input, state field, or edge. Its fields are defined by
+`Docket.Runtime.Graph.Channel` (`lib/docket/runtime/graph/channel.ex`); v0.1
+channel types are `:last_value`, `:ephemeral`, and `:barrier`.
 
 Channel schemas should be strongly typed by default. The runtime should validate
 both stored values and incoming updates before applying reducers.
@@ -557,7 +550,7 @@ This keeps the public graph clear while preserving a uniform runtime: all
 activation ultimately flows through channel updates.
 
 Node-local branch groups are public grouping metadata over the same guarded edge
-records. For v1, Docket does not generate branch-specific runtime channels.
+records. For v0.1, Docket does not generate branch-specific runtime channels.
 
 ## 9. Active Run State
 
@@ -577,8 +570,8 @@ initialize a fresh run or continue a saved run.
 `Docket.Run` should be a real struct with nested structs for channel, task,
 and interrupt records where useful. Host applications persist and pass it
 back, but they do not construct, pattern match, mutate, or depend on
-Docket-owned execution internals. See `Docket.Run` (`lib/docket/run.ex`) for
-the canonical struct.
+Docket-owned execution internals. `Docket.Run` (`lib/docket/run.ex`) defines
+the persisted fields.
 
 Run persistence is owned by the configured backend, not by a public host wire
 format. The Postgres backend partitions relational fields from one opaque
@@ -588,14 +581,14 @@ legacy decoder; public runtime APIs and in-memory state use `%Docket.Run{}`.
 
 ### 9.1 Nested Run State
 
-The nested channel, task, and interrupt records are canonical in code: see
 `Docket.Run.ChannelState`, `Docket.Run.TaskState`, and
-`Docket.Run.InterruptState` under `lib/docket/run/`. Timers are a post-v1
-surface; `Docket.Run.timers` is a plain map placeholder in v1.
+`Docket.Run.InterruptState` under `lib/docket/run/` define the nested channel,
+task, and interrupt records. Timers are a post-v0.1 surface; `Docket.Run.timers`
+is a plain map placeholder in v0.1.
 
 ## 10. Runtime Process Topology
 
-Default v1 topology:
+Default v0.1 topology:
 
 ```text
 Application supervisor
@@ -704,7 +697,7 @@ or:
 
 ```elixir
 {:interrupt, %Docket.Interrupt{...}}
-{:await, term}   # reserved post-v1; v1 treats it as a permanent node failure
+{:await, term}   # reserved post-v0.1; v0.1 treats it as a permanent node failure
 {:error, reason}
 ```
 
@@ -782,12 +775,12 @@ channels. A channel owns:
 
 ### 12.1 Channel Representation
 
-v1 does not expose a public channel behaviour. Channel types are a closed
+v0.1 does not expose a public channel behaviour. Channel types are a closed
 internal set on `Docket.Runtime.Graph.Channel`
 (`lib/docket/runtime/graph/channel.ex`), and reducer/guard semantics live in
 `Docket.Runtime.Algorithm`.
 
-### 12.2 v1 Channel Types
+### 12.2 v0.1 Channel Types
 
 #### LastValue (`:last_value`)
 
@@ -817,7 +810,7 @@ run reviewer only after researcher and tester have both written
 
 Richer channel families explored during research - topics, reducer-backed
 aggregates, delta channels with snapshots, error-collection channels, and
-command channels - are deferred post-v1 design space (see the resolved v1
+command channels - are deferred post-v0.1 design space (see the resolved v0.1
 scope section).
 
 ## 13. Activation and Guards
@@ -846,7 +839,7 @@ Design-space guard primitives:
 - `not(predicate)`
 - custom application guard
 
-v1 guard constructors:
+v0.1 guard constructors:
 
 ```elixir
 Docket.Guard.changed(channel)
@@ -862,7 +855,7 @@ Docket.Guard.not(expression)
 Guards are serializable data expressions. They must be deterministic and side
 effect free. Guards can read the newly committed state, channel versions, and
 the changed field set from the update barrier that produced the edge candidate.
-They do not call external services, and v1 does not support custom application
+They do not call external services, and v0.1 does not support custom application
 guards or arbitrary predicate matches.
 
 ## 14. External Effects
@@ -1027,8 +1020,7 @@ be safe to receive the same checkpoint more than once.
 
 ### 15.3 Run Document Shape
 
-`Docket.Run` is the public restorable run document; see `Docket.Run`
-(`lib/docket/run.ex`) for the canonical struct.
+`Docket.Run` (`lib/docket/run.ex`) is the public restorable run document.
 
 Apps may inspect top-level fields such as `id`, `graph_id`, `graph_hash`,
 `status`, `step`, `input`, `output`, and timestamps. The run also contains
@@ -1058,11 +1050,10 @@ graph = MyApp.Graphs.fetch_docket_graph!(run.graph_id, run.graph_hash)
 
 ### 15.4 Event History
 
-Events should be append-only. See `Docket.Event` (`lib/docket/event.ex`) for
-the canonical struct and the v1 event types (run lifecycle, node completion
-and failure, channel updates, edge triggers, and interrupts). Post-v1
-protocols may add event types for planning, async/late completions, timers,
-and commands.
+Events should be append-only. `Docket.Event` (`lib/docket/event.ex`) defines
+the v0.1 event types: run lifecycle, node completion and failure, channel updates,
+edge triggers, and interrupts. Post-v0.1 protocols may add event types for
+planning, async/late completions, timers, and commands.
 
 Events are emitted with checkpoints. Apps that need replay, time travel,
 debugging, or audit history may persist `checkpoint.events`. Apps that only need
@@ -1260,7 +1251,7 @@ the checkpoint handler or executor unless the host intentionally runs multiple
 named Docket runtimes.
 
 The library must not create atoms from untrusted strings. All graph record IDs
-are binaries in v1, including graph, input, field, output, node, and edge IDs.
+are binaries in v0.1, including graph, input, field, output, node, and edge IDs.
 Branch group names are binaries scoped to their source node. Runtime-generated
 channel IDs are also binaries. Existing atoms may still appear as ordinary
 Elixir enum/status/config values, but they are not accepted as graph IDs.
@@ -1390,7 +1381,7 @@ the next superstep.
 
 ## 22. Streaming and Observability
 
-Streaming and first-class telemetry are post-v1 surfaces. The durable event log
+Streaming and first-class telemetry are post-v0.1 surfaces. The durable event log
 and checkpoints remain authoritative.
 
 Future streaming surfaces:
@@ -1437,7 +1428,7 @@ Backpressure exists at several layers:
 - per-channel retention limits
 - global scheduler capacity
 
-The Runtime can dispatch to `Task.Supervisor` for v1. For high-throughput
+The Runtime can dispatch to `Task.Supervisor` for v0.1. For high-throughput
 or queue-backed workloads, an Executor adapter can use GenStage or Broadway.
 
 Scheduling policies:
@@ -1609,7 +1600,7 @@ defmodule Docket.Executor do
 end
 ```
 
-`{:await, term()}` is reserved for post-v1 late-completion protocols; v1
+`{:await, term()}` is reserved for post-v0.1 late-completion protocols; v0.1
 treats it as a permanent node failure.
 
 Built-in executors:
@@ -1674,7 +1665,7 @@ branch arm has a stable edge ID and lowers to an `edge:<edge_id>` activation
 channel.
 
 A future runtime could add an explicit branch node for debugging or dynamic
-routing, but v1 keeps branch execution in the same channel family as every other
+routing, but v0.1 keeps branch execution in the same channel family as every other
 edge activation.
 
 ## 27. WaterCooler as First Consumer
@@ -1933,7 +1924,7 @@ Benefits:
 Problems:
 
 - Sophisticated model.
-- More complexity than v1 needs.
+- More complexity than v0.1 needs.
 
 Recommendation:
 
@@ -1962,13 +1953,13 @@ Recommendation:
 Use GenStage/Broadway behind Executor adapters or schedulers, not as the primary
 graph state model.
 
-## 29. Resolved v1 Scope
+## 29. Resolved v0.1 Scope
 
-The v1 implementation should be the smallest durable graph runtime that proves
+The v0.1 implementation should be the smallest durable graph runtime that proves
 the graph construction, compiler, runtime, checkpoint, retry, and crash-recovery
 contracts.
 
-Included in v1:
+Included in v0.1:
 
 1. Canonical `Docket.Graph` and `Docket.Run` public documents.
 2. Binary-only graph IDs and binary runtime-generated channel IDs.
@@ -1996,7 +1987,7 @@ Included in v1:
 14. Crash recovery from the latest saved `Docket.Run` checkpoint through
     `Docket.resume/4`.
 
-Deferred until after v1:
+Deferred until after v0.1:
 
 - telemetry as a first-class API/module
 - full event-history replay, time travel, and replay-only execution
@@ -2008,7 +1999,7 @@ Deferred until after v1:
 - WaterCooler/sequential workflow compatibility compiler
 - windowing, watermarks, and richer stream-processing semantics
 
-v1 acceptance tests:
+v0.1 acceptance tests:
 
 - Single-node graph returns output.
 - Two-node chain runs in two supersteps.
@@ -2016,14 +2007,14 @@ v1 acceptance tests:
 - Fan-in waits for required channels.
 - Cycle terminates when node stops writing or a guard reaches a halt condition.
 - Writes are invisible until the next step.
-- Multiple writes use the configured v1 reducer semantics.
+- Multiple writes use the configured v0.1 reducer semantics.
 - Failed node prevents barrier commit by default.
 - Retry succeeds without duplicating committed writes.
 - Interrupt pauses and resumes through channel update.
 - Runtime crash recovers from the latest saved checkpoint.
 - Resume never commits uncheckpointed writes from a crashed Runtime.
 
-## 30. Post-v1 Priorities
+## 30. Post-v0.1 Priorities
 
 After the MVP, the top priority is Beam-style time and collection semantics:
 

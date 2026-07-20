@@ -77,7 +77,7 @@ defmodule Docket.Graph.Compiler.LoweringTest do
       assert channel.sources == ["left", "right"]
     end
 
-    test "no branch-specific channels are generated in v1" do
+    test "no branch-specific channels are generated in v0.1" do
       runtime_graph = compile!(Graphs.branch_group())
 
       refute Enum.any?(Map.keys(runtime_graph.channels), &String.starts_with?(&1, "branch:"))

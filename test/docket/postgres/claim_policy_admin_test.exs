@@ -267,7 +267,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         """
         INSERT INTO docket_graph_versions
           (tenant_id, graph_id, graph_hash, graph, inserted_at)
-        VALUES ('acme', 'admin-inspection', 'v1', $1, CURRENT_TIMESTAMP)
+        VALUES ('acme', 'admin-inspection', 'graph-hash-1', $1, CURRENT_TIMESTAMP)
         """,
         [<<131, 106>>]
       )
@@ -279,13 +279,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
            checkpoint_seq, wake_at, tenant_admitted_at, claim_token, claimed_at,
            inserted_at, started_at, updated_at)
         VALUES
-          ('queued', 'acme', 'admin-inspection', 'v1', 'running', $1,
+          ('queued', 'acme', 'admin-inspection', 'graph-hash-1', 'running', $1,
            1, CURRENT_TIMESTAMP - interval '3 seconds', NULL, NULL, NULL,
            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-          ('admitted-ready', 'acme', 'admin-inspection', 'v1', 'running', $1,
+          ('admitted-ready', 'acme', 'admin-inspection', 'graph-hash-1', 'running', $1,
            1, CURRENT_TIMESTAMP - interval '2 seconds', CURRENT_TIMESTAMP, NULL, NULL,
            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-          ('admitted-claimed', 'acme', 'admin-inspection', 'v1', 'running', $1,
+          ('admitted-claimed', 'acme', 'admin-inspection', 'graph-hash-1', 'running', $1,
            1, NULL, CURRENT_TIMESTAMP, gen_random_uuid(), CURRENT_TIMESTAMP,
            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,

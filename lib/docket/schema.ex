@@ -15,7 +15,7 @@ defmodule Docket.Schema do
   ## Constraints
 
   Constraints are stored as a string-keyed map (the constructors normalize
-  atom option keys) and enforced by `validate/2` since v1.1:
+  atom option keys) and enforced by `validate/2` since v0.1.1:
 
     * numbers (`:float`, `:integer`) — `min`, `max` (inclusive)
     * strings — `min_length`, `max_length`, `pattern` (Elixir/PCRE regex

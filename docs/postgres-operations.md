@@ -1,8 +1,7 @@
 # Docket.Postgres Operations and Correctness Guide
 
-This guide is the operator-facing reference for the v0.1.0 PostgreSQL runtime.
-Start with the [README quickstart](../README.md), then use
-this page for production configuration, inspection, and failure recovery.
+Complete the [README quickstart](../README.md) before configuring production,
+inspecting the runtime, or recovering failures.
 
 ## Fresh application setup
 
@@ -402,7 +401,7 @@ admitted-run count does not preempt work. It blocks FIFO queue promotion until
 admission releases bring the count below the new cap. Immediate cooperative
 yield and expired lease recovery retain admission and remain count-neutral.
 
-### Existing v1 installations
+### Existing schema V1 installations
 
 The generated upgrade is an ordinary transactional migration:
 
@@ -430,10 +429,9 @@ were collapsed into the current V2 migration. A database that applied one of
 those discarded shapes must be recreated or rolled back with its matching old
 code before adopting the current migration.
 
-The [TenantFair release evidence
-gate](architecture/docket-tenant-fair.md#release-evidence-and-current-blocker)
-owns current status. Timing and large benchmarks are regression diagnostics,
-not proof.
+Current TenantFair validation status and test coverage are listed under
+[correctness evidence](architecture/docket-tenant-fair.md#correctness-evidence).
+Timing and large benchmarks are regression diagnostics, not proof.
 
 ## Operational inspection
 

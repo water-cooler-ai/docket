@@ -362,7 +362,7 @@ defmodule Docket.Test.Fixtures.Nodes do
 
   defmodule Awaits do
     @moduledoc false
-    # {:await, _} is a reserved post-v1 return shape.
+    # {:await, _} is a reserved post-v0.1 return shape.
     @behaviour Docket.Node
 
     @impl true

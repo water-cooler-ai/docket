@@ -1,6 +1,6 @@
-# Docket v1.1 Roadmap — Composability & Ergonomics
+# Docket v0.1.1 Roadmap — Composability & Ergonomics
 
-Status: slices 1–5 implemented (2026-07-05): schema-v1.1, reducers,
+Status: slices 1–5 implemented (2026-07-05): schema-v0.1.1, reducers,
 schema-shorthand, inline-fields, telemetry-events. The reducer contract
 rationale moved to `docs/architecture/docket-reducers-design.md`; API truth
 lives in module docs. Themes 6 (graph module DSL) and 7 (subgraph
@@ -8,7 +8,7 @@ composition) remain open design space, recorded below. Theme 9 records the
 operational hardening follow-up for shipped TenantFair. Theme 10 records the
 `{:await}` late-completion protocol, sized during the claim-freshness review.
 
-The v1.1 theme: **make building graphs feel natural without adding a second
+The v0.1.1 theme: **make building graphs feel natural without adding a second
 canonical model.** Every proposal below is sugar or extension over the existing
 graph contract, and everything a helper does must be expressible as plain
 `put_*` calls.
@@ -17,7 +17,7 @@ graph contract, and everything a helper does must be expressible as plain
 
 ## Theme 1 — Reducer library (aggregates)
 
-v1 ships only `:last_value`, and the runtime applies reducers only to resolve
+v0.1 ships only `:last_value`, and the runtime applies reducers only to resolve
 _same-step_ write conflicts (`Docket.Runtime.Algorithm.apply_state_writes/3`
 folds the step's writes and replaces the committed value). Aggregates change
 the reducer contract: the reducer must fold the **prior committed value** with
@@ -73,7 +73,7 @@ determinism footgun in host hands.
 
 ---
 
-## Theme 2 — Schema engine v1.1
+## Theme 2 — Schema engine v0.1.1
 
 Prerequisite for Theme 1 (`append` needs a list type) and the cheapest win in
 the whole roadmap.
@@ -85,8 +85,8 @@ the whole roadmap.
   `max_length`/`pattern` on strings, `min_items`/`max_items` on lists. These
   are already stored in `constraints` and documented as ignored — enforcing
   them changes runtime behavior for existing stored graphs that carry
-  constraints. Decision needed: accept as a documented v1.1 behavior change
-  (recommended — v1 docs said "ignored in v1", nobody should be relying on
+  constraints. Decision needed: accept as a documented v0.1.1 behavior change
+  (recommended — v0.1 docs said "ignored in v0.1", nobody should be relying on
   non-enforcement), or gate behind a graph policy.
 - **Object openness:** an `open: true` option on `object` to permit unknown
   keys (today unknown keys are rejected; `map` is the all-or-nothing escape
@@ -143,7 +143,7 @@ graph
 This is pure editing-API expansion: `inputs:`/`fields:` entries become the
 exact `put_input!`/`put_field!` calls you would have written by hand. Nothing
 new lands on the node record — the document keeps fields as the single
-canonical model (the v1 stance from `examples/llm-node.md`), and the hash
+canonical model (the v0.1 stance from `examples/llm-node.md`), and the hash
 reflects the materialized fields because they are ordinary fields.
 
 Rules:
@@ -216,7 +216,7 @@ why Themes 3–5 still come first.
 
 The headline "graph composability" item. Two distinct designs:
 
-### 7a. Build-time inlining (proposed for v1.1)
+### 7a. Build-time inlining (proposed for v0.1.1)
 
 ```elixir
 Docket.Graph.compose!(parent, "triage", child_graph,
@@ -231,7 +231,7 @@ parent attachment points, map inputs/outputs to parent fields, and merge
 diagnostics. Pros: zero runtime changes, the flat document stays the single
 truth, the hash covers the composed whole, checkpoints/resume/interrupts all
 work today. Cons: composition is by-value — editing the child later doesn't
-update parents (that's host-side graph versioning, which v1 already assigns
+update parents (that's host-side graph versioning, which v0.1 already assigns
 to the host).
 
 Design points: ID namespacing scheme (delimiter must be legal in IDs and
@@ -253,7 +253,7 @@ after 7a proves insufficient.
 
 ## Theme 8 — Extension points: what else becomes a behaviour?
 
-v1 has three behaviours, all at _effectful boundaries_: `Docket.Node` (do
+v0.1 has three behaviours, all at _effectful boundaries_: `Docket.Node` (do
 work), `Docket.Checkpoint` (persist), `Docket.Executor` (dispatch). The
 guiding split for opening more:
 
@@ -297,7 +297,7 @@ guiding split for opening more:
 6. **ID generation** — already pluggable (`:id_generator` on
    `Docket.Graph.new/1`); nothing to do.
 
-Suggested v1.1 scope: telemetry events (3) as a small standalone slice;
+Suggested v0.1.1 scope: telemetry events (3) as a small standalone slice;
 reducer behaviour (1) only if a real host graph exhausts the Theme 1
 built-ins; guards (2) written up but deferred until a concrete predicate
 can't be expressed with `path`/`equals`/`all`/`any`.
@@ -307,11 +307,11 @@ can't be expressed with `path`/`equals`/`all`/`any`.
 ## Theme 9 — TenantFair follow-up work
 
 TenantFair's single sticky-admission design landed in v0.1.0. The
-[TenantFair claim policy](architecture/docket-tenant-fair.md) owns its state,
-FIFO, ring, work bounds, conditional fixed-window theorem, evidence, and
-exclusions. Do not restate that shipped contract in this roadmap.
+[TenantFair claim policy](architecture/docket-tenant-fair.md) describes its
+state, FIFO, ring, work bounds, conditional fixed-window theorem, evidence,
+and exclusions.
 
-The v1.1 follow-up scope is operational hardening that does not change the
+The v0.1.1 follow-up scope is operational hardening that does not change the
 admission model: safer public administration, aggregate observability, and
 regression tooling. Weighted or preferred service, borrowing, reclaim,
 preemption, TTL slot expiry, dynamic-population guarantees, and alternate
@@ -329,7 +329,7 @@ runs under the finite runtime-owned attempt deadline. Work an external system
 durably owns parks as an external wait instead. The remaining shape is work a
 node started **in-process** but wants to hand back to the runtime — stop
 holding a vehicle slot and claim while it finishes. The execution contract
-reserves `{:await, term()}` for exactly this; v1 rejects it as permanent
+reserves `{:await, term()}` for exactly this; v0.1 rejects it as permanent
 failure. This theme promotes it to a specified protocol.
 
 Design skeleton, established during the adversarial claim-freshness review:
@@ -360,17 +360,17 @@ Design skeleton, established during the adversarial claim-freshness review:
 Epic-sized (~15+ files: executor behaviour and both executors, runtime
 dispatcher, TaskResult/TaskState/Moment, Loop/Algorithm, RunMutation,
 Lifecycle, RunStore schedule + sweeper, Postgres dispatcher/vehicle, a holder
-module, MemoryBackend, and both contract docs). This targets v1.1 after the
+module, MemoryBackend, and both contract docs). This targets v0.1.1 after the
 v0.1.0 line ships.
 
 ---
 
 ## Proposed slice order
 
-Each slice is a branch per the v1 workflow; order reflects dependencies and
+Each slice is a branch per the v0.1 workflow; order reflects dependencies and
 value-per-risk:
 
-1. **schema-v1.1** — `:list`/`:boolean`/`:integer`, constraint enforcement,
+1. **schema-v0.1.1** — `:list`/`:boolean`/`:integer`, constraint enforcement,
    `open` objects. (Prereq for reducers; smallest risk.)
 2. **reducers** — reducer contract extension (prior value + writes),
    `append`/`merge`/`sum`/`first_value`/`union`, reducer-aware write

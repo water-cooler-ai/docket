@@ -7,7 +7,7 @@ defmodule Docket.Run.TimerState do
   the scheduled work may execute; shells and backends derive the run's wake
   from the earliest timer.
 
-  The only v1 kind is `:retry`: the parked next attempt of an active task.
+  The only v0.1 kind is `:retry`: the parked next attempt of an active task.
   """
 
   defstruct [:kind, :fires_at]

@@ -8,7 +8,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.RunStore
     alias Docket.Postgres.TestRepo
 
-    @v1 20_260_716_000_101
+    @schema_v1 20_260_716_000_101
     @v2 20_260_716_000_102
     @private 20_260_716_000_103
     @private_v1 20_260_716_000_104
@@ -105,8 +105,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ]
     end
 
-    test "v1-to-current backfills cap partitions and unfinished-ring membership transactionally" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+    test "schema-V1-to-current backfills cap partitions and unfinished-ring membership transactionally" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
 
       insert_v1_graph_and_run("tenant-a", "run-a")
       insert_v1_graph_and_run(nil, "run-system")
@@ -129,7 +129,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "current schema exposes one unversioned TenantFair claim function" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
       assert tenant_fair_function_catalog("public") == []
 
       :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
@@ -142,8 +142,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              ]
     end
 
-    test "v1-to-current backfills healthy claims, leaves ready rows queued, and preserves over-cap debt" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+    test "schema-V1-to-current backfills healthy claims, leaves ready rows queued, and preserves over-cap debt" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
       insert_v1_graph_and_run("tenant-a", "claimed-a")
       insert_v1_graph_and_run("tenant-a", "claimed-b")
       insert_v1_graph_and_run("tenant-a", "queued")
@@ -201,7 +201,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "Legacy poison clears a backfilled admission marker" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
       insert_v1_graph_and_run("tenant-a", "legacy-poison")
 
       TestRepo.query!("""
@@ -231,7 +231,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                """).rows
     end
 
-    test "custom-prefix current upgrade and down return to v1" do
+    test "custom-prefix current upgrade and down return to schema V1" do
       :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
       insert_v1_graph_and_run(nil, "tenantless-live", "docket_private")
 
@@ -273,7 +273,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert tenant_fair_function_catalog("docket_private") == []
     end
 
-    test "host v1-to-current and fresh-current paths have equivalent schemas" do
+    test "host schema-V1-to-current and fresh-current paths have equivalent schemas" do
       :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a", "docket_private")
       :ok = Ecto.Migrator.up(TestRepo, @private_v2, UpgradePrivateV2, log: false)
@@ -354,8 +354,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @tag timeout: 20_000
-    test "v1 inserts serialize before the v2 backfill snapshot on distinct connections" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+    test "schema V1 inserts serialize before the V2 backfill snapshot on distinct connections" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
       parent = self()
 
       writer =
@@ -379,7 +379,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 receive do
                   :commit_writer -> :committed
                 after
-                  5_000 -> raise "timed out waiting to commit the v1 insert"
+                  5_000 -> raise "timed out waiting to commit the schema V1 insert"
                 end
               end)
             end,
@@ -408,8 +408,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                [["tenant-late"]]
     end
 
-    test "a failed transactional v2 upgrade preserves the v1 schema and data" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+    test "a failed transactional V2 upgrade preserves the schema V1 data" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a")
 
       assert_raise RuntimeError, "forced v2 rollback", fn ->
@@ -444,8 +444,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                [["run-a", "tenant-a"], ["run-system", nil]]
     end
 
-    test "v2 down removes current authority and the claim function while preserving v1 data" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+    test "V2 down removes current authority and the claim function while preserving schema V1 data" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a")
       insert_v1_graph_and_run(nil, "run-system")
       :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
@@ -457,8 +457,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert v1_runs("public") == [["run-a", "tenant-a"], ["run-system", nil]]
     end
 
-    test "host v1-to-current rollback target returns to v1" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+    test "host schema-V1-to-current rollback target returns to schema V1" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a")
 
       :ok = Ecto.Migrator.up(TestRepo, @host_v1_to_current, HostV1ToCurrent, log: false)

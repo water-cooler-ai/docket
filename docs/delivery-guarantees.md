@@ -1,8 +1,5 @@
 # Delivery and Execution Guarantees
 
-This document defines the current delivery and execution contract of Docket's
-durable PostgreSQL runtime. The short version is:
-
 > Docket atomically commits one winning durable transition. The node attempts
 > that propose a transition may execute more than once. External effects are
 > effectively-once only when the receiving system atomically deduplicates a
@@ -122,4 +119,3 @@ the single database history visible to Docket.
   wakeups, diagnostics, and other reconstructable projections.
 - Treat timeout and cancellation as loss of local execution control, not proof
   that an external effect did not happen.
-

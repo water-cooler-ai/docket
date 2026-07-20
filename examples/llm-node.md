@@ -1,7 +1,6 @@
 # LLM Node Example
 
-This example shows how a host application can implement a generic LLM node with
-the simplified v1 node contract:
+A generic host-defined LLM node uses the simplified v0.1 node contract:
 
 - `config_schema/0` declares configurable values such as model, reasoning
   effort, temperature, output field, and prompt template.
@@ -95,7 +94,7 @@ A few contract details worth noting:
   context keys (`run_id`, `node_id`, `step`, `attempt`, `source_versions`,
   `idempotency_key`) are supplied by the runtime.
 - Constraints like `min`/`max` on `Docket.Schema.float/1` are stored in the
-  schema but not enforced by the v1 validation engine.
+  schema but not enforced by the v0.1 validation engine.
 
 ## Prompt Template Helper
 

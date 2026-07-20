@@ -97,7 +97,7 @@ defmodule Docket.Runtime.Algorithm do
   Builds one activation per selected node from committed run state only.
 
   Returns `{:ok, [activation]}` or `{:error, Docket.Error.t()}` when a node
-  declares an invalid v1 policy.
+  declares an invalid v0.1 policy.
   """
   def prepare_activations(rtg, run, node_ids, _config) do
     snapshot = state_snapshot(rtg, run)
@@ -145,7 +145,7 @@ defmodule Docket.Runtime.Algorithm do
 
   Returns `{:ok, [activation]}` sorted by node ID, or
   `{:error, Docket.Error.t()}` when a task references an unknown node or the
-  node declares an invalid v1 policy.
+  node declares an invalid v0.1 policy.
   """
   def resume_activations(rtg, run) do
     run.active_tasks

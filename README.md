@@ -5,8 +5,8 @@ built for long-running, interruptible work like agentic LLM sessions, where a
 run may pause for an external resolution, survive a deploy, and resume exactly
 where it left off.
 
-This branch is `0.1.0-dev`. Graph semantics are usable processlessly through
-`Docket.Test`; supervised production requires the assembled `Docket.Postgres`
+Graph semantics are usable processlessly through `Docket.Test`; supervised
+production requires the assembled `Docket.Postgres`
 durable backend. The PostgreSQL bundle owns its stores,
 transaction recipes, claim fencing, dispatcher, claimed-run vehicles,
 notification fast path, and retention pruner. See the

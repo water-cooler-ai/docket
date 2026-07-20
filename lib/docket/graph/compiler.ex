@@ -15,7 +15,7 @@ defmodule Docket.Graph.Compiler do
   ## Options
 
   - `:profile` - `:publish` (default) or `:run`; both apply identical rules
-    in v1
+    in v0.1
   - `:max_supersteps` - runtime default cycle bound used when the graph does
     not declare a `"max_supersteps"` policy
   """

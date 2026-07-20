@@ -14,14 +14,9 @@ Related documents:
 - `docs/architecture/docket-runtime-design.md`
 - `docs/architecture/docket-graph-construction-design.md`
 
-Implementation note: this document owns the detailed execution and checkpoint
-contract; concrete APIs are canonical in the module docs under `lib/docket/`.
-
 ## 1. Purpose
 
-This document narrows Docket's graph execution contract.
-
-It focuses on the boundary between:
+The execution contract covers the boundary between:
 
 - the supervised runtime
 - the Runtime process
@@ -80,7 +75,7 @@ The execution loop must not be duplicated. The supervised Runtime and inline tes
 runtime should call the same planning, validation, reducer, update, and
 checkpoint-building code.
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - `Docket.Runtime.Loop` is the internal transition module.
 - `Docket.Runtime.Algorithm` holds the pure planning, guard evaluation, reducer,
@@ -137,7 +132,7 @@ Docket.Runtime.Dispatcher
   dispatch selected node executions and collect outputs
 ```
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - Keep `Docket.Runtime.Loop` and `Docket.Runtime.Algorithm` separate.
 - Keep the public adapter boundary as `Docket.Executor`.
@@ -298,7 +293,7 @@ resume(runtime, graph, run, opts) ->
   start_or_locate_runtime(runtime, graph, run, opts)
 ```
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - `use Docket` generates host wrappers for `run/3`, `resume/3`, `get_run/2`,
   and `resolve_interrupt/4`.
@@ -334,7 +329,7 @@ may occur before the initialization checkpoint succeeds.
 If the initialization checkpoint fails, execution has not started and the caller
 receives a checkpoint error.
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - `Docket.run/4` starts a Runtime in a `:starting` state.
 - `Docket.run/4` creates the initial `Docket.Run`, then uses the same Runtime
@@ -358,7 +353,7 @@ Resolved v1 contract:
 
 ## 7. Active Run Reads
 
-`get_run/3` is part of the v1 execution API.
+`get_run/3` is part of the v0.1 execution API.
 
 Known contract:
 
@@ -368,7 +363,7 @@ Known contract:
 - It is observational.
 - The latest accepted checkpoint remains the durable source of truth.
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - If no active Runtime owns the `run_id`, return `{:error, :not_found}`.
 - `get_run/3` returns only the public `Docket.Run` snapshot.
@@ -389,7 +384,7 @@ Known contract:
   `Docket.Run` and continues from it.
 - Active runs stay on their original graph content hash.
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - Resume requires the stored effective graph ID and compiler-produced private
   hash to match the run's pinned `graph_id` and `graph_hash`.
@@ -402,7 +397,7 @@ Resolved v1 contract:
   `Docket.Run`, but it still passes through the same `Loop.propose_init/3` durable
   barrier. The checkpoint handler upserts the run by ID, updating an existing
   host row if one exists.
-- v1 does not support queue/remote active-task reconciliation. Local/task
+- v0.1 does not support queue/remote active-task reconciliation. Local/task
   executor work that was not checkpointed is retried or failed according to retry
   policy after resume.
 - Resume must not treat Runtime process startup as graph progress. It should
@@ -485,14 +480,14 @@ Known rules:
 - Termination occurs when there are no active nodes and no pending external
   work.
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - A planned activation is an internal struct containing task ID, public node ID,
   runtime graph node ID, superstep, attempt, input hash, idempotency key, readable
   channel snapshot, and deadline.
-- v1 waits for all selected local/task executions to finish, interrupt, await,
+- v0.1 waits for all selected local/task executions to finish, interrupt, await,
   timeout, or fail before the update barrier.
-- v1 does not support partial success. Any permanent node failure fails the
+- v0.1 does not support partial success. Any permanent node failure fails the
   superstep and commits no writes from that superstep.
 - Pure no-op/wait decisions do not emit `:step_committed` checkpoints. Terminal,
   interrupt, failure, and externally resolved state changes do emit checkpoints.
@@ -576,7 +571,7 @@ tick 2 / plan
   emit :run_completed checkpoint
 ```
 
-This example clarifies:
+Execution properties:
 
 - `Docket.run/4` is a start barrier, not a completion barrier.
 - the initialized run document must be checkpointed before `FetchUser` can run.
@@ -590,20 +585,20 @@ This example clarifies:
 - Terminal detection happens on the next plan after `PremiumStep` commits
   `b_status`, not inside the same update.
 
-Resolved decisions from this example:
+Resulting design decisions:
 
 - Every public edge lowers to an ephemeral activation channel. The Runtime emits
   that activation after successful source-node completion, successful barrier
   commit, and guard approval when the edge has a guard. `FetchUser` never
   manually writes `edge:edge_fetch_user_premium_step`.
 - Public fan-in and branch intent stays on ordinary graph records: multi-source
-  edges and node-local branch groups over outgoing guarded edges. v1 keeps the
+  edges and node-local branch groups over outgoing guarded edges. v0.1 keeps the
   runtime lowering simple: generated edge activation channels, compiled guards,
   and barrier semantics. The Runtime consumes the lowered `Docket.Runtime.Graph`,
   not public graph records directly.
 - Guards that inspect nested values use durable data paths such as
   `path("user", ["premium_user"])`.
-- Guard-false candidates emit no activation signal. v1 does not need a durable
+- Guard-false candidates emit no activation signal. v0.1 does not need a durable
   skipped event unless debug tracing is enabled.
 - Node-facing config, the committed state snapshot, and runtime context are
   passed as separate arguments to node code. Internal compiled runtime details
@@ -626,7 +621,7 @@ Known node callback shape:
             | {:error, term()}
 ```
 
-`{:await, term()}` is reserved for post-v1 late-completion protocols; in v1
+`{:await, term()}` is reserved for post-v0.1 late-completion protocols; in v0.1
 the dispatcher treats it as a permanent node failure.
 
 Known call shape (see `lib/docket/runtime/dispatcher.ex`):
@@ -651,7 +646,7 @@ Known output shape:
 {:ok, %{"field_name" => value}}
 ```
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - Keep two concepts, but name them clearly:
   - Public node: the user-authored node in `Docket.Graph`.
@@ -665,9 +660,9 @@ Resolved v1 contract:
 - the returned update map is keyed by graph field ID.
 - The executor receives the runtime graph node and can inspect runtime IDs,
   generated channels, subscriptions, timeout, retry, and metadata.
-- v1 node callbacks use `call/3`. Runtime structs may keep a function field for
-  later, but v1 should compile-time/runtime reject unsupported function names.
-- command-style returns remain a reserved extension point, but v1 rejects them
+- v0.1 node callbacks use `call/3`. Runtime structs may keep a function field for
+  later, but v0.1 should compile-time/runtime reject unsupported function names.
+- command-style returns remain a reserved extension point, but v0.1 rejects them
   with `:unsupported_command`.
 - The runtime treats returned updates as graph field writes.
 - Output validation rejects unknown update fields, invalid output values, excess
@@ -702,7 +697,7 @@ Known executor callback:
             | {:error, term()}
 ```
 
-`{:await, term()}` is reserved for post-v1 late-completion protocols; v1
+`{:await, term()}` is reserved for post-v0.1 late-completion protocols; v0.1
 treats it as a permanent node failure.
 
 Design-space executor families:
@@ -723,12 +718,12 @@ Known effect rule:
 - Docket supplies idempotency keys.
 - Integrations must cooperate with idempotency and replay rules.
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - First implementation supports `Docket.Executor.Local`. The superstep contract
   remains barrier-synchronous: the runtime collects all selected results before
   update.
-- Queue, remote, replay-only, and late-completion protocols are post-v1.
+- Queue, remote, replay-only, and late-completion protocols are post-v0.1.
 - Timeouts become node attempt failures. Retry policy decides whether to
   dispatch another attempt or mark the failure permanent.
 - Preserve the design space for a future durable queue with backpressure, where
@@ -756,12 +751,12 @@ Design-space guard primitives:
 - `not(predicate)`
 - custom application guard
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - Guards are durable data expressions, not function captures.
-- v1 supports `changed/1`, `version_at_least/2`, `exists/1`, `equals/2`,
+- v0.1 supports `changed/1`, `version_at_least/2`, `exists/1`, `equals/2`,
   `all/1`, `any/1`, `not/1`, and `path/2`.
-- v1 does not support custom application guards.
+- v0.1 does not support custom application guards.
 - Guards are evaluated only for outgoing edge candidates produced by successful
   source-node completion or satisfied multi-source barriers.
 - Change tracking is write-based, not value-diff-based, matching LangGraph
@@ -839,9 +834,9 @@ Known rules:
 - Apps that only need crash resume may persist only the latest
   `checkpoint.run`.
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
-- v1 supports `:sync` and `:async` checkpoint delivery modes.
+- v0.1 supports `:sync` and `:async` checkpoint delivery modes.
 - Sync checkpoints run in the Runtime execution path and must be accepted before
   the state transition is committed or the related public API reports success.
 - Async checkpoints are submitted after the in-memory transition commits. The
@@ -858,12 +853,12 @@ Resolved v1 contract:
   checkpoint events in one host transaction or outbox write. That outbox can
   provide backpressure and allow projections to catch up later.
 - Checkpoints are only constructed and delivered between superstep phases: no
-  executor work is in flight when a checkpoint callback runs. The v1
+  executor work is in flight when a checkpoint callback runs. The v0.1
   barrier-synchronous superstep makes this structural (Plan, then dispatch and
   await all selected executions, then apply updates in memory, then
   checkpoint). This matches the LangGraph loop ordering, where `checkpointer.put`
   runs only after all tasks for the step have completed and writes are applied.
-- v1 does not automatically retry failed sync checkpoint callbacks. The current
+- v0.1 does not automatically retry failed sync checkpoint callbacks. The current
   operation returns a typed checkpoint error and no later runtime progress is
   acknowledged.
 - On sync checkpoint failure the Runtime discards the uncommitted in-memory
@@ -872,10 +867,10 @@ Resolved v1 contract:
   through the same failing sink. The host's durable state remains the last
   successful checkpoint, and resume re-executes the uncommitted superstep.
 - Async checkpoint callback failures are reported through debug or
-  test-observable surfaces in v1 and may be retried by the host's outbox or
+  test-observable surfaces in v0.1 and may be retried by the host's outbox or
   callback implementation, but they do not block the active Runtime. First-class
-  telemetry is post-v1.
-- v1 checkpoint types are `:run_initialized`, `:step_committed`,
+  telemetry is post-v0.1.
+- v0.1 checkpoint types are `:run_initialized`, `:step_committed`,
   `:interrupt_requested`, `:interrupt_resolved`, `:run_completed`, and
   `:run_failed`.
 
@@ -897,7 +892,7 @@ Known recovery rules:
 - Lost in-flight effects are retried or marked unknown according to executor
   policy.
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - Node returns of `{:error, reason}`, exceptions, exits, throws, timeouts,
   output validation failures, and guard evaluation failures are node attempt
@@ -906,7 +901,7 @@ Resolved v1 contract:
 - Exhausting retry policy makes the failure permanent.
 - Permanent superstep failure commits no writes from that superstep and emits a
   `:run_failed` checkpoint with node failure events.
-- v1 local/task in-flight work that was not checkpointed is retried or fails
+- v0.1 local/task in-flight work that was not checkpointed is retried or fails
   according to retry policy after resume.
 - Recovery after a crash or sync checkpoint failure re-executes the entire
   uncommitted superstep. Idempotency keys are stable across that re-execution
@@ -955,7 +950,7 @@ Known rules:
 - Interrupt resolution is a durable event.
 - The resume-channel write activates subscribers in the next superstep.
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - Interrupt schemas use the same schema representation as channel update
   schemas.
@@ -965,7 +960,7 @@ Resolved v1 contract:
 - Unknown or closed interrupts return `{:error, :not_found}`.
 - Authorization remains host-owned and should happen before calling
   `resolve_interrupt/5`.
-- Interrupt timeouts and deadlines are post-v1. A v1 interrupt waits
+- Interrupt timeouts and deadlines are post-v0.1. A v0.1 interrupt waits
   indefinitely until the host resolves it; hosts that need expiry enforce it
   themselves and resolve or fail the run through public APIs.
 
@@ -988,7 +983,7 @@ Docket.Test.run_inline(graph, input, opts \\ [])
 Docket.Test.step_inline(run, opts \\ [])
 ```
 
-Resolved v1 contract:
+Resolved v0.1 contract:
 
 - Test helpers are `Docket.Test.run_inline/3` and `Docket.Test.step_inline/2`.
 - Return shape:
@@ -1008,7 +1003,7 @@ Resolved v1 contract:
 
 ## 17. Resolved Contract Index
 
-The highest-priority v1 decisions are:
+The highest-priority v0.1 decisions are:
 
 1. Shared execution loop module/function boundaries.
 2. Runtime GenServer call/message API.
@@ -1022,7 +1017,7 @@ The highest-priority v1 decisions are:
 10. Local executor error versus exception handling.
 11. Inline test runtime API.
 
-Post-v1 design space to preserve:
+Post-v0.1 design space to preserve:
 
 - Durable queue/backpressure support for checkpoint/event envelopes.
 - Queue and remote executor delivery, completion, and reconciliation protocol.

@@ -1,7 +1,7 @@
 defmodule Docket.Graph.Compiler.PolicyValidationTest do
   use Docket.Test.Case, async: true
 
-  # Compiler validation of the v1 node policy surface defined by the runtime
+  # Compiler validation of the v0.1 node policy surface defined by the runtime
   # ("timeout_ms", "retry" => %{"max_attempts", "backoff_ms"}, reserved
   # "on_error"). Invalid policies are compile errors instead of plan-time run
   # failures.
@@ -11,7 +11,7 @@ defmodule Docket.Graph.Compiler.PolicyValidationTest do
   end
 
   describe "valid node policies" do
-    test "the full v1 surface compiles" do
+    test "the full v0.1 surface compiles" do
       graph =
         with_policies(%{
           "timeout_ms" => 5_000,

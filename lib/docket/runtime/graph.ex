@@ -26,7 +26,7 @@ defmodule Docket.Runtime.Graph do
   @typedoc """
   Runtime edge descriptor.
 
-  Kept as a plain map in v1 (compiler design, open decision 4). `from` is a
+  Kept as a plain map in v0.1 (compiler design, open decision 4). `from` is a
   list of public node IDs or `["$start"]`; `to` is a public node ID or
   `"$finish"`. `barrier` is true for edges declared with a list-form `from`
   (which may contain a single source).

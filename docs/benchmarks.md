@@ -4,7 +4,7 @@ Docket ships one source-checkout benchmark suite under `bench/`. It is not part
 of the public API or Hex package contract and requires a dedicated PostgreSQL
 database via `DOCKET_BENCH_DATABASE_URL`.
 
-- **Scorecard** (`bench/postgres/scorecard.exs`, this document): system-level
+- **Scorecard** (`bench/postgres/scorecard.exs`): system-level
   scenarios against the real supervised runtime, condensed into named 0–100
   scores with invariant gates.
 
@@ -106,16 +106,3 @@ check (`--profile smoke --check`); it is not a v0.1 CI release gate. `local` is
 the default developer profile; `scale` grows backlogs roughly an order of
 magnitude for dedicated runs. Exact knobs live in
 `bench/support/scorecard/config.ex`.
-
-## Relationship to the exploratory harness
-
-The `codex/dckt-38-v010` branch carries the full exploratory benchmark
-harness (saturation matrices, knee analysis, blocked-vehicle plateaus,
-observer-effect controls). The scorecard supersedes it for regression
-tracking; the harness remains the tool for open-ended capacity exploration.
-Scenario lineage: `empty_one_step → throughput`, knee matrix → `concurrency`,
-`claim_only → claim_ceiling`, `mixed_service_times → fast_slow`,
-`steady_arrival → surge`; `tenant_fairness` follows the
-[canonical TenantFair contract](architecture/docket-tenant-fair.md), whose
-[release gate](architecture/docket-tenant-fair.md#release-evidence-and-current-blocker)
-indexes the deterministic correctness evidence.

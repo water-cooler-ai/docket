@@ -10,8 +10,6 @@ Related documents:
 
 ## 1. Purpose
 
-This document defines the compiler contract for Docket v1.
-
 The compiler is the bridge between:
 
 ```text
@@ -35,9 +33,7 @@ The compiler does not own graph editing, graph storage, run storage, node
 execution, checkpoint persistence, UI canvas projection, or runtime process
 state.
 
-## 2. Current Repository State
-
-The compiler described by this document is implemented.
+## 2. Implementation
 
 - `Docket.Graph` is the canonical editable graph document, and graph editing
   helpers clear stale diagnostics.
@@ -116,14 +112,14 @@ run.
 9. Make compile behavior testable without supervisors, databases, network
    services, LLMs, or host app infrastructure.
 10. Keep room for future optimizations such as compiled graph caching without
-    making caches part of the v1 public contract.
+    making caches part of the v0.1 public contract.
 
 ## 5. Non-Goals
 
 1. Do not introduce a second public builder schema.
 2. Do not require UI code to construct runtime channels or runtime nodes.
 3. Do not persist `Docket.Runtime.Graph` as the canonical graph format.
-4. Do not store compile receipts on `Docket.Graph` in v1.
+4. Do not store compile receipts on `Docket.Graph` in v0.1.
 5. Do not make compile mutate a published host graph artifact.
 6. Do not allow raw function captures or non-durable terms in graph semantics.
 7. Do not make runtime executor/checkpoint/storage adapters part of graph
@@ -161,7 +157,7 @@ runs validation first, and only lowers when blocking diagnostics are absent.
 - On `{:error, graph}`, diagnostics contain at least one `:error` diagnostic.
 
 `compile/2` returns the internal runtime graph on success. It should not return
-a public compile report in v1. If implementation needs a richer internal result,
+a public compile report in v0.1. If implementation needs a richer internal result,
 keep it private to the compiler.
 
 ## 7. Internal Pipeline
@@ -251,7 +247,7 @@ Rules:
 - state fields with no reducer lower to `Docket.Reducer.last_value()`
 - inputs lower to last-value input channels
 - reducer descriptors must be serializable Docket reducer terms
-- v1 supports `:last_value` only
+- v0.1 supports `:last_value` only
 - defaults must validate against their field schema when present
 - required fields without defaults must be provided at run start
 
@@ -274,13 +270,13 @@ Outputs are projections over committed run state. They are not executable nodes.
 Rules:
 
 - every node in `:publish` and `:run` profiles must have an implementation
-- v1 supports `%{type: :module, module: module, function: :call}`
-- v1 rejects unsupported implementation types with diagnostics
+- v0.1 supports `%{type: :module, module: module, function: :call}`
+- v0.1 rejects unsupported implementation types with diagnostics
 - module implementations must be loadable
 - module implementations must satisfy `Docket.Node` by exporting
   `config_schema/0` and `call/3`
 - `config_schema/0` must exist and return a valid `Docket.Schema`
-- v1 node callbacks use `call/3`; unsupported function names are compile errors
+- v0.1 node callbacks use `call/3`; unsupported function names are compile errors
 - node config is validated against `config_schema/0`
 - config defaults are applied during lowering, not stored back into
   `Docket.Graph`
@@ -289,7 +285,7 @@ Rules:
 If `config_schema/0` raises, exits, or returns malformed data, compile should
 surface a diagnostic on the node rather than crashing the compiler.
 
-Node implementation validation may be policy-sensitive later. For v1, keep the
+Node implementation validation may be policy-sensitive later. For v0.1, keep the
 rules strict and local.
 
 ### 8.6 Validate Edges
@@ -320,11 +316,11 @@ Rules:
 - branch group edge IDs exist
 - every grouped edge has `from` equal to the branch owner node
 - grouped edges should normally have guards; unguarded grouped edges should
-  receive a warning in v1, not an error
+  receive a warning in v0.1, not an error
 - an edge can appear in only one branch group for a source node unless a future
   explicit aliasing feature is added
 
-The runtime does not need separate branch channels in v1. Branch groups lower
+The runtime does not need separate branch channels in v0.1. Branch groups lower
 through ordinary guarded edge activation channels and lowering metadata.
 
 ### 8.8 Validate Guards
@@ -353,7 +349,7 @@ Rules:
 - all runnable nodes must be reachable from `"$start"`
 - all edge targets must be reachable from the start frontier
 - nodes with no outgoing edge are allowed and terminate by quiescence
-- an explicit edge to `"$finish"` is recommended but not required in v1
+- an explicit edge to `"$finish"` is recommended but not required in v0.1
 - unreachable nodes are errors in `:publish` and `:run` profiles
 - disconnected draft work can still be saved by the host because graph editing
   does not require verification
@@ -370,7 +366,7 @@ Rules:
 - detect strongly connected components
 - require a global max-supersteps limit from graph policy or runtime default
 - warn on cycles with no guarded edge or no apparent halt condition
-- allow cycles in v1 when max-supersteps is enforced
+- allow cycles in v0.1 when max-supersteps is enforced
 - allow a stricter future profile to reject unguarded cycles
 
 Runtime remains the final safety net. If a cycle does not halt, the run fails
@@ -542,7 +538,7 @@ Runtime node IDs can either be the public node ID or `node:<node_id>`. The
 important rule is consistency. If channel IDs are namespaced, node IDs should
 also be namespaced internally to avoid ambiguity in debug tooling.
 
-Recommended v1 runtime ID policy:
+Recommended v0.1 runtime ID policy:
 
 ```text
 node:<node_id>
@@ -639,7 +635,7 @@ Run APIs should normalize compiler errors into runtime-facing typed errors once
 ```
 
 Until `Docket.Error` exists, `Docket.run/4` can return the graph with attached
-diagnostics or a temporary typed tuple. The final v1 shape should not make
+diagnostics or a temporary typed tuple. The final v0.1 shape should not make
 callers scrape exception messages.
 
 ## 12. Compiler And Runtime Boundary
@@ -746,16 +742,15 @@ Each step should have tests before expanding the next lowering feature.
 These should be resolved during implementation, but they should not block the
 initial compiler slice:
 
-1. Runtime node ID format: public node ID versus `node:<node_id>`. This document
-   recommends `node:<node_id>` internally while preserving public node IDs in
-   node callback context.
-2. Finish semantics: v1 should allow quiescence without explicit `$finish`, but
+1. Runtime node ID format: use `node:<node_id>` internally while preserving
+   public node IDs in node callback context.
+2. Finish semantics: v0.1 should allow quiescence without explicit `$finish`, but
    warn when no explicit finish path exists if that proves useful in product UI.
 3. Preview profile: initial compiler can implement only default `:publish`.
    Add `:preview` only when editor UX needs non-blocking severity policy.
 4. Runtime edge struct: start with internal descriptors inside
    `Docket.Runtime.Graph`; split into a struct if tests become unclear.
-5. Cycle strictness: v1 should allow cycles with a runtime max-supersteps guard
+5. Cycle strictness: v0.1 should allow cycles with a runtime max-supersteps guard
    and warn on obviously unguarded cycles. A stricter future policy can reject
    them.
 
