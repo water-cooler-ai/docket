@@ -26,13 +26,21 @@ defmodule Docket.Bench.Scorecard.Scenario do
 
   def run_variants(name, ctx) do
     if policy_sensitive?(name) do
-      Enum.map(ctx.config.claim_policies, fn policy ->
+      ctx.config.claim_policies
+      |> Enum.filter(&valid_policy_variant?(name, &1))
+      |> Enum.map(fn policy ->
         run_one(name, Map.put(ctx, :claim_policy, policy))
       end)
     else
       [run_one(name, ctx)]
     end
   end
+
+  defp valid_policy_variant?("tenant_fairness", %{config: config}) do
+    Keyword.get(config, :implementation) == Docket.Postgres.ClaimPolicy.TenantFair
+  end
+
+  defp valid_policy_variant?(_name, _policy), do: true
 
   def module(name) do
     case List.keyfind(@registry, name, 0) do
@@ -67,7 +75,7 @@ defmodule Docket.Bench.Scorecard.Scenario do
   end
 
   def run_trial(ctx, plan, opts \\ []) do
-    Db.truncate(ctx)
+    Db.reset(ctx)
     Docket.Postgres.GraphCache.clear()
     seed = Seed.seed(ctx, plan)
 

@@ -11,7 +11,7 @@ Add Docket plus the optional PostgreSQL dependencies to the host, configure
 ```elixir
 def deps do
   [
-    {:docket, "~> 0.1.0"},
+    {:docket, github: "water-cooler-ai/docket", branch: "v0.1.0"},
     {:ecto_sql, "~> 3.10"},
     {:postgrex, "~> 0.17"}
   ]
@@ -22,6 +22,15 @@ end
 mix deps.get
 mix docket.gen.migration -r MyApp.Repo
 mix ecto.migrate -r MyApp.Repo
+```
+
+When an existing host adds `ecto_sql` and `postgrex` after compiling Docket
+without them, rebuild the dependency so its conditional PostgreSQL modules are
+included:
+
+```sh
+mix deps.clean docket --build
+mix deps.get
 ```
 
 Define one complete facade. Production retention has no implicit defaults:
@@ -63,7 +72,7 @@ mix-and-match configuration.
 
 `Docket.Runtime.Moment` is a pre-commit proposal containing the next run,
 assigned events, checkpoint metadata, and scheduling disposition.
-`Docket.Lifecycle` is the single transaction composer: it persists the run,
+The lifecycle layer is the single transaction composer: it persists the run,
 schedule, and events atomically, then invokes best-effort observers only after
 commit. A failed event append or lost claim fence commits none of the moment.
 
@@ -278,7 +287,7 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `prefix:` | `public` | Must match both directions of the generated migration. |
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
 | `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` for `tenant_mode: :none` | Required PostgreSQL tenancy must select `Docket.Postgres.ClaimPolicy.TenantFair`; implementations are validated before startup and cannot be selected per call. |
-| `claim_policy.default_max_active_runs` | required by TenantFair | Positive bootstrap cap. The persisted default and per-scope overrides are authoritative after initialization. |
+| `claim_policy.default_max_active_runs` | required by TenantFair | Bootstrap cap in `1..2_147_483_647`. The persisted default and per-scope overrides are authoritative after initialization. |
 | `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
 | `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
 | `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
@@ -374,7 +383,7 @@ claim_policy: [
 ```
 
 The configured value initializes an unset database default. Thereafter use the
-small current-state API:
+administration API:
 
 ```elixir
 alias Docket.Postgres.ClaimPolicy.Admin
@@ -424,14 +433,9 @@ Fresh installations generated without an upgrade flag install V01 and V02 in
 one host migration. Use the same explicit prefix in both migration
 directions and runtime configuration.
 
-There is no supported V2-to-V3 transition: the unreleased development shapes
-were collapsed into the current V2 migration. A database that applied one of
-those discarded shapes must be recreated or rolled back with its matching old
-code before adopting the current migration.
-
-Current TenantFair validation status and test coverage are listed under
+The checked-in TenantFair tests are listed under
 [correctness evidence](architecture/docket-tenant-fair.md#correctness-evidence).
-Timing and large benchmarks are regression diagnostics, not proof.
+Timing and large benchmarks are regression diagnostics.
 
 ## Operational inspection
 

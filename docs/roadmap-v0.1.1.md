@@ -1,179 +1,58 @@
-# Docket v0.1.1 Roadmap — Composability & Ergonomics
+# Docket v0.1.1 Roadmap — Composability and Ergonomics
 
-Status: slices 1–5 implemented (2026-07-05): schema-v0.1.1, reducers,
-schema-shorthand, inline-fields, telemetry-events. The reducer contract
-rationale moved to `docs/architecture/docket-reducers-design.md`; API truth
-lives in module docs. Themes 6 (graph module DSL) and 7 (subgraph
-composition) remain open design space, recorded below. Theme 9 records the
-operational hardening follow-up for shipped TenantFair. Theme 10 records the
-`{:await}` late-completion protocol, sized during the claim-freshness review.
+The current development tree includes the schema, reducer, graph-editing,
+telemetry, and TenantFair operations work summarized below. The remaining
+sections describe open work only. Module documentation defines the implemented
+API.
 
-The v0.1.1 theme: **make building graphs feel natural without adding a second
-canonical model.** Every proposal below is sugar or extension over the existing
-graph contract, and everything a helper does must be expressible as plain
-`put_*` calls.
+## Implemented outcomes
 
----
+### Schema and reducer support
 
-## Theme 1 — Reducer library (aggregates)
+- Schemas support strings, floats, integers, booleans, maps, objects, enums,
+  and lists.
+- Numeric, string, and list constraints are enforced. Objects may opt into
+  unknown keys with `open: true`.
+- Schema shorthand accepts primitive atoms and type tuples throughout graph
+  construction.
+- Reducers fold the prior committed value with deterministically ordered writes.
+  Built-ins are `last_value`, `first_value`, `append`, `merge`, `sum`, and
+  `union`.
+- Accumulating reducers provide natural initial values and reducer-aware write
+  validation. List writes to `append` and `union` concatenate their elements.
 
-v0.1 ships only `:last_value`, and the runtime applies reducers only to resolve
-_same-step_ write conflicts (`Docket.Runtime.Algorithm.apply_state_writes/3`
-folds the step's writes and replaces the committed value). Aggregates change
-the reducer contract: the reducer must fold the **prior committed value** with
-the step's deterministically-sorted writes:
+See `Docket.Schema`, `Docket.Reducer`, and the
+[reducer rationale](architecture/docket-reducers-design.md).
 
-```
-new_value = reduce(reducer, current_committed_value, sorted_step_writes)
-```
+### Inline graph fields
 
-`:last_value` is the degenerate case that ignores `current`. This is the one
-real semantic extension in the theme; everything else is additive descriptors.
+`Docket.Graph.put_node/4` and `put_node!/4` accept `inputs:` and `fields:`
+declarations that materialize ordinary graph fields. Identical declarations are
+idempotent, conflicting declarations fail, and deleting a node does not delete
+shared fields.
 
-### Proposed built-ins
+### Event telemetry
 
-| Reducer       | Semantics                                            | Options                                                           |
-| ------------- | ---------------------------------------------------- | ----------------------------------------------------------------- |
-| `last_value`  | existing; last write in sorted node order wins       | —                                                                 |
-| `first_value` | keep the first committed value; later writes ignored | —                                                                 |
-| `append`      | list accumulation: `current ++ writes`               | `unique: true`, `max_length: n` (sliding window — chat histories) |
-| `merge`       | map merge: `Map.merge(current, write)`               | `deep: true`                                                      |
-| `sum`         | numeric accumulation                                 | —                                                                 |
-| `union`       | list-as-set: append + dedupe                         | `by: path` (dedupe key, e.g. message `"id"`)                      |
+Every committed `Docket.Event` with a public telemetry mapping emits after the
+commit. This gives live instrumentation a direct event stream without requiring
+checkpoint parsing. Delivery remains best effort; retained events are the
+durable source.
 
-### Contract details to settle
+See `Docket.Telemetry` and the [telemetry guide](telemetry.md).
 
-- **Write validation becomes reducer-aware.** For an `append` field the node
-  writes an _item_, but the committed channel value is a _list_. Validation in
-  `validate_write_schema/4` must validate the write against the schema's
-  `item` for accumulating reducers, and the field schema stays the truth for
-  the committed shape. Compiler diagnostics enforce reducer/schema pairing
-  (`append` ⇒ `:list` schema, `sum` ⇒ numeric, `merge` ⇒ `:map`/`:object`).
-- **Initial values.** Accumulating fields need a natural zero when unset:
-  `[]` for `append`/`union`, `%{}` for `merge`, `0` for `sum` — applied as the
-  effective default when the field has none.
-- **Open question — list writes to `append`.** Does writing a list append one
-  element or concatenate? LangGraph concatenates list writes and appends
-  scalar writes. That's convenient but type-ambiguous when `item` is itself a
-  list type. Proposal: concatenate when the write is a list and `item` is not
-  a list type; otherwise append — and let the compiler flag the ambiguous case.
-- **Interrupt resume.** `resolve_interrupt` writes through the resume field's
-  reducer, so resolving into an `append` field accumulates naturally.
-- **Wire format.** Reducer already serializes as `type` + `opts`; new types
-  are additive. Old graphs load unchanged.
+### TenantFair operations
 
-### Stretch: custom reducers
+The TenantFair claim policy includes versioned administration of the persisted
+default and per-owner overrides, aggregate admission counts, telemetry, and
+regression tooling. Weighted service, borrowing, reclaim, and alternate
+schedulers are separate proposals in the [future roadmap](future-roadmap.md).
 
-Module-referenced reducers, mirroring node implementation refs:
-`%{type: :module, module: M, function: :reduce}` with contract
-`reduce(current, values, opts) :: value`. Durable (module name is data),
-must be pure/deterministic — replan after crash must produce identical
-commits. Defer until built-ins prove insufficient; every custom reducer is a
-determinism footgun in host hands.
+## Open work
 
----
+### Graph modules and a static DSL
 
-## Theme 2 — Schema engine v0.1.1
-
-Prerequisite for Theme 1 (`append` needs a list type) and the cheapest win in
-the whole roadmap.
-
-- **New types:** `:boolean`, `:integer`, `:list` (`Docket.Schema.list(item, opts)`
-  — the struct's `item` slot already exists, there is just no builder or
-  validation for it).
-- **Enforce stored constraints:** `min`/`max` on numbers, `min_length`/
-  `max_length`/`pattern` on strings, `min_items`/`max_items` on lists. These
-  are already stored in `constraints` and documented as ignored — enforcing
-  them changes runtime behavior for existing stored graphs that carry
-  constraints. Decision needed: accept as a documented v0.1.1 behavior change
-  (recommended — v0.1 docs said "ignored in v0.1", nobody should be relying on
-  non-enforcement), or gate behind a graph policy.
-- **Object openness:** an `open: true` option on `object` to permit unknown
-  keys (today unknown keys are rejected; `map` is the all-or-nothing escape
-  hatch).
-
----
-
-## Theme 3 — Schema shorthand (the "Schema DSL", cheap tier)
-
-Before reaching for macros: accept terse literals anywhere a schema is
-expected, normalized by the constructors/editing API into real
-`%Docket.Schema{}` values.
-
-```elixir
-# atoms as bare types
-Docket.Graph.put_input!(g, "message", schema: :string, required: true)
-
-# tuples as type + opts
-Docket.Schema.object(%{
-  name: :string,
-  age: {:integer, min: 0},
-  tags: {:list, :string}
-})
-```
-
-Why this tier first: it is plain data, so it works identically for
-hand-written Elixir and compilers—no new concepts, no macro layer to keep in
-sync. A macro `config do ... end`
-DSL for `Docket.Node.config_schema/0` can sit on top later if the shorthand
-still feels heavy (see Theme 6).
-
----
-
-## Theme 5 — Inline field declaration on `put_node!`
-
-The requested helper: when **adding a node to the graph**, declare the fields
-it reads and writes right there, and the editing API materializes them as
-graph fields — no separate `put_field!`/`put_input!` calls:
-
-```elixir
-graph
-|> Docket.Graph.put_node!("draft_reply",
-  implementation: MyApp.Nodes.LLM,
-  config: %{output_field: "draft_response", ...},
-  inputs: %{"customer_message" => [schema: :string, required: true]},
-  fields: %{
-    "draft_response" => :string,                       # shorthand schema
-    "llm_usage" => [schema: :map],
-    "messages" => [schema: {:list, :map}, reducer: :append]
-  }
-)
-```
-
-This is pure editing-API expansion: `inputs:`/`fields:` entries become the
-exact `put_input!`/`put_field!` calls you would have written by hand. Nothing
-new lands on the node record — the document keeps fields as the single
-canonical model (the v0.1 stance from `examples/llm-node.md`), and the hash
-reflects the materialized fields because they are ordinary fields.
-
-Rules:
-
-- **Existing field, identical definition** — no-op, so two nodes can declare
-  the same shared field and order doesn't matter.
-- **Existing field, conflicting definition** — `{:error, %Graph.Error{}}`
-  (or raise from the bang form), never a silent overwrite. An explicit
-  `put_field!` after the fact still updates freely; only the inline
-  declaration is conservative.
-- **Deleting the node does not delete the fields** — fields are shared state;
-  cleanup stays explicit (`verify/2` can flag orphaned fields as a
-  diagnostic).
-- Values accept everything `put_field!` accepts, plus the Theme 3 schema
-  shorthand, so `"draft_response" => :string` is the minimal spelling.
-
-For generic nodes (like the LLM node) whose config names its own output
-fields, some duplication between `config` and `fields:` remains — that's
-inherent to config-bound field names and stays the host's call. A
-`state_contract/1` node callback that lets the _implementation_ report its
-reads/writes for compiler diagnostics is a separate, complementary idea —
-parked in Theme 8's explore list, not part of this slice.
-
----
-
-## Theme 6 — Graph modules and DSL (macro tier)
-
-Make `use Docket.Graph` the natural convention for static graph definitions.
-Using the graph module installs the graph DSL, including the schema declaration
-tools used by inputs, fields, node-local declarations, and outputs:
+A static graph module could expose a declarative frontend while preserving the
+existing graph document as the only canonical representation:
 
 ```elixir
 defmodule MyApp.Graphs.SupportReply do
@@ -181,218 +60,69 @@ defmodule MyApp.Graphs.SupportReply do
 
   input :customer_message, :string, required: true
   field :messages, {:list, :map}, reducer: :append
-  node :draft, MyApp.Nodes.LLM, config: %{...}
+  node :draft, MyApp.Nodes.LLM, config: %{}
   chain [:start, :draft, :finish]
   output :draft_response
 end
-
-MyApp.Graphs.SupportReply.graph()           #=> %Docket.Graph{}
-MyApp.Graphs.SupportReply.compiled_graph()  #=> %Docket.Runtime.Graph{}
 ```
 
-The module is compiled and validated in `__before_compile__/1`. Its canonical
-`Docket.Graph` and lowered `Docket.Runtime.Graph` are embedded into the BEAM;
-they are not written to ETS or `:persistent_term` during compilation and do
-not need to be rebuilt during application startup. Invalid static definitions
-therefore fail the application build rather than the first run. Literal node
-module references must establish compile dependencies so changes to a node's
-schema cause dependent graph modules to be recompiled.
+An implementation would need to:
 
-`graph/0` preserves the authored canonical document for inspection,
-publication, and serialization. `compiled_graph/0` returns the immutable
-runtime materialization and is the direct execution path. Runtime-created,
-UI-built, and stored graphs remain ordinary `%Docket.Graph{}` values and
-continue through the existing compiler and node-local runtime cache.
+- expand through the public graph-editing and schema APIs;
+- preserve an authored `%Docket.Graph{}` for publication and serialization;
+- validate static definitions at compile time; and
+- establish compile dependencies on referenced node modules so schema changes
+  recompile dependent graph modules.
 
-Hard requirement: every DSL macro expands to the exact same public editing and
-schema APIs used by hand-written graph pipelines — one construction semantics,
-two spellings. `use Docket.Graph` is an additive module frontend, not a second
-graph representation. The macro tier only serves static definitions, which is
-why Themes 3–5 still come first.
+Runtime-created, UI-built, and stored graphs would remain ordinary graph
+documents using the existing compiler and runtime cache.
 
----
+### Subgraph composition
 
-## Theme 7 — Subgraph composition
-
-The headline "graph composability" item. Two distinct designs:
-
-### 7a. Build-time inlining (proposed for v0.1.1)
+The first candidate is build-time inlining:
 
 ```elixir
 Docket.Graph.compose!(parent, "triage", child_graph,
-  inputs: %{"message" => "customer_message"},   # child input <- parent field
-  outputs: %{"result" => "triage_result"}        # child output -> parent field
+  inputs: %{"message" => "customer_message"},
+  outputs: %{"result" => "triage_result"}
 )
 ```
 
-A pure document transformation: namespace the child's nodes/fields/edges under
-the prefix (`"triage/classify"`), rewire the child's `$start`/`$finish` to the
-parent attachment points, map inputs/outputs to parent fields, and merge
-diagnostics. Pros: zero runtime changes, the flat document stays the single
-truth, the hash covers the composed whole, checkpoints/resume/interrupts all
-work today. Cons: composition is by-value — editing the child later doesn't
-update parents (that's host-side graph versioning, which v0.1 already assigns
-to the host).
+Inlining would namespace child nodes, fields, and edges; map its inputs and
+outputs to parent fields; and produce one flat graph document covered by one
+hash. The design still needs stable namespacing, collision diagnostics,
+rewriting rules for field references in guards and configuration, and a decision
+on provenance metadata.
 
-Design points: ID namespacing scheme (delimiter must be legal in IDs and
-stable), guard/config references inside the child that name child field IDs
-must be rewritten, collision diagnostics, and whether composed regions carry
-provenance metadata (`metadata["$composed_from"]` is reserved-prefix
-territory — needs a decision since `$` keys are reserved on the wire).
+A runtime subgraph node referencing an independently versioned child graph is
+deferred. It would require nested run, checkpoint, interrupt, and recovery
+semantics rather than only a graph-document transformation.
 
-### 7b. Runtime subgraph node (defer, likely v2)
+### Detached node completion
 
-A `:subgraph` node type referencing a child graph by id+hash, executed as a
-nested run. Requires nested checkpoint semantics, interrupt propagation,
-resume across two run documents, and executor changes. Real value (independent
-versioning, shared child instances, bounded document size) but it's a runtime
-contract change, not an ergonomics slice. Record the design space now, build
-after 7a proves insufficient.
+Vehicles do not refresh claims. In-process node attempts run under the
+runtime-owned hard deadline, and token/sequence fencing rejects a stale commit
+after claim recovery. Work durably owned by an external system should park the
+run and return through an interrupt or another serialized signal.
 
----
+`{:await, term()}` is reserved by the executor contract and currently becomes a
+permanent node failure. Supporting detached completion would require:
 
-## Theme 8 — Extension points: what else becomes a behaviour?
+- a durable task state that records stable task and attempt identity without
+  trying to checkpoint an in-flight process;
+- a serialized result mutation fenced on that exact detached task and attempt;
+- a mandatory durable deadline and recovery path;
+- a supervised home for local completions after the vehicle exits; and
+- unchanged replay and external-effect idempotency rules for late or rejected
+  results.
 
-v0.1 has three behaviours, all at _effectful boundaries_: `Docket.Node` (do
-work), `Docket.Checkpoint` (persist), `Docket.Executor` (dispatch). The
-guiding split for opening more:
+The completion protocol must release the vehicle and claim while ensuring that
+stale, duplicate, and superseded results cannot advance the run.
 
-- **Effectful boundaries** (side effects, observability) are safe to open —
-  they can't corrupt deterministic semantics.
-- **Semantic pure functions** (reducers, guards, validation) are the
-  determinism contract itself. Opening one hands the purity obligation to the
-  host, and the module name becomes durable graph content (it's in the hash,
-  and the graph only loads where that module exists). Open these sparingly,
-  with loud contracts.
+### Additional extension points
 
-### Candidates, ranked
-
-1. **`Docket.Reducer` behaviour** (semantic; pairs with Theme 1's stretch).
-   `reduce(current, values, opts) :: value`, plus optional `init(opts)` (the
-   zero value) and optional `write_schema(field_schema, opts)` (what a single
-   write validates against, mirroring the built-in append-validates-item
-   rule). Referenced from the document like node implementations
-   (`%{type: :module, module: M}`). Must be pure — replan after crash must
-   reproduce identical commits.
-2. **`Docket.Guard` custom predicates** (semantic). A `:module` guard op with
-   `evaluate(args, snapshot_view) :: boolean` over the committed snapshot
-   only. Unlocks domain predicates the closed op set can't express
-   (thresholds over nested data, cross-field conditions). Same
-   purity-and-durability caveats as reducers; the read-only snapshot view is
-   the enforcement surface.
-3. **Event delivery** (effectful — safe). Today events exist only inside
-   checkpoints; live UIs must parse checkpoint payloads. Two options:
-   `:telemetry` emission (Elixir-native, zero new behaviour, recommended) or
-   a `handle_event(event, context)` observer behaviour on the runtime config.
-   Either is observability-only: delivery failures never affect the run.
-4. **Retry/backoff strategy** (effectful-ish). Node retry _policies_ are data;
-   the strategy interpreting them is fixed. A behaviour would allow jittered
-   backoff or circuit-breaking. Timing doesn't touch committed-state
-   determinism (task identity stays derived from plan), so this is safe but
-   lower value — wait for a concrete host need.
-5. **Schema validation** — recommend **keeping closed**. Validation runs on
-   the commit path and defines graph portability; host-pluggable validators
-   would make the same document valid on one node and invalid on another.
-   Extend the engine itself (Theme 2) instead.
-6. **ID generation** — already pluggable (`:id_generator` on
-   `Docket.Graph.new/1`); nothing to do.
-
-Suggested v0.1.1 scope: telemetry events (3) as a small standalone slice;
-reducer behaviour (1) only if a real host graph exhausts the Theme 1
-built-ins; guards (2) written up but deferred until a concrete predicate
-can't be expressed with `path`/`equals`/`all`/`any`.
-
----
-
-## Theme 9 — TenantFair follow-up work
-
-TenantFair's single sticky-admission design landed in v0.1.0. The
-[TenantFair claim policy](architecture/docket-tenant-fair.md) describes its
-state, FIFO, ring, work bounds, conditional fixed-window theorem, evidence,
-and exclusions.
-
-The v0.1.1 follow-up scope is operational hardening that does not change the
-admission model: safer public administration, aggregate observability, and
-regression tooling. Weighted or preferred service, borrowing, reclaim,
-preemption, TTL slot expiry, dynamic-population guarantees, and alternate
-schedulers require separate future contracts. They are not implicit TenantFair
-features. Cross-release ideas live in the general
-[future roadmap](future-roadmap.md).
-
----
-
-## Theme 10 — `{:await}` late-completion protocol for detached execution
-
-v0.1.0 gives blocking node work two freshness strategies: keep each
-between-commit stretch under the orphan TTL, or refresh the claim while work
-runs under the finite runtime-owned attempt deadline. Work an external system
-durably owns parks as an external wait instead. The remaining shape is work a
-node started **in-process** but wants to hand back to the runtime — stop
-holding a vehicle slot and claim while it finishes. The execution contract
-reserves `{:await, term()}` for exactly this; v0.1 rejects it as permanent
-failure. This theme promotes it to a specified protocol.
-
-Design skeleton, established during the adversarial claim-freshness review:
-
-- Detachment is voluntary. The runtime can never extract an await from opaque
-  blocking code — any TTL-fired takeover is a timeout in disguise. The
-  node/executor returns `{:await, token}`; the runtime dispatcher becomes
-  partial-result-capable.
-- A new detached `TaskState` status and wait kind make the mid-superstep park
-  legal: the checkpoint records task identity only (task ID, attempt,
-  idempotency key, input hash) — in-flight call state is uncheckpointable.
-  The retry-park pending-writes machinery already proves the checkpoint shape.
-- Result re-entry is a new serialized `RunMutation` through the row-locked
-  signal path, fenced on the run still holding that exact task detached at
-  that exact attempt; stale, duplicate, and superseded results are no-ops.
-- `TaskState.deadline_at` becomes live with a detached-deadline sweeper.
-  Every await carries a mandatory deadline: any bounded version of detachment
-  contains a timeout as its own backstop, and a detached run must never sit
-  `:waiting` with neither wake nor deadline.
-- The completion needs a live home after the vehicle exits (node-local holder,
-  unreplicated); holder crash resolves through deadline expiry.
-- External effects stay replayable. A rejected late result's effects already
-  happened; stable task/idempotency keys remain the only dedupe surface. This
-  preserves the current boundary in
-  [`delivery-guarantees.md`](delivery-guarantees.md): Docket makes no
-  exactly-once external-effect promise.
-
-Epic-sized (~15+ files: executor behaviour and both executors, runtime
-dispatcher, TaskResult/TaskState/Moment, Loop/Algorithm, RunMutation,
-Lifecycle, RunStore schedule + sweeper, Postgres dispatcher/vehicle, a holder
-module, MemoryBackend, and both contract docs). This targets v0.1.1 after the
-v0.1.0 line ships.
-
----
-
-## Proposed slice order
-
-Each slice is a branch per the v0.1 workflow; order reflects dependencies and
-value-per-risk:
-
-1. **schema-v0.1.1** — `:list`/`:boolean`/`:integer`, constraint enforcement,
-   `open` objects. (Prereq for reducers; smallest risk.)
-2. **reducers** — reducer contract extension (prior value + writes),
-   `append`/`merge`/`sum`/`first_value`/`union`, reducer-aware write
-   validation, compiler pairing diagnostics, interrupt-resume-through-reducer.
-3. **schema-shorthand** — atom/tuple schema literals across all constructors.
-4. **inline-fields** — `inputs:`/`fields:` options on `put_node!` that
-   materialize graph fields, conflict rules, orphaned-field diagnostic.
-5. **telemetry-events** — `:telemetry` emission for run/node/interrupt events
-   (Theme 8.3); independent of everything above, can slot in anywhere.
-6. **tenant-fair-operations** — public administration, aggregate
-   observability, and regression tooling for the shipped sticky-admission
-   engine (Theme 9; no scheduler or fairness-contract change).
-7. **await-protocol** — `{:await, term()}` late-completion protocol for
-   detached node execution (Theme 10, after the v0.1.0 line ships; it breaks
-   down into its own slices when scheduled).
-
-## Open questions (need a call before their slice starts)
-
-1. `append` + list writes: concatenate, append-as-element, or compiler-flagged
-   ambiguity? (Theme 1) **Concatenate**
-2. Constraint enforcement: documented behavior change vs. policy-gated?
-   (Theme 2) **document change**
-3. Inline field conflict rule: is identical-definition-no-op /
-   conflict-error the right balance, or should a `force: true` escape hatch
-   exist? (Theme 5) **this is good for now**
+Custom reducer or guard behaviours remain possible, but they would make host
+modules part of durable graph semantics and move determinism obligations to the
+host. They should be added only for requirements that the built-in reducers and
+guard expressions cannot represent. Retry/backoff strategy customization is
+also deferred pending a concrete integration need.

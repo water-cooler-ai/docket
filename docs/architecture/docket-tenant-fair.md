@@ -21,10 +21,10 @@ use Docket,
   ]
 ```
 
-`default_max_active_runs` is a required positive bootstrap value. It initializes
-an unset database default; the persisted default and per-scope Admin overrides
-are authoritative afterward. The engine is selected once per backend instance,
-not per claim call.
+`default_max_active_runs` is a required integer in `1..2_147_483_647`. It
+initializes an unset database default; the persisted default and per-scope Admin
+overrides are authoritative afterward. The engine is selected once per backend
+instance, not per claim call.
 
 Legacy remains the omitted-policy default only for `tenant_mode: :none`. It is
 tenant-blind and never creates admission markers. Required tenancy rejects
@@ -341,14 +341,14 @@ low-volume target row, and complete each outcome before the next call.
 Legacy selects all `N` older rows first, so bypass is exactly `N`. On the
 equivalent two-partition TenantFair trace with `L = 0`, the hot partition gets
 at most one grant or `Q` outcomes before the target grant, independently of
-`N`. The release matrix uses `N = 2`, `10`, and `1000`.
+`N`.
 
 This is separation on one eligible frozen trace, not global dominance for
 dynamic membership, other class/demand mixes, latency, or throughput.
 
 ## Schema, migration, and administration
 
-Schema version 2 installs the entire current engine: policy and partition
+Schema version 2 installs the engine's policy and partition
 authority, stable unfinished ring, marker and partial indexes, lifecycle
 triggers, serialized cursor, and the sole seven-argument claim function.
 
@@ -358,10 +358,6 @@ becomes debt rather than being trimmed. Fresh installs apply V1 and V2 in one
 host migration. Custom prefix, failed transactional upgrade, populated
 backfill, concurrent first partition creation, and rollback/down to V1 are
 release-gated.
-
-There is no V2-to-V3 migration. Unreleased development shapes were collapsed
-into the rewritten V2 migration. A database that applied a discarded shape
-must be recreated or rolled back with matching old code.
 
 The supported rollout is stopped and homogeneous:
 
@@ -377,11 +373,11 @@ and audited mode history are outside v0.1.0.
 A binary that predates the engine interlock cannot be made safe by new database
 code alone.
 
-The Admin surface is deliberately small: `get_default/1`, `put_default/3`,
-`put_override/4`, `reset_override/3`, and `get_effective/2`. Writes use optional
-version CAS; caps are positive integers. Effective reads expose token-free
-`queued`, `admitted_ready`, `admitted_claimed`, and `debt` counts. There are no
-weights, cap zero, holds, policy history, borrowing, or governance workflows.
+The Admin surface provides `get_default/1`, `put_default/2,3`,
+`put_override/3,4`, `reset_override/2,3`, and `get_effective/2`. Writes accept an
+optional `:expected_version` CAS value; caps must be integers in
+`1..2_147_483_647`. Effective reads expose token-free `queued`,
+`admitted_ready`, `admitted_claimed`, and `debt` counts.
 
 ## Observability and performance evidence
 
@@ -393,90 +389,38 @@ ordinary metric labels.
 
 Production invokes the claim function with trace mode disabled and filters all
 inspection rows/internal columns before decoding public outcomes. Trusted
-direct inspection may explicitly enable the identity-bearing raw trace. The
-committed proof wrapper and journal are test-only schema objects and are never
-installed by production migrations. Aggregate telemetry cannot reconstruct
-per-target bypass.
+direct inspection may explicitly enable the identity-bearing raw trace.
+Aggregate telemetry cannot reconstruct per-target bypass.
 
 Timing percentiles, query plans, and the PostgreSQL scorecard may detect
 regressions but cannot satisfy fairness correctness. See the
 [telemetry guide](../telemetry.md) and [benchmark guide](../benchmarks.md) for
 their operational contracts.
 
-The scorecard currently expands a Legacy variant for a required-tenancy
-TenantFair scenario; startup correctly rejects that combination. It is a known
-invalid benchmark row and is not runnable release evidence.
+The scorecard runs its required-tenancy fairness scenario only with TenantFair.
+Claim ceiling and fast/slow scenarios run both registered policy variants.
 
 ## Correctness evidence
-
-Correctness evidence is database-authored and layered:
-
-- the committed journal owns call order, commit provenance, cursor/visit order,
-  outcomes, epochs, and logical-work counters;
-- full ring snapshots plus independent nonterminal counts establish `C` and
-  `H`;
-- the verifier derives minimal `P` and `A` from the target and actual pre-target
-  grantees;
-- policy/function fingerprints and monotonic qualification audits detect
-  changes even when a value changes and later reverts;
-- a production-equivalent authoritative recheck establishes target
-  admissibility; and
-- durable run/token/poison state and the full epoch map cross-check every
-  recorded outcome and grant.
-
-The harness opens a window only after every fixture fact commits and no
-pre-window claim call remains in flight.
-
-The journal is written in the same transaction as the production claim call.
-Rollback leaves no journal, cursor, epoch, or outcome evidence. Database call
-sequence must be gap-free; the target-grant call must be complete; and trace-on
-and trace-off executions must have identical durable behavior after removing
-trace-only columns.
-
-Caller timestamps, mailbox order, transaction IDs, telemetry order, benchmark
-duration, and asserted `committed` flags are never proof. Falsification tests
-must reject fabricated/reordered/omitted evidence, sticky-cap safety mutants,
-scheduler/work-budget mutants, and trace-only behavior changes.
 
 The repository includes implementation-level evidence for:
 
 - ring, cursor, class, budget, and epoch mechanics in
-  [`tenant_fair_ring_test.exs`](../../test/docket/postgres/tenant_fair_ring_test.exs);
+  [`tenant_fair_ring_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/tenant_fair_ring_test.exs);
+- the demand-aware formulas and trace-oracle invariants in
+  [`fair_rotation_oracle_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/fair_rotation_oracle_test.exs);
 - cap-two/cap-ten identities, FIFO, debt, steal, poison, interlock, and rollback
-  in [`claim_policy_tenant_fair_test.exs`](../../test/docket/postgres/claim_policy_tenant_fair_test.exs);
+  in [`claim_policy_tenant_fair_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/claim_policy_tenant_fair_test.exs);
 - Admin CAS/effective counts, engine selection, startup shape, and supervised
   admission in
-  [`claim_policy_admin_test.exs`](../../test/docket/postgres/claim_policy_admin_test.exs),
-  [`claim_policy_test.exs`](../../test/docket/postgres/claim_policy_test.exs),
-  [`backend_test.exs`](../../test/docket/postgres/backend_test.exs), and
-  [`dispatcher_test.exs`](../../test/docket/postgres/dispatcher_test.exs);
+  [`claim_policy_admin_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/claim_policy_admin_test.exs),
+  [`claim_policy_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/claim_policy_test.exs),
+  [`backend_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/backend_test.exs), and
+  [`dispatcher_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/dispatcher_test.exs);
 - marker lifecycle in
-  [`run_store_test.exs`](../../test/docket/postgres/run_store_test.exs);
+  [`run_store_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/run_store_test.exs);
 - fresh/populated/prefix/rollback/concurrent-creation migration paths in
-  [`migration_test.exs`](../../test/docket/postgres/migration_test.exs).
+  [`migration_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/migration_test.exs).
 
-Additional validation may use a separate test-only proof harness with a formula
-oracle, committed journal, qualified-window matrix, Legacy comparison,
-falsification controls, and stale-snapshot mutant. That harness is deliberately
-outside the package and is not a prerequisite for using the supported runtime.
-
-Release coverage combines the implementation-level evidence above with the
-ordinary, core-only, PostgreSQL 13, and PostgreSQL 17 matrices. PostgreSQL 17
-repeats the deterministic adversarial cases across multiple ExUnit seeds.
-Timing, randomized soak, or scenario count cannot substitute for correctness
-evidence.
-
-## Design lineage
-
-The sticky release model is informed by [Solid Queue concurrency
-controls](https://github.com/rails/solid_queue/blob/98af3c9e6d1740afbf1df34958c38e36c634b046/README.md#concurrency-controls),
-and [Oban Pro global partitioning](https://oban.pro/docs/pro/Oban.Pro.Engines.Smart.html#module-global-partitioning)
-is precedent for cluster-wide partitions. Neither supplies Docket's FIFO,
-no-TTL residency, or bounded-window theorem.
-
-PostgreSQL documents [`SKIP LOCKED`](https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE),
-[Read Committed snapshots](https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED),
-[triggers](https://www.postgresql.org/docs/current/trigger-definition.html), and
-[partial indexes](https://www.postgresql.org/docs/current/indexes-partial.html).
-Docket's fixed structural IDs, contiguous cursor, authoritative rechecks, and
-proof harness are project-owned guarantees, not PostgreSQL guarantees.
+CI runs the ordinary, core-only, PostgreSQL 13, and PostgreSQL 17 test jobs.
+Timing, randomized soak, and scenario count remain regression evidence rather
+than proof of the fixed-window assumptions.

@@ -45,13 +45,12 @@ TenantFair implementation with an explicit cap.
 `Docket.Postgres.ClaimPolicy.TenantFair` is the sole required-tenancy engine.
 It invokes the prefix-local claim function once; the function owns sticky
 admission, bounded ring traversal, locking, mutation, and cursor/epoch
-accounting. The [TenantFair claim policy](docket-tenant-fair.md) covers its
-configuration, mechanics, formal bounds, rollout, nonclaims, and correctness
-evidence.
+accounting. Its complete contract is the
+[TenantFair claim policy](docket-tenant-fair.md).
 
 Engine choice is instance-level. Deployments must not mix binaries that predate
-the `admission_mode` interlock. Current stopped-upgrade commands and operational
-inspection live in the [PostgreSQL operations guide](../postgres-operations.md).
+the `admission_mode` interlock. Stopped-upgrade commands and operational
+inspection are in the [PostgreSQL operations guide](../postgres-operations.md).
 
 ## Test contract
 
@@ -59,4 +58,4 @@ The shared ClaimPolicy and live RunStore matrices verify implementation
 selection, one-statement execution, decoded lease persistence, PostgreSQL error
 preservation, transaction behavior, and telemetry. The
 [TenantFair correctness evidence](docket-tenant-fair.md#correctness-evidence)
-lists its policy-specific tests and current validation status.
+names its policy-specific tests.

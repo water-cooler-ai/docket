@@ -8,7 +8,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Returns the fixed-budget circular active-tenant traversal.
 
     `$1` is the last committed ring position. The query reads scheduling rows
-    without locking them. A future admission function must attempt partition
+    without locking them. The installed admission function attempts partition
     authority separately so a lock skip remains one explicit inspection. The
     recursive seek intentionally revisits the ring after wrap when `H < S`.
     """

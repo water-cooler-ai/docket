@@ -443,7 +443,8 @@ the package page.
   operational signals and non-oracle regression measurements.
 - [examples/llm-node.md](examples/llm-node.md) — a generic, configurable LLM
   node implementation.
-- [docs/architecture/](docs/architecture/) — design rationale: the graph
-  document contract, compiler, execution contract, and runtime background.
+- [Architecture guide index](docs/architecture/README.md) — design rationale:
+  the graph document contract, compiler, execution contract, and runtime
+  background.
 - Module docs — `Docket`, `Docket.Graph`, `Docket.Run`, `Docket.Node`,
   `Docket.Checkpoint`, and `Docket.Test` are the authoritative API reference.

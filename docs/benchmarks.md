@@ -22,7 +22,7 @@ Options:
 | `--profile smoke\|local\|scale` | workload size and score targets (default `local`) |
 | `--only a,b` | run a subset of scenarios |
 | `--output PATH` | artifact directory (default `tmp/bench/postgres/scorecard/<run-id>/`) |
-| `--check` | raise on any invariant violation (CI mode; never gates on timing) |
+| `--check` | raise on an invariant violation, scenario error, or missing score; never gate on the numeric timing score |
 | `--keep-schema` | keep the scratch schema for inspection |
 | `--seed N` | deterministic interleave seed |
 
@@ -39,8 +39,8 @@ The drain scenarios drive the real `Docket.Runtime.Supervisor` with the
 retains the resulting claims. Metrics come from durable rows, not telemetry;
 for drain scenarios each run's wait is
 `finished_at − max(staged due time, runtime start)`, so seeding overhead
-never counts as queue time. Scores are 0–100; the mapping from raw measurements to a
-score is stated per scenario and every threshold below is an explicit
+never counts as queue time. Scores are 0–100; the mapping from raw measurements
+to a score is stated per scenario and every threshold below is an explicit
 calibration knob in the profile.
 
 | Metric | Scenario | Score definition |
@@ -64,12 +64,9 @@ set above the largest frozen-backlog fixture because claim efficiency retains
 claims by design; deterministic PostgreSQL tests, rather than scorecard rows,
 remain the sticky-cap correctness evidence.
 
-The current tenant-fairness scenario requires tenant-scoped storage, so only
-TenantFair is a valid engine for that row. The registry still expands a Legacy
-variant that required-tenancy validation rejects; do not treat the full
-tenant-fairness scorecard as runnable release evidence until the harness skips
-or replaces that invalid combination. The formal Legacy comparison is the
-deterministic `N = 2, 10, 1000` ordinary-ready trace in the
+The tenant-fairness scenario requires tenant-scoped storage and therefore runs
+only with TenantFair. Claim efficiency and fast/slow fairness run with both
+registered policies. The formal Legacy comparison is the logical trace in the
 [TenantFair Legacy separation](architecture/docket-tenant-fair.md#conditional-separation-from-legacy),
 not a timing score.
 

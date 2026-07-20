@@ -1,7 +1,8 @@
 defmodule Docket.Graph.Compiler.Validation do
   @moduledoc false
 
-  # Public graph validation passes (compiler design phases 9.2 - 9.10).
+  # Public graph validation passes. See the validation contract in the compiler
+  # design document.
   #
   # Passes never trust edit-time normalization: hosts may load old, manually
   # edited, or externally generated graph documents. All passes run even when

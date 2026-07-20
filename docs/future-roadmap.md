@@ -1,47 +1,7 @@
 # Docket Future Roadmap
 
-Status: living planning document.
-
-This is the general home for future Docket work that is worth preserving but
-is not part of a committed release. It may track features, API changes,
-correctness work, operational improvements, performance investigations,
-developer experience, documentation, research, or experiments.
-
-An entry here is not a release commitment and does not change current product
-behavior. Released behavior remains defined by code, module documentation, and
-the focused documents under `docs/architecture/`.
-
-## How to use this roadmap
-
-Each idea should record enough context to remain useful without depending on an
-external planning system:
-
-- **Status:** idea, exploring, planned, in progress, shipped, or dropped.
-- **Horizon:** next, later, or a named release when one exists.
-- **Area:** the part of Docket affected.
-- **Summary:** what could change.
-- **Why:** the user, operator, or maintainer problem it addresses.
-- **Possible direction:** the current design shape, without treating it as
-  final.
-- **Open questions:** decisions or evidence still needed.
-- **Dependencies:** work or decisions that should happen first.
-
-Add ideas when they are concrete enough to explain. Split an entry when its
-parts can ship or be rejected independently. When work is assigned to a
-release, link its focused plan from here. When it ships, move authoritative
-details into the relevant contract or guide and reduce the roadmap entry to a
-short outcome note.
-
-This roadmap can cover any project area, including:
-
-- runtime and execution;
-- graph authoring and public APIs;
-- scheduling and multi-tenancy;
-- persistence, migrations, and backend conformance;
-- operations, observability, and recovery;
-- performance and scalability;
-- developer experience, testing, and documentation; and
-- research or experimental capabilities.
+Items are exploratory, not release commitments. Current behavior is defined by
+the code, module documentation, and focused architecture and operations guides.
 
 ## Future work
 
@@ -128,26 +88,4 @@ must not introduce partition/run lock cycles.
 ## Related focused roadmaps
 
 - [v0.1.1 composability and ergonomics roadmap](roadmap-v0.1.1.md) tracks work
-  already organized around that release theme.
-
-## Entry template
-
-```markdown
-### Area
-
-#### Idea name
-
-- **Status:** idea | exploring | planned | in progress | shipped | dropped
-- **Horizon:** next | later | release name
-- **Area:** affected subsystem
-
-**Summary:** What could change.
-
-**Why:** The problem or opportunity.
-
-**Possible direction:** Current design thoughts, if any.
-
-**Open questions:** Decisions, risks, and evidence still needed.
-
-**Dependencies:** Work or decisions that should happen first.
-```
+  around graph composition, authoring, and detached execution.

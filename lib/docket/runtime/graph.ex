@@ -3,9 +3,9 @@ defmodule Docket.Runtime.Graph do
   Internal executable graph materialization produced by `Docket.Graph.Compiler`.
 
   A runtime graph is ephemeral node-local derived state, never a durable graph
-  format. The planned operational vehicle will fetch the effective canonical
-  `Docket.Graph`, compile it once on the executing node, and reuse this
-  structure for its claim drain. Every runtime ID maps back to public graph
+  format. Backend execution vehicles fetch the effective canonical
+  `Docket.Graph`, compile it on the executing node, and may reuse this structure
+  through a generation-scoped cache. Every runtime ID maps back to public graph
   intent through `lowering`.
   """
 
@@ -26,10 +26,10 @@ defmodule Docket.Runtime.Graph do
   @typedoc """
   Runtime edge descriptor.
 
-  Kept as a plain map in v0.1 (compiler design, open decision 4). `from` is a
-  list of public node IDs or `["$start"]`; `to` is a public node ID or
-  `"$finish"`. `barrier` is true for edges declared with a list-form `from`
-  (which may contain a single source).
+  `from` is a list of public node IDs or `["$start"]`; `to` is a public node ID
+  or `"$finish"`. `barrier` is true for edges declared with a list-form `from`
+  (which may contain a single source). The descriptor is a private map so edge
+  lowering can evolve without adding a public document type.
   """
   @type edge_descriptor :: %{
           id: String.t(),

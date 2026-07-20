@@ -93,13 +93,13 @@ A few contract details worth noting:
   option, and arrives at the node under `context.application`. The other
   context keys (`run_id`, `node_id`, `step`, `attempt`, `source_versions`,
   `idempotency_key`) are supplied by the runtime.
-- Constraints like `min`/`max` on `Docket.Schema.float/1` are stored in the
-  schema but not enforced by the v0.1 validation engine.
+- Constraints like `min`/`max` on `Docket.Schema.float/1` are enforced when
+  configuration and state values are validated.
 
 ## Prompt Template Helper
 
-This helper is intentionally small. A real app may use a richer template engine.
-The important part is that template variables are treated as state keys.
+Template variables map directly to graph state keys. Applications may replace
+this helper with another template engine while preserving that mapping.
 
 ```elixir
 defmodule MyApp.PromptTemplate do
@@ -223,7 +223,7 @@ The runtime validates update keys against graph fields, validates values against
 field schemas, applies reducers, and emits compiler-generated edge activations
 after successful node completion.
 
-## Why This Shape Matters
+## Graph Model Boundary
 
 This keeps the durable graph model smaller:
 

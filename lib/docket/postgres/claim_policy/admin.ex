@@ -1,18 +1,18 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.ClaimPolicy.Admin do
     @moduledoc """
-    Minimal current-state administration and token-free inspection for
-    max-active-run admission.
+    Administration and token-free inspection for max-active-run admission.
 
-    Updates are compare-and-set when `:expected_version` is supplied. Policy
-    history, actors, receipts, legal holds, and export workflows are outside
-    the v0.1.0 contract.
+    Caps are integers in `1..2_147_483_647`. Updates are compare-and-set when
+    `:expected_version` is supplied.
     """
 
     alias Docket.Postgres.Storage
 
+    @type cap :: 1..2_147_483_647
+
     @type policy :: %{
-            required(:max_active_runs) => pos_integer() | nil,
+            required(:max_active_runs) => cap() | nil,
             required(:version) => non_neg_integer(),
             required(:updated_at) => DateTime.t(),
             optional(:admission_mode) => :legacy | :tenant_fair
@@ -20,7 +20,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @type effective_policy :: %{
             required(:owner_scope) => Docket.Backend.owner_scope(),
-            required(:max_active_runs) => pos_integer(),
+            required(:max_active_runs) => cap(),
             required(:source) => :default | :override,
             required(:default_version) => non_neg_integer(),
             required(:override_version) => non_neg_integer(),
@@ -30,6 +30,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             required(:debt) => non_neg_integer()
           }
 
+    @doc """
+    Returns the persisted domain default and its version.
+
+    Before the policy is initialized, `max_active_runs` is `nil` and `version`
+    is zero.
+    """
     @spec get_default(Docket.Backend.ctx()) :: {:ok, policy()} | {:error, term()}
     def get_default(context) do
       with {:ok, control} <- control(context),
@@ -49,7 +55,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    @spec put_default(Docket.Backend.ctx(), pos_integer(), keyword()) ::
+    @doc """
+    Sets the persisted domain default.
+
+    `max_active_runs` must be in `1..2_147_483_647`. Pass
+    `expected_version: version` for compare-and-set behavior; a version mismatch
+    returns `{:error, :stale}` without changing the policy.
+    """
+    @spec put_default(Docket.Backend.ctx(), cap(), keyword()) ::
             {:ok, policy()} | {:error, :stale | term()}
     def put_default(context, max_active_runs, opts \\ []) do
       with :ok <- validate_cap(max_active_runs),
@@ -84,10 +97,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    @doc """
+    Sets a cap override for one owner scope.
+
+    `owner_scope` must be `:tenantless` or `{:tenant, non_empty_binary}` and the
+    cap must be in `1..2_147_483_647`. The partition is created if necessary.
+    Pass `expected_version: 0` to create its first override with CAS semantics;
+    a version mismatch returns `{:error, :stale}`.
+    """
     @spec put_override(
             Docket.Backend.ctx(),
             Docket.Backend.owner_scope(),
-            pos_integer(),
+            cap(),
             keyword()
           ) ::
             {:ok, policy()} | {:error, :stale | term()}
@@ -132,6 +153,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    @doc """
+    Clears one owner scope's override so it inherits the domain default.
+
+    Pass `expected_version: version` for compare-and-set behavior; a missing or
+    mismatched partition version returns `{:error, :stale}`.
+    """
     @spec reset_override(Docket.Backend.ctx(), Docket.Backend.owner_scope(), keyword()) ::
             {:ok, policy()} | {:error, :stale | term()}
     def reset_override(context, owner_scope, opts \\ []) do
@@ -166,7 +193,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    @doc "Returns effective policy plus aggregate, token-free admission state."
+    @doc """
+    Returns the effective cap and aggregate, token-free admission state.
+
+    `queued` counts due, healthy, unclaimed rows without admission;
+    `admitted_ready` counts due, healthy, unclaimed admitted rows;
+    `admitted_claimed` counts healthy admitted rows with a claim; and `debt` is
+    the admitted count above the effective cap. An uninitialized domain returns
+    `{:error, :not_initialized}`.
+    """
     @spec get_effective(Docket.Backend.ctx(), Docket.Backend.owner_scope()) ::
             {:ok, effective_policy()} | {:error, :not_initialized | term()}
     def get_effective(context, owner_scope) do

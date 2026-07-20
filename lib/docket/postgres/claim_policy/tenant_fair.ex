@@ -4,35 +4,33 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Database-authoritative exact-cap admission with bounded cross-tenant rotation.
 
     The configured default cap only bootstraps an uninitialized database. Once
-    persisted, the default and tenant overrides are managed through `Admin`.
+    persisted, the default and tenant overrides are managed through
+    `Docket.Postgres.ClaimPolicy.Admin`.
 
     ## Responsibility boundary
 
-    `RingFunction` owns the database-side scheduling state machine: cursor and
-    partition authority, ring traversal, bounded candidate discovery, exact row
-    locking, authoritative rechecks, run mutation, and service-epoch
-    accounting.
+    `Docket.Postgres.ClaimPolicy.TenantFair.RingFunction` owns the database-side
+    scheduling state machine: cursor and partition authority, ring traversal,
+    bounded candidate discovery, exact row locking, authoritative rechecks, run
+    mutation, and service-epoch accounting.
 
-    This module remains the application-side `ClaimPolicy` implementation. It:
+    This module is the application-side `Docket.Postgres.ClaimPolicy`
+    implementation. It:
 
-    * validates the configured bootstrap cap through `Config`;
+    * validates the configured bootstrap cap;
     * normalizes runtime timestamps and derives the expired-claim cutoff;
-    * builds one data-only `ClaimPolicy.Plan` with the six semantic bind values;
+    * builds one data-only `Docket.Postgres.ClaimPolicy.Plan` with the six
+      semantic bind values;
     * resolves the prefix-qualified claim function installed by the migration;
     * decodes the unchanged fourteen public columns into leases and poisoned
       results; and
     * emits bounded claim, poison, steal, age, duration, and contention
       observations after execution.
 
-    `SQL` is the narrow wrapper between these two sides. It invokes the claim function with raw
-    tracing disabled, removes internal inspection rows and columns, and orders
-    public outcomes by the function's visit and outcome ordinals. `RunStore`
-    remains the sole executor of the resulting plan, while `Admin` is the
-    separate API for persisted default and per-scope cap state.
-
-    In other words, `RingFunction` decides and transactionally applies *which
-    runs are admitted*; this module handles configuration, invocation, public
-    decoding, and observability around that decision.
+    `Docket.Postgres.ClaimPolicy.TenantFair.SQL` invokes the claim function with
+    raw tracing disabled, removes internal inspection rows and columns, and
+    orders public outcomes by the function's visit and outcome ordinals.
+    `Docket.Postgres.RunStore` remains the sole executor of the resulting plan.
     """
 
     @behaviour Docket.Postgres.ClaimPolicy

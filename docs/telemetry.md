@@ -75,8 +75,8 @@ rows before the unchanged public decoder. Tenant ID, raw `scope_key`, run or
 graph identity, call token, cursor token, and claim token are forbidden as
 ordinary metric labels. Aggregate telemetry cannot reconstruct the per-target
 bounded-bypass proof; consult the [TenantFair correctness
-evidence](architecture/docket-tenant-fair.md#correctness-evidence) for current
-validation status.
+evidence](architecture/docket-tenant-fair.md#correctness-evidence) for the
+checked-in validation coverage.
 
 Aggregate TenantFair outcome observations distinguish queued promotion,
 admitted-ready reacquisition, and expired admitted steal. Cap/debt denial is a

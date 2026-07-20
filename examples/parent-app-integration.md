@@ -3,8 +3,6 @@
 Durable Docket runs can reference app-owned users, accounts, and workflow rows
 without making the parent application a second persistence driver.
 
-> **Status:** v0.1.0 production integration API.
-
 ## Configure one backend
 
 ```elixir

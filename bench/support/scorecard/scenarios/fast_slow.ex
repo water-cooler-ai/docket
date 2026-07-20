@@ -112,7 +112,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.FastSlow do
   end
 
   defp multi_seed_trial(ctx, plans, opts) do
-    Db.truncate(ctx)
+    Db.reset(ctx)
     Docket.Postgres.GraphCache.clear()
 
     seed =

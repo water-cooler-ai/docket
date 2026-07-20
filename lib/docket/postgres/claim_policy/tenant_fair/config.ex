@@ -5,7 +5,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @enforce_keys [:default_max_active_runs]
     defstruct @enforce_keys
 
-    @type t :: %__MODULE__{default_max_active_runs: pos_integer()}
+    @type t :: %__MODULE__{default_max_active_runs: 1..2_147_483_647}
 
     @spec new(keyword()) :: {:ok, t()} | {:error, term()}
     def new(options) when is_list(options) do

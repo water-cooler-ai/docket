@@ -577,8 +577,8 @@ defmodule Docket.Runtime.Loop do
     }
   end
 
-  # The durable cause for a permanent node failure. Per-node reasons ride in
-  # details so a failed run keeps them even when event persistence is off.
+  # The durable cause for a permanent node failure. Per-node reasons remain in
+  # the run's details independently of retained event history.
   defp node_failure(permanent, failed_nodes) do
     errors = Map.new(permanent, fn failure -> {failure.node_id, inspect(failure.reason)} end)
 

@@ -5,9 +5,9 @@ Operational instrumentation and correctness boundaries are documented in the
 Production status, configuration, failure recovery, and inspection are in the
 [PostgreSQL operations guide](../postgres-operations.md).
 
-These documents record the design rationale behind Docket. The code and its
-module docs are the authoritative reference for the current API; read these
-when you want to understand *why* the contracts are shaped the way they are.
+Module docs are authoritative for the current API. Architecture documents
+capture cross-module contracts and the rationale that is not useful at an
+individual function boundary.
 
 ## Current guides and contracts
 
@@ -40,9 +40,11 @@ Graph and compiler internals are documented in
 
 - [v0.1.0 spec-lock audit](docket-v0.1.0-spec-lock-audit.md) is the historical
   pre-cutover sequencing audit.
-- [Graph execution contract](docket-graph-execution-contract-design.md) and
-  [runtime design](docket-runtime-design.md) record 0.0.1 behavior and research
-  background.
+- [Historical graph execution contract](docket-graph-execution-contract-design.md)
+  records the 0.0.1 resident-runtime boundary and the execution semantics that
+  carried forward.
+- [Runtime rationale](docket-runtime-design.md) summarizes the current runtime
+  shape, its research influences, and the retired 0.0.1 process boundary.
 
 ## Release-Line Boundary
 
@@ -55,9 +57,9 @@ helpers carry forward. The lifecycle owner changes:
 - `0.1.0`: one required backend owns persistence, scheduling, recovery, and
   signals. The old supervised `run` / `resume` / `get_run` path is absent.
 
-The execution-contract and runtime-research documents below record the `0.0.1`
-host-owned boundary and are superseded for v0.1.0 production guidance. The
-graph-construction document remains current.
+The historical execution contract is not production guidance. The runtime
+rationale labels the retired 0.0.1 boundary separately from its current
+architecture summary. Graph construction and compiler design are current.
 
 ## Current Core Shape
 
@@ -95,9 +97,3 @@ Application-owned surfaces:
 - Authorization and tenant/project ownership.
 - UI projections for editors and live run overlays.
 - External effects performed by node code or adapters.
-
-## Documentation Rule
-
-When an implementation decision changes a contract, update the focused design
-doc if the rationale changed; keep API details in module docs, not here. Keep
-this index small: it should route people, not repeat the design.

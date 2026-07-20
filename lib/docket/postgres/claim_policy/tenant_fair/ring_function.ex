@@ -128,9 +128,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     and grants. Trace rows are returned only to the caller and are never stored
     in a trace table or emitted as identity-bearing metric labels.
 
-    This Elixir module generates the prefix-qualified function definition,
-    exposes its SQL identity and record shape, and supplies its migration create
-    and drop statements.
     """
 
     alias Docket.Postgres.ClaimPolicy.TenantFair.Budgets
