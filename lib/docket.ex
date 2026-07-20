@@ -513,7 +513,8 @@ defmodule Docket do
 
   The returned `Docket.ClaimPolicyInfo` contains token-free counts for due
   queued, admitted-ready, and admitted-claimed logical runs, plus cap debt.
-  An unset persisted default returns `{:error, :not_initialized}`.
+  An unset persisted default returns `{:error, :not_initialized}`. A persisted
+  cap under an inactive engine returns `{:error, :inactive_engine}`.
   """
   @spec inspect_claim_policy(term(), Docket.Backend.owner_scope()) ::
           {:ok, ClaimPolicyInfo.t()} | {:error, term()}
@@ -534,11 +535,12 @@ defmodule Docket do
 
   The options become immutable configuration for the runtime instance. The host module
   gets supervision and operational wrappers that call `Docket` with the
-  module as the runtime instance. When the backend declared here exposes the
+  module as the runtime instance. When the static configuration selects
+  `Docket.Postgres.ClaimPolicy.TenantFair` and the declared backend exposes the
   optional claim-policy administration capability, the host module also gets
   the five same-named public policy wrappers. That export decision is made from
-  the `use Docket` backend; if a startup override replaces it with an incapable
-  backend, those wrappers safely return
+  the `use Docket` options; if a startup override replaces the backend with an
+  incapable backend, those wrappers safely return
   `%Docket.Error{type: :unsupported_capability}`.
   """
   defmacro __using__(default_opts) do
@@ -548,7 +550,16 @@ defmodule Docket do
                                            backend =
                                              Keyword.get(@docket_default_opts, :backend)
 
-                                           is_atom(backend) and not is_nil(backend) and
+                                           claim_policy =
+                                             Keyword.get(@docket_default_opts, :claim_policy, [])
+
+                                           tenant_fair? =
+                                             Keyword.keyword?(claim_policy) and
+                                               Keyword.get(claim_policy, :implementation) ==
+                                                 Docket.Postgres.ClaimPolicy.TenantFair
+
+                                           tenant_fair? and is_atom(backend) and
+                                             not is_nil(backend) and
                                              match?(
                                                {:module, _module},
                                                Code.ensure_compiled(backend)

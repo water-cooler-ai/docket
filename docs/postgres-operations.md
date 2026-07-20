@@ -416,16 +416,19 @@ The equivalent top-level forms take the configured runtime first, for example
 `Docket.inspect_claim_policy(MyApp.Docket, owner_scope)`. The five frozen
 operations are `fetch_claim_policy_default`, `put_claim_policy_default`,
 `put_claim_policy_override`, `reset_claim_policy_override`, and
-`inspect_claim_policy`. PostgreSQL-configured modules export the same names
-without the runtime argument; modules configured with an unsupported backend do
-not export them. Top-level calls against an unsupported backend return
+`inspect_claim_policy`. Modules whose static options select TenantFair export
+the same names without the runtime argument when their backend exposes the
+optional administration capability. Legacy-configured modules and modules with
+an unsupported backend do not export them. Runtime overrides do not change this
+compile-time export set. Top-level calls against an unsupported backend return
 `%Docket.Error{type: :unsupported_capability}`.
 
 Default and mutation calls return `Docket.ClaimPolicy`; inspection returns
 `Docket.ClaimPolicyInfo`. Compare-and-set mismatch is `:stale`; stable
 validation errors are `:invalid_max_active_runs`, `:invalid_owner_scope`,
 `:invalid_expected_version`, and `:invalid_options`; inspection before default
-initialization returns `:not_initialized`.
+initialization returns `:not_initialized`, and a persisted cap under a dormant
+Legacy engine returns `:inactive_engine` rather than an effective policy.
 
 `effective` includes token-free `queued`, `admitted_ready`,
 `admitted_claimed`, and `debt` counts. Reducing a cap below the current

@@ -30,8 +30,9 @@ project follows [Semantic Versioning](https://semver.org/).
   `fetch_claim_policy_default`, `put_claim_policy_default`,
   `put_claim_policy_override`, `reset_claim_policy_override`, and
   `inspect_claim_policy`. Top-level `Docket` calls accept a configured runtime;
-  `use Docket` generates same-named wrappers only when the configured backend
-  explicitly exposes the optional capability. Results are normalized into
+  `use Docket` generates same-named wrappers only when its static options select
+  TenantFair and the configured backend exposes the optional capability.
+  Results are normalized into
   `Docket.ClaimPolicy` and `Docket.ClaimPolicyInfo`, CAS keeps `:stale`, and
   unsupported backends return a typed capability error without exposing
   storage contexts or PostgreSQL identifiers.

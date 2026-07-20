@@ -27,6 +27,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       use Docket,
         backend: Docket.Postgres,
         repo: TestRepo,
+        claim_policy: [
+          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+          default_max_active_runs: 5
+        ],
         testing: :manual,
         notifier: :none
     end
@@ -37,6 +41,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       use Docket,
         backend: Backend,
         repo: TestRepo,
+        claim_policy: [
+          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+          default_max_active_runs: 5
+        ],
         testing: :manual,
         notifier: :none
     end
@@ -46,6 +54,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         backend: Docket.Postgres,
         repo: TestRepo,
         prefix: "docket_private",
+        claim_policy: [
+          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+          default_max_active_runs: 5
+        ],
         testing: :manual,
         notifier: :none
     end
@@ -55,11 +67,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       @docket_opts [
         backend: @backend,
         repo: TestRepo,
+        claim_policy: [
+          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+          default_max_active_runs: 5
+        ],
         testing: :manual,
         notifier: :none
       ]
 
       use Docket, @docket_opts
+    end
+
+    defmodule LegacyFacadeHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        testing: :manual,
+        notifier: :none
     end
 
     setup do
@@ -68,6 +92,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :ok = Ecto.Adapters.Postgres.storage_up(config)
       start_supervised!(TestRepo)
       :ok = Ecto.Migrator.up(TestRepo, @migration_version, InstallDocket, log: false)
+
+      TestRepo.query!(
+        "UPDATE docket_claim_policy SET admission_mode = 'tenant_fair' WHERE id = 1"
+      )
+
       %{context: Docket.Postgres.context(repo: TestRepo)}
     end
 
@@ -82,6 +111,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           arity <- arities do
         assert function_exported?(FacadeHostA, name, arity)
         assert function_exported?(AttributeConfiguredFacadeHost, name, arity)
+        refute function_exported?(LegacyFacadeHost, name, arity)
       end
     end
 
@@ -95,16 +125,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "public facade administers both owner-scope forms with stable values and errors" do
       start_supervised!(FacadeHostA)
 
-      assert {:ok, %Docket.ClaimPolicy{max_active_runs: nil, version: 0}} =
-               FacadeHostA.fetch_claim_policy_default()
+      assert {:ok, %Docket.ClaimPolicy{} = initial} = FacadeHostA.fetch_claim_policy_default()
 
-      assert {:error, :not_initialized} = FacadeHostA.inspect_claim_policy(:tenantless)
+      if is_nil(initial.max_active_runs) do
+        assert {:error, :not_initialized} = FacadeHostA.inspect_claim_policy(:tenantless)
+      else
+        assert initial.max_active_runs == 5
+      end
 
-      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 5, version: 1}} =
-               FacadeHostA.put_claim_policy_default(5, expected_version: 0)
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 5} = default} =
+               ensure_default(FacadeHostA, 5)
 
       assert {:error, :stale} =
-               FacadeHostA.put_claim_policy_default(6, expected_version: 0)
+               FacadeHostA.put_claim_policy_default(6,
+                 expected_version: max(default.version - 1, 0)
+               )
 
       assert {:ok, %Docket.ClaimPolicy{max_active_runs: 2, version: 1}} =
                FacadeHostA.put_claim_policy_override({:tenant, "acme"}, 2, expected_version: 0)
@@ -114,13 +149,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 owner_scope: {:tenant, "acme"},
                 max_active_runs: 2,
                 source: :override,
-                default_version: 1,
+                default_version: default_version,
                 override_version: 1,
                 queued: 0,
                 admitted_ready: 0,
                 admitted_claimed: 0,
                 debt: 0
               } = info} = FacadeHostA.inspect_claim_policy({:tenant, "acme"})
+
+      assert default_version == default.version
 
       refute Map.has_key?(info, :max_active)
       refute Map.has_key?(info, :claim_token)
@@ -148,10 +185,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       start_supervised!(FacadeHostA)
       start_supervised!(FacadeHostB)
 
-      assert {:ok, %Docket.ClaimPolicy{version: 1}} =
-               FacadeHostA.put_claim_policy_default(7, expected_version: 0)
+      assert {:ok, %Docket.ClaimPolicy{} = current} = FacadeHostA.fetch_claim_policy_default()
 
-      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 7, version: 1}} =
+      assert {:ok, %Docket.ClaimPolicy{version: version}} =
+               FacadeHostA.put_claim_policy_default(7, expected_version: current.version)
+
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 7, version: ^version}} =
                Docket.fetch_claim_policy_default(FacadeHostB)
 
       assert {:ok, %Docket.ClaimPolicy{version: 1}} =
@@ -167,7 +206,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "sets and reads the current default with optional CAS", %{context: context} do
-      assert {:ok, %{max_active_runs: nil, version: 0} = initial} = Admin.get_default(context)
+      assert {:ok, %{admission_mode: :tenant_fair, max_active_runs: nil, version: 0} = initial} =
+               Admin.get_default(context)
+
       refute Map.has_key?(initial, :max_active)
 
       assert {:ok, %{max_active_runs: 4, version: 1}} =
@@ -179,6 +220,27 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, %{max_active_runs: 3, version: 2}} = Admin.put_default(context, 3)
       assert {:ok, %{max_active_runs: 3, version: 2}} = Admin.get_default(context)
+    end
+
+    test "a Legacy or dormant cap is never reported as effective", %{context: context} do
+      start_supervised!(FacadeHostA)
+
+      TestRepo.query!("""
+      UPDATE docket_claim_policy
+      SET admission_mode = 'legacy', max_active = NULL, policy_version = 0,
+          initialized_at = NULL
+      WHERE id = 1
+      """)
+
+      assert {:error, :not_initialized} = Admin.get_effective(context, :tenantless)
+
+      assert {:ok, %{max_active_runs: 5, version: 1}} =
+               Admin.put_default(context, 5, expected_version: 0)
+
+      assert {:ok, %{max_active_runs: 5, version: 1}} = Admin.get_default(context)
+      assert {:error, :inactive_engine} = Admin.get_effective(context, :tenantless)
+
+      assert {:error, :inactive_engine} = FacadeHostA.inspect_claim_policy(:tenantless)
     end
 
     test "sets and resets a tenant override without deleting its partition", %{context: context} do
@@ -260,8 +322,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "public inspection reports token-free queue, admission, and cap-debt counts" do
       start_supervised!(FacadeHostA)
 
-      assert {:ok, %Docket.ClaimPolicy{version: 1}} =
-               FacadeHostA.put_claim_policy_default(1, expected_version: 0)
+      assert {:ok, %Docket.ClaimPolicy{} = current} = FacadeHostA.fetch_claim_policy_default()
+
+      assert {:ok, %Docket.ClaimPolicy{}} =
+               FacadeHostA.put_claim_policy_default(1, expected_version: current.version)
 
       assert {:ok, %Docket.ClaimPolicy{version: 1}} =
                FacadeHostA.put_claim_policy_override({:tenant, "acme"}, 1, expected_version: 0)
@@ -304,14 +368,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           log: false
         )
 
+      TestRepo.query!(
+        "UPDATE docket_private.docket_claim_policy " <>
+          "SET admission_mode = 'tenant_fair' WHERE id = 1"
+      )
+
       start_supervised!(PrefixedFacadeHost)
       prefixed_context = Docket.Postgres.context(repo: TestRepo, prefix: "docket_private")
 
-      assert {:ok, %Docket.ClaimPolicy{max_active_runs: nil, version: 0}} =
+      assert {:ok, %Docket.ClaimPolicy{} = current} =
                PrefixedFacadeHost.fetch_claim_policy_default()
 
-      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 7, version: 1}} =
-               PrefixedFacadeHost.put_claim_policy_default(7, expected_version: 0)
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 7, version: default_version}} =
+               PrefixedFacadeHost.put_claim_policy_default(7,
+                 expected_version: current.version
+               )
 
       assert {:ok, %Docket.ClaimPolicy{max_active_runs: 3, version: 1}} =
                PrefixedFacadeHost.put_claim_policy_override({:tenant, "private-acme"}, 3,
@@ -323,7 +394,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 owner_scope: {:tenant, "private-acme"},
                 max_active_runs: 3,
                 source: :override,
-                default_version: 1,
+                default_version: ^default_version,
                 override_version: 1
               }} = PrefixedFacadeHost.inspect_claim_policy({:tenant, "private-acme"})
 
@@ -342,6 +413,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, %{max_active_runs: nil, version: 0}} = Admin.get_default(context)
       assert [] = partition_rows(context)
       assert [["private-acme", nil, 2]] = partition_rows(prefixed_context)
+    end
+
+    defp ensure_default(runtime, maximum) do
+      with {:ok, %Docket.ClaimPolicy{} = current} <- Docket.fetch_claim_policy_default(runtime) do
+        if current.max_active_runs == maximum do
+          {:ok, current}
+        else
+          Docket.put_claim_policy_default(runtime, maximum, expected_version: current.version)
+        end
+      end
     end
 
     test "stale and invalid operations leave current state exactly unchanged", %{

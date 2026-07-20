@@ -35,6 +35,15 @@ defmodule Docket.PublicFacadeTest do
   end
 
   defmodule InvalidCapabilityHost do
+    use Docket,
+      backend: InvalidCapabilityBackend,
+      claim_policy: [
+        implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+        default_max_active_runs: 1
+      ]
+  end
+
+  defmodule LegacyCapabilityHost do
     use Docket, backend: InvalidCapabilityBackend
   end
 
@@ -118,6 +127,7 @@ defmodule Docket.PublicFacadeTest do
         ],
         arity <- arities do
       refute function_exported?(Host, name, arity)
+      refute function_exported?(LegacyCapabilityHost, name, arity)
     end
   end
 

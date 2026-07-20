@@ -119,7 +119,9 @@ PostgreSQL ClaimPolicy execution engine below is a backend-private extension
 seam. A capable backend implements all five `Docket.Backend.ClaimPolicyAdmin`
 callbacks and returns that module from `claim_policy_admin/0`; incapable
 backends omit the accessor. This explicit accessor controls configured-module
-facade generation and never depends on whether PostgreSQL modules are loaded.
+facade generation together with a static TenantFair selection; Legacy modules
+do not export the convenience wrappers. The decision never depends on whether
+PostgreSQL modules are merely loaded.
 
 ClaimPolicy is a PostgreSQL-backend extension seam rather than a portable
 `Docket.Backend` capability. Its source-owned reusable cases live in
