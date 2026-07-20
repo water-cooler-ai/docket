@@ -4,8 +4,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Database-authoritative exact-cap admission with bounded cross-tenant rotation.
 
     The configured default cap only bootstraps an uninitialized database. Once
-    persisted, the default and tenant overrides are managed through
-    `Docket.Postgres.ClaimPolicy.Admin`.
+    persisted, applications manage the default and tenant overrides through
+    Docket's public claim-policy facade.
 
     ## Responsibility boundary
 

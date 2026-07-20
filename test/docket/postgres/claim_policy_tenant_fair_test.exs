@@ -28,6 +28,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down(prefix: "docket_private")
     end
 
+    defmodule FacadeHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        tenant_mode: :required,
+        claim_policy: [
+          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+          default_max_active_runs: 3
+        ],
+        testing: :manual,
+        notifier: :none
+    end
+
     setup do
       config = TestRepo.config()
       _ = Ecto.Adapters.Postgres.storage_down(config)
@@ -77,10 +90,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert live_count("tenant") == 1
     end
 
-    test "cap reduction creates debt and release restores capacity only below the cap", %{
-      context: context
-    } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 3, expected_version: 0)
+    test "facade cap reduction is non-preemptive and the live claim path consumes it" do
+      start_supervised!(FacadeHost)
+      {:ok, defaults} = Docket.Runtime.Instance.defaults(FacadeHost)
+      context = Keyword.fetch!(defaults, :backend_context)
+
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 3, version: 1}} =
+               FacadeHost.put_claim_policy_default(3, expected_version: 0)
 
       for id <- ~w(active-a active-b active-c), do: insert_ready("tenant", id, @now)
       # Demand four reserves the unmatched expired class and intentionally
@@ -88,7 +104,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, %{leases: leases}} = RunStore.claim_due(context, :system, policy(4))
       assert length(leases) == 3
 
-      assert {:ok, %{version: 2}} = Admin.put_default(context, 1, expected_version: 1)
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 1, version: 2}} =
+               FacadeHost.put_claim_policy_default(1, expected_version: 1)
+
+      assert {:ok,
+              %Docket.ClaimPolicyInfo{
+                max_active_runs: 1,
+                admitted_claimed: 3,
+                debt: 2
+              }} = FacadeHost.inspect_claim_policy({:tenant, "tenant"})
+
+      expected_admitted = leases |> Enum.map(&[&1.run_id]) |> Enum.sort()
+      assert admitted_run_ids("tenant") == expected_admitted
+
       insert_ready("tenant", "waiting", @now)
       assert {:ok, %{leases: []}} = RunStore.claim_due(context, :system, policy(1))
 

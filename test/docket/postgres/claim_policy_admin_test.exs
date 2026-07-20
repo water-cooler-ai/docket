@@ -23,6 +23,45 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down(prefix: "docket_private")
     end
 
+    defmodule FacadeHostA do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        testing: :manual,
+        notifier: :none
+    end
+
+    defmodule FacadeHostB do
+      alias Docket.Postgres, as: Backend
+
+      use Docket,
+        backend: Backend,
+        repo: TestRepo,
+        testing: :manual,
+        notifier: :none
+    end
+
+    defmodule PrefixedFacadeHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        prefix: "docket_private",
+        testing: :manual,
+        notifier: :none
+    end
+
+    defmodule AttributeConfiguredFacadeHost do
+      @backend Docket.Postgres
+      @docket_opts [
+        backend: @backend,
+        repo: TestRepo,
+        testing: :manual,
+        notifier: :none
+      ]
+
+      use Docket, @docket_opts
+    end
+
     setup do
       config = TestRepo.config()
       _ = Ecto.Adapters.Postgres.storage_down(config)
@@ -30,6 +69,101 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       start_supervised!(TestRepo)
       :ok = Ecto.Migrator.up(TestRepo, @migration_version, InstallDocket, log: false)
       %{context: Docket.Postgres.context(repo: TestRepo)}
+    end
+
+    test "configured PostgreSQL modules export the frozen facade arities" do
+      for {name, arities} <- [
+            fetch_claim_policy_default: [0],
+            put_claim_policy_default: [1, 2],
+            put_claim_policy_override: [2, 3],
+            reset_claim_policy_override: [1, 2],
+            inspect_claim_policy: [1]
+          ],
+          arity <- arities do
+        assert function_exported?(FacadeHostA, name, arity)
+        assert function_exported?(AttributeConfiguredFacadeHost, name, arity)
+      end
+    end
+
+    test "a startup override to an incapable backend fails safely through compiled wrappers" do
+      start_supervised!({FacadeHostA, backend: Docket.Test.MemoryBackend})
+
+      assert {:error, %Docket.Error{type: :unsupported_capability}} =
+               FacadeHostA.fetch_claim_policy_default()
+    end
+
+    test "public facade administers both owner-scope forms with stable values and errors" do
+      start_supervised!(FacadeHostA)
+
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: nil, version: 0}} =
+               FacadeHostA.fetch_claim_policy_default()
+
+      assert {:error, :not_initialized} = FacadeHostA.inspect_claim_policy(:tenantless)
+
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 5, version: 1}} =
+               FacadeHostA.put_claim_policy_default(5, expected_version: 0)
+
+      assert {:error, :stale} =
+               FacadeHostA.put_claim_policy_default(6, expected_version: 0)
+
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 2, version: 1}} =
+               FacadeHostA.put_claim_policy_override({:tenant, "acme"}, 2, expected_version: 0)
+
+      assert {:ok,
+              %Docket.ClaimPolicyInfo{
+                owner_scope: {:tenant, "acme"},
+                max_active_runs: 2,
+                source: :override,
+                default_version: 1,
+                override_version: 1,
+                queued: 0,
+                admitted_ready: 0,
+                admitted_claimed: 0,
+                debt: 0
+              } = info} = FacadeHostA.inspect_claim_policy({:tenant, "acme"})
+
+      refute Map.has_key?(info, :max_active)
+      refute Map.has_key?(info, :claim_token)
+
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: nil, version: 2}} =
+               FacadeHostA.reset_claim_policy_override({:tenant, "acme"},
+                 expected_version: 1
+               )
+
+      assert {:ok, %Docket.ClaimPolicyInfo{max_active_runs: 5, source: :default}} =
+               FacadeHostA.inspect_claim_policy({:tenant, "acme"})
+
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 3, version: 1}} =
+               FacadeHostA.put_claim_policy_override(:tenantless, 3, expected_version: 0)
+
+      assert {:ok,
+              %Docket.ClaimPolicyInfo{
+                owner_scope: :tenantless,
+                max_active_runs: 3,
+                source: :override
+              }} = FacadeHostA.inspect_claim_policy(:tenantless)
+    end
+
+    test "updates are immediately visible through another runtime sharing the database" do
+      start_supervised!(FacadeHostA)
+      start_supervised!(FacadeHostB)
+
+      assert {:ok, %Docket.ClaimPolicy{version: 1}} =
+               FacadeHostA.put_claim_policy_default(7, expected_version: 0)
+
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 7, version: 1}} =
+               Docket.fetch_claim_policy_default(FacadeHostB)
+
+      assert {:ok, %Docket.ClaimPolicy{version: 1}} =
+               Docket.put_claim_policy_override(
+                 FacadeHostB,
+                 {:tenant, "shared"},
+                 2,
+                 expected_version: 0
+               )
+
+      assert {:ok, %Docket.ClaimPolicyInfo{max_active_runs: 2, source: :override}} =
+               FacadeHostA.inspect_claim_policy({:tenant, "shared"})
     end
 
     test "sets and reads the current default with optional CAS", %{context: context} do
@@ -123,16 +257,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert [["", nil, 2]] = partition_rows(context)
     end
 
-    test "reports token-free queue, admission, and cap-debt counts", %{context: context} do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+    test "public inspection reports token-free queue, admission, and cap-debt counts" do
+      start_supervised!(FacadeHostA)
 
-      assert {:ok, %{version: 1}} =
-               Admin.put_override(context, {:tenant, "acme"}, 1, expected_version: 0)
+      assert {:ok, %Docket.ClaimPolicy{version: 1}} =
+               FacadeHostA.put_claim_policy_default(1, expected_version: 0)
+
+      assert {:ok, %Docket.ClaimPolicy{version: 1}} =
+               FacadeHostA.put_claim_policy_override({:tenant, "acme"}, 1, expected_version: 0)
 
       insert_admission_inspection_fixture()
 
       assert {:ok,
-              %{
+              %Docket.ClaimPolicyInfo{
                 owner_scope: {:tenant, "acme"},
                 max_active_runs: 1,
                 source: :override,
@@ -140,9 +277,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 admitted_ready: 1,
                 admitted_claimed: 1,
                 debt: 1
-              } = effective} = Admin.get_effective(context, {:tenant, "acme"})
+              } = effective} = FacadeHostA.inspect_claim_policy({:tenant, "acme"})
 
-      assert Enum.sort(Map.keys(effective)) ==
+      assert Enum.sort(effective |> Map.from_struct() |> Map.keys()) ==
                Enum.sort([
                  :owner_scope,
                  :max_active_runs,
@@ -156,7 +293,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ])
     end
 
-    test "routes all administration through an explicit custom prefix", %{context: context} do
+    test "routes all public facade administration through the configured custom prefix", %{
+      context: context
+    } do
       :ok =
         Ecto.Migrator.up(
           TestRepo,
@@ -165,34 +304,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           log: false
         )
 
+      start_supervised!(PrefixedFacadeHost)
       prefixed_context = Docket.Postgres.context(repo: TestRepo, prefix: "docket_private")
 
-      assert {:ok, %{max_active_runs: nil, version: 0}} = Admin.get_default(prefixed_context)
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: nil, version: 0}} =
+               PrefixedFacadeHost.fetch_claim_policy_default()
 
-      assert {:ok, %{max_active_runs: 7, version: 1}} =
-               Admin.put_default(prefixed_context, 7, expected_version: 0)
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 7, version: 1}} =
+               PrefixedFacadeHost.put_claim_policy_default(7, expected_version: 0)
 
-      assert {:ok, %{max_active_runs: 3, version: 1}} =
-               Admin.put_override(prefixed_context, {:tenant, "private-acme"}, 3,
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 3, version: 1}} =
+               PrefixedFacadeHost.put_claim_policy_override({:tenant, "private-acme"}, 3,
                  expected_version: 0
                )
 
       assert {:ok,
-              %{
+              %Docket.ClaimPolicyInfo{
                 owner_scope: {:tenant, "private-acme"},
                 max_active_runs: 3,
                 source: :override,
                 default_version: 1,
                 override_version: 1
-              }} = Admin.get_effective(prefixed_context, {:tenant, "private-acme"})
+              }} = PrefixedFacadeHost.inspect_claim_policy({:tenant, "private-acme"})
 
-      assert {:ok, %{max_active_runs: nil, version: 2}} =
-               Admin.reset_override(prefixed_context, {:tenant, "private-acme"},
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: nil, version: 2}} =
+               PrefixedFacadeHost.reset_claim_policy_override({:tenant, "private-acme"},
                  expected_version: 1
                )
 
-      assert {:ok, %{max_active_runs: 7, source: :default, override_version: 2}} =
-               Admin.get_effective(prefixed_context, {:tenant, "private-acme"})
+      assert {:ok,
+              %Docket.ClaimPolicyInfo{
+                max_active_runs: 7,
+                source: :default,
+                override_version: 2
+              }} = PrefixedFacadeHost.inspect_claim_policy({:tenant, "private-acme"})
 
       assert {:ok, %{max_active_runs: nil, version: 0}} = Admin.get_default(context)
       assert [] = partition_rows(context)

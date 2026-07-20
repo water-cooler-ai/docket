@@ -271,6 +271,16 @@ LISTEN/NOTIFY latency fast path, remove `notifier: :none`; deployments behind
 PgBouncer transaction or statement pooling must give the notifier a direct or
 session-pooled connection. Polling always remains the correctness path.
 
+Authorized host code can change TenantFair caps at runtime through the public
+configured facade: `fetch_claim_policy_default`, `put_claim_policy_default`,
+`put_claim_policy_override`, `reset_claim_policy_override`, and
+`inspect_claim_policy`. Owner scopes are explicit (`:tenantless` or
+`{:tenant, id}`), changes are immediately shared by runtimes using the same
+database and prefix, and compare-and-set updates accept `expected_version:`.
+The host application remains responsible for authorizing the actor and owner
+scope; Docket accepts no authorization token and stores no actor identity. See
+the [parent-application example](examples/parent-app-integration.md#administer-tenantfair-caps).
+
 `save_graph` snapshots node configuration schemas, materializes their defaults,
 and validates and compiles the effective graph before storing its canonical,
 content-addressed document. `start_run` accepts only the returned stable

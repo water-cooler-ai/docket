@@ -76,6 +76,9 @@ defmodule Docket.Backend do
   @doc "Returns the backend's `Docket.Backend.EventStore` implementation."
   @callback events() :: capability()
 
+  @doc "Returns the backend's optional claim-policy administration capability."
+  @callback claim_policy_admin() :: capability()
+
   @doc "Builds the backend's supervision child specification from options and its resolved context."
   @callback child_spec(opts :: keyword(), ctx()) :: Supervisor.child_spec()
 
@@ -85,4 +88,6 @@ defmodule Docket.Backend do
   @doc "Synchronously claims and drains due runs using the resolved backend context."
   @callback drain_runs(ctx(), opts :: keyword()) ::
               {:ok, drain_summary()} | {:error, term()}
+
+  @optional_callbacks claim_policy_admin: 0
 end

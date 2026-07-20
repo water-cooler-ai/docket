@@ -7,6 +7,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     `:expected_version` is supplied.
     """
 
+    @behaviour Docket.Backend.ClaimPolicyAdmin
+
     alias Docket.Postgres.Storage
 
     @type cap :: 1..2_147_483_647
@@ -36,6 +38,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Before the policy is initialized, `max_active_runs` is `nil` and `version`
     is zero.
     """
+    @impl true
     @spec get_default(Docket.Backend.ctx()) :: {:ok, policy()} | {:error, term()}
     def get_default(context) do
       with {:ok, control} <- control(context),
@@ -62,6 +65,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     `expected_version: version` for compare-and-set behavior; a version mismatch
     returns `{:error, :stale}` without changing the policy.
     """
+    @impl true
     @spec put_default(Docket.Backend.ctx(), cap(), keyword()) ::
             {:ok, policy()} | {:error, :stale | term()}
     def put_default(context, max_active_runs, opts \\ []) do
@@ -105,6 +109,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Pass `expected_version: 0` to create its first override with CAS semantics;
     a version mismatch returns `{:error, :stale}`.
     """
+    @impl true
     @spec put_override(
             Docket.Backend.ctx(),
             Docket.Backend.owner_scope(),
@@ -159,6 +164,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Pass `expected_version: version` for compare-and-set behavior; a missing or
     mismatched partition version returns `{:error, :stale}`.
     """
+    @impl true
     @spec reset_override(Docket.Backend.ctx(), Docket.Backend.owner_scope(), keyword()) ::
             {:ok, policy()} | {:error, :stale | term()}
     def reset_override(context, owner_scope, opts \\ []) do
@@ -202,6 +208,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     the admitted count above the effective cap. An uninitialized domain returns
     `{:error, :not_initialized}`.
     """
+    @impl true
     @spec get_effective(Docket.Backend.ctx(), Docket.Backend.owner_scope()) ::
             {:ok, effective_policy()} | {:error, :not_initialized | term()}
     def get_effective(context, owner_scope) do

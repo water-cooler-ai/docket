@@ -27,7 +27,7 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     assert {:context, 1} in callbacks
     assert {:child_spec, 2} in callbacks
     assert {:drain_runs, 2} in callbacks
-    assert optional_callbacks == []
+    assert optional_callbacks == [claim_policy_admin: 0]
     refute {:storage, 0} in callbacks
     refute Code.ensure_loaded?(Docket.Storage)
     refute Code.ensure_loaded?(Docket.Storage.Graphs)
@@ -49,6 +49,7 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     assert Code.ensure_loaded?(Docket.Test.MemoryBackend)
     assert function_exported?(Docket.Test.MemoryBackend, :transaction, 2)
     refute function_exported?(Docket.Test.MemoryBackend, :storage, 0)
+    refute function_exported?(Docket.Test.MemoryBackend, :claim_policy_admin, 0)
 
     for {name, arity} <- [
           fetch_graph: 4,

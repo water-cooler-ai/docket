@@ -383,32 +383,58 @@ claim_policy: [
 ```
 
 The configured value initializes an unset database default. Thereafter use the
-administration API:
+public administration facade. Authorization belongs to the host application;
+Docket accepts no actor or authorization token and does not persist actor
+identity:
 
 ```elixir
-alias Docket.Postgres.ClaimPolicy.Admin
+def update_tenant_cap(actor, tenant_id, max_active_runs, expected_version) do
+  owner_scope = {:tenant, tenant_id}
+  :ok = MyApp.PolicyAuthorization.authorize(actor, :manage_docket_caps, owner_scope)
 
-context = Docket.Postgres.context(repo: MyApp.Repo, prefix: "public")
+  MyApp.Docket.put_claim_policy_override(owner_scope, max_active_runs,
+    expected_version: expected_version
+  )
+end
 
-{:ok, default} = Admin.get_default(context)
-{:ok, updated} = Admin.put_default(context, 8, expected_version: default.version)
+{:ok, default} = MyApp.Docket.fetch_claim_policy_default()
 
-{:ok, override} =
-  Admin.put_override(context, {:tenant, "tenant-a"}, 2, expected_version: 0)
+{:ok, updated} =
+  MyApp.Docket.put_claim_policy_default(8, expected_version: default.version)
 
-{:ok, effective} = Admin.get_effective(context, {:tenant, "tenant-a"})
+{:ok, override} = update_tenant_cap(actor, "tenant-a", 2, 0)
+{:ok, effective} = MyApp.Docket.inspect_claim_policy({:tenant, "tenant-a"})
 
 {:ok, _reset} =
-  Admin.reset_override(context, {:tenant, "tenant-a"},
+  MyApp.Docket.reset_claim_policy_override({:tenant, "tenant-a"},
     expected_version: override.version
   )
 ```
+
+The equivalent top-level forms take the configured runtime first, for example
+`Docket.fetch_claim_policy_default(MyApp.Docket)` and
+`Docket.inspect_claim_policy(MyApp.Docket, owner_scope)`. The five frozen
+operations are `fetch_claim_policy_default`, `put_claim_policy_default`,
+`put_claim_policy_override`, `reset_claim_policy_override`, and
+`inspect_claim_policy`. PostgreSQL-configured modules export the same names
+without the runtime argument; modules configured with an unsupported backend do
+not export them. Top-level calls against an unsupported backend return
+`%Docket.Error{type: :unsupported_capability}`.
+
+Default and mutation calls return `Docket.ClaimPolicy`; inspection returns
+`Docket.ClaimPolicyInfo`. Compare-and-set mismatch is `:stale`; stable
+validation errors are `:invalid_max_active_runs`, `:invalid_owner_scope`,
+`:invalid_expected_version`, and `:invalid_options`; inspection before default
+initialization returns `:not_initialized`.
 
 `effective` includes token-free `queued`, `admitted_ready`,
 `admitted_claimed`, and `debt` counts. Reducing a cap below the current
 admitted-run count does not preempt work. It blocks FIFO queue promotion until
 admission releases bring the count below the new cap. Immediate cooperative
 yield and expired lease recovery retain admission and remain count-neutral.
+The facade does not provide hold/drain states, bulk changes, enumeration,
+policy history or audit identity, weighted sharing, borrowing, preemption, or
+online-rollout coordination.
 
 ### Existing schema V1 installations
 

@@ -21,11 +21,20 @@ project follows [Semantic Versioning](https://semver.org/).
   installs the indexes, engine interlock, and sole claim function, supports
   custom prefixes and rollback to host schema V1, and makes stale schema shapes
   fail closed. Required PostgreSQL tenancy selects TenantFair with an explicit
-  `default_max_active_runs`; the versioned Admin API manages the persisted
+  `default_max_active_runs`; the versioned public facade manages the persisted
   default and per-owner overrides and reports token-free queued, admitted, and
   debt counts. ClaimPolicy implementations receive the quoted schema
   identifiers needed to build prefix-local plans. See the
   [TenantFair claim policy](docs/architecture/docket-tenant-fair.md).
+- Public TenantFair cap administration through
+  `fetch_claim_policy_default`, `put_claim_policy_default`,
+  `put_claim_policy_override`, `reset_claim_policy_override`, and
+  `inspect_claim_policy`. Top-level `Docket` calls accept a configured runtime;
+  `use Docket` generates same-named wrappers only when the configured backend
+  explicitly exposes the optional capability. Results are normalized into
+  `Docket.ClaimPolicy` and `Docket.ClaimPolicyInfo`, CAS keeps `:stale`, and
+  unsupported backends return a typed capability error without exposing
+  storage contexts or PostgreSQL identifiers.
 - `Docket.BackendTests`, a source-owned shared ExUnit suite under
   `test/support`. One explicit backend matrix generates identical black-box
   cases for the memory and PostgreSQL bundles; external backend projects can

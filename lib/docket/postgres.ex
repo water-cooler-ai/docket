@@ -48,6 +48,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       Storage
     }
 
+    alias Docket.Postgres.ClaimPolicy.Admin
+
     @default_dispatcher [
       concurrency: 10,
       poll_interval_ms: 1_000,
@@ -95,6 +97,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl Docket.Backend
     def events, do: EventStore
+
+    @impl Docket.Backend
+    def claim_policy_admin, do: Admin
 
     @impl Docket.Backend
     def context(opts) do
