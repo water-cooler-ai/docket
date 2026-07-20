@@ -4,7 +4,7 @@
 
 - `main` is the current stable line.
 - `v0.1.0` is the active release branch for the 0.1.0 operational runtime
-  (see [docs/architecture/docket-operational-transition-spec.md](docs/architecture/docket-operational-transition-spec.md)).
+  (see [docs/postgres-operations.md](docs/postgres-operations.md)).
   **All 0.1.0 work targets `v0.1.0`, not `main`.** The release branch merges
   back to `main` when 0.1.0 ships.
 
@@ -50,8 +50,9 @@ CI builds and tests three release gates (`.github/workflows/ci.yml`):
 
 Every gate compiles with `--warnings-as-errors`. The full and core gates run
 the default suite; the live Postgres gate includes the tests tagged
-`:postgres`. The exploratory TenantFair benchmark is not part of the v0.1
-release gate. To reproduce the core gate locally:
+`:postgres`. The [PostgreSQL scorecard](docs/benchmarks.md) is optional
+regression tooling, not correctness evidence or a v0.1 release gate. To
+reproduce the core gate locally:
 
 ```sh
 DOCKET_CORE_ONLY=1 mix deps.get

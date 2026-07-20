@@ -9,61 +9,47 @@ These documents record the design rationale behind Docket. The code and its
 module docs are the authoritative reference for the current API; read these
 when you want to understand *why* the contracts are shaped the way they are.
 
-## Reading Order
+## Current guides and contracts
 
-1. `../delivery-guarantees.md`
-   - Current guarantee matrix for atomic durable transitions, replayable node
-     execution, external effects, event export, and best-effort callbacks.
-2. `migration-0.0.1-to-0.1.0.md`
-   - Drain-and-cut-over instructions for existing 0.0.1 adopters.
-3. `docket-operational-transition-spec.md`
-   - A public-facing guide to the implemented PostgreSQL data model, queue
-     semantics, claim fencing, tenancy, migrations, and backend operations.
-4. `docket-v0.1.0-spec-lock-audit.md`
-   - A historical pre-cutover audit retained to explain the final sequencing.
-5. `docket-graph-construction-design.md`
-   - The public `Docket.Graph` editing API, ID rules, publication boundary,
-     private effective-graph identity contract, and the rationale for the
-     authored map interchange (`to_map`/`from_map`).
-6. `docket-compiler-design.md`
-   - Compiler verification, diagnostics, and lowering from the public graph
-     to the internal runtime graph.
-7. `docket-graph-execution-contract-design.md`
-   - Historical 0.0.1 execution contract: the removed resident runtime and
-     host-checkpoint APIs, plus still-relevant executor, guard, failure, and
-     interrupt rationale.
-8. `docket-reducers-design.md`
-   - Why the v1.1 reducer contract folds the prior committed value, and the
-     rationale behind list-write concatenation, natural zeros, and
-     reducer-aware write validation.
-9. `docket-exact-cap-contract.md`
-   - The v0.1.0 exact per-owner cap plus the frozen conditional bounded-bypass
-     fair-rotation population, cursor, service-accounting, proof-oracle, and
-     stopped-upgrade invariants.
-10. `docket-tenant-fair.md`
-    - The sole TenantFair design: fixed discovery budgets, authoritative
-      unfinished ring, sticky logical-run admission, FIFO promotion, admission
-      lifetime, and the stopped homogeneous rollout boundary.
-11. `docket-claim-policy.md`
-    - The RunStore-to-ClaimPolicy boundary and the implemented Legacy and
-      TenantFair engines.
-12. `docket-runtime-design.md`
-    - Historical 0.0.1 runtime research and background: goals, alternatives
-      considered (Pregel, LangGraph, Temporal), and future design space.
+- [Delivery guarantees](../delivery-guarantees.md) — durable transactions,
+  replay, external effects, event export, and best-effort callbacks.
+- [PostgreSQL operations](../postgres-operations.md) — production setup,
+  configuration, migration, recovery, and inspection.
+- [TenantFair claim policy](docket-tenant-fair.md) — state model, sticky
+  admission, FIFO, bounded ring traversal, formal fair-rotation contract,
+  release evidence, rollout, and nonclaims.
+- [ClaimPolicy boundary](docket-claim-policy.md) — the one-statement internal
+  seam and Legacy/TenantFair selection and interlock.
+- [0.0.1 to 0.1.0 migration](migration-0.0.1-to-0.1.0.md) — drain-and-cut-over
+  instructions for old host-owned persistence adopters.
+
+Graph and compiler internals are documented in
+[graph construction](docket-graph-construction-design.md),
+[compiler design](docket-compiler-design.md), and
+[reducers](docket-reducers-design.md).
+
+## Historical and research material
+
+- [v0.1.0 spec-lock audit](docket-v0.1.0-spec-lock-audit.md) is the historical
+  pre-cutover sequencing audit.
+- [Graph execution contract](docket-graph-execution-contract-design.md) and
+  [runtime design](docket-runtime-design.md) record 0.0.1 behavior and research
+  background.
 
 ## Release-Line Boundary
 
 The graph programming model is continuous across the release lines: node
-modules, graphs, schemas, reducers, interrupts, executors, run serialization,
-and `Docket.Test` helpers carry forward. The lifecycle owner changes:
+modules, graphs, schemas, reducers, interrupts, executors, and `Docket.Test`
+helpers carry forward. The lifecycle owner changes:
 
 - `0.0.1`: the host checkpoint callback persisted runs and the host explicitly
   resumed resident per-run processes.
 - `0.1.0`: one required backend owns persistence, scheduling, recovery, and
   signals. The old supervised `run` / `resume` / `get_run` path is absent.
 
-The older graph-construction and execution-contract documents below record the
-`0.0.1` host-owned boundary and are superseded for v0.1.0 production guidance.
+The execution-contract and runtime-research documents below record the `0.0.1`
+host-owned boundary and are superseded for v0.1.0 production guidance. The
+graph-construction document remains current.
 
 ## Current Core Shape
 

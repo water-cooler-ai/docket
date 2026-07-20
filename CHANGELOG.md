@@ -11,42 +11,29 @@ Each v0.1.0 change updates the Unreleased section in its own PR.
 The developing operational release line. The backend contract, PostgreSQL
 stores, migration, lifecycle transactions, dispatcher, claimed-run vehicle,
 notifier, pruner, and public `Docket.Postgres` bundle have landed. The
-implementation guide and current-state audit live in `docs/architecture/`;
+current guides and historical spec-lock audit live in `docs/architecture/`;
 entries below reflect what has landed so far.
 
 ### Added
 
-- PostgreSQL schema version 2 adds the complete TenantFair claim policy: an
-  authoritative trigger-maintained unfinished-tenant ring, bounded
-  cross-tenant traversal, and sticky logical-run admission. FIFO promotion and
-  fresh admitted-count checks enforce `max_active_runs`; cooperative yield,
-  reacquisition, refresh, and expired steal retain admission, while future
-  scheduling, external waiting, interruption, poison, and terminal transitions
-  release it. The stopped migration backfills healthy claims, installs the
-  admitted/queued indexes and sole claim function, supports custom prefixes
-  and rollback to host schema V1, and makes old-schema startup fail closed.
-  Required PostgreSQL tenancy now requires TenantFair with an explicit
-  `default_max_active_runs`; Admin results use `max_active_runs` and expose
-  token-free queue/admission/debt counts.
-- PostgreSQL run creation now atomically materializes the canonical
-  owner-derived claim partition with an inherited cap and version-zero state.
-  Concurrent first inserts use `ON CONFLICT DO NOTHING`, preserving Admin-owned
-  state and versions. A non-locking existence read keeps established
-  partitions off that uniqueness path, so run creation does not wait behind an
-  admission epoch update. Failed or outer-rolled-back run creation leaves no
-  new partition or wake notification. Dormant partition rows are retained
-  after their last run disappears and are never selected from serialized
-  payload identity.
-- The same schema version includes the prefix-local exact-cap policy, partition,
-  ordinary supporting indexes, engine interlock, and TenantFair claim function.
-  Existing scope keys are backfilled transactionally while inserts are blocked.
-  ClaimPolicy implementations receive the additive quoted identifier context.
-- TenantFair admission with one persisted
-  default, optional per-owner overrides, concurrent final-slot serialization,
-  sticky logical-run residency, count-neutral expired recovery,
-  cap-reduction debt, and bounded cross-owner
-  rotation. The current-state Admin API supports versioned default and override
-  changes without rollout ledgers, audit history, or governance workflows.
+- PostgreSQL schema version 2 adds the complete TenantFair engine: one
+  database-and-schema fairness domain, an authoritative trigger-maintained
+  unfinished-partition ring, a serialized circular cursor, bounded
+  cross-partition traversal, and exact sticky logical-run admission. FIFO
+  promotion and fresh marker counts enforce `max_active_runs`; cooperative
+  yield, refresh, reacquisition, and expired steal retain admission, while
+  future scheduling, external waiting, interruption, poison, and terminal
+  transitions release it. Cap decreases create non-preemptive debt. Run
+  creation atomically materializes its owner partition, and rollback leaves no
+  partition or wake behind. The stopped migration backfills healthy claims,
+  installs the indexes, engine interlock, and sole claim function, supports
+  custom prefixes and rollback to host schema V1, and makes stale schema shapes
+  fail closed. Required PostgreSQL tenancy selects TenantFair with an explicit
+  `default_max_active_runs`; the versioned Admin API manages the persisted
+  default and per-owner overrides and reports token-free queued, admitted, and
+  debt counts. ClaimPolicy implementations receive the quoted schema
+  identifiers needed to build prefix-local plans. See the
+  [TenantFair claim policy](docs/architecture/docket-tenant-fair.md).
 - `Docket.BackendTests`, a source-owned shared ExUnit suite under
   `test/support`. One explicit backend matrix generates identical black-box
   cases for the memory and PostgreSQL bundles; external backend projects can

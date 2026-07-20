@@ -1,11 +1,11 @@
 # Docket v1.1 Roadmap — Composability & Ergonomics
 
-Status: slices 1–5 implemented (PR #6, 2026-07-05): schema-v1.1, reducers,
+Status: slices 1–5 implemented (2026-07-05): schema-v1.1, reducers,
 schema-shorthand, inline-fields, telemetry-events. The reducer contract
 rationale moved to `docs/architecture/docket-reducers-design.md`; API truth
 lives in module docs. Themes 6 (graph module DSL) and 7 (subgraph
 composition) remain open design space, recorded below. Theme 9 records the
-tenant-claim fairness follow-up targeted at v0.1.1. Theme 10 records the
+operational hardening follow-up for shipped TenantFair. Theme 10 records the
 `{:await}` late-completion protocol, sized during the claim-freshness review.
 
 The v1.1 theme: **make building graphs feel natural without adding a second
@@ -306,81 +306,17 @@ can't be expressed with `path`/`equals`/`all`/`any`.
 
 ## Theme 9 — TenantFair follow-up work
 
-The TenantFair claim policy is the single shipped PostgreSQL tenant scheduler.
-Its sticky queued admission design is documented in
-[`architecture/docket-tenant-fair.md`](architecture/docket-tenant-fair.md) and
-its exact distributed-cap and fairness obligations in
-[`architecture/docket-exact-cap-contract.md`](architecture/docket-exact-cap-contract.md):
+TenantFair's single sticky-admission design landed in v0.1.0. The
+[TenantFair claim policy](architecture/docket-tenant-fair.md) owns its state,
+FIFO, ring, work bounds, conditional fixed-window theorem, evidence, and
+exclusions. Do not restate that shipped contract in this roadmap.
 
-```elixir
-dispatcher: [concurrency: 100],
-claim_policy: [
-  implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-  default_max_active_runs: 4
-]
-```
-
-The fixed design is:
-
-- Claim selection is fair across eligible tenant partitions and FIFO-stable
-  within each tenant.
-- `max_active_runs` is an absolute ceiling enforced across every dispatcher sharing
-  the database and prefix, not independently per BEAM node.
-- Tenantless runs form their own partition, and Admin may set numeric per-tenant
-  cap overrides.
-
-Follow-up scope is limited to administration, observability, and operational
-hardening of this path. Weighted service, preferred capacity, borrowing, TTL
-slot expiry, and alternate admission modes are not parallel TenantFair designs.
-
-This is deliberately separate from the two existing vehicle mechanisms:
-
-- **Drain budgets provide run-level time slicing.** A vehicle may retain its
-  claim for another superstep while both its moment and elapsed budgets remain.
-  Once either budget is exhausted, the in-flight superstep finishes, and its
-  commit atomically advances the run, releases its transient claim while
-  retaining admission, and records an immediate wake. Nothing is preempted
-  halfway through a superstep.
-- **Finite attempt deadlines bound claim residency.** Runtime-owned activation
-  processes are terminated at their effective timeout; fencing rejects stale
-  results after crash recovery or steal.
-
-Together, the partition limit prevents one tenant's collection of runs from
-occupying the fleet, while the drain budget gives other admitted runs execution
-opportunities without transferring sticky admission to later queued runs. This
-is moderate fairness, not a promise of strict round robin, bounded queue
-latency, weighted fair queuing, or equal resource usage: one superstep may
-contain substantially more parallel node work than another.
-
-### Storage and pooling constraints
-
-- Vehicles continue to hold no database connection while node code runs.
-  Partition accounting belongs in atomic claim/release/commit operations; it
-  must not introduce a transaction spanning execution.
-- Prefer claim-query/index changes over a row-locking coordinator or one queue
-  per tenant. High-cardinality tenants must not create high-cardinality OTP
-  processes, database queues, or telemetry labels.
-- Measure claim latency, rows scanned, pool checkout time, and claim/commit
-  throughput with many partitions, one hot partition, and mixed ready/expired
-  claims.
-- Any denormalized partition counters must be recoverable from authoritative
-  admitted-run markers and remain correct across crash, expiry, steal, cancellation,
-  terminal commit, and poison recovery. Avoid counters if the claim query can
-  enforce the limit efficiently from indexed run rows.
-
-### Required tests
-
-- Multiple dispatchers cannot exceed a tenant's configured admission cap under
-  concurrent claims.
-- A tenant with thousands of eligible runs cannot block another tenant's first
-  run from being claimed.
-- Cooperative yields, claim expiry, steal, and vehicle crashes retain logical
-  admission and allow the same run to reacquire ahead of later queued runs.
-- External waits, future scheduling, terminal commits, poisoning, and
-  interruption release admission exactly once so the FIFO head can be promoted
-  without leaking or double-counting slots.
-- Tenant partitioning changes scheduling only; existing tenant scope checks
-  continue to prevent cross-tenant reads and mutations.
+The v1.1 follow-up scope is operational hardening that does not change the
+admission model: safer public administration, aggregate observability, and
+regression tooling. Weighted or preferred service, borrowing, reclaim,
+preemption, TTL slot expiry, dynamic-population guarantees, and alternate
+schedulers require separate future contracts. They are not implicit TenantFair
+features.
 
 ---
 
@@ -443,9 +379,9 @@ value-per-risk:
    materialize graph fields, conflict rules, orphaned-field diagnostic.
 5. **telemetry-events** — `:telemetry` emission for run/node/interrupt events
    (Theme 8.3); independent of everything above, can slot in anywhere.
-6. **tenant-claim-fairness** — database-wide tenant-partitioned active-claim
-   limits, fair partition selection, optional spare-capacity bursting, and
-   contention/pool benchmarks (Theme 9; v0.1.1 operational follow-up).
+6. **tenant-fair-operations** — public administration, aggregate
+   observability, and regression tooling for the shipped sticky-admission
+   engine (Theme 9; no scheduler or fairness-contract change).
 7. **await-protocol** — `{:await, term()}` late-completion protocol for
    detached node execution (Theme 10, after the v0.1.0 line ships; it breaks
    down into its own slices when scheduled).
@@ -459,9 +395,3 @@ value-per-risk:
 3. Inline field conflict rule: is identical-definition-no-op /
    conflict-error the right balance, or should a `force: true` escape hatch
    exist? (Theme 5) **this is good for now**
-4. Tenant claim enforcement: indexed live-run selection alone or recoverable
-   denormalized partition counters? Decide from contention benchmarks rather
-   than API preference. (Theme 9)
-5. Burst semantics: how quickly must spare claims turn over once another
-   tenant becomes eligible, without preempting an in-flight superstep?
-   (Theme 9)
