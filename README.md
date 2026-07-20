@@ -10,7 +10,7 @@ This branch is `0.1.0-dev`. Graph semantics are usable processlessly through
 durable backend. The PostgreSQL bundle owns its stores,
 transaction recipes, claim fencing, dispatcher, claimed-run vehicles,
 notification fast path, and retention pruner. See the
-[PostgreSQL backend guide](docs/architecture/docket-operational-transition-spec.md)
+[PostgreSQL operations guide](docs/postgres-operations.md)
 for configuration and operational boundaries.
 
 You describe a workflow as a graph document: nodes that do work, shared state
@@ -264,7 +264,8 @@ as `latest_seq > 0` with `latest_available_seq == nil`.
 For multi-tenant PostgreSQL applications, configure `tenant_mode: :required`,
 select `Docket.Postgres.ClaimPolicy.TenantFair` with an explicit
 `default_max_active_runs`, and pass a non-empty `tenant_id` to every run, read,
-and signal call. See the
+and signal call. See the [TenantFair claim policy](docs/architecture/docket-tenant-fair.md)
+for the sticky-cap and fairness boundary, and the
 [parent-application example](examples/parent-app-integration.md). To enable the
 LISTEN/NOTIFY latency fast path, remove `notifier: :none`; deployments behind
 PgBouncer transaction or statement pooling must give the notifier a direct or
@@ -433,6 +434,11 @@ the package page.
 - [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).
 - [PostgreSQL operations and correctness guide](docs/postgres-operations.md) —
   statuses, claims, poison recovery, configuration, and inspection.
+- [TenantFair claim policy](docs/architecture/docket-tenant-fair.md) — the
+  shipped state model, exact-cap and fair-rotation contract, release evidence,
+  rollout boundary, and explicit nonclaims.
+- [Telemetry](docs/telemetry.md) and [benchmarks](docs/benchmarks.md) —
+  operational signals and non-oracle regression measurements.
 - [examples/llm-node.md](examples/llm-node.md) — a generic, configurable LLM
   node implementation.
 - [docs/architecture/](docs/architecture/) — design rationale: the graph

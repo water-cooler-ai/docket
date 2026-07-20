@@ -73,8 +73,10 @@ only from the disabled-by-default raw trace result mode used by deterministic
 tests and trusted inspection. Production passes trace off and filters those
 rows before the unchanged public decoder. Tenant ID, raw `scope_key`, run or
 graph identity, call token, cursor token, and claim token are forbidden as
-ordinary metric labels. DCKT-79 owns full trace qualification and the
-per-target bounded-bypass proof; aggregate telemetry cannot reconstruct it.
+ordinary metric labels. Aggregate telemetry cannot reconstruct the per-target
+bounded-bypass proof; consult the [TenantFair release evidence
+gate](architecture/docket-tenant-fair.md#release-evidence-and-current-blocker)
+for current status.
 
 Aggregate TenantFair outcome observations distinguish queued promotion,
 admitted-ready reacquisition, and expired admitted steal. Cap/debt denial is a
@@ -87,9 +89,9 @@ they never carry tenant or run identity.
 `admitted_claimed`, and `debt` counts for trusted operational inspection.
 
 The normative populations, units, formulas, exclusions, and Legacy control are
-in the [exact-cap and fair-rotation admission contract](architecture/docket-exact-cap-contract.md).
-Timing and query-plan benchmarks remain separate regression evidence and never
-replace that correctness oracle.
+in the [TenantFair fair-rotation contract](architecture/docket-tenant-fair.md#fixed-window-fair-rotation-contract).
+Timing and query-plan measurements in the [benchmark guide](benchmarks.md)
+remain separate regression evidence and never replace that correctness oracle.
 
 ## Benchmark derivations
 

@@ -279,6 +279,7 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `prefix:` | `public` | Must match both directions of the generated migration. |
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
 | `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` for `tenant_mode: :none` | Required PostgreSQL tenancy must select `Docket.Postgres.ClaimPolicy.TenantFair`; implementations are validated before startup and cannot be selected per call. |
+| `claim_policy.default_max_active_runs` | required by TenantFair | Positive bootstrap cap. The persisted default and per-scope overrides are authoritative after initialization. |
 | `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
 | `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
 | `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
@@ -357,7 +358,14 @@ count, scan cursor, sticky logical-run admission, fixed budgets, and sole claim
 function. The unfinished ring is an
 authoritative superset of current eligibility, so future timers and parked
 running work may consume an unsuccessful inspection without becoming
-invisible. Enable TenantFair consistently across the fleet:
+invisible.
+
+The [TenantFair claim policy](architecture/docket-tenant-fair.md) owns the
+state, FIFO, work bounds, formal fairness boundary, evidence, and nonclaims;
+operators should not infer a latency or unconditional starvation guarantee from
+ring rotation.
+
+Enable TenantFair consistently across the fleet:
 
 ```elixir
 claim_policy: [
@@ -371,6 +379,8 @@ small current-state API:
 
 ```elixir
 alias Docket.Postgres.ClaimPolicy.Admin
+
+context = Docket.Postgres.context(repo: MyApp.Repo, prefix: "public")
 
 {:ok, default} = Admin.get_default(context)
 {:ok, updated} = Admin.put_default(context, 8, expected_version: default.version)
@@ -415,13 +425,24 @@ Fresh installations generated without an upgrade flag install V01 and V02 in
 one host migration. Use the same explicit prefix in both migration
 directions and runtime configuration.
 
+There is no supported V2-to-V3 transition: the unreleased development shapes
+were collapsed into the current V2 migration. A database that applied one of
+those discarded shapes must be recreated or rolled back with its matching old
+code before adopting the current migration.
+
+The [TenantFair release evidence
+gate](architecture/docket-tenant-fair.md#release-evidence-and-current-blocker)
+owns current status. Timing and large benchmarks are regression diagnostics,
+not proof.
+
 ## Operational inspection
 
 Use `inspect_run` for per-run scheduling, claim age, attempt counts, and poison
-health. Use telemetry for dispatcher backlog/claim activity, vehicle outcomes,
-observer failures, notifier health, and pruning passes. Database tables and
-opaque binary columns are backend implementation details rather than an
-application query API.
+health. Use the [telemetry guide](telemetry.md) for dispatcher backlog/claim
+activity, vehicle outcomes, observer failures, notifier health, and pruning
+passes, and the [benchmark guide](benchmarks.md) for regression diagnostics.
+Database tables and opaque binary columns are backend implementation details
+rather than an application query API.
 
 For application-facing discovery, use `list_runs` with the same tenant scope
 as every other run read. It returns indexed summary columns rather than opaque

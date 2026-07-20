@@ -39,8 +39,16 @@ backend that owns persistence, scheduling, recovery, and signals.
    children = [MyApp.Repo, MyApp.Docket]
    ```
 
-   For a non-`public` PostgreSQL schema, edit both directions of the generated
-   migration to pass the same `prefix:` configured on the Docket facade.
+   For a non-`public` PostgreSQL schema, generate with the same prefix configured
+   on the Docket facade:
+
+   ```sh
+   mix docket.gen.migration -r MyApp.Repo --prefix automation
+   ```
+
+   Required-tenancy adopters must also configure TenantFair with an explicit
+   `default_max_active_runs`; see the
+   [current PostgreSQL migration and rollout guide](../postgres-operations.md#existing-v1-installations).
    The generated fresh migration installs the current schema. Existing
    schema-V1 Docket installations instead use `--upgrade-from-v1`; stop every
    Docket writer before the upgrade. The
