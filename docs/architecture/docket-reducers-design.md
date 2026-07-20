@@ -1,20 +1,20 @@
-# Docket Reducers — v1.1 Contract Rationale
+# Docket Reducers — v0.1.1 Contract Rationale
 
-API details live in the `Docket.Reducer` module docs. This note records why
-the v1.1 reducer contract is shaped the way it is.
+The v0.1.1 contract extends reduction to the prior committed value so aggregate
+fields can accumulate across steps.
 
 ## The contract change
 
-v1 applied reducers only to resolve same-step write conflicts: the runtime
+v0.1 applied reducers only to resolve same-step write conflicts: the runtime
 folded the step's writes and replaced the committed value. Aggregates
 (chat histories, usage counters, merged metadata) need the reducer to fold
 the **prior committed value** as well:
 
     new_value = reduce(reducer, current_committed_value, sorted_step_writes)
 
-`last_value` is the degenerate case that ignores `current`, so the v1
+`last_value` is the degenerate case that ignores `current`, so the v0.1
 behavior is unchanged for every existing graph. This is the only semantic
-extension in v1.1; everything else layered on it (built-in reducer types,
+extension in v0.1.1; everything else layered on it (built-in reducer types,
 options, shorthand) is additive descriptor data on the wire.
 
 ## Why the runtime owns reduction
@@ -22,7 +22,7 @@ options, shorthand) is additive descriptor data on the wire.
 Reduction lives in `Docket.Reducer.reduce/3`, a pure function called from
 the update barrier (`apply_state_writes`) and from interrupt resolution.
 Reducers are part of the determinism contract: replanning after a crash must
-reproduce identical commits, which is why v1.1 ships only built-in reducers
+reproduce identical commits, which is why v0.1.1 ships only built-in reducers
 and defers module-referenced custom reducers until a real host graph
 exhausts the built-ins (every custom reducer hands the purity obligation to
 the host and makes a module name durable graph content).
@@ -52,7 +52,7 @@ the host and makes a module name durable graph content).
   committed type.
 - **Interrupt resolutions flow through the reducer.** Resolution already
   wrote through `apply_state_writes`, so resolving into an `append`
-  field accumulates with no special case. This fell out of the v1 design
+  field accumulates with no special case. This fell out of the v0.1 design
   rather than being added.
 - **Union dedupes first-occurrence-wins.** `union` is list-as-set:
   membership semantics, not upsert. A keyed replace-in-place reducer can be
@@ -61,4 +61,4 @@ the host and makes a module name durable graph content).
 ## Wire compatibility
 
 Reducers already serialized as `type` + open `opts`; the new types and
-options are additive, so v1 documents load unchanged and hash identically.
+options are additive, so v0.1 documents load unchanged and hash identically.

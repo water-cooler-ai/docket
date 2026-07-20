@@ -4,7 +4,7 @@ defmodule Docket.Event do
   edge triggers, and interrupts.
 
   Events are built at update barriers and persisted with committed transitions. The
-  v1 event types are:
+  v0.1 event types are:
 
   - `:run_initialized`, `:run_completed`, `:run_failed`, `:run_cancelled`
   - `:checkpoint_committed` (metadata-only durable checkpoint history)

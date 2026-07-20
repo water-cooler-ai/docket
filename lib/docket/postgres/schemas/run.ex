@@ -13,6 +13,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         future instant means a timer or retry backoff, and `nil` means
         claimed, externally parked, poisoned, or terminal.
       * `claim_token` / `claimed_at` — execution ownership.
+      * `tenant_admitted_at` — durable TenantFair cohort residency. It is
+        independent of the transient claim token and is never set by Legacy.
       * `checkpoint_seq` — the optimistic commit fence.
       * `claim_attempts` — consecutive claims consumed by launched execution
         without committed progress.
@@ -46,6 +48,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             latest_checkpoint_type: Docket.Checkpoint.type() | nil,
             claim_token: Ecto.UUID.t() | nil,
             claimed_at: DateTime.t() | nil,
+            tenant_admitted_at: DateTime.t() | nil,
             wake_at: DateTime.t() | nil,
             claim_attempts: non_neg_integer(),
             claim_abandons: non_neg_integer(),
@@ -70,6 +73,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       field(:latest_checkpoint_type, Ecto.Enum, values: Docket.Checkpoint.types())
       field(:claim_token, Ecto.UUID, redact: true)
       field(:claimed_at, :utc_datetime_usec)
+      field(:tenant_admitted_at, :utc_datetime_usec)
       field(:wake_at, :utc_datetime_usec)
       field(:claim_attempts, :integer, default: 0)
       field(:claim_abandons, :integer, default: 0)

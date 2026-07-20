@@ -64,7 +64,7 @@ testable without pretending arbitrary stores can be safely mixed.
 commit-authority tuple. PostgreSQL may split schemas and codecs internally,
 but claim and graph-state fencing update the same row.
 
-The version 1 migration enforces the five durable statuses and the valid
+The schema version 1 migration enforces the five durable statuses and the valid
 status/schedule/claim/poison shapes with database constraints. Separate partial
 indexes serve ready, expired-claim, and poison inspection paths. Generated
 scope keys and the scoped graph-version foreign key enforce graph ownership.

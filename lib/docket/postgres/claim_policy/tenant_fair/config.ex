@@ -2,23 +2,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.ClaimPolicy.TenantFair.Config do
     @moduledoc false
 
-    @enforce_keys [:default_max_active]
+    @enforce_keys [:default_max_active_runs]
     defstruct @enforce_keys
 
-    @type t :: %__MODULE__{default_max_active: pos_integer()}
+    @type t :: %__MODULE__{default_max_active_runs: 1..2_147_483_647}
 
     @spec new(keyword()) :: {:ok, t()} | {:error, term()}
     def new(options) when is_list(options) do
       with true <- Keyword.keyword?(options) || {:error, :not_keyword},
-           [] <- Keyword.keys(options) -- [:default_max_active],
-           {:ok, maximum} <- Keyword.fetch(options, :default_max_active),
+           [] <- Keyword.keys(options) -- [:default_max_active_runs],
+           {:ok, maximum} <- Keyword.fetch(options, :default_max_active_runs),
            true <- is_integer(maximum) and maximum > 0 and maximum <= 2_147_483_647 do
-        {:ok, %__MODULE__{default_max_active: maximum}}
+        {:ok, %__MODULE__{default_max_active_runs: maximum}}
       else
         {:error, :not_keyword} -> {:error, :not_keyword}
-        :error -> {:error, {:missing_option, :default_max_active}}
+        :error -> {:error, {:missing_option, :default_max_active_runs}}
         unknown when is_list(unknown) -> {:error, {:unknown_options, unknown}}
-        false -> {:error, {:invalid_option, :default_max_active}}
+        false -> {:error, {:invalid_option, :default_max_active_runs}}
       end
     end
 

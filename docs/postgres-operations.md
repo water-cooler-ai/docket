@@ -1,8 +1,7 @@
 # Docket.Postgres Operations and Correctness Guide
 
-This guide is the operator-facing reference for the v0.1.0 PostgreSQL runtime.
-Start with the [README quickstart](../README.md), then use
-this page for production configuration, inspection, and failure recovery.
+Complete the [README quickstart](../README.md) before configuring production,
+inspecting the runtime, or recovering failures.
 
 ## Fresh application setup
 
@@ -12,7 +11,7 @@ Add Docket plus the optional PostgreSQL dependencies to the host, configure
 ```elixir
 def deps do
   [
-    {:docket, "~> 0.1.0"},
+    {:docket, github: "water-cooler-ai/docket", branch: "v0.1.0"},
     {:ecto_sql, "~> 3.10"},
     {:postgrex, "~> 0.17"}
   ]
@@ -23,6 +22,15 @@ end
 mix deps.get
 mix docket.gen.migration -r MyApp.Repo
 mix ecto.migrate -r MyApp.Repo
+```
+
+When an existing host adds `ecto_sql` and `postgrex` after compiling Docket
+without them, rebuild the dependency so its conditional PostgreSQL modules are
+included:
+
+```sh
+mix deps.clean docket --build
+mix deps.get
 ```
 
 Define one complete facade. Production retention has no implicit defaults:
@@ -51,8 +59,9 @@ Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
 ```
 
 This setup uses polling and tenantless storage. Removing `notifier: :none`
-enables LISTEN/NOTIFY; changing to `tenant_mode: :required` requires the same
-authorized non-empty binary tenant ID on every run, read, and signal call.
+enables LISTEN/NOTIFY. Changing to `tenant_mode: :required` also requires the
+TenantFair claim policy with an explicit `default_max_active_runs`, plus the
+same authorized non-empty binary tenant ID on every run, read, and signal call.
 
 ## Persistence and transaction ownership
 
@@ -63,7 +72,7 @@ mix-and-match configuration.
 
 `Docket.Runtime.Moment` is a pre-commit proposal containing the next run,
 assigned events, checkpoint metadata, and scheduling disposition.
-`Docket.Lifecycle` is the single transaction composer: it persists the run,
+The lifecycle layer is the single transaction composer: it persists the run,
 schedule, and events atomically, then invokes best-effort observers only after
 commit. A failed event append or lost claim fence commits none of the moment.
 
@@ -277,7 +286,8 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `backend:` | required | Use the complete `Docket.Postgres` bundle. |
 | `prefix:` | `public` | Must match both directions of the generated migration. |
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
-| `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` | Internal instance-level admission rollout switch. Implementations are validated before startup and cannot be selected per call. |
+| `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` for `tenant_mode: :none` | Required PostgreSQL tenancy must select `Docket.Postgres.ClaimPolicy.TenantFair`; implementations are validated before startup and cannot be selected per call. |
+| `claim_policy.default_max_active_runs` | required by TenantFair | Bootstrap cap in `1..2_147_483_647`. The persisted default and per-scope overrides are authoritative after initialization. |
 | `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
 | `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
 | `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
@@ -347,24 +357,38 @@ only adds latency because polling remains correctness. Fence loss discards the
 proposal and recovery replans from the last committed run, so its cost is
 re-execution, not a partial durable moment.
 
-## Exact per-owner caps
+## Exact per-owner caps and TenantFair schema state
 
-Schema version 2 adds the minimal policy and partition authority needed by
-`Docket.Postgres.ClaimPolicy.TenantFair`. Enable it consistently across the
-fleet:
+Schema version 2 contains the complete
+`Docket.Postgres.ClaimPolicy.TenantFair` design: policy and partition
+authority, the unique unfinished ring, exact trigger-maintained unfinished-run
+count, scan cursor, sticky logical-run admission, fixed budgets, and sole claim
+function. The unfinished ring is an
+authoritative superset of current eligibility, so future timers and parked
+running work may consume an unsuccessful inspection without becoming
+invisible.
+
+The [TenantFair claim policy](architecture/docket-tenant-fair.md) owns the
+state, FIFO, work bounds, formal fairness boundary, evidence, and nonclaims;
+operators should not infer a latency or unconditional starvation guarantee from
+ring rotation.
+
+Enable TenantFair consistently across the fleet:
 
 ```elixir
 claim_policy: [
   implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-  default_max_active: 4
+  default_max_active_runs: 4
 ]
 ```
 
 The configured value initializes an unset database default. Thereafter use the
-small current-state API:
+administration API:
 
 ```elixir
 alias Docket.Postgres.ClaimPolicy.Admin
+
+context = Docket.Postgres.context(repo: MyApp.Repo, prefix: "public")
 
 {:ok, default} = Admin.get_default(context)
 {:ok, updated} = Admin.put_default(context, 8, expected_version: default.version)
@@ -380,11 +404,13 @@ alias Docket.Postgres.ClaimPolicy.Admin
   )
 ```
 
-Reducing a cap below the current live count does not terminate claims. It
-creates debt and blocks additive ready claims until completions bring the live
-count below the new cap. Expired lease recovery remains count-neutral.
+`effective` includes token-free `queued`, `admitted_ready`,
+`admitted_claimed`, and `debt` counts. Reducing a cap below the current
+admitted-run count does not preempt work. It blocks FIFO queue promotion until
+admission releases bring the count below the new cap. Immediate cooperative
+yield and expired lease recovery retain admission and remain count-neutral.
 
-### Existing v1 installations
+### Existing schema V1 installations
 
 The generated upgrade is an ordinary transactional migration:
 
@@ -395,26 +421,30 @@ mix ecto.migrate -r MyApp.Repo
 
 Stop dispatchers and all Docket run writers before the upgrade, deploy one
 homogeneous binary version, migrate, and restart. The migration locks the runs
-table against inserts while it backfills owner partitions. The current binary
-requires schema version 2; version 1 is only the rollback point for the old
-binary. Online migrations, readiness ledgers, fleet attestations, and audited
-activation are intentionally outside the v0.1.0 contract.
+table against inserts while it backfills owner partitions and schedule rows.
+The current binary requires schema version 2 and checks it before starting
+backend children. Rolling back a generated host-schema-V1 upgrade removes the
+TenantFair schema and returns to schema version 1. Online migrations,
+readiness ledgers, fleet
+attestations, and audited activation are intentionally outside the v0.1.0
+contract.
 
-Fresh installations generated without `--upgrade-from-v1` install both schema
-versions in one host migration.
+Fresh installations generated without an upgrade flag install V01 and V02 in
+one host migration. Use the same explicit prefix in both migration
+directions and runtime configuration.
 
-DCKT-68's development-only version-2 schema is not an upgrade source. This
-cleanup rewrites v2 before the 0.1.0 release; recreate any local/test database
-that already applied that development migration, or roll it back using the
-matching DCKT-68 code first.
+The checked-in TenantFair tests are listed under
+[correctness evidence](architecture/docket-tenant-fair.md#correctness-evidence).
+Timing and large benchmarks are regression diagnostics.
 
 ## Operational inspection
 
 Use `inspect_run` for per-run scheduling, claim age, attempt counts, and poison
-health. Use telemetry for dispatcher backlog/claim activity, vehicle outcomes,
-observer failures, notifier health, and pruning passes. Database tables and
-opaque binary columns are backend implementation details rather than an
-application query API.
+health. Use the [telemetry guide](telemetry.md) for dispatcher backlog/claim
+activity, vehicle outcomes, observer failures, notifier health, and pruning
+passes, and the [benchmark guide](benchmarks.md) for regression diagnostics.
+Database tables and opaque binary columns are backend implementation details
+rather than an application query API.
 
 For application-facing discovery, use `list_runs` with the same tenant scope
 as every other run read. It returns indexed summary columns rather than opaque

@@ -4,19 +4,49 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Database-authoritative exact-cap admission with bounded cross-tenant rotation.
 
     The configured default cap only bootstraps an uninitialized database. Once
-    persisted, the default and tenant overrides are managed through `Admin`.
+    persisted, the default and tenant overrides are managed through
+    `Docket.Postgres.ClaimPolicy.Admin`.
+
+    ## Responsibility boundary
+
+    `Docket.Postgres.ClaimPolicy.TenantFair.RingFunction` owns the database-side
+    scheduling state machine: cursor and partition authority, ring traversal,
+    bounded candidate discovery, exact row locking, authoritative rechecks, run
+    mutation, and service-epoch accounting.
+
+    This module is the application-side `Docket.Postgres.ClaimPolicy`
+    implementation. It:
+
+    * validates the configured bootstrap cap;
+    * normalizes runtime timestamps and derives the expired-claim cutoff;
+    * builds one data-only `Docket.Postgres.ClaimPolicy.Plan` with the six
+      semantic bind values;
+    * resolves the prefix-qualified claim function installed by the migration;
+    * decodes the unchanged fourteen public columns into leases and poisoned
+      results; and
+    * emits bounded claim, poison, steal, age, duration, and contention
+      observations after execution.
+
+    `Docket.Postgres.ClaimPolicy.TenantFair.SQL` invokes the claim function with
+    raw tracing disabled, removes internal inspection rows and columns, and
+    orders public outcomes by the function's visit and outcome ordinals.
+    `Docket.Postgres.RunStore` remains the sole executor of the resulting plan.
     """
 
     @behaviour Docket.Postgres.ClaimPolicy
 
     alias Docket.Postgres.ClaimPolicy.Plan
-    alias Docket.Postgres.ClaimPolicy.TenantFair.{Config, Function, SQL}
+    alias Docket.Postgres.ClaimPolicy.TenantFair.{Config, RingFunction, SQL}
     alias Docket.Postgres.Storage
 
     @empty_stats %{
       ready_candidates: 0,
       expired_candidates: 0,
       ready_selected: 0,
+      admitted_ready_selected: 0,
+      queued_ready_selected: 0,
+      queued_promotions: 0,
+      admission_releases: 0,
       expired_selected: 0,
       steals: 0,
       ready_oldest_age_ms: 0,
@@ -28,7 +58,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl true
     def build_plan(
-          %{prefix: prefix, identifiers: %{runs: runs, claim_partitions: partitions}},
+          %{prefix: prefix},
           %{
             now: %DateTime{} = now,
             limit: limit,
@@ -36,21 +66,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             max_claim_attempts: max,
             preference: preference
           },
-          %Config{default_max_active: default_max_active}
+          %Config{default_max_active_runs: default_max_active_runs}
         ) do
       now = normalize_database_datetime(now)
       cutoff = DateTime.add(now, -ttl, :millisecond)
-      function = Storage.qualified_table(prefix, Function.name())
+      function = Storage.qualified_table(prefix, RingFunction.name())
 
       %Plan{
-        statement: SQL.statement(runs, partitions, function),
+        statement: SQL.statement(function),
         params: [
           now,
           cutoff,
           limit,
           max,
           preference && Atom.to_string(preference),
-          default_max_active
+          default_max_active_runs
         ],
         decoder: %{now: now, orphan_ttl_ms: ttl},
         observation: %{demand: limit, preference: preference}
@@ -58,6 +88,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @impl true
+    def decode([["error", "lock_contention" | _tail]], _decoder, %Config{}) do
+      {:error, {:claim_policy_unavailable, :lock_contention}, %{contention_phase: :policy_cursor}}
+    end
+
     def decode([["error", reason | _tail]], _decoder, %Config{}) do
       {:error, {:claim_policy_unavailable, load_error_reason(reason)}, %{}}
     end
@@ -167,6 +201,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
       end)
 
+      if stats.admission_releases > 0 do
+        :telemetry.execute(
+          [:docket, :postgres, :admission, :release],
+          %{count: stats.admission_releases},
+          %{reason: :poison}
+        )
+      end
+
       :ok
     end
 
@@ -205,12 +247,33 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               ready_oldest_age_ms: max(stats.ready_oldest_age_ms, age)
           }
 
+        "admitted_ready" ->
+          %{
+            stats
+            | ready_candidates: stats.ready_candidates + 1,
+              ready_selected: stats.ready_selected + 1,
+              admitted_ready_selected: stats.admitted_ready_selected + 1,
+              admission_releases: stats.admission_releases + if(lease?, do: 0, else: 1),
+              ready_oldest_age_ms: max(stats.ready_oldest_age_ms, age)
+          }
+
+        "queued_ready" ->
+          %{
+            stats
+            | ready_candidates: stats.ready_candidates + 1,
+              ready_selected: stats.ready_selected + 1,
+              queued_ready_selected: stats.queued_ready_selected + 1,
+              queued_promotions: stats.queued_promotions + if(lease?, do: 1, else: 0),
+              ready_oldest_age_ms: max(stats.ready_oldest_age_ms, age)
+          }
+
         "expired" ->
           %{
             stats
             | expired_candidates: stats.expired_candidates + 1,
               expired_selected: stats.expired_selected + 1,
               steals: stats.steals + if(lease?, do: 1, else: 0),
+              admission_releases: stats.admission_releases + if(lease?, do: 0, else: 1),
               expired_oldest_age_ms: max(stats.expired_oldest_age_ms, age)
           }
       end
@@ -218,6 +281,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp load_error_reason("read_only_transaction"), do: :read_only_transaction
     defp load_error_reason("unsupported_isolation"), do: :unsupported_isolation
+    defp load_error_reason("lock_contention"), do: :lock_contention
     defp load_error_reason(_reason), do: :unavailable
 
     defp owner_scope(nil), do: :tenantless

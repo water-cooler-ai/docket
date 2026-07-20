@@ -8,7 +8,7 @@ defmodule Docket.Graph.Serializer do
   #
   # This module owns two related concerns:
   #
-  # - `dump/2` produces a plain, JSON-safe map (the v1 wire format) from an
+  # - `dump/2` produces a plain, JSON-safe map (the v0.1 wire format) from an
   #   in-memory `Docket.Graph`. All keys are binaries and all values are
   #   durable JSON-safe terms (binaries, numbers, booleans, nil, lists,
   #   string-keyed maps).

@@ -7,12 +7,12 @@ defmodule Docket.Executor do
   writes. The dispatcher normalizes raises, exits, and throws, so executors
   may let node exceptions propagate.
 
-  v1 ships `Docket.Executor.Local`, which executes inside the dispatcher's
+  v0.1 ships `Docket.Executor.Local`, which executes inside the dispatcher's
   isolated, finite-deadline activation process. Custom executors receive the
   same hard outer boundary. Queue,
-  remote, and late-completion protocols are post-v1; the `{:await, term()}`
+  remote, and late-completion protocols are post-v0.1; the `{:await, term()}`
   return is reserved for them and is treated as a permanent node failure in
-  v1.
+  v0.1.
 
   The runtime dispatches all activations in a superstep concurrently. The
   executor callback remains a single-activation boundary; the update barrier

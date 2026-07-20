@@ -3,8 +3,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @shortdoc "Generates a Docket PostgreSQL migration"
 
     @moduledoc """
-    Generates either a fresh Docket schema migration or the ordinary v1-to-v2
-    exact-cap upgrade.
+    Generates a fresh Docket schema migration or a host schema-V1-to-current
+    upgrade.
     """
 
     use Mix.Task
@@ -34,12 +34,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           Mix.raise("--prefix must be a lowercase identifier up to 63 bytes")
         end
 
+        from_v1? = Keyword.get(opts, :upgrade_from_v1, false)
+
+        current_version = Docket.Postgres.Migration.current_version()
+
         {basename, migration_name, version, down_version} =
-          if Keyword.get(opts, :upgrade_from_v1, false) do
-            {"upgrade_docket_to_v2", UpgradeDocketToV2, 2, 2}
-          else
-            {"add_docket_tables", AddDocketTables, Docket.Postgres.Migration.current_version(),
-             Docket.Postgres.Migration.initial_version()}
+          case from_v1? do
+            true ->
+              {"upgrade_docket_to_v2", UpgradeDocketToV2, current_version, 2}
+
+            false ->
+              {"add_docket_tables", AddDocketTables, current_version,
+               Docket.Postgres.Migration.initial_version()}
           end
 
         file = Path.join(path, "#{timestamp()}_#{basename}.exs")

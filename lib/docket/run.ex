@@ -2,11 +2,10 @@ defmodule Docket.Run do
   @moduledoc """
   Durable execution state for one graph run.
 
-  A run is created by Docket when a run starts, advanced through committed
-  read-only checkpoint notifications, and stored by the configured backend.
-  the top-level fields (`id`,
+  Docket creates a run when execution starts, and the configured backend stores
+  each committed transition. Applications may read the top-level fields (`id`,
   `graph_id`, `graph_hash`, `status`, `step`, `input`, `output`, and the
-  timestamps) but should not interpret, pattern match, mutate, or rebuild
+  timestamps), but should not interpret, pattern match, mutate, or rebuild
   Docket-owned execution internals such as channels, interrupts, the
   changed-channel set, or the active-superstep state (`active_tasks`,
   `pending_writes`, and `timers`).
@@ -24,8 +23,9 @@ defmodule Docket.Run do
   - `:done` / `:failed` / `:cancelled` - terminal and absorbing.
 
   `:created` is a private initialization sentinel: a built-but-never
-  initialized run consumed by the runtime's init barrier. It never appears
-  , in an uncommitted transition, is not cancellable, and is rejected by durable storage.
+  initialized run consumed by the runtime's init barrier. It exists only before
+  that transition commits, is not cancellable, and is rejected by durable
+  storage.
 
   Status describes graph execution state, not Runtime process liveness and
   not operational health - see `Docket.RunInfo` for the latter.
@@ -54,8 +54,7 @@ defmodule Docket.Run do
 
   `failure` carries the durable `Docket.Run.Failure` cause of a
   terminal graph failure. It is present exactly when `status` is `:failed`
-  (see `validate_failure/1`), so a failed run retains its cause even when
-  event persistence is disabled.
+  (see `validate_failure/1`), independently of retained event history.
   """
 
   alias Docket.{DurableCodec, Interrupt, Schema}

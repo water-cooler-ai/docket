@@ -3,8 +3,8 @@ defmodule Docket.Run.Failure do
   Durable, JSON-safe description of a terminal graph failure.
 
   A failure is present on a `Docket.Run` exactly when the run's status is
-  `:failed`, and it survives storage round trips even when event persistence
-  is disabled. It describes only the terminal graph outcome: retryable
+  `:failed`, and it survives storage round trips independently of retained
+  event history. It describes only the terminal graph outcome: retryable
   node-attempt failures, operational poison facts, API validation errors,
   fence loss, and observer failures are separate concerns and never appear
   here.

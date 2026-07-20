@@ -152,6 +152,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  max_claim_attempts: 3
                })
 
+      TestRepo.update_all(
+        from(run in Run, where: run.run_id == ^initial.run.id),
+        set: [tenant_admitted_at: @now]
+      )
+
       later = DateTime.add(@now, 1, :second)
 
       next =
@@ -179,6 +184,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                RunStore.inspect_run(TestRepo, :tenantless, next.run.id) |> elem(1)
 
       assert %DateTime{} = later_claimed
+      assert TestRepo.get_by!(Run, run_id: next.run.id).tenant_admitted_at == @now
       assert TestRepo.aggregate(Event, :count) == 4
 
       assert Enum.map(TestRepo.all(from(event in Event, order_by: event.seq)), & &1.seq) == [
@@ -224,6 +230,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  max_claim_attempts: 3
                })
 
+      TestRepo.update_all(
+        from(run in Run, where: run.run_id == ^initial.run.id),
+        set: [tenant_admitted_at: @now]
+      )
+
+      admitted_at = TestRepo.get_by!(Run, run_id: initial.run.id).tenant_admitted_at
+      assert admitted_at == @now
+
       next =
         Moment.propose(
           initial.run,
@@ -247,6 +261,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert %{claim_attempts: 1, wake_at: nil} =
                RunStore.inspect_run(TestRepo, :tenantless, initial.run.id) |> elem(1)
+
+      assert TestRepo.get_by!(Run, run_id: initial.run.id).tenant_admitted_at == admitted_at
 
       assert TestRepo.aggregate(Event, :count) == 0
     end
@@ -658,6 +674,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp insert_persisted_run!(run, checkpoint_type, overrides) do
       {:ok, attrs} = RunCodec.dump(run)
+
+      TestRepo.insert_all(ClaimPartition, [%{scope_key: ""}], on_conflict: :nothing)
 
       attrs
       |> Map.merge(%{

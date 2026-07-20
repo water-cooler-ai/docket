@@ -258,7 +258,7 @@ defmodule Docket.Test.Fixtures.Graphs do
   @doc """
   start fans out to ok_node and failing_node; their join must never run.
 
-  Proves v1 permanent failure commits no writes from the failed superstep.
+  Proves v0.1 permanent failure commits no writes from the failed superstep.
   """
   def parallel_failure do
     Graph.new!(id: "parallel-failure")

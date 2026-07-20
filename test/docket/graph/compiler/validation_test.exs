@@ -269,7 +269,7 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       |> assert_diagnostic(:invalid_field_default, path: [:fields, "count", :default])
     end
 
-    test "accepts v1.1 schema types on fields" do
+    test "accepts v0.1.1 schema types on fields" do
       graph =
         Graphs.minimal_linear()
         |> Graph.put_field!("count", schema: Schema.integer(min: 0), default: 0)
@@ -349,7 +349,7 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       )
     end
 
-    test "rejects callback functions other than call in v1" do
+    test "rejects callback functions other than call in v0.1" do
       Graphs.minimal_linear()
       |> Graph.update_node!("copy", implementation: {Nodes.CopyInput, :run})
       |> verify_error!()

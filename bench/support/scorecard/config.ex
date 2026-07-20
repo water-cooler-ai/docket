@@ -3,7 +3,19 @@ defmodule Docket.Bench.Scorecard.Config do
 
   @default_seed 62_038
 
-  @claim_policies [%{name: "legacy", config: []}]
+  @claim_policies [
+    %{name: "legacy", config: []},
+    %{
+      name: "tenant_fair",
+      config: [
+        implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+        # Claim-ceiling intentionally retains every frozen claim. Keep the cap
+        # above the largest fixture so this remains a policy-path benchmark,
+        # not a sticky-cohort lifecycle test.
+        default_max_active_runs: 2_147_483_647
+      ]
+    }
+  ]
 
   @scenario_names [
     "throughput",

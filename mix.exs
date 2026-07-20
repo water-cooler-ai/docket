@@ -20,6 +20,7 @@ defmodule Docket.MixProject do
       description:
         "Durable, graph-based workflow execution for long-running, " <>
           "interruptible work like agentic LLM sessions.",
+      docs: docs(),
       package: package(),
       source_url: @source_url
     ]
@@ -59,8 +60,35 @@ defmodule Docket.MixProject do
     [
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => @source_url},
-      files:
-        ~w(lib mix.exs README.md CHANGELOG.md LICENSE docs/architecture docs/backend-conformance.md docs/telemetry.md docs/postgres-operations.md examples)
+      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE docs examples)
     ]
+  end
+
+  defp docs do
+    extras =
+      [{"README.md", filename: "readme"}, {"CHANGELOG.md", []}] ++
+        extra_pages("docs/*.md", "") ++
+        extra_pages("docs/architecture/*.md", "architecture-") ++
+        extra_pages("examples/*.md", "example-")
+
+    [
+      main: "readme",
+      extras: extras,
+      skip_undefined_reference_warnings_on: [
+        "README.md",
+        "CHANGELOG.md",
+        "docs/architecture/README.md",
+        "docs/architecture/docket-compiler-design.md",
+        "docs/architecture/docket-graph-execution-contract-design.md",
+        "docs/architecture/docket-runtime-design.md",
+        "docs/architecture/docket-v0.1.0-spec-lock-audit.md"
+      ]
+    ]
+  end
+
+  defp extra_pages(pattern, prefix) do
+    Enum.map(Path.wildcard(pattern), fn path ->
+      {path, filename: prefix <> Path.basename(path, ".md")}
+    end)
   end
 end

@@ -4,14 +4,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
+    alias Docket.Postgres.ClaimPolicy.TenantFair.RingFunction
+    alias Docket.Postgres.RunStore
     alias Docket.Postgres.TestRepo
 
-    @v1 20_260_716_000_101
+    @schema_v1 20_260_716_000_101
     @v2 20_260_716_000_102
     @private 20_260_716_000_103
     @private_v1 20_260_716_000_104
     @private_v2 20_260_716_000_105
     @failed_v2 20_260_716_000_106
+    @host_v1_to_current 20_260_716_000_107
+    @fresh_current 20_260_719_000_111
 
     defmodule InstallV1 do
       use Ecto.Migration
@@ -55,6 +59,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: :ok
     end
 
+    defmodule HostV1ToCurrent do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(version: 2)
+      def down, do: Docket.Postgres.Migration.down(version: 2)
+    end
+
     setup do
       config = TestRepo.config()
       _ = Ecto.Adapters.Postgres.storage_down(config)
@@ -63,32 +73,40 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :ok
     end
 
-    test "fresh v2 installs only current policy and partition authority" do
+    test "fresh current v2 installs cap authority, unfinished ring, cursor, and functions" do
       :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
 
       assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
 
-      assert Enum.sort(owned_claim_tables("public")) ==
-               ["docket_claim_partitions", "docket_claim_policy"]
+      assert Enum.sort(owned_claim_tables("public")) == current_claim_tables()
 
-      assert [[1, "legacy", nil, 0, nil]] =
+      assert [[1, "legacy", nil, 0, 0, nil]] =
                TestRepo.query!(
-                 "SELECT id, admission_mode, max_active, policy_version, initialized_at " <>
+                 "SELECT id, admission_mode, max_active, policy_version, " <>
+                   "scan_ring_position, initialized_at " <>
                    "FROM docket_claim_policy"
                ).rows
 
-      assert function_count("public") == 1
+      assert TestRepo.query!("SELECT count(*) FROM docket_claim_schedule").rows == [[0]]
+      assert tenant_fair_function_count("public") == 1
+      assert membership_function_count("public") == 1
+      assert membership_trigger_count("public") == 1
+      assert activity_function_count("public") == 1
+      assert activity_trigger_count("public") == 1
+      assert run_truncate_guard_trigger_count("public") == 1
+      assert schedule_truncate_guard_trigger_count("public") == 1
 
       assert Enum.sort(scope_indexes("public")) ==
                [
-                 "docket_runs_scope_expired_index",
-                 "docket_runs_scope_live_index",
-                 "docket_runs_scope_ready_index"
+                 "docket_runs_scope_admitted_expired_index",
+                 "docket_runs_scope_admitted_index",
+                 "docket_runs_scope_admitted_ready_index",
+                 "docket_runs_scope_queued_ready_index"
                ]
     end
 
-    test "ordinary v1-to-v2 upgrade backfills existing scopes transactionally" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+    test "schema-V1-to-current backfills cap partitions and unfinished-ring membership transactionally" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
 
       insert_v1_graph_and_run("tenant-a", "run-a")
       insert_v1_graph_and_run(nil, "run-system")
@@ -97,23 +115,184 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert TestRepo.query!("SELECT scope_key FROM docket_claim_partitions ORDER BY scope_key").rows ==
                [[""], ["tenant-a"]]
+
+      assert TestRepo.query!(
+               "SELECT scope_key, unfinished_count " <>
+                 "FROM docket_claim_schedule ORDER BY scope_key"
+             ).rows == [["", 1], ["tenant-a", 1]]
+
+      assert [[2, 2, 2]] =
+               TestRepo.query!(
+                 "SELECT count(*), count(DISTINCT scope_key), " <>
+                   "count(DISTINCT ring_position) FROM docket_claim_schedule"
+               ).rows
     end
 
-    test "fresh v2 and a populated v1-to-v2 upgrade have equivalent schemas" do
-      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
-      fresh = schema_signature("public")
+    test "current schema exposes one unversioned TenantFair claim function" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
+      assert tenant_fair_function_catalog("public") == []
 
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      assert tenant_fair_function_catalog("public") == [
+               [
+                 "docket_tenant_fair_claim",
+                 "timestamp with time zone, timestamp with time zone, integer, integer, text, integer, boolean"
+               ]
+             ]
+    end
+
+    test "schema-V1-to-current backfills healthy claims, leaves ready rows queued, and preserves over-cap debt" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "claimed-a")
+      insert_v1_graph_and_run("tenant-a", "claimed-b")
+      insert_v1_graph_and_run("tenant-a", "queued")
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET claim_token = CASE run_id
+            WHEN 'claimed-a' THEN '00000000-0000-0000-0000-000000000001'::uuid
+            WHEN 'claimed-b' THEN '00000000-0000-0000-0000-000000000002'::uuid
+          END,
+          claimed_at = CURRENT_TIMESTAMP - CASE run_id
+            WHEN 'claimed-a' THEN interval '2 seconds'
+            ELSE interval '1 second'
+          END,
+          wake_at = NULL,
+          claim_attempts = 1
+      WHERE run_id IN ('claimed-a', 'claimed-b')
+      """)
+
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      TestRepo.query!("""
+      UPDATE docket_claim_policy
+      SET max_active = 1, policy_version = 1,
+          initialized_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      """)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+
+      assert [
+               ["claimed-a", true, true],
+               ["claimed-b", true, true],
+               ["queued", false, false]
+             ] ==
+               TestRepo.query!("""
+               SELECT run_id, claim_token IS NOT NULL, tenant_admitted_at IS NOT NULL
+               FROM docket_runs
+               ORDER BY run_id
+               """).rows
+
+      assert [[2, 1]] =
+               TestRepo.query!("""
+               SELECT count(*) FILTER (WHERE tenant_admitted_at IS NOT NULL)::integer,
+                      greatest(count(*) FILTER (WHERE tenant_admitted_at IS NOT NULL) - 1, 0)::integer
+               FROM docket_runs
+               WHERE scope_key = 'tenant-a' AND status = 'running' AND poisoned_at IS NULL
+               """).rows
+
+      assert tenant_fair_function_catalog("public") == [
+               ["docket_tenant_fair_claim", RingFunction.identity_arguments()]
+             ]
+
+      assert_function_abi_works!("public")
+    end
+
+    test "Legacy poison clears a backfilled admission marker" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "legacy-poison")
+
+      TestRepo.query!("""
+      UPDATE docket_runs
+      SET claim_token = '00000000-0000-0000-0000-000000000009'::uuid,
+          claimed_at = CURRENT_TIMESTAMP - interval '2 minutes',
+          wake_at = NULL,
+          claim_attempts = 5
+      WHERE run_id = 'legacy-poison'
+      """)
+
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      assert {:ok, %{leases: [], poisoned: [%{run_id: "legacy-poison"}]}} =
+               RunStore.claim_due(Docket.Postgres.context(repo: TestRepo), :system, %{
+                 now: DateTime.utc_now(),
+                 limit: 1,
+                 orphan_ttl_ms: 1_000,
+                 max_claim_attempts: 5,
+                 preference: :expired
+               })
+
+      assert [[nil, true]] =
+               TestRepo.query!("""
+               SELECT tenant_admitted_at, poisoned_at IS NOT NULL
+               FROM docket_runs WHERE run_id = 'legacy-poison'
+               """).rows
+    end
+
+    test "custom-prefix current upgrade and down return to schema V1" do
+      :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
+      insert_v1_graph_and_run(nil, "tenantless-live", "docket_private")
+
+      TestRepo.query!("""
+      UPDATE docket_private.docket_runs
+      SET claim_token = '00000000-0000-0000-0000-000000000003'::uuid,
+          claimed_at = CURRENT_TIMESTAMP, wake_at = NULL, claim_attempts = 1
+      WHERE run_id = 'tenantless-live'
+      """)
+
+      :ok = Ecto.Migrator.up(TestRepo, @private_v2, UpgradePrivateV2, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(
+               repo: TestRepo,
+               prefix: "docket_private"
+             ) == 2
+
+      assert [["tenantless-live", true]] =
+               TestRepo.query!("""
+               SELECT run_id, tenant_admitted_at IS NOT NULL
+               FROM docket_private.docket_runs
+               """).rows
+
+      assert tenant_fair_function_catalog("docket_private") == [
+               ["docket_tenant_fair_claim", RingFunction.identity_arguments()]
+             ]
+
+      assert_function_abi_works!("docket_private")
+
+      :ok = Ecto.Migrator.down(TestRepo, @private_v2, UpgradePrivateV2, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(
+               repo: TestRepo,
+               prefix: "docket_private"
+             ) == 1
+
+      refute column_exists?("docket_private", "docket_runs", "tenant_admitted_at")
+
+      assert tenant_fair_function_catalog("docket_private") == []
+    end
+
+    test "host schema-V1-to-current and fresh-current paths have equivalent schemas" do
       :ok = Ecto.Migrator.up(TestRepo, @private_v1, InstallPrivateV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a", "docket_private")
       :ok = Ecto.Migrator.up(TestRepo, @private_v2, UpgradePrivateV2, log: false)
 
-      assert schema_signature("docket_private") == fresh
+      assert Docket.Postgres.Migration.migrated_version(
+               repo: TestRepo,
+               prefix: "docket_private"
+             ) == 2
 
-      assert TestRepo.query!("SELECT scope_key FROM docket_private.docket_claim_partitions").rows ==
+      upgraded = schema_signature("docket_private")
+
+      :ok = Ecto.Migrator.up(TestRepo, @fresh_current, UpgradeV2, log: false)
+      assert schema_signature("public") == upgraded
+
+      assert TestRepo.query!("SELECT scope_key FROM docket_private.docket_claim_schedule").rows ==
                [["tenant-a"]]
     end
 
-    test "database constraints reject invalid exact-cap authority" do
+    test "current v2 constraints reject invalid cap, cursor, and ring authority" do
       :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
 
       rejected = [
@@ -140,11 +319,43 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ).rows
 
       assert TestRepo.query!("SELECT count(*) FROM docket_claim_partitions").rows == [[0]]
+
+      TestRepo.query!(
+        "INSERT INTO docket_claim_partitions (scope_key) VALUES ('tenant'), ('tenant-2')"
+      )
+
+      [ring_position] =
+        TestRepo.query!(
+          "SELECT ring_position FROM docket_claim_schedule WHERE scope_key = 'tenant'"
+        ).rows
+        |> hd()
+
+      rejected = [
+        "UPDATE docket_claim_policy SET scan_ring_position = -1 WHERE id = 1",
+        "UPDATE docket_claim_schedule SET unfinished_count = -1 WHERE scope_key = 'tenant'",
+        "UPDATE docket_claim_schedule SET unfinished_count = 1 WHERE scope_key = 'tenant'",
+        "INSERT INTO docket_claim_schedule (scope_key) VALUES ('orphan')",
+        "INSERT INTO docket_claim_schedule (scope_key, ring_position) OVERRIDING SYSTEM VALUE " <>
+          "VALUES ('tenant-2', #{ring_position})",
+        "UPDATE docket_claim_schedule SET ring_position = DEFAULT WHERE scope_key = 'tenant'",
+        "UPDATE docket_claim_schedule SET scope_key = 'moved' WHERE scope_key = 'tenant'",
+        "DELETE FROM docket_claim_schedule WHERE scope_key = 'tenant'"
+      ]
+
+      Enum.each(rejected, fn statement ->
+        assert_raise Postgrex.Error, fn -> TestRepo.query!(statement) end
+      end)
+
+      TestRepo.query!("DELETE FROM docket_claim_partitions WHERE scope_key = 'tenant-2'")
+
+      assert TestRepo.query!(
+               "SELECT count(*) FROM docket_claim_schedule WHERE scope_key = 'tenant-2'"
+             ).rows == [[0]]
     end
 
     @tag timeout: 20_000
-    test "v1 inserts serialize before the v2 backfill snapshot on distinct connections" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+    test "schema V1 inserts serialize before the V2 backfill snapshot on distinct connections" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
       parent = self()
 
       writer =
@@ -168,7 +379,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 receive do
                   :commit_writer -> :committed
                 after
-                  5_000 -> raise "timed out waiting to commit the v1 insert"
+                  5_000 -> raise "timed out waiting to commit the schema V1 insert"
                 end
               end)
             end,
@@ -197,8 +408,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                [["tenant-late"]]
     end
 
-    test "a failed transactional v2 upgrade preserves the v1 schema and data" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+    test "a failed transactional V2 upgrade preserves the schema V1 data" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a")
 
       assert_raise RuntimeError, "forced v2 rollback", fn ->
@@ -208,7 +419,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
       assert owned_claim_tables("public") == []
       assert scope_indexes("public") == []
-      assert function_count("public") == 0
+      assert tenant_fair_function_count("public") == 0
       assert v1_runs("public") == [["run-a", "tenant-a"]]
     end
 
@@ -224,12 +435,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  "ORDER BY scope_key"
              ).rows == [[""], ["tenant-a"]]
 
+      assert TestRepo.query!(
+               "SELECT scope_key, unfinished_count " <>
+                 "FROM docket_private.docket_claim_schedule ORDER BY scope_key"
+             ).rows == [["", 1], ["tenant-a", 1]]
+
       assert v1_runs("docket_private") ==
                [["run-a", "tenant-a"], ["run-system", nil]]
     end
 
-    test "v2 down removes only exact-cap objects and preserves populated v1 data" do
-      :ok = Ecto.Migrator.up(TestRepo, @v1, InstallV1, log: false)
+    test "V2 down removes current authority and the claim function while preserving schema V1 data" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
       insert_v1_graph_and_run("tenant-a", "run-a")
       insert_v1_graph_and_run(nil, "run-system")
       :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
@@ -237,18 +453,121 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
       assert owned_claim_tables("public") == []
-      assert function_count("public") == 0
+      assert tenant_fair_function_count("public") == 0
       assert v1_runs("public") == [["run-a", "tenant-a"], ["run-system", nil]]
+    end
+
+    test "host schema-V1-to-current rollback target returns to schema V1" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "run-a")
+
+      :ok = Ecto.Migrator.up(TestRepo, @host_v1_to_current, HostV1ToCurrent, log: false)
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+
+      :ok = Ecto.Migrator.down(TestRepo, @host_v1_to_current, HostV1ToCurrent, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
+      assert v1_runs("public") == [["run-a", "tenant-a"]]
+      assert owned_claim_tables("public") == []
+      assert tenant_fair_function_catalog("public") == []
+    end
+
+    test "cursor, epoch, and run state share one transaction boundary" do
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+      TestRepo.query!("INSERT INTO docket_claim_partitions (scope_key) VALUES ('tenant')")
+
+      [[position]] =
+        TestRepo.query!(
+          "SELECT ring_position FROM docket_claim_schedule WHERE scope_key = 'tenant'"
+        ).rows
+
+      assert {:error, :rollback} =
+               TestRepo.transaction(fn ->
+                 TestRepo.query!(
+                   "UPDATE docket_claim_policy " <>
+                     "SET scan_ring_position = $1 WHERE id = 1",
+                   [position]
+                 )
+
+                 TestRepo.query!(
+                   "UPDATE docket_claim_partitions " <>
+                     "SET admission_epoch = admission_epoch + 1 WHERE scope_key = 'tenant'"
+                 )
+
+                 TestRepo.rollback(:rollback)
+               end)
+
+      assert [[0, 0]] = cursor_and_epoch()
+
+      assert {:ok, :committed} =
+               TestRepo.transaction(fn ->
+                 TestRepo.query!(
+                   "UPDATE docket_claim_policy " <>
+                     "SET scan_ring_position = $1 WHERE id = 1",
+                   [position]
+                 )
+
+                 TestRepo.query!(
+                   "UPDATE docket_claim_partitions " <>
+                     "SET admission_epoch = admission_epoch + 1 WHERE scope_key = 'tenant'"
+                 )
+
+                 :committed
+               end)
+
+      assert [[^position, 1]] = cursor_and_epoch()
+    end
+
+    test "concurrent first partition creation materializes one immutable ring position" do
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+
+      results =
+        1..8
+        |> Task.async_stream(
+          fn _index ->
+            TestRepo.query!(
+              "INSERT INTO docket_claim_partitions (scope_key) VALUES ('tenant') " <>
+                "ON CONFLICT (scope_key) DO NOTHING"
+            )
+          end,
+          max_concurrency: 8,
+          timeout: 5_000
+        )
+        |> Enum.to_list()
+
+      assert Enum.all?(results, &match?({:ok, %Postgrex.Result{}}, &1))
+      assert TestRepo.query!("SELECT count(*) FROM docket_claim_partitions").rows == [[1]]
+      assert TestRepo.query!("SELECT count(*) FROM docket_claim_schedule").rows == [[1]]
+
+      assert TestRepo.query!("SELECT count(DISTINCT ring_position) FROM docket_claim_schedule").rows ==
+               [[1]]
     end
 
     test "supports an explicit prefix without cross-schema objects" do
       :ok = Ecto.Migrator.up(TestRepo, @private, InstallPrivate, log: false)
 
-      assert Enum.sort(owned_claim_tables("docket_private")) ==
-               ["docket_claim_partitions", "docket_claim_policy"]
+      TestRepo.query!(
+        "INSERT INTO docket_private.docket_claim_partitions (scope_key) " <>
+          "VALUES ('prefix-tenant')"
+      )
+
+      assert Enum.sort(owned_claim_tables("docket_private")) == current_claim_tables()
+
+      assert TestRepo.query!("SELECT scope_key FROM docket_private.docket_claim_schedule").rows ==
+               [["prefix-tenant"]]
 
       assert owned_claim_tables("public") == []
-      assert function_count("docket_private") == 1
+      assert tenant_fair_function_count("docket_private") == 1
+      assert run_truncate_guard_trigger_count("docket_private") == 1
+      assert schedule_truncate_guard_trigger_count("docket_private") == 1
+    end
+
+    defp current_claim_tables do
+      [
+        "docket_claim_partitions",
+        "docket_claim_policy",
+        "docket_claim_schedule"
+      ]
     end
 
     defp owned_claim_tables(prefix) do
@@ -264,18 +583,168 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> List.flatten()
     end
 
-    defp function_count(prefix) do
+    defp tenant_fair_function_count(prefix) do
       TestRepo.query!(
         """
         SELECT count(*)::integer
         FROM pg_proc
         JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
-        WHERE pg_namespace.nspname = $1 AND proname = 'docket_tenant_fair_claim_v1'
+        WHERE pg_namespace.nspname = $1 AND proname = 'docket_tenant_fair_claim'
         """,
         [prefix]
       ).rows
       |> hd()
       |> hd()
+    end
+
+    defp tenant_fair_function_catalog(prefix) do
+      TestRepo.query!(
+        """
+        SELECT procedure.proname, pg_get_function_identity_arguments(procedure.oid)
+        FROM pg_proc AS procedure
+        JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+        WHERE namespace.nspname = $1
+          AND procedure.proname LIKE 'docket_tenant_fair_claim%'
+        ORDER BY procedure.proname
+        """,
+        [prefix]
+      ).rows
+    end
+
+    defp assert_function_abi_works!(prefix) do
+      function = ~s("#{prefix}"."docket_tenant_fair_claim")
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      assert %Postgrex.Result{} =
+               TestRepo.query!(
+                 "SELECT count(*) FROM #{function}($1, $2, $3, $4, $5, $6, false) " <>
+                   "AS claimed(#{RingFunction.result_definition()})",
+                 [now, DateTime.add(now, -3_600, :second), 1, 5, nil, 4]
+               )
+    end
+
+    defp column_exists?(prefix, table, column) do
+      TestRepo.query!(
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
+        )
+        """,
+        [prefix, table, column]
+      ).rows == [[true]]
+    end
+
+    defp membership_function_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_proc
+        JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+        WHERE pg_namespace.nspname = $1
+          AND proname = 'docket_claim_schedule_partition_v1'
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp membership_trigger_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = $1
+          AND trigger.tgname = 'docket_claim_schedule_partition_insert'
+          AND NOT trigger.tgisinternal
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp activity_function_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_proc
+        JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+        WHERE pg_namespace.nspname = $1
+          AND proname = 'docket_claim_schedule_activity_v1'
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp activity_trigger_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = $1
+          AND trigger.tgname = 'docket_claim_schedule_run_activity'
+          AND NOT trigger.tgisinternal
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp run_truncate_guard_trigger_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = $1
+          AND trigger.tgname = 'docket_claim_schedule_run_truncate_guard'
+          AND relation.relname = 'docket_runs'
+          AND trigger.tgtype = 34
+          AND NOT trigger.tgisinternal
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp schedule_truncate_guard_trigger_count(prefix) do
+      TestRepo.query!(
+        """
+        SELECT count(*)::integer
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = $1
+          AND trigger.tgname = 'docket_claim_schedule_truncate_guard'
+          AND relation.relname = 'docket_claim_schedule'
+          AND trigger.tgtype = 34
+          AND NOT trigger.tgisinternal
+        """,
+        [prefix]
+      ).rows
+      |> hd()
+      |> hd()
+    end
+
+    defp cursor_and_epoch do
+      TestRepo.query!("""
+      SELECT policy.scan_ring_position, partitions.admission_epoch
+      FROM docket_claim_policy AS policy
+      CROSS JOIN docket_claim_partitions AS partitions
+      WHERE policy.id = 1 AND partitions.scope_key = 'tenant'
+      """).rows
     end
 
     defp scope_indexes(prefix) do
@@ -357,12 +826,28 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           [prefix]
         ).rows
 
+      triggers =
+        TestRepo.query!(
+          """
+          SELECT relation.relname, trigger.tgname, pg_get_triggerdef(trigger.oid)
+          FROM pg_trigger AS trigger
+          JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+          JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = $1
+            AND relation.relname LIKE 'docket_%'
+            AND NOT trigger.tgisinternal
+          ORDER BY relation.relname, trigger.tgname
+          """,
+          [prefix]
+        ).rows
+
       %{
         columns: normalize_schema(columns, prefix),
         constraints: normalize_schema(constraints, prefix),
         indexes: normalize_schema(indexes, prefix),
         sequences: normalize_schema(sequences, prefix),
-        functions: normalize_schema(functions, prefix)
+        functions: normalize_schema(functions, prefix),
+        triggers: normalize_schema(triggers, prefix)
       }
     end
 

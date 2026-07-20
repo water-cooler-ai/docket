@@ -4,7 +4,7 @@ defmodule Docket.Runtime.Graph.Lowering do
 
   Supports diagnostics, runtime debug views, live run overlays, event mapping,
   and test assertions. Branch groups do not lower to execution machinery in
-  v1; they are preserved here for editors and overlays.
+  v0.1; they are preserved here for editors and overlays.
   """
 
   defstruct public_to_runtime: %{

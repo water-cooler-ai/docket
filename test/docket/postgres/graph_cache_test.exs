@@ -108,13 +108,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "a redefined node implementation module invalidates the cached graph" do
-      define_node_module(@mutable_module, "v1")
+      define_node_module(@mutable_module, "revision-1")
       {:ok, rtg} = Compiler.compile(graph_with_module(@mutable_module))
 
       assert :ok = GraphCache.put_compiled("mutable", "hash-1", rtg)
       assert GraphCache.fetch("mutable", "hash-1") == {:ok, rtg}
 
-      define_node_module(@mutable_module, "v2")
+      define_node_module(@mutable_module, "revision-2")
 
       assert GraphCache.fetch("mutable", "hash-1") == :miss
     end

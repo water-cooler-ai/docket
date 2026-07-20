@@ -29,16 +29,16 @@ defmodule Docket.Graph.Compiler.Policies do
   @spec max_supersteps_key() :: String.t()
   def max_supersteps_key, do: @max_supersteps_key
 
-  @typedoc "Resolved v1 node execution policies with defaults applied."
+  @typedoc "Resolved v0.1 node execution policies with defaults applied."
   @type node_policies :: %{
           timeout_ms: pos_integer() | nil,
           retry: %{max_attempts: pos_integer(), backoff_ms: non_neg_integer()}
         }
 
   @doc """
-  Resolves the v1 node policy surface: `"timeout_ms"` and
+  Resolves the v0.1 node policy surface: `"timeout_ms"` and
   `"retry" => %{"max_attempts", "backoff_ms"}`. `"on_error"` is reserved for
-  post-v1 routing and rejected so graphs cannot silently depend on it;
+  post-v0.1 routing and rejected so graphs cannot silently depend on it;
   other unknown keys are ignored as open content.
 
   Returns every problem, keyed by the offending policy key, so compiler
@@ -68,7 +68,7 @@ defmodule Docket.Graph.Compiler.Policies do
         []
 
       {:ok, _value} ->
-        [{"on_error", "node policy \"on_error\" is reserved and not supported in v1"}]
+        [{"on_error", "node policy \"on_error\" is reserved and not supported in v0.1"}]
     end
   end
 

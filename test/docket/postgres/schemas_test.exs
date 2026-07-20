@@ -51,9 +51,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert run.step == 0
         assert run.checkpoint_seq == 0
         assert run.claim_attempts == 0
+        assert run.tenant_admitted_at == nil
         assert run.poisoned_at == nil
         assert run.poison_reason == nil
         assert :state in Run.__schema__(:redact_fields)
+      end
+
+      test "keeps the internal TenantFair admission marker read-only" do
+        run =
+          @valid_run
+          |> Map.put(:tenant_admitted_at, ~U[2026-07-09 00:00:01.000000Z])
+          |> Run.changeset()
+          |> Ecto.Changeset.apply_changes()
+
+        assert run.tenant_admitted_at == nil
       end
 
       test "requires run identity, status, state, and started_at" do
@@ -177,6 +188,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    :admission_mode,
                    :max_active,
                    :policy_version,
+                   :scan_ring_position,
                    :initialized_at,
                    :updated_at
                  ]

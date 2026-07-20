@@ -85,7 +85,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.ClaimCeiling do
   end
 
   defp seed_backlog(ctx, n) do
-    Db.truncate(ctx)
+    Db.reset(ctx)
     Docket.Postgres.GraphCache.clear()
 
     due_at = DateTime.add(DateTime.utc_now(), -1, :second)

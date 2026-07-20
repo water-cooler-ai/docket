@@ -4,36 +4,28 @@ All notable changes to `docket` are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [Semantic Versioning](https://semver.org/).
 
-Each v0.1.0 change updates the Unreleased section in its own PR.
-
 ## 0.1.0 — Unreleased
-
-The developing operational release line. The backend contract, PostgreSQL
-stores, migration, lifecycle transactions, dispatcher, claimed-run vehicle,
-notifier, pruner, and public `Docket.Postgres` bundle have landed. The
-implementation guide and current-state audit live in `docs/architecture/`;
-entries below reflect what has landed so far.
 
 ### Added
 
-- PostgreSQL run creation now atomically materializes the canonical
-  owner-derived claim partition with an inherited cap and version-zero state.
-  Concurrent first inserts use `ON CONFLICT DO NOTHING`, preserving Admin-owned
-  state and versions. A non-locking existence read keeps established
-  partitions off that uniqueness path, so run creation does not wait behind an
-  admission epoch update. Failed or outer-rolled-back run creation leaves no
-  new partition or wake notification. Dormant partition rows are retained
-  after their last run disappears and are never selected from serialized
-  payload identity.
-- PostgreSQL schema version 2: prefix-local exact-cap policy, partition,
-  ordinary supporting indexes, engine interlock, and TenantFair claim function.
-  Existing scope keys are backfilled transactionally while inserts are blocked.
-  ClaimPolicy implementations receive the additive quoted identifier context.
-- Exact-cap `Docket.Postgres.ClaimPolicy.TenantFair` admission with one persisted
-  default, optional per-owner overrides, concurrent final-slot serialization,
-  count-neutral expired recovery, cap-reduction debt, and bounded cross-owner
-  rotation. The current-state Admin API supports versioned default and override
-  changes without rollout ledgers, audit history, or governance workflows.
+- PostgreSQL schema version 2 adds the complete TenantFair engine: one
+  database-and-schema fairness domain, an authoritative trigger-maintained
+  unfinished-partition ring, a serialized circular cursor, bounded
+  cross-partition traversal, and exact sticky logical-run admission. FIFO
+  promotion and fresh marker counts enforce `max_active_runs`; cooperative
+  yield, refresh, reacquisition, and expired steal retain admission, while
+  future scheduling, external waiting, interruption, poison, and terminal
+  transitions release it. Cap decreases create non-preemptive debt. Run
+  creation atomically materializes its owner partition, and rollback leaves no
+  partition or wake behind. The stopped migration backfills healthy claims,
+  installs the indexes, engine interlock, and sole claim function, supports
+  custom prefixes and rollback to host schema V1, and makes stale schema shapes
+  fail closed. Required PostgreSQL tenancy selects TenantFair with an explicit
+  `default_max_active_runs`; the versioned Admin API manages the persisted
+  default and per-owner overrides and reports token-free queued, admitted, and
+  debt counts. ClaimPolicy implementations receive the quoted schema
+  identifiers needed to build prefix-local plans. See the
+  [TenantFair claim policy](docs/architecture/docket-tenant-fair.md).
 - `Docket.BackendTests`, a source-owned shared ExUnit suite under
   `test/support`. One explicit backend matrix generates identical black-box
   cases for the memory and PostgreSQL bundles; external backend projects can
@@ -210,10 +202,9 @@ entries below reflect what has landed so far.
 - Durable graphs and opaque run/event state use a private versioned
   deterministic ETF codec and PostgreSQL `bytea`. Graph identity hashes the
   exact stored ETF projection; relational columns retain the facts needed for
-  claiming, scheduling, inspection, retention, and constraints. The
-  graph JSON serializer and public `Docket.Graph.to_map/from_map` and
-  `Docket.Graph.hash` APIs, along with the persistence-only Run map
-  codec/version, were removed with no v0.0.1 decoder or dual-write path.
+  claiming, scheduling, inspection, retention, and constraints. The public
+  `Docket.Graph.hash` API and persistence-only Run map codec/version were
+  removed with no v0.0.1 decoder or dual-write path.
   Graph identity is now computed privately only from effective graph bytes
   produced by compiler ingest. Graph-specific canonicalization and strict
   recovered collection validation live at the compiler boundary; the generic
@@ -221,15 +212,12 @@ entries below reflect what has landed so far.
   (#26).
 - `Docket.Event`: metadata-only `:checkpoint_committed` event type and the
   `types/0` helper (#12).
-- The original operational transition spec and v0.1.0 spec-lock audit
-  (#13), since rewritten as a current PostgreSQL guide and
-  implementation audit.
 - `Docket.Run.Failure`: durable, JSON-safe terminal failure payload
   (`code`, `message`, optional `node_id`/`details`), present exactly when a
   run is `:failed` (`Run.validate_failure/1`, enforced at the wire boundary
   and shared backend commits) and populated by every runtime terminal-failure
-  path, so a failed run retains its cause with event persistence off
-  (#17).
+  path, so a failed run retains its cause independently of retained event
+  history (#17).
 - `Docket.RunInfo`: token-free operational projection (`run`, `wake_at`,
   `claimed_at`, `claim_attempts`, paired poison facts) returned by
   `Docket.Backend.RunStore.inspect_run`, documenting the `inspect_run` contract
@@ -316,9 +304,9 @@ entries below reflect what has landed so far.
   dependencies, migration, supervision, retention, publication, and durable
   execution. Release documentation consistently describes the backend-owned
   v0.1.0 lifecycle, processless waiting, required tenant scope, deterministic
-  testing modes, and current production vehicles. The Hex package includes its linked
-  examples, telemetry guide, architecture guides, and changelog, and the
-  historical pre-cutover audit is labeled at each obsolete finding.
+  testing modes, and current production vehicles. The Hex package and ExDoc
+  output include the linked operational, architecture, roadmap, and example
+  guides.
 - Runtime dispatch now executes every node selected for a superstep
   concurrently against the same committed snapshot, then collects results in
   deterministic activation order before crossing the existing update barrier.
@@ -345,10 +333,7 @@ entries below reflect what has landed so far.
 - One `docket` package: `Docket.Postgres.*` compiles only when the host
   supplies optional `ecto_sql`/`postgrex`; the core keeps no hard Postgres
   dependency (#8/#9).
-- Version bumped to `0.1.0-dev`; release work branches from and merges back
-  to `v0.1.0` (#8).
-- Module docs restated as API truth: design rationale moved out of module
-  docs and comments into the design docs (#10).
+- Version bumped to `0.1.0-dev` (#8).
 - `Docket.Node` documentation clarifies the four failure-signaling forms and
   their identical normalization (#12).
 
@@ -390,7 +375,7 @@ entries below reflect what has landed so far.
 
 - `docket_checkpoints` table and its Ecto schema: `docket_runs.checkpoint_seq`
   is the run fence, recovery reads the run row, and retained events provide
-  history. Exactly three operational tables remain (#11).
+  history (#11).
 - Loader acceptance of version-1 run documents and the serialized `created`
   status (#17).
 

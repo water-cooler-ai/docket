@@ -1,8 +1,8 @@
 defmodule Docket.Graph.Compiler.Lowering do
   @moduledoc false
 
-  # Phase 9.11: lowers a validated public graph into the internal runtime
-  # graph. Only runs when validation produced no blocking diagnostics, so it
+  # Lowers a validated public graph into the internal runtime graph. It runs
+  # only when validation produced no blocking diagnostics, so it
   # may assume record shapes are sound. All iteration is sorted by public ID
   # and generated content is derived only from graph content plus compile
   # opts, keeping compilation deterministic.
@@ -217,7 +217,7 @@ defmodule Docket.Graph.Compiler.Lowering do
   end
 
   # ---------------------------------------------------------------------------
-  # Runtime ID policy (compiler design section 11)
+  # Runtime ID policy
   # ---------------------------------------------------------------------------
 
   defp input_channel_id(id), do: "input:" <> id

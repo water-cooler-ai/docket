@@ -21,7 +21,7 @@ defmodule Docket.Bench.Scorecard.Migration do
 end
 
 defmodule Docket.Bench.Scorecard.Db do
-  @moduledoc "Repo lifecycle, scratch schema management, truncation, and environment metadata."
+  @moduledoc "Repo lifecycle, scratch schema management, reset, and environment metadata."
 
   alias Docket.Bench.Scorecard.{Migration, Repo, Types}
 
@@ -77,11 +77,36 @@ defmodule Docket.Bench.Scorecard.Db do
     :ok
   end
 
-  def truncate(ctx) do
-    events = table(ctx.prefix, "docket_events")
+  def reset(ctx) do
     runs = table(ctx.prefix, "docket_runs")
     graphs = table(ctx.prefix, "docket_graph_versions")
-    Repo.query!("TRUNCATE #{events}, #{runs}, #{graphs} RESTART IDENTITY CASCADE")
+    partitions = table(ctx.prefix, "docket_claim_partitions")
+    policy = table(ctx.prefix, "docket_claim_policy")
+
+    {:ok, _result} =
+      Repo.transaction(fn ->
+        # V2 protects trigger-maintained unfinished counts by rejecting TRUNCATE.
+        # Deleting runs first lets the activity trigger bring every schedule row
+        # to zero before its owning partition is removed.
+        Repo.query!("DELETE FROM #{runs}")
+        Repo.query!("DELETE FROM #{graphs}")
+        Repo.query!("DELETE FROM #{partitions}")
+
+        # Policy variants share this isolated scratch schema. With no runs or
+        # partitions left, restore its pre-admission state so Legacy and
+        # TenantFair trials remain independent.
+        Repo.query!("""
+        UPDATE #{policy}
+        SET admission_mode = 'legacy',
+            max_active = NULL,
+            policy_version = 0,
+            scan_ring_position = 0,
+            initialized_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = 1
+        """)
+      end)
+
     :ok
   end
 

@@ -16,7 +16,7 @@ defmodule Docket.Node do
   node's resolved retry policy (`max_attempts`/`backoff_ms`); when retries are
   exhausted the failure becomes *permanent*.
 
-  A permanent node failure fails the **entire run**, not just the node. v1 has
+  A permanent node failure fails the **entire run**, not just the node. v0.1 has
   no per-node error recovery or error-edge routing: at the update barrier a
   permanent failure commits **no writes** from that superstep (including writes
   from sibling nodes that succeeded), transitions the run to the terminal
@@ -30,7 +30,7 @@ defmodule Docket.Node do
   field and branch on that field with an edge guard — do not return
   `{:error, ...}`.
 
-  `{:await, term()}` is reserved for post-v1 late-completion protocols; in v1
+  `{:await, term()}` is reserved for post-v0.1 late-completion protocols; in v0.1
   the dispatcher treats it as a permanent node failure.
   """
 
@@ -40,8 +40,8 @@ defmodule Docket.Node do
   Executes the node against its state snapshot, resolved config, and runtime
   context.
 
-  `{:await, term()}` is reserved for post-v1 late-completion protocols; in
-  v1 the dispatcher treats it as a permanent node failure.
+  `{:await, term()}` is reserved for post-v0.1 late-completion protocols; in
+  v0.1 the dispatcher treats it as a permanent node failure.
   """
   @callback call(state :: map(), config :: map(), context :: map()) ::
               {:ok, state_update :: map()}

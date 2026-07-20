@@ -158,7 +158,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.Surge do
       end
 
     plan = %{scenario: name(), tenant_mode: :none, graph: graph(), runs: runs}
-    Db.truncate(ctx)
+    Db.reset(ctx)
     Docket.Postgres.GraphCache.clear()
     Seed.seed(ctx, plan)
     :ok

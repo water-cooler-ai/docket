@@ -43,7 +43,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, _ast} = Code.string_to_quoted(content)
     end
 
-    test "generates an explicit ordinary v1-to-v2 upgrade" do
+    test "generates an explicit schema-V1-to-current upgrade with a schema-V1 rollback point" do
       [file] =
         Mix.Tasks.Docket.Gen.Migration.run([
           "-r",

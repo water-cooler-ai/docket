@@ -6,6 +6,339 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @default_timeout 5_000
 
+    defmodule FairRotationOracle do
+      @moduledoc false
+
+      @unsuccessful_dispositions [:lock_skip, :cap_denied, :stale, :empty]
+
+      @doc false
+      def bounds!(opts) when is_list(opts) do
+        target = Keyword.fetch!(opts, :target)
+        cohort = opts |> Keyword.fetch!(:cohort) |> MapSet.new()
+        ring = ring!(opts)
+        ring_count = length(ring)
+        scan_budget = positive!(opts, :scan_budget)
+        quantum = positive!(opts, :quantum)
+        lock_failures = non_negative!(opts, :lock_failures)
+        population = MapSet.size(cohort)
+
+        unless MapSet.member?(cohort, target) do
+          raise ArgumentError, "fair-rotation cohort must contain the target"
+        end
+
+        ring_set = ring |> Enum.map(&elem(&1, 1)) |> MapSet.new()
+
+        unless MapSet.subset?(cohort, ring_set) do
+          raise ArgumentError, "fair-rotation ring must contain every cohort partition"
+        end
+
+        if population == 0 or population > ring_count do
+          raise ArgumentError,
+                "fair-rotation population must satisfy 1 <= A <= H, got A=#{population}, H=#{ring_count}"
+        end
+
+        grant_bound = (lock_failures + 1) * (population - 1)
+
+        %{
+          population: population,
+          ring: ring,
+          ring_count: ring_count,
+          scan_budget: scan_budget,
+          quantum: quantum,
+          lock_failures: lock_failures,
+          other_grants: grant_bound,
+          other_outcomes: quantum * grant_bound,
+          scan_calls:
+            (lock_failures + 1) *
+              (population - 1 + ceil_div(ring_count - population + 1, scan_budget))
+        }
+      end
+
+      @doc false
+      def assert_trace!(trace, opts) when is_list(trace) and is_list(opts) do
+        target = Keyword.fetch!(opts, :target)
+        cohort = opts |> Keyword.fetch!(:cohort) |> MapSet.new()
+        bounds = bounds!(opts)
+        committed = Enum.map(trace, &normalize_event!/1)
+        assert_ordered_calls!(committed)
+        target_index = target_grant_index!(committed, target)
+        target_call = committed |> Enum.at(target_index) |> Map.fetch!(:call)
+        through_target_call = Enum.take_while(committed, &(&1.call <= target_call))
+        window = Enum.take(committed, target_index + 1)
+
+        assert_cursor!(through_target_call, bounds.ring)
+        assert_call_budgets!(through_target_call, bounds.scan_budget)
+        assert_events!(window, cohort, bounds.quantum)
+        assert_rounds!(window, target)
+
+        target_failures =
+          window
+          |> Enum.drop(-1)
+          |> Enum.count(&(&1.partition == target))
+
+        if target_failures > bounds.lock_failures do
+          fail!("target failed #{target_failures} inspections; L allows #{bounds.lock_failures}")
+        end
+
+        before_target = Enum.drop(window, -1)
+        other_grants = Enum.count(before_target, &(&1.disposition == :grant))
+
+        other_outcomes =
+          before_target
+          |> Enum.filter(&(&1.disposition == :grant))
+          |> Enum.sum_by(& &1.outcomes)
+
+        scan_calls = window |> Enum.map(& &1.call) |> Enum.uniq() |> length()
+
+        assert_at_most!(other_grants, bounds.other_grants, "other-partition grants")
+        assert_at_most!(other_outcomes, bounds.other_outcomes, "other-partition outcomes")
+        assert_at_most!(scan_calls, bounds.scan_calls, "qualifying scan calls")
+
+        Map.merge(bounds, %{
+          observed_other_grants: other_grants,
+          observed_other_outcomes: other_outcomes,
+          observed_scan_calls: scan_calls
+        })
+      end
+
+      defp normalize_event!(
+             %{
+               call: call,
+               ordinal: ordinal,
+               cursor_before: cursor_before,
+               cursor_after: cursor_after,
+               demand: demand,
+               partition: partition,
+               disposition: disposition,
+               outcomes: outcomes,
+               epoch_delta: epoch_delta
+             } = event
+           )
+           when is_integer(call) and call > 0 and is_integer(ordinal) and ordinal > 0 and
+                  is_integer(cursor_before) and cursor_before >= 0 and
+                  is_integer(cursor_after) and cursor_after >= 0 and
+                  is_integer(demand) and demand > 0 and
+                  is_integer(outcomes) and outcomes >= 0 and
+                  is_integer(epoch_delta) do
+        if Map.get(event, :committed, true) != true do
+          fail!("fair-rotation oracle accepts committed trace events only")
+        end
+
+        %{
+          call: call,
+          ordinal: ordinal,
+          cursor_before: cursor_before,
+          cursor_after: cursor_after,
+          demand: demand,
+          partition: partition,
+          disposition: disposition,
+          outcomes: outcomes,
+          epoch_delta: epoch_delta
+        }
+      end
+
+      defp normalize_event!(event),
+        do: fail!("invalid fair-rotation trace event: #{inspect(event)}")
+
+      defp target_grant_index!(events, target) do
+        case Enum.find_index(events, &(&1.partition == target and &1.disposition == :grant)) do
+          nil -> fail!("fair-rotation trace contains no committed target grant")
+          index -> index
+        end
+      end
+
+      defp assert_ordered_calls!(events) do
+        positions = Enum.map(events, &{&1.call, &1.ordinal})
+
+        if positions != Enum.sort(positions) or Enum.uniq(positions) != positions do
+          fail!("fair-rotation trace is not ordered by database scan sequence")
+        end
+
+        Enum.each(Enum.group_by(events, & &1.call), fn {call, inspected} ->
+          ordinals = Enum.map(inspected, & &1.ordinal)
+
+          if ordinals != Enum.to_list(1..length(inspected)) do
+            fail!("scan call #{call} has non-contiguous visit ordinals: #{inspect(ordinals)}")
+          end
+        end)
+      end
+
+      defp assert_call_budgets!(events, scan_budget) do
+        Enum.each(Enum.group_by(events, & &1.call), fn {call, inspected} ->
+          count = length(inspected)
+
+          if count > scan_budget do
+            fail!("scan call #{call} inspected #{count} positions; S=#{scan_budget}")
+          end
+
+          demands = inspected |> Enum.map(& &1.demand) |> Enum.uniq()
+
+          if length(demands) != 1 do
+            fail!("scan call #{call} has inconsistent demand: #{inspect(demands)}")
+          end
+
+          remaining =
+            Enum.reduce(inspected, hd(demands), fn event, remaining ->
+              if remaining == 0 do
+                fail!("scan call #{call} continued after filling demand")
+              end
+
+              if event.outcomes > remaining do
+                fail!("scan call #{call} returned more outcomes than remaining demand")
+              end
+
+              remaining - event.outcomes
+            end)
+
+          if remaining > 0 and count != scan_budget do
+            fail!(
+              "unfilled scan call #{call} advanced #{count} positions; expected full S=#{scan_budget}"
+            )
+          end
+        end)
+      end
+
+      defp assert_cursor!(events, ring) do
+        Enum.reduce(events, nil, fn event, prior_after ->
+          if prior_after != nil and event.cursor_before != prior_after do
+            fail!("scan cursor is not contiguous between visits")
+          end
+
+          {expected_after, expected_partition} =
+            Enum.find(ring, fn {position, _partition} -> position > event.cursor_before end) ||
+              hd(ring)
+
+          unless event.cursor_after == expected_after do
+            fail!("scan cursor did not advance to the next cyclic ring position")
+          end
+
+          unless expected_partition == event.partition do
+            fail!("inspected partition does not match the frozen cursor position")
+          end
+
+          event.cursor_after
+        end)
+
+        :ok
+      end
+
+      defp assert_events!(events, cohort, quantum) do
+        Enum.each(events, fn event ->
+          case event.disposition do
+            :grant ->
+              unless MapSet.member?(cohort, event.partition) do
+                fail!("partition outside the frozen cohort received a grant")
+              end
+
+              unless event.outcomes in 1..quantum do
+                fail!("grant outcomes must be in 1..Q, got #{event.outcomes} with Q=#{quantum}")
+              end
+
+              if event.epoch_delta != 1 do
+                fail!("a committed grant must advance admission_epoch exactly once")
+              end
+
+            disposition when disposition in @unsuccessful_dispositions ->
+              if event.outcomes != 0 or event.epoch_delta != 0 do
+                fail!(
+                  "unsuccessful inspections cannot return outcomes or advance admission_epoch"
+                )
+              end
+
+            disposition ->
+              fail!("unknown fair-rotation disposition: #{inspect(disposition)}")
+          end
+        end)
+      end
+
+      defp assert_rounds!(events, target) do
+        Enum.reduce(events, MapSet.new(), fn event, granted ->
+          cond do
+            event.partition == target ->
+              MapSet.new()
+
+            event.disposition == :grant and MapSet.member?(granted, event.partition) ->
+              fail!(
+                "partition #{inspect(event.partition)} received two grants in one target interval"
+              )
+
+            event.disposition == :grant ->
+              MapSet.put(granted, event.partition)
+
+            true ->
+              granted
+          end
+        end)
+
+        :ok
+      end
+
+      defp assert_at_most!(observed, bound, _label) when observed <= bound, do: :ok
+
+      defp assert_at_most!(observed, bound, label),
+        do: fail!("#{label} exceeded bound: observed #{observed}, bound #{bound}")
+
+      defp positive!(opts, key) do
+        case Keyword.fetch!(opts, key) do
+          value when is_integer(value) and value > 0 ->
+            value
+
+          value ->
+            raise ArgumentError, "#{key} must be a positive integer, got: #{inspect(value)}"
+        end
+      end
+
+      defp non_negative!(opts, key) do
+        case Keyword.fetch!(opts, key) do
+          value when is_integer(value) and value >= 0 ->
+            value
+
+          value ->
+            raise ArgumentError, "#{key} must be a non-negative integer, got: #{inspect(value)}"
+        end
+      end
+
+      defp ring!(opts) do
+        case Keyword.fetch!(opts, :ring) do
+          ring when is_list(ring) and ring != [] ->
+            valid? =
+              Enum.all?(ring, fn
+                {position, partition} ->
+                  is_integer(position) and position > 0 and not is_nil(partition)
+
+                _other ->
+                  false
+              end)
+
+            unless valid? do
+              raise ArgumentError,
+                    "ring must contain positive {ring_position, partition} pairs"
+            end
+
+            positions = Enum.map(ring, &elem(&1, 0))
+            partitions = Enum.map(ring, &elem(&1, 1))
+
+            cond do
+              positions != Enum.sort(positions) ->
+                raise ArgumentError, "fair-rotation ring must be ordered by ring position"
+
+              Enum.uniq(positions) != positions or Enum.uniq(partitions) != partitions ->
+                raise ArgumentError, "fair-rotation ring must be duplicate-free"
+
+              true ->
+                ring
+            end
+
+          ring ->
+            raise ArgumentError, "ring must be a non-empty list, got: #{inspect(ring)}"
+        end
+      end
+
+      defp ceil_div(dividend, divisor), do: div(dividend + divisor - 1, divisor)
+
+      defp fail!(message), do: raise(ArgumentError, message)
+    end
+
     defmodule KnownBadRankThenLock do
       @moduledoc false
 

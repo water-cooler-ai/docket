@@ -8,7 +8,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     alias Docket.Postgres.{GraphStore, Pruner, RunCodec, RunStore}
     alias Docket.Postgres.PrunerTestRepo, as: TestRepo
-    alias Docket.Postgres.Schemas.{Event, GraphVersion, Run}
+    alias Docket.Postgres.Schemas.{ClaimPartition, Event, GraphVersion, Run}
     alias Docket.Run.Failure
 
     @migration_version 20_260_711_000_027
@@ -360,6 +360,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           inserted_at: updated_at
         })
 
+      scope_key = attrs.tenant_id || ""
+      TestRepo.insert_all(ClaimPartition, [%{scope_key: scope_key}], on_conflict: :nothing)
       assert {1, _} = TestRepo.insert_all(Run, [attrs])
       run
     end

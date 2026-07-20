@@ -1,10 +1,7 @@
 # Parent App Integration Example
 
-This example connects durable Docket runs to app-owned users, accounts, and
-workflow rows without making the parent application a second persistence
-driver.
-
-> **Status:** this is the v0.1.0 production integration API.
+Durable Docket runs can reference app-owned users, accounts, and workflow rows
+without making the parent application a second persistence driver.
 
 ## Configure one backend
 
@@ -14,6 +11,10 @@ defmodule MyApp.Docket do
     repo: MyApp.Repo,
     backend: Docket.Postgres,
     tenant_mode: :required,
+    claim_policy: [
+      implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+      default_max_active_runs: 4
+    ],
     checkpoint_observers: [MyApp.DocketProjection],
     pruner: [
       interval_ms: :timer.hours(1),

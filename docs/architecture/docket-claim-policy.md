@@ -36,58 +36,26 @@ lock on `docket_claim_policy` and admits only while `admission_mode` is
 `legacy`. A TenantFair mode, a skipped policy lock, a read-only transaction,
 or non-Read-Committed isolation fails closed before run mutation.
 
-Legacy remains the default when `claim_policy:` is omitted.
+Legacy remains the default for `tenant_mode: :none` when `claim_policy:` is
+omitted. PostgreSQL `tenant_mode: :required` rejects Legacy and requires the
+TenantFair implementation with an explicit cap.
 
 ## TenantFair
 
-TenantFair adds exact per-owner caps and bounded cross-owner rotation:
+`Docket.Postgres.ClaimPolicy.TenantFair` is the sole required-tenancy engine.
+It invokes the prefix-local claim function once; the function owns sticky
+admission, bounded ring traversal, locking, mutation, and cursor/epoch
+accounting. Its complete contract is the
+[TenantFair claim policy](docket-tenant-fair.md).
 
-```elixir
-use Docket,
-  backend: Docket.Postgres,
-  repo: MyApp.Repo,
-  tenant_mode: :required,
-  claim_policy: [
-    implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-    default_max_active: 4
-  ]
-```
-
-`default_max_active` is its only implementation option. It bootstraps an unset
-database default; persisted values and partition overrides remain authoritative.
-
-The outer statement discovers a bounded partition page ordered by
-`admission_epoch` and invokes `docket_tenant_fair_claim_v1` once. Inside the
-function, a fresh Read Committed command locks partition authority, counts live
-claims, and selects and mutates rows. Ready admission is limited to available
-capacity; expired steals are count-neutral. Every considered partition
-advances its epoch so a cap-denied head cannot permanently hide later work.
-
-See [Exact-cap admission contract](docket-exact-cap-contract.md) for the
-normative invariants and upgrade boundary.
-
-## Configuration and rollout
-
-The engine choice is instance-level, while its cap is database-wide. Do not
-run a mixed deployment that includes binaries predating the `admission_mode`
-interlock.
-
-For an existing v1 installation:
-
-1. stop Docket dispatchers and all run writers;
-2. apply the generated transactional v1-to-v2 migration;
-3. deploy one homogeneous application version;
-4. configure every instance for the same engine; and
-5. restart processing.
-
-This stopped upgrade is the v0.1.0 operational contract. Online schema changes,
-fleet attestations, readiness ledgers, activation ceremonies, audited mode
-history, and hot mixed-version rollout are deferred.
+Engine choice is instance-level. Deployments must not mix binaries that predate
+the `admission_mode` interlock. Stopped-upgrade commands and operational
+inspection are in the [PostgreSQL operations guide](../postgres-operations.md).
 
 ## Test contract
 
 The shared ClaimPolicy and live RunStore matrices verify implementation
 selection, one-statement execution, decoded lease persistence, PostgreSQL error
-preservation, transaction behavior, and telemetry. TenantFair adds live tests
-for concurrent final-slot enforcement, cap reduction, expired recovery,
-cross-scope rotation, capped-head progress, and the Legacy interlock.
+preservation, transaction behavior, and telemetry. The
+[TenantFair correctness evidence](docket-tenant-fair.md#correctness-evidence)
+names its policy-specific tests.

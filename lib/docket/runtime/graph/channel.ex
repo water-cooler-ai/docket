@@ -2,7 +2,7 @@ defmodule Docket.Runtime.Graph.Channel do
   @moduledoc """
   Internal runtime channel definition.
 
-  v1 channel types:
+  v0.1 channel types:
 
   - `:last_value` - input and state channels; stores the last committed value
   - `:ephemeral` - generated edge activation channels; visible for one step

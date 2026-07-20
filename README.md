@@ -5,12 +5,12 @@ built for long-running, interruptible work like agentic LLM sessions, where a
 run may pause for an external resolution, survive a deploy, and resume exactly
 where it left off.
 
-This branch is `0.1.0-dev`. Graph semantics are usable processlessly through
-`Docket.Test`; supervised production requires the assembled `Docket.Postgres`
+Graph semantics are usable processlessly through `Docket.Test`; supervised
+production requires the assembled `Docket.Postgres`
 durable backend. The PostgreSQL bundle owns its stores,
 transaction recipes, claim fencing, dispatcher, claimed-run vehicles,
 notification fast path, and retention pruner. See the
-[PostgreSQL backend guide](docs/architecture/docket-operational-transition-spec.md)
+[PostgreSQL operations guide](docs/postgres-operations.md)
 for configuration and operational boundaries.
 
 You describe a workflow as a graph document: nodes that do work, shared state
@@ -261,8 +261,11 @@ report the retained window, while `latest_seq` is the run's latest committed
 event sequence regardless of retention, so a fully pruned history is detectable
 as `latest_seq > 0` with `latest_available_seq == nil`.
 
-For multi-tenant applications, configure `tenant_mode: :required` and pass a
-non-empty `tenant_id` to every run, read, and signal call. See the
+For multi-tenant PostgreSQL applications, configure `tenant_mode: :required`,
+select `Docket.Postgres.ClaimPolicy.TenantFair` with an explicit
+`default_max_active_runs`, and pass a non-empty `tenant_id` to every run, read,
+and signal call. See the [TenantFair claim policy](docs/architecture/docket-tenant-fair.md)
+for the sticky-cap and fairness boundary, and the
 [parent-application example](examples/parent-app-integration.md). To enable the
 LISTEN/NOTIFY latency fast path, remove `notifier: :none`; deployments behind
 PgBouncer transaction or statement pooling must give the notifier a direct or
@@ -431,9 +434,17 @@ the package page.
 - [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).
 - [PostgreSQL operations and correctness guide](docs/postgres-operations.md) —
   statuses, claims, poison recovery, configuration, and inspection.
+- [TenantFair claim policy](docs/architecture/docket-tenant-fair.md) — the
+  shipped state model, exact-cap and fair-rotation contract, release evidence,
+  rollout boundary, and explicit nonclaims.
+- [Future roadmap](docs/future-roadmap.md) — project-wide future features,
+  improvements, investigations, and research.
+- [Telemetry](docs/telemetry.md) and [benchmarks](docs/benchmarks.md) —
+  operational signals and non-oracle regression measurements.
 - [examples/llm-node.md](examples/llm-node.md) — a generic, configurable LLM
   node implementation.
-- [docs/architecture/](docs/architecture/) — design rationale: the graph
-  document contract, compiler, execution contract, and runtime background.
+- [Architecture guide index](docs/architecture/README.md) — design rationale:
+  the graph document contract, compiler, execution contract, and runtime
+  background.
 - Module docs — `Docket`, `Docket.Graph`, `Docket.Run`, `Docket.Node`,
   `Docket.Checkpoint`, and `Docket.Test` are the authoritative API reference.

@@ -1,7 +1,7 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.ClaimPolicy.Legacy do
     @moduledoc """
-    Current tenant-blind PostgreSQL admission engine.
+    Tenant-blind PostgreSQL admission engine.
 
     This module owns the complete legacy claim plan: ready and expired
     selection, class progress and preference, claim/steal/poison mutation,
@@ -289,6 +289,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               CASE WHEN runs.claim_attempts < $4 THEN gen_random_uuid() ELSE NULL END,
             claimed_at =
               CASE WHEN runs.claim_attempts < $4 THEN $1 ELSE NULL END,
+            tenant_admitted_at =
+              CASE WHEN runs.claim_attempts < $4 THEN runs.tenant_admitted_at ELSE NULL END,
             wake_at = NULL,
             claim_attempts =
               CASE

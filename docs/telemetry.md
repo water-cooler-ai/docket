@@ -21,9 +21,10 @@ labels. Claim tokens are never emitted.
 | `[:docket, :postgres, :dispatcher, :shutdown]` | `duration`, `vehicles_remaining` | `result` |
 | `[:docket, :postgres, :notification]` | `count` | `result` |
 | `[:docket, :postgres, :run_store, :claim]` | duration, candidate/selection ages and counts, `demand`, `leases`, `poisoned`, `steals`, `claim_attempts` | `preference`, `fallback`, `result` |
-| `[:docket, :postgres, :claim_policy, :admission]` | `duration`, `demand`, `leases`, `poisoned` | `implementation`, `result` |
+| `[:docket, :postgres, :claim_policy, :admission]` | `duration`, `demand`, `leases`, `poisoned`, `contentions` | `implementation`, `result`, `contention_phase` |
 | `[:docket, :postgres, :claim, :attempt]` | `count`, `claim_attempts` | `result` |
 | `[:docket, :postgres, :claim, :poisoned]` | `count` | `reason` |
+| `[:docket, :postgres, :admission, :release]` | `count` | `reason` |
 | `[:docket, :postgres, :claim, :operation]` | `duration`, optionally `matched` | `operation`, `result` |
 | `[:docket, :postgres, :claim, :fence_lost]` | `count` | `stage`, `result` |
 | `[:docket, :postgres, :graph_cache, :fetch]` | `duration` | `result` |
@@ -55,6 +56,42 @@ can raise `in_flight` without holding a database connection.
 Claims fence durable state only. A stolen claim can execute node code and
 external effects more than once even though only one moment commits. External
 effects require their own stable idempotency scheme.
+
+## Fair-rotation evidence boundary
+
+The TenantFair sticky-admission engine keeps the generic ClaimPolicy and claim events in the
+catalog above. The admission event reports total duration and a normalized
+`contentions` count; `contention_phase: :policy_cursor` distinguishes bounded
+singleton-cursor pressure without adding identity labels. That phase is set
+only when the ring function catches contention while acquiring its singleton
+policy/cursor authority; a later database lock timeout retains the public
+`lock_contention` error but reports `contentions: 0` and
+`contention_phase: :none` because its phase is not proven.
+
+Detailed cursor, visit, disposition, outcome, and epoch evidence is available
+only from the disabled-by-default raw trace result mode used by deterministic
+tests and trusted inspection. Production passes trace off and filters those
+rows before the unchanged public decoder. Tenant ID, raw `scope_key`, run or
+graph identity, call token, cursor token, and claim token are forbidden as
+ordinary metric labels. Aggregate telemetry cannot reconstruct the per-target
+bounded-bypass proof; consult the [TenantFair correctness
+evidence](architecture/docket-tenant-fair.md#correctness-evidence) for the
+checked-in validation coverage.
+
+Aggregate TenantFair outcome observations distinguish queued promotion,
+admitted-ready reacquisition, and expired admitted steal. Cap/debt denial is a
+raw inspection disposition, not a production aggregate: ordinary production
+calls intentionally filter inspection rows before decoding.
+Admission release counts use the bounded reasons `future`, `external`,
+`terminal`, `signal`, `host_incompatible`, `poison`, and `abandon_backoff`;
+they never carry tenant or run identity.
+`Admin.get_effective/2` supplies token-free `queued`, `admitted_ready`,
+`admitted_claimed`, and `debt` counts for trusted operational inspection.
+
+The normative populations, units, formulas, exclusions, and Legacy control are
+in the [TenantFair fair-rotation contract](architecture/docket-tenant-fair.md#fixed-window-fair-rotation-contract).
+Timing and query-plan measurements in the [benchmark guide](benchmarks.md)
+remain separate regression evidence and never replace that correctness oracle.
 
 ## Benchmark derivations
 
