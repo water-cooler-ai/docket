@@ -7,7 +7,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     the sole executor of policy plans. A selected implementation receives
     normalized policy values and pre-quoted identifiers, builds one data-only
     SQL plan, decodes that statement's rows, and owns its bounded admission
-    observations. It never receives a run-store module or query callback.
+    observations. A policy may also implement one narrow startup configuration
+    callback. Plan construction never receives a run-store module or query
+    callback.
     """
 
     alias Docket.Postgres.Storage
@@ -74,6 +76,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defstruct @enforce_keys
 
     @callback init(keyword(), init_context()) :: {:ok, state :: term()} | {:error, term()}
+    @callback configure(
+                Docket.Backend.ctx(),
+                state :: term(),
+                query :: (String.t(), [term()] -> {:ok, term()} | {:error, term()})
+              ) :: :ok | {:error, term()}
     @callback build_plan(plan_context(), runtime_input(), state :: term()) :: Plan.t()
 
     @callback decode(rows :: [list()], decoder :: term(), state :: term()) ::
@@ -87,6 +94,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 duration :: integer(),
                 state :: term()
               ) :: :ok
+
+    @optional_callbacks configure: 3
 
     @doc false
     @spec new(keyword(), Docket.Backend.ctx()) :: t()
@@ -146,6 +155,27 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc false
     @spec implementation(t()) :: module()
     def implementation(%__MODULE__{implementation: implementation}), do: implementation
+
+    @doc false
+    @spec configures_on_startup?(t()) :: boolean()
+    def configures_on_startup?(%__MODULE__{implementation: implementation}) do
+      function_exported?(implementation, :configure, 3)
+    end
+
+    @doc false
+    @spec configure(t(), Docket.Backend.ctx(), (String.t(), [term()] -> term())) ::
+            :ok | {:error, term()}
+    def configure(%__MODULE__{} = claim_policy, context, query) when is_function(query, 2) do
+      if configures_on_startup?(claim_policy) do
+        claim_policy.implementation.configure(
+          context,
+          claim_policy.implementation_state,
+          query
+        )
+      else
+        :ok
+      end
+    end
 
     @doc false
     @spec effective_policy!(runtime_input()) :: runtime_input()

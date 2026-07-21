@@ -9,6 +9,44 @@ defmodule Docket.PublicFacadeTest do
     use Docket, backend: Docket.Test.MemoryBackend, tenant_mode: :required
   end
 
+  defmodule InvalidClaimPolicyAdmin do
+    def get_default(_context), do: {:ok, :backend_private_value}
+    def put_default(_context, _maximum, _opts), do: :backend_private_value
+
+    def put_override(_context, _owner_scope, _maximum, _opts),
+      do: {:ok, :backend_private_value}
+
+    def reset_override(_context, _owner_scope, _opts), do: {:ok, :backend_private_value}
+    def get_effective(_context, _owner_scope), do: {:ok, :backend_private_value}
+  end
+
+  defmodule InvalidCapabilityBackend do
+    @behaviour Docket.Backend
+
+    defdelegate transaction(context, fun), to: Docket.Test.MemoryBackend
+    defdelegate context(opts), to: Docket.Test.MemoryBackend
+    defdelegate child_spec(opts, context), to: Docket.Test.MemoryBackend
+    defdelegate drain_runs(context, opts), to: Docket.Test.MemoryBackend
+
+    def graphs, do: Docket.Test.MemoryBackend
+    def runs, do: Docket.Test.MemoryBackend
+    def events, do: Docket.Test.MemoryBackend
+    def claim_policy_admin, do: InvalidClaimPolicyAdmin
+  end
+
+  defmodule InvalidCapabilityHost do
+    use Docket,
+      backend: InvalidCapabilityBackend,
+      claim_policy: [
+        implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+        default_max_active_runs: 1
+      ]
+  end
+
+  defmodule LegacyCapabilityHost do
+    use Docket, backend: InvalidCapabilityBackend
+  end
+
   test "the 0.0.1 production facade is not exported" do
     assert Code.ensure_loaded?(Docket)
     assert Code.ensure_loaded?(Host)
@@ -65,6 +103,81 @@ defmodule Docket.PublicFacadeTest do
 
     for {name, arity} <- [run_inline: 3, resume_inline: 3, step_inline: 2] do
       assert function_exported?(Docket.Test, name, arity)
+    end
+  end
+
+  test "claim-policy administration freezes the top-level surface and omits unsupported wrappers" do
+    for {name, arities} <- [
+          fetch_claim_policy_default: [1],
+          put_claim_policy_default: [2, 3],
+          put_claim_policy_override: [3, 4],
+          reset_claim_policy_override: [2, 3],
+          inspect_claim_policy: [2]
+        ],
+        arity <- arities do
+      assert function_exported?(Docket, name, arity)
+    end
+
+    for {name, arities} <- [
+          fetch_claim_policy_default: [0],
+          put_claim_policy_default: [1, 2],
+          put_claim_policy_override: [2, 3],
+          reset_claim_policy_override: [1, 2],
+          inspect_claim_policy: [1]
+        ],
+        arity <- arities do
+      refute function_exported?(Host, name, arity)
+      refute function_exported?(LegacyCapabilityHost, name, arity)
+    end
+  end
+
+  test "top-level claim-policy calls return one stable error for an unsupported backend" do
+    start_supervised!(Host)
+
+    for result <- [
+          Docket.fetch_claim_policy_default(Host),
+          Docket.put_claim_policy_default(Host, 2),
+          Docket.put_claim_policy_override(Host, {:tenant, "acme"}, 2),
+          Docket.reset_claim_policy_override(Host, {:tenant, "acme"}),
+          Docket.inspect_claim_policy(Host, {:tenant, "acme"})
+        ] do
+      assert {:error,
+              %Docket.Error{
+                type: :unsupported_capability,
+                details: %{capability: :claim_policy_administration}
+              }} = result
+    end
+  end
+
+  test "claim-policy validation is backend-neutral and runs before delegation" do
+    assert {:error, :invalid_max_active_runs} =
+             Docket.put_claim_policy_default(Host, 0)
+
+    assert {:error, :invalid_owner_scope} =
+             Docket.put_claim_policy_override(Host, :system, 2)
+
+    assert {:error, :invalid_expected_version} =
+             Docket.reset_claim_policy_override(Host, :tenantless, expected_version: -1)
+
+    assert {:error, :invalid_options} =
+             Docket.put_claim_policy_default(Host, 2, actor: "not-supported")
+  end
+
+  test "a malformed capability result cannot leak through the public facade" do
+    start_supervised!(InvalidCapabilityHost)
+
+    for result <- [
+          InvalidCapabilityHost.fetch_claim_policy_default(),
+          InvalidCapabilityHost.put_claim_policy_default(2),
+          InvalidCapabilityHost.put_claim_policy_override(:tenantless, 2),
+          InvalidCapabilityHost.reset_claim_policy_override(:tenantless),
+          InvalidCapabilityHost.inspect_claim_policy(:tenantless)
+        ] do
+      assert {:error,
+              %Docket.Error{
+                type: :invalid_backend_capability,
+                details: %{capability: :claim_policy_administration}
+              }} = result
     end
   end
 

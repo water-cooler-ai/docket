@@ -287,7 +287,7 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `prefix:` | `public` | Must match both directions of the generated migration. |
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
 | `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` for `tenant_mode: :none` | Required PostgreSQL tenancy must select `Docket.Postgres.ClaimPolicy.TenantFair`; implementations are validated before startup and cannot be selected per call. |
-| `claim_policy.default_max_active_runs` | required by TenantFair | Bootstrap cap in `1..2_147_483_647`. The persisted default and per-scope overrides are authoritative after initialization. |
+| `claim_policy.default_max_active_runs` | required by TenantFair | Configured persisted default in `1..2_147_483_647`. Startup synchronizes it only when the configured value changes; runtime changes otherwise survive restarts, and per-scope overrides are never synchronized from config. |
 | `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
 | `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
 | `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
@@ -382,33 +382,72 @@ claim_policy: [
 ]
 ```
 
-The configured value initializes an unset database default. Thereafter use the
-administration API:
+After schema validation and before dispatchers start, each TenantFair instance
+atomically synchronizes the configured default and active engine. Changing the
+option on a deployment updates the centralized default. Restarting with
+unchanged config is a no-op, so runtime default changes survive ordinary
+restarts. Per-owner overrides are never synchronized from config.
+
+Use the public administration facade for runtime changes. Authorization belongs
+to the host application; Docket accepts no actor or authorization token and does
+not persist actor identity:
 
 ```elixir
-alias Docket.Postgres.ClaimPolicy.Admin
+def update_tenant_cap(actor, tenant_id, max_active_runs, expected_version) do
+  owner_scope = {:tenant, tenant_id}
+  :ok = MyApp.PolicyAuthorization.authorize(actor, :manage_docket_caps, owner_scope)
 
-context = Docket.Postgres.context(repo: MyApp.Repo, prefix: "public")
+  MyApp.Docket.put_claim_policy_override(owner_scope, max_active_runs,
+    expected_version: expected_version
+  )
+end
 
-{:ok, default} = Admin.get_default(context)
-{:ok, updated} = Admin.put_default(context, 8, expected_version: default.version)
+{:ok, default} = MyApp.Docket.fetch_claim_policy_default()
 
-{:ok, override} =
-  Admin.put_override(context, {:tenant, "tenant-a"}, 2, expected_version: 0)
+{:ok, updated} =
+  MyApp.Docket.put_claim_policy_default(8, expected_version: default.version)
 
-{:ok, effective} = Admin.get_effective(context, {:tenant, "tenant-a"})
+{:ok, override} = update_tenant_cap(actor, "tenant-a", 2, 0)
+{:ok, effective} = MyApp.Docket.inspect_claim_policy({:tenant, "tenant-a"})
 
 {:ok, _reset} =
-  Admin.reset_override(context, {:tenant, "tenant-a"},
+  MyApp.Docket.reset_claim_policy_override({:tenant, "tenant-a"},
     expected_version: override.version
   )
 ```
+
+The equivalent top-level forms take the configured runtime first, for example
+`Docket.fetch_claim_policy_default(MyApp.Docket)` and
+`Docket.inspect_claim_policy(MyApp.Docket, owner_scope)`. The five frozen
+operations are `fetch_claim_policy_default`, `put_claim_policy_default`,
+`put_claim_policy_override`, `reset_claim_policy_override`, and
+`inspect_claim_policy`. Modules whose static options select TenantFair export
+the same names without the runtime argument when their backend exposes the
+optional administration capability. Legacy-configured modules and modules with
+an unsupported backend do not export them. Runtime overrides do not change this
+compile-time export set. Top-level calls against an unsupported backend return
+`%Docket.Error{type: :unsupported_capability}`.
+
+Default and mutation calls return `Docket.ClaimPolicy`; inspection returns
+`Docket.ClaimPolicyInfo`. Compare-and-set mismatch is `:stale`; stable
+validation errors are `:invalid_max_active_runs`, `:invalid_owner_scope`,
+`:invalid_expected_version`, and `:invalid_options`; inspection before default
+initialization returns `:not_initialized`, and a persisted cap under a dormant
+Legacy engine returns `:inactive_engine` rather than an effective policy.
+
+A runtime default change remains live across restarts until a deployment
+changes `default_max_active_runs`. All instances sharing the database and prefix
+must deploy the same value. Mixed independently deployed configurations are
+unsupported in v0.1.
 
 `effective` includes token-free `queued`, `admitted_ready`,
 `admitted_claimed`, and `debt` counts. Reducing a cap below the current
 admitted-run count does not preempt work. It blocks FIFO queue promotion until
 admission releases bring the count below the new cap. Immediate cooperative
 yield and expired lease recovery retain admission and remain count-neutral.
+The facade does not provide hold/drain states, bulk changes, enumeration,
+policy history or audit identity, weighted sharing, borrowing, preemption, or
+online-rollout coordination.
 
 ### Existing schema V1 installations
 

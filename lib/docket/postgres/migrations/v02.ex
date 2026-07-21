@@ -32,6 +32,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         id smallint PRIMARY KEY DEFAULT 1,
         admission_mode varchar(16) NOT NULL DEFAULT 'legacy',
         max_active integer NULL,
+        configured_max_active integer NULL,
         policy_version bigint NOT NULL DEFAULT 0,
         scan_ring_position bigint NOT NULL DEFAULT 0,
         initialized_at timestamptz NULL,
@@ -41,6 +42,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           admission_mode IN ('legacy', 'tenant_fair')
         ),
         CONSTRAINT docket_claim_policy_version_check CHECK (policy_version >= 0),
+        CONSTRAINT docket_claim_policy_configured_max_check CHECK (
+          configured_max_active IS NULL OR
+          (configured_max_active > 0 AND configured_max_active <= 2147483647)
+        ),
         CONSTRAINT docket_claim_policy_scan_ring_position_check
           CHECK (scan_ring_position >= 0),
         CONSTRAINT docket_claim_policy_shape_check CHECK (

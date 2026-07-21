@@ -85,8 +85,9 @@ calls intentionally filter inspection rows before decoding.
 Admission release counts use the bounded reasons `future`, `external`,
 `terminal`, `signal`, `host_incompatible`, `poison`, and `abandon_backoff`;
 they never carry tenant or run identity.
-`Admin.get_effective/2` supplies token-free `queued`, `admitted_ready`,
-`admitted_claimed`, and `debt` counts for trusted operational inspection.
+The public `Docket.inspect_claim_policy/2` facade supplies token-free `queued`,
+`admitted_ready`, `admitted_claimed`, and `debt` counts for trusted operational
+inspection after the host application authorizes the actor and owner scope.
 
 The normative populations, units, formulas, exclusions, and Legacy control are
 in the [TenantFair fair-rotation contract](architecture/docket-tenant-fair.md#fixed-window-fair-rotation-contract).

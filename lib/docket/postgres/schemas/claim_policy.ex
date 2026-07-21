@@ -8,6 +8,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     schema "docket_claim_policy" do
       field(:admission_mode, Ecto.Enum, values: [:legacy, :tenant_fair], default: :legacy)
       field(:max_active, :integer)
+      field(:configured_max_active, :integer)
       field(:policy_version, :integer, default: 0)
       field(:scan_ring_position, :integer, default: 0)
       field(:initialized_at, :utc_datetime_usec)

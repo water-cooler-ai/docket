@@ -22,9 +22,14 @@ use Docket,
 ```
 
 `default_max_active_runs` is a required integer in `1..2_147_483_647`. It
-initializes an unset database default; the persisted default and per-scope Admin
-overrides are authoritative afterward. The engine is selected once per backend
-instance, not per claim call.
+is a configured persisted field. After schema validation and before backend
+children start, every homogeneous TenantFair instance synchronizes the
+singleton policy row. First startup initializes it; changing the configured
+value updates it on the next deployment. Restarting with unchanged config is a
+no-op, so a runtime default change survives until the Elixir option changes.
+Per-scope overrides are durable runtime state and are never synchronized from
+application configuration. Independently deployed configurations sharing one
+domain are unsupported in v0.1.
 
 Legacy remains the omitted-policy default only for `tenant_mode: :none`. It is
 tenant-blind and never creates admission markers. Required tenancy rejects
@@ -350,7 +355,7 @@ dynamic membership, other class/demand mixes, latency, or throughput.
 
 Schema version 2 installs the engine's policy and partition
 authority, stable unfinished ring, marker and partial indexes, lifecycle
-triggers, serialized cursor, and the sole seven-argument claim function.
+triggers, serialized cursor, and the sole six-argument claim function.
 
 The stopped V1-to-V2 upgrade backfills `tenant_admitted_at = claimed_at` only
 for healthy claimed rows. Unclaimed rows remain queued; an over-cap tenant
@@ -364,20 +369,25 @@ The supported rollout is stopped and homogeneous:
 1. stop every Docket dispatcher and run writer;
 2. apply the generated transactional migration;
 3. deploy one homogeneous application version and engine configuration; and
-4. restart processing.
+4. restart processing; TenantFair persists its configured default before
+   starting dispatchers.
 
 Startup requires schema version 2 plus the validated marker-column and sole
-seven-argument function-signature shape.
+six-argument function-signature shape. Claim traffic only reads and verifies
+the initialized active policy under its existing policy lock; it never
+initializes the default or switches engines.
 Online migration, mixed old binaries, readiness ledgers, activation ceremonies,
 and audited mode history are outside v0.1.0.
 A binary that predates the engine interlock cannot be made safe by new database
 code alone.
 
-The Admin surface provides `get_default/1`, `put_default/2,3`,
-`put_override/3,4`, `reset_override/2,3`, and `get_effective/2`. Writes accept an
+The public facade provides `fetch_claim_policy_default`,
+`put_claim_policy_default`, `put_claim_policy_override`,
+`reset_claim_policy_override`, and `inspect_claim_policy`. Writes accept an
 optional `:expected_version` CAS value; caps must be integers in
-`1..2_147_483_647`. Effective reads expose token-free `queued`,
-`admitted_ready`, `admitted_claimed`, and `debt` counts.
+`1..2_147_483_647`. Effective inspection exposes token-free `queued`,
+`admitted_ready`, `admitted_claimed`, and `debt` counts. Configured-module forms
+use the runtime's Repo and prefix without exposing a storage context.
 
 ## Observability and performance evidence
 
@@ -410,8 +420,8 @@ The repository includes implementation-level evidence for:
   [`fair_rotation_oracle_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/fair_rotation_oracle_test.exs);
 - cap-two/cap-ten identities, FIFO, debt, steal, poison, interlock, and rollback
   in [`claim_policy_tenant_fair_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/claim_policy_tenant_fair_test.exs);
-- Admin CAS/effective counts, engine selection, startup shape, and supervised
-  admission in
+- public-facade CAS/effective counts, engine selection, startup shape, and
+  supervised admission in
   [`claim_policy_admin_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/claim_policy_admin_test.exs),
   [`claim_policy_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/claim_policy_test.exs),
   [`backend_test.exs`](https://github.com/water-cooler-ai/docket/blob/2638bb15bc44f4920f6d40b219f4046651a0359c/test/docket/postgres/backend_test.exs), and

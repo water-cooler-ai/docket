@@ -7,6 +7,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     `:expected_version` is supplied.
     """
 
+    @behaviour Docket.Backend.ClaimPolicyAdmin
+
     alias Docket.Postgres.Storage
 
     @type cap :: 1..2_147_483_647
@@ -36,6 +38,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Before the policy is initialized, `max_active_runs` is `nil` and `version`
     is zero.
     """
+    @impl true
     @spec get_default(Docket.Backend.ctx()) :: {:ok, policy()} | {:error, term()}
     def get_default(context) do
       with {:ok, control} <- control(context),
@@ -62,6 +65,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     `expected_version: version` for compare-and-set behavior; a version mismatch
     returns `{:error, :stale}` without changing the policy.
     """
+    @impl true
     @spec put_default(Docket.Backend.ctx(), cap(), keyword()) ::
             {:ok, policy()} | {:error, :stale | term()}
     def put_default(context, max_active_runs, opts \\ []) do
@@ -105,6 +109,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Pass `expected_version: 0` to create its first override with CAS semantics;
     a version mismatch returns `{:error, :stale}`.
     """
+    @impl true
     @spec put_override(
             Docket.Backend.ctx(),
             Docket.Backend.owner_scope(),
@@ -159,6 +164,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Pass `expected_version: version` for compare-and-set behavior; a missing or
     mismatched partition version returns `{:error, :stale}`.
     """
+    @impl true
     @spec reset_override(Docket.Backend.ctx(), Docket.Backend.owner_scope(), keyword()) ::
             {:ok, policy()} | {:error, :stale | term()}
     def reset_override(context, owner_scope, opts \\ []) do
@@ -200,10 +206,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     `admitted_ready` counts due, healthy, unclaimed admitted rows;
     `admitted_claimed` counts healthy admitted rows with a claim; and `debt` is
     the admitted count above the effective cap. An uninitialized domain returns
-    `{:error, :not_initialized}`.
+    `{:error, :not_initialized}`; a persisted cap under an inactive engine
+    returns `{:error, :inactive_engine}`.
     """
+    @impl true
     @spec get_effective(Docket.Backend.ctx(), Docket.Backend.owner_scope()) ::
-            {:ok, effective_policy()} | {:error, :not_initialized | term()}
+            {:ok, effective_policy()}
+            | {:error, :not_initialized | :inactive_engine | term()}
     def get_effective(context, owner_scope) do
       with {:ok, scope_key} <- scope_key(owner_scope),
            {:ok, control} <- control(context),
@@ -211,6 +220,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             %{
               rows: [
                 [
+                  admission_mode,
                   default_max,
                   default_version,
                   override_max,
@@ -224,7 +234,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             }} <-
              control.repo.query(
                """
-               SELECT policy.max_active, policy.policy_version,
+               SELECT policy.admission_mode, policy.max_active, policy.policy_version,
                       partitions.max_active, COALESCE(partitions.partition_version, 0),
                       count(*) FILTER (
                         WHERE runs.status = 'running' AND runs.poisoned_at IS NULL AND
@@ -249,28 +259,33 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                LEFT JOIN #{control.partitions} AS partitions ON partitions.scope_key = $1
                LEFT JOIN #{control.runs} AS runs ON runs.scope_key = $1
                WHERE policy.id = 1
-               GROUP BY policy.max_active, policy.policy_version,
+               GROUP BY policy.admission_mode, policy.max_active, policy.policy_version,
                         partitions.max_active, partitions.partition_version
                """,
                [scope_key]
              ) do
-        if is_nil(default_max) do
-          {:error, :not_initialized}
-        else
-          max_active_runs = override_max || default_max
+        cond do
+          is_nil(default_max) ->
+            {:error, :not_initialized}
 
-          {:ok,
-           %{
-             owner_scope: owner_scope,
-             max_active_runs: max_active_runs,
-             source: if(is_nil(override_max), do: :default, else: :override),
-             default_version: default_version,
-             override_version: override_version,
-             queued: queued,
-             admitted_ready: admitted_ready,
-             admitted_claimed: admitted_claimed,
-             debt: max(admitted_total - max_active_runs, 0)
-           }}
+          admission_mode != "tenant_fair" ->
+            {:error, :inactive_engine}
+
+          true ->
+            max_active_runs = override_max || default_max
+
+            {:ok,
+             %{
+               owner_scope: owner_scope,
+               max_active_runs: max_active_runs,
+               source: if(is_nil(override_max), do: :default, else: :override),
+               default_version: default_version,
+               override_version: override_version,
+               queued: queued,
+               admitted_ready: admitted_ready,
+               admitted_claimed: admitted_claimed,
+               debt: max(admitted_total - max_active_runs, 0)
+             }}
         end
       end
     end

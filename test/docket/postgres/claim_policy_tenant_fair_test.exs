@@ -4,6 +4,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
+    alias Docket.Postgres.ClaimPolicy
     alias Docket.Postgres.ClaimPolicy.Admin
     alias Docket.Postgres.RunStore
     alias Docket.Postgres.TestRepo
@@ -28,6 +29,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       def down, do: Docket.Postgres.Migration.down(prefix: "docket_private")
     end
 
+    defmodule FacadeHost do
+      use Docket,
+        backend: Docket.Postgres,
+        repo: TestRepo,
+        tenant_mode: :required,
+        claim_policy: [
+          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
+          default_max_active_runs: 3
+        ],
+        testing: :manual,
+        notifier: :none
+    end
+
     setup do
       config = TestRepo.config()
       _ = Ecto.Adapters.Postgres.storage_down(config)
@@ -43,11 +57,29 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       %{context: context, second_context: second_context}
     end
 
+    test "claims require startup configuration and never initialize policy", %{context: context} do
+      before = policy_authority()
+
+      assert {:error, {:claim_policy_unavailable, :not_initialized}} =
+               RunStore.claim_due(context, :system, policy(1))
+
+      assert policy_authority() == before
+
+      assert :ok = configure(context, 1)
+      insert_ready("tenant", "configured", @now)
+      configured = policy_authority()
+
+      assert {:ok, %{leases: [%{run_id: "configured"}]}} =
+               RunStore.claim_due(context, :system, policy(1))
+
+      assert policy_authority() == configured
+    end
+
     test "two independent pools cannot overfill the final slot", %{
       context: context,
       second_context: second_context
     } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("tenant", "cap-race-a", @now)
       insert_ready("tenant", "cap-race-b", @now)
 
@@ -77,10 +109,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert live_count("tenant") == 1
     end
 
-    test "cap reduction creates debt and release restores capacity only below the cap", %{
-      context: context
-    } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 3, expected_version: 0)
+    test "facade cap reduction is non-preemptive and the live claim path consumes it" do
+      start_supervised!(FacadeHost)
+      {:ok, defaults} = Docket.Runtime.Instance.defaults(FacadeHost)
+      context = Keyword.fetch!(defaults, :backend_context)
+
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 3, version: 1}} =
+               FacadeHost.fetch_claim_policy_default()
 
       for id <- ~w(active-a active-b active-c), do: insert_ready("tenant", id, @now)
       # Demand four reserves the unmatched expired class and intentionally
@@ -88,7 +123,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, %{leases: leases}} = RunStore.claim_due(context, :system, policy(4))
       assert length(leases) == 3
 
-      assert {:ok, %{version: 2}} = Admin.put_default(context, 1, expected_version: 1)
+      assert {:ok, %Docket.ClaimPolicy{max_active_runs: 1, version: 2}} =
+               FacadeHost.put_claim_policy_default(1, expected_version: 1)
+
+      assert {:ok,
+              %Docket.ClaimPolicyInfo{
+                max_active_runs: 1,
+                admitted_claimed: 3,
+                debt: 2
+              }} = FacadeHost.inspect_claim_policy({:tenant, "tenant"})
+
+      expected_admitted = leases |> Enum.map(&[&1.run_id]) |> Enum.sort()
+      assert admitted_run_ids("tenant") == expected_admitted
+
       insert_ready("tenant", "waiting", @now)
       assert {:ok, %{leases: []}} = RunStore.claim_due(context, :system, policy(1))
 
@@ -106,7 +153,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "cap increase promotes the oldest queued run without replacing the admitted cohort", %{
       context: context
     } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("tenant", "first", DateTime.add(@now, -3, :second))
       insert_ready("tenant", "second", DateTime.add(@now, -2, :second))
       insert_ready("tenant", "third", DateTime.add(@now, -1, :second))
@@ -125,7 +172,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "demand and candidate pages larger than cap preserve the cap-ten oldest identities", %{
       context: context
     } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 10, expected_version: 0)
+      assert :ok = configure(context, 10)
 
       for index <- 1..100 do
         insert_ready(
@@ -146,7 +193,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "demand-one discovery rotates from a deep tenant to another tenant", %{context: context} do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 4, expected_version: 0)
+      assert :ok = configure(context, 4)
       insert_ready("a", "a-1", DateTime.add(@now, -3, :second))
       insert_ready("a", "a-2", DateTime.add(@now, -2, :second))
       insert_ready("a", "a-3", DateTime.add(@now, -1, :second))
@@ -162,7 +209,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "an admitted run remains sticky across an immediate cooperative release", %{
       context: context
     } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("tenant", "first", DateTime.add(@now, -2, :second))
       insert_ready("tenant", "second", DateTime.add(@now, -1, :second))
 
@@ -203,7 +250,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       context: context,
       second_context: second_context
     } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 2, expected_version: 0)
+      assert :ok = configure(context, 2)
 
       for index <- 1..100 do
         insert_ready("tenant", "queued-#{String.pad_leading(to_string(index), 3, "0")}", @now)
@@ -260,7 +307,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "capped heads rotate so a later eligible tenant makes progress", %{context: context} do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
 
       insert_claimed("a", "a-live", @now)
       insert_ready("a", "a-waiting", DateTime.add(@now, -3, :second))
@@ -275,7 +322,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "an expired steal is count-neutral and does not admit queued work", %{context: context} do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_claimed("tenant", "expired", DateTime.add(@now, -10, :second))
       insert_ready("tenant", "queued", DateTime.add(@now, -5, :second))
 
@@ -289,7 +336,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "admitted expired work outranks a ready-preferred queued promotion", %{context: context} do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 2, expected_version: 0)
+      assert :ok = configure(context, 2)
       insert_claimed("tenant", "expired", DateTime.add(@now, -10, :second))
       insert_ready("tenant", "queued", DateTime.add(@now, -5, :second))
 
@@ -306,7 +353,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
          %{
            context: context
          } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 100, expected_version: 0)
+      assert :ok = configure(context, 100)
 
       for index <- 1..40 do
         insert_claimed(
@@ -326,7 +373,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "poison makes progress without consuming the tenant cap", %{context: context} do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_run("tenant", "poison", nil, nil, DateTime.add(@now, -2, :second), 5)
       insert_ready("tenant", "ordinary", DateTime.add(@now, -1, :second))
 
@@ -351,7 +398,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "admitted poison releases a slot consumed by the queued head in the same visit", %{
       context: context
     } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("tenant", "admitted-poison", DateTime.add(@now, -2, :second))
       insert_ready("tenant", "queued", DateTime.add(@now, -1, :second))
 
@@ -385,7 +432,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "exact run locks skip a locked candidate and continue around the ring", %{
       context: context
     } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("a", "locked", DateTime.add(@now, -1, :second))
       insert_ready("b", "available", @now)
 
@@ -419,7 +466,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "TenantFair fails closed in read-only and non-read-committed transactions", %{
       context: context
     } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("tenant", "transaction-mode", @now)
 
       assert {:error, {:claim_policy_unavailable, :read_only_transaction}} =
@@ -465,7 +512,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("tenant", "policy-lock", @now)
       policy_before = policy_row()
 
@@ -522,7 +569,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("tenant", "schedule-lock", @now)
       policy_before = policy_row()
 
@@ -570,7 +617,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "TenantFair admits tenantless work", %{context: context} do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("", "tenantless", @now)
 
       assert {:ok, %{leases: [%{run_id: "tenantless", owner_scope: :tenantless}]}} =
@@ -589,7 +636,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       context = tenant_fair_context(TestRepo, 1, prefix: "docket_private")
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("tenant", "prefixed", @now, prefix: "docket_private")
 
       assert {:ok, %{leases: [%{run_id: "prefixed", owner_scope: {:tenant, "tenant"}}]}} =
@@ -599,7 +646,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     test "transaction-scoped TenantFair admission commits and rolls back with its caller", %{
       context: context
     } do
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("tenant", "transactional", @now)
 
       assert {:error, :test_rollback} =
@@ -627,7 +674,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       second_context: second_context
     } do
       legacy_context = Docket.Postgres.context(repo: SecondRepo)
-      assert {:ok, %{version: 1}} = Admin.put_default(context, 1, expected_version: 0)
+      assert :ok = configure(context, 1)
       insert_ready("tenant", "tenant-fair", @now)
       insert_ready("other", "legacy-blocked", @now)
 
@@ -650,6 +697,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       Docket.Postgres.context(opts)
+    end
+
+    defp configure(context, maximum) do
+      configured = tenant_fair_context(context.repo, maximum, prefix: context.prefix)
+      claim_policy = ClaimPolicy.resolve(configured)
+
+      ClaimPolicy.configure(claim_policy, configured, fn statement, params ->
+        context.repo.query(statement, params, log: false)
+      end)
+    end
+
+    defp policy_authority do
+      TestRepo.query!(
+        "SELECT admission_mode, max_active, policy_version, initialized_at " <>
+          "FROM docket_claim_policy WHERE id = 1"
+      ).rows
     end
 
     defp policy(limit) do

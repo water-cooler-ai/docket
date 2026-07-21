@@ -52,8 +52,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                ~U[2026-07-15 23:59:59.000000Z],
                8,
                5,
-               "ready",
-               3
+               "ready"
              ]
 
       assert plan.statement =~ "docket_tenant_fair_claim"

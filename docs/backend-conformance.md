@@ -4,7 +4,9 @@
 implementations. It lives under `test/support`, not in the shipped library API.
 The production contract is defined by `Docket.Backend`,
 `Docket.Backend.GraphStore`, `Docket.Backend.RunStore`, and
-`Docket.Backend.EventStore`.
+`Docket.Backend.EventStore`. Backends may additionally expose the narrow
+`Docket.Backend.ClaimPolicyAdmin` capability through the optional
+`claim_policy_admin/0` accessor.
 
 ## Docket-owned backends
 
@@ -111,6 +113,15 @@ backend receives the same assertion. Substrate mechanics should remain in
 backend-specific suites.
 
 ## PostgreSQL ClaimPolicy implementations
+
+Claim-policy administration is a portable optional capability even though the
+PostgreSQL ClaimPolicy execution engine below is a backend-private extension
+seam. A capable backend implements all five `Docket.Backend.ClaimPolicyAdmin`
+callbacks and returns that module from `claim_policy_admin/0`; incapable
+backends omit the accessor. This explicit accessor controls configured-module
+facade generation together with a static TenantFair selection; Legacy modules
+do not export the convenience wrappers. The decision never depends on whether
+PostgreSQL modules are merely loaded.
 
 ClaimPolicy is a PostgreSQL-backend extension seam rather than a portable
 `Docket.Backend` capability. Its source-owned reusable cases live in

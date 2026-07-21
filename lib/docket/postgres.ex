@@ -48,6 +48,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       Storage
     }
 
+    alias Docket.Postgres.ClaimPolicy.Admin
+
     @default_dispatcher [
       concurrency: 10,
       poll_interval_ms: 1_000,
@@ -95,6 +97,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl Docket.Backend
     def events, do: EventStore
+
+    @impl Docket.Backend
+    def claim_policy_admin, do: Admin
 
     @impl Docket.Backend
     def context(opts) do
@@ -157,7 +162,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       validate_nested!(Keyword.get(opts, :vehicle, []), :vehicle)
       dispatcher = effective_dispatcher(opts)
       validate_dispatcher!(dispatcher)
-      _resolved_claim_policy = ClaimPolicy.resolve(context)
+      resolved_claim_policy = ClaimPolicy.resolve(context)
       validate_schema_version!(context, opts)
       execution = effective_execution(opts)
       vehicle = effective_vehicle(Keyword.get(opts, :vehicle, []))
@@ -165,6 +170,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       validate_runtime_limits!(dispatcher, execution, vehicle)
 
       children = children(opts, name, context)
+      configure_claim_policy!(context, resolved_claim_policy)
 
       Supervisor.init(children, strategy: :one_for_one)
     end
@@ -251,6 +257,27 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             "Docket.Postgres found schema version #{Migration.current_version()} in prefix " <>
               "#{inspect(prefix)}, but its structure does not match the current Docket schema; " <>
               "recreate the unreleased development schema from the current generated migration"
+    end
+
+    defp configure_claim_policy!(context, claim_policy) do
+      if ClaimPolicy.configures_on_startup?(claim_policy) do
+        %{repo: repo} = context
+
+        result =
+          ClaimPolicy.configure(claim_policy, context, fn statement, params ->
+            repo.query(statement, params, log: false)
+          end)
+
+        case result do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            raise ArgumentError,
+                  "Docket.Postgres could not persist its configured claim policy before " <>
+                    "startup: #{inspect(reason)}"
+        end
+      end
     end
 
     defp children(opts, name, context) do
