@@ -18,8 +18,10 @@ a checkpoint at every durable transition.
 [Google's Pregel](https://research.google/pubs/pregel-a-system-for-large-scale-graph-processing/)
 and [LangGraph's Pregel runtime](https://docs.langchain.com/oss/python/langgraph/pregel):
 the established bulk-synchronous pattern of computation separated by commit
-barriers. Docket adapts that lineage to an Elixir-native graph API and durable
-execution model.
+barriers. That model fits the BEAM naturally: Docket fans each superstep into
+isolated, monitored node processes, gathers their results at a mailbox barrier,
+and uses supervision for fault containment while PostgreSQL—not process
+identity—remains the recovery authority.
 
 ## Features
 
