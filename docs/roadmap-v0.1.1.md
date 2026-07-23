@@ -1,7 +1,7 @@
 # Docket v0.1.1 Roadmap — Composability and Ergonomics
 
 The current development tree includes the schema, reducer, graph-editing,
-telemetry, and TenantFair operations work summarized below. The remaining
+and telemetry work summarized below. The remaining
 sections describe open work only. Module documentation defines the implemented
 API.
 
@@ -40,12 +40,13 @@ durable source.
 
 See `Docket.Telemetry` and the [telemetry guide](telemetry.md).
 
-### TenantFair operations
+### Claim policies
 
-The TenantFair claim policy includes versioned administration of the persisted
-default and per-owner overrides, aggregate admission counts, telemetry, and
-regression tooling. Weighted service, borrowing, reclaim, and alternate
-schedulers are separate proposals in the [future roadmap](future-roadmap.md).
+The WindowedInterleave claim policy provides statistical cross-tenant fairness
+with sticky in-flight cohorts under its own admission mode; Legacy remains the
+tenant-blind baseline. Hard per-tenant caps, weighted service, borrowing,
+reclaim, and alternate schedulers are separate proposals in the
+[future roadmap](future-roadmap.md).
 
 ## Open work
 

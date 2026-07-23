@@ -46,8 +46,8 @@ backend that owns persistence, scheduling, recovery, and signals.
    mix docket.gen.migration -r MyApp.Repo --prefix automation
    ```
 
-   Required-tenancy adopters must also configure TenantFair with an explicit
-   `default_max_active_runs`; see the
+   Required-tenancy adopters must also configure the WindowedInterleave claim
+   policy; see the
    [current PostgreSQL migration and rollout guide](../postgres-operations.md#existing-schema-v1-installations).
    The generated fresh migration installs the current schema. Existing
    schema-V1 Docket installations instead use `--upgrade-from-v1`; stop every

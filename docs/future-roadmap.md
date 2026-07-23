@@ -11,7 +11,9 @@ the code, module documentation, and focused architecture and operations guides.
 
 - **Status:** exploring
 - **Horizon:** later
-- **Area:** PostgreSQL TenantFair admission
+- **Area:** PostgreSQL claim-policy admission (builds on reintroduced
+  per-tenant caps; the TenantFair engine that carried them was removed in
+  v0.1.0 — see the [design record](architecture/docket-tenant-fair.md))
 
 **Summary:** Separate a tenant's preferred concurrency from its hard maximum.
 Allow tenants to borrow otherwise-idle capacity while giving newly backlogged
@@ -50,7 +52,7 @@ ClaimPolicy/RunStore boundary.
 
 - **Status:** idea
 - **Horizon:** later
-- **Area:** PostgreSQL TenantFair scheduling and service accounting
+- **Area:** PostgreSQL claim-policy scheduling and service accounting
 
 **Summary:** Distribute service proportionally among currently active tenants
 using configured integer weights.

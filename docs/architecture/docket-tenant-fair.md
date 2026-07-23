@@ -1,5 +1,21 @@
 # PostgreSQL TenantFair claim policy
 
+> **Status: removed from v0.1.0 (2026-07-23).** This document is retained as
+> the design record. The engine, its ring function, per-tenant `max_active`
+> caps, and the cap administration facade were removed before the first
+> release in favor of `Docket.Postgres.ClaimPolicy.WindowedInterleave`, which
+> delivers the measured fairness outcomes at an order of magnitude higher
+> admission throughput with no fleet-wide serialization. Scorecard evidence
+> (M2 Pro / Postgres 15.1, seed 62038): claim ceiling on a 20k single-scope
+> backlog 451/s p99 1.1s (TenantFair) vs 5.3k/s p99 147ms (windowed);
+> tenant-fairness light-tenant p95 47% vs 46% of drain; sticky-cohort peak WIP
+> 15/200 for both. What v0.1.0 gives up with this engine: hard per-tenant
+> caps, strict FIFO-head promotion, deterministic ring rotation, and
+> intra-scope convoy protection — candidates to return post-v1 if demanded
+> (see the future roadmap). The v2 admission substrate this design introduced
+> (schedule membership counts, partitions, scoped partial indexes, the
+> admission-mode gate) remains in place and serves the windowed engine.
+
 TenantFair provides exact per-owner logical-run admission plus conditional
 bounded cross-partition rotation. It does not promise completion order,
 wall-clock latency, CPU or resource equality, strict round robin, dynamic-

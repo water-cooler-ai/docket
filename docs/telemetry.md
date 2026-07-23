@@ -57,42 +57,21 @@ Claims fence durable state only. A stolen claim can execute node code and
 external effects more than once even though only one moment commits. External
 effects require their own stable idempotency scheme.
 
-## Fair-rotation evidence boundary
+## Admission evidence boundary
 
-The TenantFair sticky-admission engine keeps the generic ClaimPolicy and claim events in the
+Every claim policy keeps the generic ClaimPolicy and claim events in the
 catalog above. The admission event reports total duration and a normalized
-`contentions` count; `contention_phase: :policy_cursor` distinguishes bounded
-singleton-cursor pressure without adding identity labels. That phase is set
-only when the ring function catches contention while acquiring its singleton
-policy/cursor authority; a later database lock timeout retains the public
-`lock_contention` error but reports `contentions: 0` and
-`contention_phase: :none` because its phase is not proven.
+`contentions` count; the `contention_phase` label is retained for shape
+stability and is always `:none` for the shipped engines. Tenant ID, raw
+`scope_key`, run or graph identity, and claim token are forbidden as ordinary
+metric labels.
 
-Detailed cursor, visit, disposition, outcome, and epoch evidence is available
-only from the disabled-by-default raw trace result mode used by deterministic
-tests and trusted inspection. Production passes trace off and filters those
-rows before the unchanged public decoder. Tenant ID, raw `scope_key`, run or
-graph identity, call token, cursor token, and claim token are forbidden as
-ordinary metric labels. Aggregate telemetry cannot reconstruct the per-target
-bounded-bypass proof; consult the [TenantFair correctness
-evidence](architecture/docket-tenant-fair.md#correctness-evidence) for the
-checked-in validation coverage.
-
-Aggregate TenantFair outcome observations distinguish queued promotion,
-admitted-ready reacquisition, and expired admitted steal. Cap/debt denial is a
-raw inspection disposition, not a production aggregate: ordinary production
-calls intentionally filter inspection rows before decoding.
 Admission release counts use the bounded reasons `future`, `external`,
-`terminal`, `signal`, `host_incompatible`, `poison`, and `abandon_backoff`;
-they never carry tenant or run identity.
-The public `Docket.inspect_claim_policy/2` facade supplies token-free `queued`,
-`admitted_ready`, `admitted_claimed`, and `debt` counts for trusted operational
-inspection after the host application authorizes the actor and owner scope.
+`terminal`, and `signal`; they never carry tenant or run identity.
 
-The normative populations, units, formulas, exclusions, and Legacy control are
-in the [TenantFair fair-rotation contract](architecture/docket-tenant-fair.md#fixed-window-fair-rotation-contract).
 Timing and query-plan measurements in the [benchmark guide](benchmarks.md)
-remain separate regression evidence and never replace that correctness oracle.
+are regression evidence for admission behavior, including the cross-scope
+fairness and cohort-stickiness scenarios that exercise the windowed engine.
 
 ## Benchmark derivations
 

@@ -12,8 +12,7 @@ defmodule MyApp.Docket do
     backend: Docket.Postgres,
     tenant_mode: :required,
     claim_policy: [
-      implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-      default_max_active_runs: 4
+      implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave
     ],
     checkpoint_observers: [MyApp.DocketProjection],
     pruner: [
@@ -110,38 +109,6 @@ tenant_id = to_string(workflow.account_id)
 
 `fetch_run` returns the last committed `%Docket.Run{}`. `inspect_run` adds
 token-free scheduling and operational health facts.
-
-## Administer TenantFair caps
-
-Authorize policy administration in the parent application before calling
-Docket. The Docket facade deliberately accepts no actor or authorization token
-and does not persist actor identity:
-
-```elixir
-def change_docket_cap(actor, account, max_active_runs, expected_version) do
-  :ok = MyApp.Accounts.authorize(actor, :manage_docket_caps, account)
-  owner_scope = {:tenant, to_string(account.id)}
-
-  MyApp.Docket.put_claim_policy_override(owner_scope, max_active_runs,
-    expected_version: expected_version
-  )
-end
-
-{:ok, override} = change_docket_cap(actor, account, 2, 0)
-
-{:ok, current} =
-  MyApp.Docket.inspect_claim_policy({:tenant, to_string(account.id)})
-
-{:ok, reset} =
-  MyApp.Docket.reset_claim_policy_override(
-    {:tenant, to_string(account.id)},
-    expected_version: override.version
-  )
-```
-
-Use `fetch_claim_policy_default/0` and `put_claim_policy_default/2` for the
-persisted default. These functions use the configured Repo and prefix; callers
-never construct a storage context or depend on PostgreSQL table names.
 
 ## Project after commit
 
