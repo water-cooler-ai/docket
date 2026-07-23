@@ -4,8 +4,7 @@ defmodule Docket.BackendTests.Contract do
   @capabilities [
     graphs: Docket.Backend.GraphStore,
     runs: Docket.Backend.RunStore,
-    events: Docket.Backend.EventStore,
-    claim_policy_admin: Docket.Backend.ClaimPolicyAdmin
+    events: Docket.Backend.EventStore
   ]
 
   @spec violations(module()) :: [String.t()]

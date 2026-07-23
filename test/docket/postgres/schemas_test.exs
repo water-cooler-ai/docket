@@ -57,7 +57,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert :state in Run.__schema__(:redact_fields)
       end
 
-      test "keeps the internal TenantFair admission marker read-only" do
+      test "keeps the internal admission marker read-only" do
         run =
           @valid_run
           |> Map.put(:tenant_admitted_at, ~U[2026-07-09 00:00:01.000000Z])
@@ -172,7 +172,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    describe "exact-cap schemas" do
+    describe "admission schemas" do
       test "bind only the current policy and partition authority" do
         assert Docket.Postgres.Schemas.ClaimPolicy.__schema__(:source) ==
                  "docket_claim_policy"
@@ -183,26 +183,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       test "keep the persisted model minimal" do
         assert Docket.Postgres.Schemas.ClaimPolicy.__schema__(:fields) ==
-                 [
-                   :id,
-                   :admission_mode,
-                   :max_active,
-                   :configured_max_active,
-                   :policy_version,
-                   :scan_ring_position,
-                   :initialized_at,
-                   :updated_at
-                 ]
+                 [:id, :admission_mode, :updated_at]
 
         assert Docket.Postgres.Schemas.ClaimPartition.__schema__(:fields) ==
-                 [
-                   :scope_key,
-                   :max_active,
-                   :partition_version,
-                   :admission_epoch,
-                   :inserted_at,
-                   :updated_at
-                 ]
+                 [:scope_key, :inserted_at, :updated_at]
       end
     end
   end

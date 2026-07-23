@@ -1,5 +1,5 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
-  defmodule Docket.Test.TenantFairRunStoreSetup do
+  defmodule Docket.Test.WindowedRunStoreSetup do
     @moduledoc false
 
     def prepare!(repo, implementation_opts) do
@@ -7,7 +7,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         Docket.Postgres.context(
           repo: repo,
           claim_policy:
-            [implementation: Docket.Postgres.ClaimPolicy.TenantFair] ++ implementation_opts
+            [implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave] ++
+              implementation_opts
         )
 
       claim_policy = Docket.Postgres.ClaimPolicy.resolve(context)

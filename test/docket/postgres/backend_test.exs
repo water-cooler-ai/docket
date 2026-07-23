@@ -120,10 +120,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         backend: Docket.Postgres,
         repo: TestRepo,
         tenant_mode: :required,
-        claim_policy: [
-          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-          default_max_active_runs: 1
-        ],
+        claim_policy: [implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave],
         notifier: :none,
         dispatcher: [concurrency: 1, poll_interval_ms: 60_000],
         pruner: @pruner
@@ -190,19 +187,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ]
     end
 
-    defmodule TenantFairConfigManualHost do
+    defmodule RelayOptionsManualHost do
       use Docket,
         backend: Docket.Postgres,
         repo: TestRepo,
         testing: :manual,
         notifier: :none,
         claim_policy: [
-          implementation: Docket.Test.TenantFairConfigClaimPolicy,
-          default_max_active_runs: 4
+          implementation: Docket.Test.RelayOptionsClaimPolicy,
+          relayed_option: 4
         ]
     end
 
-    defmodule TenantFairConfigSupervisedHost do
+    defmodule RelayOptionsSupervisedHost do
       @pruner [
         interval_ms: :timer.hours(1),
         event_retention_ms: :timer.hours(24 * 30),
@@ -217,8 +214,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         dispatcher: [concurrency: 1, poll_interval_ms: 10],
         pruner: @pruner,
         claim_policy: [
-          implementation: Docket.Test.TenantFairConfigClaimPolicy,
-          default_max_active_runs: 4
+          implementation: Docket.Test.RelayOptionsClaimPolicy,
+          relayed_option: 4
         ]
     end
 
@@ -231,16 +228,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         notifier: :none
     end
 
-    defmodule SandboxTenantFairHost do
+    defmodule SandboxWindowedHost do
       use Docket,
         backend: Docket.Postgres,
         repo: SandboxRepo,
         prefix: "public",
         tenant_mode: :required,
-        claim_policy: [
-          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-          default_max_active_runs: 5
-        ],
+        claim_policy: [implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave],
         testing: :manual,
         notifier: :none
     end
@@ -278,10 +272,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       stop_host(ConcurrentManualHost)
       stop_host(ClockedManualHost)
       stop_host(AlternatePolicyManualHost)
-      stop_host(TenantFairConfigManualHost)
-      stop_host(TenantFairConfigSupervisedHost)
+      stop_host(RelayOptionsManualHost)
+      stop_host(RelayOptionsSupervisedHost)
       stop_host(SandboxInlineHost)
-      stop_host(SandboxTenantFairHost)
+      stop_host(SandboxWindowedHost)
       stop_host(ObserverInlineHost)
 
       TestRepo.delete_all(Event)
@@ -289,9 +283,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       TestRepo.query!("""
       UPDATE docket_claim_policy
-      SET admission_mode = 'legacy', max_active = NULL, configured_max_active = NULL,
-          policy_version = 0, scan_ring_position = 0, initialized_at = NULL,
-          updated_at = CURRENT_TIMESTAMP
+      SET admission_mode = 'legacy', updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       """)
 
@@ -345,7 +337,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     test "SQL Sandbox owner completes inline named interrupt flow in the caller" do
-      :ok = Ecto.Adapters.SQL.Sandbox.checkout(SandboxRepo)
+      owner = Ecto.Adapters.SQL.Sandbox.start_owner!(SandboxRepo, shared: true)
+      on_exit(fn -> if Process.alive?(owner), do: Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
       start_supervised!(SandboxInlineHost)
       assert {:ok, reference} = SandboxInlineHost.save_graph(Graphs.interrupt_review())
 
@@ -376,17 +369,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    test "TenantFair startup policy synchronization rolls back with its SQL Sandbox owner" do
+    test "windowed startup policy synchronization rolls back with its SQL Sandbox owner" do
       owner = Ecto.Adapters.SQL.Sandbox.start_owner!(SandboxRepo, shared: true)
       on_exit(fn -> if Process.alive?(owner), do: Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
 
-      assert [["legacy", nil, nil, 0]] = sandbox_policy()
+      assert [["legacy"]] = sandbox_policy()
 
-      start_supervised!(SandboxTenantFairHost)
+      start_supervised!(SandboxWindowedHost)
 
-      assert [["tenant_fair", 5, 5, 1]] = sandbox_policy()
+      assert [["windowed"]] = sandbox_policy()
 
-      stop_host(SandboxTenantFairHost)
+      stop_host(SandboxWindowedHost)
       :ok = Ecto.Adapters.SQL.Sandbox.stop_owner(owner)
 
       next_owner = Ecto.Adapters.SQL.Sandbox.start_owner!(SandboxRepo, shared: true)
@@ -395,7 +388,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         if Process.alive?(next_owner), do: Ecto.Adapters.SQL.Sandbox.stop_owner(next_owner)
       end)
 
-      assert [["legacy", nil, nil, 0]] = sandbox_policy()
+      assert [["legacy"]] = sandbox_policy()
     end
 
     test "manual testing advances only through bounded drain_runs" do
@@ -595,7 +588,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       refute_receive {:alternate_claim_policy, :init, :manual_runtime, _context}
     end
 
-    test "manual drain preserves the one normalized TenantFair configuration value" do
+    test "manual drain preserves the one normalized claim-policy configuration value" do
       Process.register(self(), :docket_claim_policy_relay)
 
       on_exit(fn ->
@@ -603,32 +596,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           do: Process.unregister(:docket_claim_policy_relay)
       end)
 
-      expected = %Docket.Postgres.ClaimPolicy.TenantFair.Config{
-        default_max_active_runs: 4
-      }
+      expected = %{relayed_option: 4}
 
-      start_supervised!(TenantFairConfigManualHost)
+      start_supervised!(RelayOptionsManualHost)
 
-      assert_receive {:tenant_fair_config_claim_policy, :init, ^expected,
+      assert_receive {:relay_options_claim_policy, :init, ^expected,
                       %{prefix: "public", identifiers: %{runs: ~s("public"."docket_runs")}}}
 
-      assert {:ok, reference} = TenantFairConfigManualHost.save_graph(Graphs.minimal_linear())
+      assert {:ok, reference} = RelayOptionsManualHost.save_graph(Graphs.minimal_linear())
 
       assert {:ok, %{status: :running}} =
-               TenantFairConfigManualHost.start_run(reference, %{"value" => "config"})
+               RelayOptionsManualHost.start_run(reference, %{"value" => "config"})
 
       assert {:ok, %{drained: 1}} =
-               TenantFairConfigManualHost.drain_runs(
+               RelayOptionsManualHost.drain_runs(
                  max_runs: 1,
                  claim_policy: [implementation: Docket.Postgres.ClaimPolicy.Legacy]
                )
 
-      assert_receive {:tenant_fair_config_claim_policy, :build_plan, ^expected, _pid}
-      assert_receive {:tenant_fair_config_claim_policy, :decode, ^expected, _pid}
-      refute_receive {:tenant_fair_config_claim_policy, :init, _, _}
+      assert_receive {:relay_options_claim_policy, :build_plan, ^expected, _pid}
+      assert_receive {:relay_options_claim_policy, :decode, ^expected, _pid}
+      refute_receive {:relay_options_claim_policy, :init, _, _}
     end
 
-    test "supervised dispatch preserves the one normalized TenantFair configuration value" do
+    test "supervised dispatch preserves the one normalized claim-policy configuration value" do
       Process.register(self(), :docket_claim_policy_relay)
 
       on_exit(fn ->
@@ -636,27 +627,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           do: Process.unregister(:docket_claim_policy_relay)
       end)
 
-      expected = %Docket.Postgres.ClaimPolicy.TenantFair.Config{
-        default_max_active_runs: 4
-      }
+      expected = %{relayed_option: 4}
 
-      start_supervised!(TenantFairConfigSupervisedHost)
+      start_supervised!(RelayOptionsSupervisedHost)
 
-      assert_receive {:tenant_fair_config_claim_policy, :init, ^expected,
+      assert_receive {:relay_options_claim_policy, :init, ^expected,
                       %{prefix: "public", identifiers: %{runs: ~s("public"."docket_runs")}}}
 
       assert {:ok, reference} =
-               TenantFairConfigSupervisedHost.save_graph(Graphs.minimal_linear())
+               RelayOptionsSupervisedHost.save_graph(Graphs.minimal_linear())
 
       assert {:ok, started} =
-               TenantFairConfigSupervisedHost.start_run(reference, %{"value" => "config"})
+               RelayOptionsSupervisedHost.start_run(reference, %{"value" => "config"})
 
       assert {:ok, %Docket.Run{status: :done}} =
-               TenantFairConfigSupervisedHost.await_run(started.id, timeout: 5_000)
+               RelayOptionsSupervisedHost.await_run(started.id, timeout: 5_000)
 
-      assert_receive {:tenant_fair_config_claim_policy, :build_plan, ^expected, _pid}
-      assert_receive {:tenant_fair_config_claim_policy, :decode, ^expected, _pid}
-      refute_receive {:tenant_fair_config_claim_policy, :init, _, _}
+      assert_receive {:relay_options_claim_policy, :build_plan, ^expected, _pid}
+      assert_receive {:relay_options_claim_policy, :decode, ^expected, _pid}
+      refute_receive {:relay_options_claim_policy, :init, _, _}
     end
 
     test "manual drains preserve retry attempt state across separate claims" do
@@ -1009,7 +998,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       assert_raise ArgumentError,
-                   ~r/tenant_mode :required requires a tenant-aware claim policy/,
+                   ~r/tenant_mode :required requires the WindowedInterleave claim policy/,
                    fn ->
                      postgres_init(
                        name: __MODULE__.TenantLegacyPolicy,
@@ -1071,53 +1060,29 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    test "TenantFair startup idempotently persists configured defaults before children" do
+    test "windowed startup idempotently normalizes the admission mode before children" do
       opts = [
-        name: __MODULE__.TenantFairStartup,
+        name: __MODULE__.WindowedStartup,
         repo: TestRepo,
         tenant_mode: :required,
-        claim_policy: [
-          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-          default_max_active_runs: 2
-        ],
+        claim_policy: [implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave],
         testing: :manual,
         notifier: :none
       ]
 
-      TestRepo.query!("UPDATE docket_claim_policy SET configured_max_active = 2 WHERE id = 1")
+      assert [["legacy", _reset_at]] = policy_configuration()
 
       assert {:ok, _supervisor_spec} = postgres_init(opts)
-
-      assert [["tenant_fair", 2, 2, 1, initialized_at]] = policy_configuration()
-      assert %DateTime{} = initialized_at
-
-      assert {:ok, %{version: 1}} =
-               Docket.Postgres.ClaimPolicy.Admin.put_override(
-                 Docket.Postgres.context(repo: TestRepo),
-                 {:tenant, "preserved"},
-                 1,
-                 expected_version: 0
-               )
-
-      assert {:ok, %{max_active_runs: 3, version: 2}} =
-               Docket.Postgres.ClaimPolicy.Admin.put_default(
-                 Docket.Postgres.context(repo: TestRepo),
-                 3,
-                 expected_version: 1
-               )
+      assert [["windowed", normalized_at]] = policy_configuration()
+      assert %DateTime{} = normalized_at
 
       assert {:ok, _supervisor_spec} = postgres_init(opts)
-      assert [["tenant_fair", 3, 2, 2, ^initialized_at]] = policy_configuration()
+      assert [["windowed", ^normalized_at]] = policy_configuration()
 
-      changed_opts = put_in(opts, [:claim_policy, :default_max_active_runs], 4)
-      assert {:ok, _supervisor_spec} = postgres_init(changed_opts)
-      assert [["tenant_fair", 4, 4, 3, ^initialized_at]] = policy_configuration()
+      TestRepo.query!("UPDATE docket_claim_policy SET admission_mode = 'legacy' WHERE id = 1")
 
-      assert [["preserved", 1, 1]] =
-               TestRepo.query!(
-                 "SELECT scope_key, max_active, partition_version " <>
-                   "FROM docket_claim_partitions WHERE scope_key = 'preserved'"
-               ).rows
+      assert {:ok, _supervisor_spec} = postgres_init(opts)
+      assert [["windowed", _renormalized_at]] = policy_configuration()
     end
 
     defp postgres_init(opts) do
@@ -1125,18 +1090,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp policy_configuration do
-      TestRepo.query!(
-        "SELECT admission_mode, max_active, configured_max_active, policy_version, " <>
-          "initialized_at " <>
-          "FROM docket_claim_policy WHERE id = 1"
-      ).rows
+      TestRepo.query!("SELECT admission_mode, updated_at FROM docket_claim_policy WHERE id = 1").rows
     end
 
     defp sandbox_policy do
-      SandboxRepo.query!(
-        "SELECT admission_mode, max_active, configured_max_active, policy_version " <>
-          "FROM docket_claim_policy WHERE id = 1"
-      ).rows
+      SandboxRepo.query!("SELECT admission_mode FROM docket_claim_policy WHERE id = 1").rows
     end
 
     test "storage remains exactly the current versioned schema" do
