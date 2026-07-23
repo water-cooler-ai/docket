@@ -11,7 +11,7 @@ Add Docket plus the optional PostgreSQL dependencies to the host, configure
 ```elixir
 def deps do
   [
-    {:docket, github: "water-cooler-ai/docket", branch: "v0.1.0"},
+    {:docket, "~> 0.1.0"},
     {:ecto_sql, "~> 3.10"},
     {:postgrex, "~> 0.17"}
   ]

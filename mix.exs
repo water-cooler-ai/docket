@@ -1,7 +1,7 @@
 defmodule Docket.MixProject do
   use Mix.Project
 
-  @version "0.1.0-dev"
+  @version "0.1.0"
   @source_url "https://github.com/water-cooler-ai/docket"
 
   # Set by the core-only CI leg to build and test without the optional
@@ -80,8 +80,7 @@ defmodule Docket.MixProject do
         "docs/architecture/README.md",
         "docs/architecture/docket-compiler-design.md",
         "docs/architecture/docket-graph-execution-contract-design.md",
-        "docs/architecture/docket-runtime-design.md",
-        "docs/architecture/docket-v0.1.0-spec-lock-audit.md"
+        "docs/architecture/docket-runtime-design.md"
       ]
     ]
   end

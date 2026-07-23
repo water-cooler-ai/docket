@@ -38,8 +38,6 @@ Graph and compiler internals are documented in
 
 ## Historical and research material
 
-- [v0.1.0 spec-lock audit](docket-v0.1.0-spec-lock-audit.md) is the historical
-  pre-cutover sequencing audit.
 - [Historical graph execution contract](docket-graph-execution-contract-design.md)
   records the 0.0.1 resident-runtime boundary and the execution semantics that
   carried forward.

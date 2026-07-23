@@ -24,7 +24,11 @@ unconditional starvation freedom.
 
 ## Configuration and engine boundary
 
-TenantFair is the sole PostgreSQL scheduler for required tenancy:
+> Removed in v0.1.0: the configuration below no longer exists.
+> `tenant_mode: :required` ships with
+> `Docket.Postgres.ClaimPolicy.WindowedInterleave`.
+
+TenantFair was the sole PostgreSQL scheduler for required tenancy:
 
 ```elixir
 use Docket,

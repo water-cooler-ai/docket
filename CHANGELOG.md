@@ -4,7 +4,7 @@ All notable changes to `docket` are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [Semantic Versioning](https://semver.org/).
 
-## 0.1.0 — Unreleased
+## 0.1.0 — 2026-07-23
 
 ### Added
 
@@ -352,8 +352,8 @@ project follows [Semantic Versioning](https://semver.org/).
   Retried attempts' `:node_failed` events now ride the `:retry_scheduled`
   checkpoint that recorded them instead of the eventual barrier checkpoint
   (#18).
-- Postgres v01 schema finalized to spec revision 8 (amended in place —
-  0.1.0 is unreleased): `claim_attempts` / `poisoned_at` / `poison_reason`
+- Postgres v01 schema finalized to spec revision 8 (amended in place
+  before the 0.1.0 release): `claim_attempts` / `poisoned_at` / `poison_reason`
   replace `attempts` / `operational_status` / `operational_error`, and
   `started_at` is non-null. Lifecycle CHECK constraints make the
   status/schedule/claim/poison tuple
@@ -364,7 +364,7 @@ project follows [Semantic Versioning](https://semver.org/).
   expired-claim `(claimed_at, id)`, and poison-introspection partial
   indexes behind positive dispatch eligibility (`status = 'running' AND
   poisoned_at IS NULL`) (#19).
-- The unreleased Postgres v01 schema makes graph versions tenant-owned without
+- The Postgres v01 schema makes graph versions tenant-owned without
   adding a publication table: generated non-null scope keys bind runs to
   `(scope_key, graph_id, graph_hash)` through a delete-restricted composite
   foreign key.
