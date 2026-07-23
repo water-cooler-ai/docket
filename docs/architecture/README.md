@@ -15,9 +15,6 @@ individual function boundary.
   replay, external effects, event export, and best-effort callbacks.
 - [PostgreSQL operations](../postgres-operations.md) — production setup,
   configuration, migration, recovery, and inspection.
-- [TenantFair claim policy](docket-tenant-fair.md) — historical: the engine
-  was removed from v0.1.0 in favor of `WindowedInterleave`; the document
-  records its design and the removal decision.
 - [ClaimPolicy boundary](docket-claim-policy.md) — the one-statement internal
   seam, engine selection, and the admission-mode interlock.
 - [0.0.1 to 0.1.0 migration](migration-0.0.1-to-0.1.0.md) — drain-and-cut-over
@@ -38,8 +35,6 @@ Graph and compiler internals are documented in
 
 ## Historical and research material
 
-- [v0.1.0 spec-lock audit](docket-v0.1.0-spec-lock-audit.md) is the historical
-  pre-cutover sequencing audit.
 - [Historical graph execution contract](docket-graph-execution-contract-design.md)
   records the 0.0.1 resident-runtime boundary and the execution semantics that
   carried forward.

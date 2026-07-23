@@ -1,60 +1,76 @@
 # Docket
 
-Docket is an Elixir library for durable, graph-based workflow execution —
-built for long-running, interruptible work like agentic LLM sessions, where a
-run may pause for an external resolution, survive a deploy, and resume exactly
-where it left off.
+[![Hex Version](https://img.shields.io/hexpm/v/docket.svg)](https://hex.pm/packages/docket)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/docket)
+[![CI](https://github.com/water-cooler-ai/docket/actions/workflows/ci.yml/badge.svg)](https://github.com/water-cooler-ai/docket/actions/workflows/ci.yml)
+[![License](https://img.shields.io/hexpm/l/docket.svg)](https://github.com/water-cooler-ai/docket/blob/main/LICENSE)
 
-Graph semantics are usable processlessly through `Docket.Test`; supervised
-production requires the assembled `Docket.Postgres`
-durable backend. The PostgreSQL bundle owns its stores,
-transaction recipes, claim fencing, dispatcher, claimed-run vehicles,
-notification fast path, and retention pruner. See the
-[PostgreSQL operations guide](docs/postgres-operations.md)
-for configuration and operational boundaries.
+Durable, graph-based workflow execution for Elixir — built for long-running,
+interruptible work like agentic LLM sessions, where a run may pause for an
+external resolution, survive a deploy, and resume exactly where it left off.
 
 You describe a workflow as a graph document: nodes that do work, shared state
 fields they read and write, and edges (optionally guarded) that decide what
-runs next. Docket executes the graph in deterministic supersteps, emitting a
-checkpoint at every durable transition boundary.
+runs next. Docket executes the graph in deterministic supersteps and commits
+a checkpoint at every durable transition.
 
-## Delivery and execution guarantees
+## Features
 
-Docket guarantees one atomic durable winner for each committed run transition:
-the claim-fenced run update, schedule change, and retained events commit
-together in PostgreSQL. That guarantee ends at the database transaction
-boundary. A node attempt that proposes the transition may execute more than
-once after a crash, timeout, or claim steal, even though only one proposal can
-commit. External effects therefore require a cooperating idempotency scheme
-when duplicates are unacceptable.
+- **Durable supersteps** — runs advance in Pregel-style plan/execute/commit
+  steps; the claim-fenced run update, schedule change, and retained events
+  commit together in one PostgreSQL transaction.
+- **External interrupts** — a node parks its run as `:waiting` with no live
+  process; when the outside world answers, `resolve_interrupt` writes the
+  value and the run continues in the next superstep.
+- **Crash-safe recovery** — claim fencing admits exactly one durable winner
+  per transition, and recovery reclaims persisted runs after a process or
+  node failure without host-owned resume code.
+- **Graphs as data** — an authored graph is a plain document that round-trips
+  through any JSON codec; publishing stores an immutable, content-addressed
+  version, and every run records the graph ID and hash it started from.
+- **Rich control flow** — fan-out, fan-in barriers, guarded branches, and
+  cycles with optional superstep bounds; node failures retry per node policy.
+- **Processless testing** — `Docket.Test.run_inline/2` exercises full graph
+  semantics in a unit test with no processes and no PostgreSQL.
+- **Multi-tenant fairness** — optional tenant scoping with claim policies
+  that admit due work breadth-first across tenants, so one tenant cannot
+  starve another.
+- **Small core** — the core depends only on `telemetry`; the PostgreSQL
+  backend compiles when the host already uses `ecto_sql` and `postgrex`, and
+  Docket takes no JSON dependency.
 
-Checkpoint observers, notifications, and telemetry are best effort and are
-not business-delivery mechanisms. Retained events are durable facts during
-their configured retention period, but exporting or consuming them is a
-separate delivery boundary. See the
+Docket guarantees one atomic durable winner for each committed run
+transition — and is explicit about where that guarantee ends. A node attempt
+that proposes a transition may execute more than once after a crash, timeout,
+or claim steal, even though only one proposal commits, so external effects
+need a cooperating idempotency scheme. Checkpoint observers, notifications,
+and telemetry are best effort. See the
 [delivery and execution guarantees](docs/delivery-guarantees.md) for the full
-matrix, partition behavior, and integration rules.
+matrix.
 
-## Docket.Postgres quickstart
+## Requirements
 
-This path starts a durable, tenantless runtime in an existing Ecto application.
-It uses polling only, which keeps the first setup independent of a dedicated
-LISTEN connection; notifications can be enabled later without changing
-correctness.
+- Elixir 1.18+.
+- The graph core and `Docket.Test` have no database requirement.
+- The durable backend requires PostgreSQL 13 or newer through the optional
+  `ecto_sql ~> 3.10` and `postgrex ~> 0.17` dependencies.
 
-### 1. Install Docket and its optional PostgreSQL dependencies
+## Installation
 
-Until 0.1.0 is published to Hex, pin the release branch:
+Add Docket and, for the durable backend, its optional PostgreSQL
+dependencies:
 
 ```elixir
 def deps do
   [
-    {:docket, github: "water-cooler-ai/docket", branch: "v0.1.0"},
+    {:docket, "~> 0.1.0"},
     {:ecto_sql, "~> 3.10"},
     {:postgrex, "~> 0.17"}
   ]
 end
 ```
+
+Then install the tables through a host-owned migration:
 
 ```sh
 mix deps.get
@@ -62,14 +78,15 @@ mix docket.gen.migration -r MyApp.Repo
 mix ecto.migrate -r MyApp.Repo
 ```
 
-The generated host migration delegates to Docket's pinned schema version.
-Commit that migration with the application; do not call the migration module
-directly from application startup.
+The generated migration delegates to Docket's pinned schema version. Commit
+it with the application; do not call the migration module directly from
+application startup.
 
-### 2. Configure and supervise one durable runtime
+## Quickstart
 
-Retention is required and explicit. These example values retain events for 30
-days and terminal runs for 90 days:
+This starts a durable, tenantless runtime in an existing Ecto application,
+using polling only; the LISTEN/NOTIFY fast path can be enabled later without
+changing correctness. Retention is required and explicit:
 
 ```elixir
 defmodule MyApp.DurableDocket do
@@ -98,10 +115,8 @@ children = [
 Supervisor.start_link(children, strategy: :one_for_one)
 ```
 
-### 3. Define a node and graph
-
-Define a node — a module that declares its config schema and does one unit of
-work against the shared state:
+Define a node — a module that declares its config schema and does one unit
+of work against the shared state:
 
 ```elixir
 defmodule MyApp.Nodes.Shout do
@@ -122,7 +137,7 @@ defmodule MyApp.Nodes.Shout do
 end
 ```
 
-Build a graph document:
+Build a graph document wiring the node between `$start` and `$finish`:
 
 ```elixir
 graph =
@@ -138,31 +153,6 @@ graph =
   |> Docket.Graph.put_output!("result", [])
 ```
 
-An authored graph is a plain document, so it round-trips through any JSON codec
-for storage in an editor or transmission over the wire. Executable node
-implementations map through an explicit host registry of stable string
-identifiers, so decoding never creates atoms from the document:
-
-```elixir
-registry = %{"myapp.shout" => MyApp.Nodes.Shout}
-
-json =
-  graph
-  |> Docket.Graph.to_map(implementations: registry)
-  |> Jason.encode!()
-
-{:ok, graph} =
-  json
-  |> Jason.decode!()
-  |> Docket.Graph.from_map(implementations: registry)
-```
-
-This is the editable *authored* graph; it carries no `GraphRef` hash. Only
-`save_graph` materializes node defaults and hashes the *effective* graph into a
-content-addressed reference, so re-saving after a node's defaults change may
-produce a different effective reference even when the authored document is
-unchanged. Docket takes no JSON dependency — the host owns encode/decode.
-
 Before publishing, the same graph can run processlessly in a unit test:
 
 ```elixir
@@ -174,12 +164,8 @@ Enum.map(checkpoints, & &1.type)
 #=> [:run_initialized, :step_committed, :run_completed]
 ```
 
-### 4. Publish and start a durable run
-
-`Docket.Postgres` assembles the durable stores, dispatcher, vehicles,
-LISTEN/NOTIFY fast path, and retention pruner behind one backend boundary.
-The application owns and supervises its Ecto Repo. Publish an immutable graph
-version, then start work from the returned reference:
+Publish an immutable graph version, then start durable work from the
+returned reference:
 
 ```elixir
 {:ok, graph_ref} = MyApp.DurableDocket.save_graph(graph)
@@ -190,158 +176,21 @@ version, then start work from the returned reference:
 {:ok, finished} = MyApp.DurableDocket.await_run(run.id, timeout: 5_000)
 finished.status #=> :done
 finished.output #=> %{"result" => "HELLO WORLD"}
-
-{:ok, committed} = MyApp.DurableDocket.fetch_run(run.id)
-{:ok, operational} = MyApp.DurableDocket.inspect_run(run.id)
-
-{:ok, latest_ref} = MyApp.DurableDocket.fetch_latest_graph_ref("shout")
-{:ok, effective_graph} = MyApp.DurableDocket.fetch_graph(latest_ref)
-
-{:ok, versions} = MyApp.DurableDocket.list_graph_versions("shout", limit: 100)
-versions.versions
-versions.next_before
-versions.has_more?
 ```
 
-`start_run` returns after the initialized run is durably committed; production
-advancement is asynchronous. `await_run` is a bounded convenience for callers
-that need to wait until a run pauses or terminates. Use `fetch_run` for the last
-committed graph state and `inspect_run` for scheduling and poison health.
+`start_run` returns after the initialized run is durably committed;
+production advancement is asynchronous, and `await_run` is a bounded
+convenience for callers that need to wait until a run pauses or terminates.
+The facade also provides paged run, event, and graph-version readers plus
+`fetch_run`, `inspect_run`, `cancel_run`, and `retry_poisoned_run`; the
+`Docket` module docs are the authoritative API reference.
 
-Use the tenant-scoped collection reader to discover runs without maintaining a
-second run-ID index in the host application. It returns lightweight summaries
-newest first, using the immutable `{started_at, run_id}` pair as its cursor:
-
-```elixir
-{:ok, page} =
-  MyApp.DurableDocket.list_runs(
-    graph_id: "shout",
-    status: [:running, :waiting],
-    limit: 100
-  )
-
-page.runs
-page.next_before
-page.has_more?
-
-{:ok, latest} = MyApp.DurableDocket.fetch_latest_run(graph_id: "shout")
-```
-
-Pass `before: page.next_before` to continue. Graph reads are tenant-owned just
-like run reads: `fetch_latest_graph_ref/1` resolves the newest distinct version
-for an ID, `list_graph_versions/2` pages retained version metadata newest first,
-and `fetch_graph/1` reads only the exact `GraphRef` supplied by the caller.
-A `GraphRef` is relative to the resolved tenant scope and never acts as an
-authorization credential.
-
-To read a run's history, page its retained events in ascending sequence order:
-
-```elixir
-{:ok, page} = MyApp.DurableDocket.list_events(run.id, after_seq: 0, limit: 250)
-
-page.events            # this page, ascending by sequence
-page.next_after_seq    # cursor for the next page
-page.has_more?         # whether more retained events follow
-```
-
-For point reads, use `fetch_event(run.id, seq)` or
-`fetch_latest_event(run.id)`. The latter means the latest *retained* event and
-returns `{:ok, nil}` when the run is visible but retention has removed its
-entire event history; a missing or wrong-tenant run still returns
-`{:error, :not_found}`.
-
-Pass `tenant_id:` under `tenant_mode: :required`; a wrong tenant and an unknown
-run both return `{:error, :not_found}`. This is the durable repair source for
-observer gaps: `checkpoint_observers:` run best-effort after commit and may drop
-or duplicate, but the reader exposes what durably committed within the retained
-window. Sequence
-gaps are normal — persistence filtering and retention pruning both leave holes,
-so pages are never contiguous. `oldest_available_seq`/`latest_available_seq`
-report the retained window, while `latest_seq` is the run's latest committed
-event sequence regardless of retention, so a fully pruned history is detectable
-as `latest_seq > 0` with `latest_available_seq == nil`.
-
-For multi-tenant PostgreSQL applications, configure `tenant_mode: :required`,
-select `Docket.Postgres.ClaimPolicy.WindowedInterleave`, and pass a non-empty
-`tenant_id` to every run, read, and signal call. The windowed engine admits
-work breadth-first across tenants with sticky in-flight cohorts, so no tenant
-starves another and started runs are driven to completion first; see the
-module documentation and the
-[parent-application example](examples/parent-app-integration.md). To enable the
-LISTEN/NOTIFY latency fast path, remove `notifier: :none`; deployments behind
-PgBouncer transaction or statement pooling must give the notifier a direct or
-session-pooled connection. Polling always remains the correctness path.
-
-`save_graph` snapshots node configuration schemas, materializes their defaults,
-and validates and compiles the effective graph before storing its canonical,
-content-addressed document. `start_run` accepts only the returned stable
-reference, fetches the saved document, and compiles it on the executing node;
-later schema defaults are never injected into that retained graph version, and
-starting a run never republishes the graph. Compiled runtime graphs are
-node-local and ephemeral. The production vehicle compiles once per
-claim and reuses that value while draining supersteps. Applications must keep node code and
-retained checkpoints compatible across deploys, drain old vehicles, or use
-versioned node modules when behavior must remain fixed. Cyclic graphs may run
-without a superstep limit; hosts may optionally configure `max_supersteps`, or
-publish a graph policy when the limit should be part of graph identity. The
-backend-neutral durable facade also provides
-`resolve_interrupt`, `cancel_run`,
-`retry_poisoned_run`, and bounded `await_run`. `tenant_mode: :none` permits
-only tenantless rows; `tenant_mode: :required` requires a non-empty
-`tenant_id` before storage access. Durable `checkpoint_observers:` run after
-commit, are best-effort, and cannot veto state. Durable consumers that cannot
-tolerate lost or duplicate delivery should export retained events with a
-durable cursor and idempotent downstream handling instead of using observer
-callbacks. Production `checkpoint:` configuration is rejected;
-`Docket.Test` returns read-only checkpoint values for processless semantic
-assertions; those values cannot affect execution.
-
-### Migration from 0.0.1
-
-The production-boundary break does not replace the graph programming model.
-Node modules and graph definitions carry over unchanged, including
-`Docket.Node`, `Docket.Graph`, `Docket.Schema`, reducers, interrupts, and
-executors. `Docket.Test.run_inline` and its related processless helpers remain
-the PostgreSQL-free graph-semantics testing surface. Run persistence is
-backend-private. The v0.0.1 host Run map codec is not part
-of v0.1.0 and there is no compatibility decoder or dual-write path.
-
-Durable integration tests use the production lifecycle and PostgreSQL stores.
-Configure `testing: :inline` to commit `start_run` and named signals in the
-caller and synchronously drain due work to its next park, without starting a
-dispatcher, notifier, vehicle task, or pruner. Configure `testing: :manual` to
-disable automatic advancement and call
-`MyApp.DurableDocket.drain_runs(max_runs: 100)`
-after starts, signals, or manual clock changes. The bound prevents cyclic
-graphs that remain immediately due from hanging a test. Both modes keep one
-production `Docket.Lifecycle`/storage transaction per logical moment; neither
-wraps node execution or a whole drain in a Docket transaction. An SQL Sandbox
-owner transaction may still surround the test itself.
-
-Tests that need deterministic durable timestamps may configure one top-level
-zero-arity `clock:` function alongside either testing mode. That clock belongs
-to the runtime instance: facade calls, synchronous claims, and vehicles share
-it, and per-call or nested dispatcher/vehicle/pruner clock overrides are not
-accepted. Claim inputs are normalized to UTC microsecond precision before the
-selected policy receives them. Production instances always use the
-system/database clock.
-
-The intended cutover is:
-
-1. Drain or terminate active `0.0.1` runs and stop old writers.
-2. Delete the host checkpoint committer and Docket-specific host tables.
-3. Install Docket's migration and configure `repo:` plus
-   `backend: Docket.Postgres`.
-4. Publish graphs with `save_graph` and retain the returned `GraphRef`.
-5. Replace `run` with `start_run`, `get_run` with `fetch_run` or
-   `inspect_run`, and remove host-owned `resume` orchestration.
-6. Use observers only for best-effort after-commit notifications; export
-   retained events with a durable cursor and idempotent downstream handling
-   when delivery must survive crashes.
-
-Because `0.0.1` storage is application-defined, Docket cannot provide one
-universal database migration. The supported path is an explicit
-drain-and-cut-over rather than a transparent dual-driver period.
+Multi-tenant applications configure `tenant_mode: :required` with a fair
+claim policy such as `Docket.Postgres.ClaimPolicy.WindowedInterleave`, and
+durable integration tests use the production lifecycle through
+`testing: :inline` or `testing: :manual`. See the
+[parent-application example](examples/parent-app-integration.md) and the
+[PostgreSQL operations guide](docs/postgres-operations.md).
 
 ## External interrupts
 
@@ -381,33 +230,6 @@ A run advances in Pregel-style supersteps:
    resolve same-step conflicts in sorted node order, evaluate edge guards and
    fan-in barriers, and commit the step atomically with a checkpoint.
 
-Edges carry the control flow: fan-out (multiple edges from one node), fan-in
-joins (multi-source barrier edges that fire when every source has completed),
-guarded branches (durable, serializable guard expressions over state), and
-cycles (optionally bounded by a graph or host `max_supersteps` policy). Node failures retry per node
-policy; a permanently failed superstep commits none of its writes.
-
-Durable graphs and run state use a private versioned deterministic ETF codec;
-the compiler canonicalizes and validates the effective graph before its exact
-ETF bytes are hashed once and stored. Graph hashing is private, and every run
-records the published graph ID and hash it was started from. Recovery validates
-strict collection key/value shapes and fails closed on malformed stored terms.
-
-## Production architecture
-
-Each instance supervises one backend bundle and shared execution resources:
-
-```text
-MyApp.DurableDocket (Supervisor, :one_for_all)
-├── Docket.Postgres     — stores, dispatcher, vehicles, notifier, pruner
-├── Runtime.Instance    — immutable facade configuration
-└── Task.Supervisor     — isolated node execution and observer delivery
-```
-
-Backend vehicles claim persisted work and execute nodes in isolated supervised
-tasks. Claim fencing protects commits, and recovery reclaims persisted runs
-after process or node failure without a host-owned resume path.
-
 ## Current boundaries
 
 Docket deliberately leaves these to the host application:
@@ -420,27 +242,24 @@ Docket deliberately leaves these to the host application:
 The configured backend exclusively owns graph/run persistence, scheduling,
 recovery, signals, and production supervision.
 
-## Package status
-
-Docket 0.1.0 is not yet published to Hex. The quickstart pins the active
-release branch; after publication, prefer the Hex requirement documented on
-the package page.
-
 ## Learn more
 
-- [Backend test guide](docs/backend-conformance.md) — the shared source test
-  suite and backend-specific coverage boundary.
+- [PostgreSQL operations and correctness guide](docs/postgres-operations.md) —
+  statuses, claims, poison recovery, configuration, testing modes, and
+  inspection.
+- [Delivery and execution guarantees](docs/delivery-guarantees.md) — the full
+  guarantee matrix, partition behavior, and integration rules.
 - [examples/parent-app-integration.md](examples/parent-app-integration.md) —
   the durable parent-application integration boundary.
-- [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).
-- [PostgreSQL operations and correctness guide](docs/postgres-operations.md) —
-  statuses, claims, poison recovery, configuration, and inspection.
-- [Future roadmap](docs/future-roadmap.md) — project-wide future features,
-  improvements, investigations, and research.
-- [Telemetry](docs/telemetry.md) and [benchmarks](docs/benchmarks.md) —
-  operational signals and non-oracle regression measurements.
 - [examples/llm-node.md](examples/llm-node.md) — a generic, configurable LLM
   node implementation.
+- [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).
+- [Backend test guide](docs/backend-conformance.md) — the shared source test
+  suite and backend-specific coverage boundary.
+- [Telemetry](docs/telemetry.md) and [benchmarks](docs/benchmarks.md) —
+  operational signals and non-oracle regression measurements.
+- [Future roadmap](docs/future-roadmap.md) — future features, improvements,
+  investigations, and research.
 - [Architecture guide index](docs/architecture/README.md) — design rationale:
   the graph document contract, compiler, execution contract, and runtime
   background.

@@ -1,11 +1,5 @@
 # PostgreSQL ClaimPolicy boundary
 
-> **Status note (2026-07-23):** the TenantFair engine described in parts of
-> this document was removed from v0.1.0; `WindowedInterleave` is the shipped
-> tenant-aware engine and holds its own `windowed` admission mode. The
-> boundary, plan validation, and mode-interlock mechanics described here are
-> unchanged.
-
 `Docket.Postgres.RunStore.claim_due/3` is the only PostgreSQL admission
 entrypoint. ClaimPolicy is an internal engine seam behind RunStore, not a
 second store API and not a per-call option.
@@ -40,25 +34,30 @@ statement.
 
 Legacy also participates in the minimal engine interlock. It takes a shared
 lock on `docket_claim_policy` and admits only while `admission_mode` is
-`legacy`. A TenantFair mode, a skipped policy lock, a read-only transaction,
-or non-Read-Committed isolation fails closed before run mutation.
+`legacy`. A `windowed` admission mode, a skipped policy lock, a read-only
+transaction, or non-Read-Committed isolation fails closed before run
+mutation.
 
 Legacy remains the default for `tenant_mode: :none` when `claim_policy:` is
 omitted. PostgreSQL `tenant_mode: :required` rejects Legacy and requires the
-TenantFair implementation with an explicit cap.
+WindowedInterleave implementation.
 
-## TenantFair
+## WindowedInterleave
 
-`Docket.Postgres.ClaimPolicy.TenantFair` is the sole required-tenancy engine.
-Backend startup synchronizes its configured default before children start, then it
-invokes the prefix-local claim function once; the function owns sticky
-admission, bounded ring traversal, locking, mutation, and cursor/epoch
-accounting while treating the persisted policy as live authority. Runtime
-default changes survive restarts until the configured value changes. Its complete contract is the
-[TenantFair claim policy](docket-tenant-fair.md).
+`Docket.Postgres.ClaimPolicy.WindowedInterleave` is the sole required-tenancy
+engine. One set-based claim statement samples active scopes in random order
+and admits due work breadth-first across them: every sampled scope's
+first-ranked run is considered before any scope's second-ranked run.
+Admission is sticky within a scope — admitted due work ranks ahead of
+unadmitted work, so in-flight runs are driven to completion before new runs
+start — and no per-tenant cap is configured. The engine claims only under
+the `windowed` admission mode, which startup normalizes last-boot-wins, and
+takes no policy-row lock beyond the shared admission gate, so concurrent
+dispatchers admit in parallel. Fairness across tenants is statistical rather
+than deterministic. The module documentation is the authoritative contract.
 
 Engine choice is instance-level. All instances sharing a domain must use one
-homogeneous version and TenantFair configuration. Deployments must not mix
+homogeneous version and claim-policy configuration. Deployments must not mix
 binaries that predate the `admission_mode` interlock. Operational details are
 in the [PostgreSQL operations guide](../postgres-operations.md).
 
@@ -66,6 +65,5 @@ in the [PostgreSQL operations guide](../postgres-operations.md).
 
 The shared ClaimPolicy and live RunStore matrices verify implementation
 selection, one-statement execution, decoded lease persistence, PostgreSQL error
-preservation, transaction behavior, and telemetry. The
-[TenantFair correctness evidence](docket-tenant-fair.md#correctness-evidence)
-names its policy-specific tests.
+preservation, transaction behavior, and telemetry. Policy-specific coverage
+lives with each implementation's test modules.
