@@ -73,6 +73,7 @@ defmodule Docket.MixProject do
 
     [
       main: "readme",
+      source_ref: "v#{@version}",
       extras: extras,
       skip_undefined_reference_warnings_on: [
         "README.md",
