@@ -54,6 +54,8 @@ defmodule Docket.Bench.Scorecard.Runtime do
     drain_max_elapsed_ms =
       Keyword.get(overrides, :drain_max_elapsed_ms, @default_drain_max_elapsed_ms)
 
+    drain_max_moments = Keyword.get(overrides, :drain_max_moments, 100)
+
     max_attempt_elapsed_ms =
       Keyword.get(overrides, :max_attempt_elapsed_ms, @default_max_attempt_elapsed_ms)
 
@@ -73,7 +75,9 @@ defmodule Docket.Bench.Scorecard.Runtime do
         max_claim_attempts: 5,
         drain_timeout_ms: 30_000
       ],
-      vehicle: [drain_budget: [max_moments: 100, max_elapsed_ms: drain_max_elapsed_ms]],
+      vehicle: [
+        drain_budget: [max_moments: drain_max_moments, max_elapsed_ms: drain_max_elapsed_ms]
+      ],
       pruner: @pruner
     ]
   end

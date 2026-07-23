@@ -27,6 +27,7 @@ defmodule Docket.Bench.Scorecard.Config do
     "claim_ceiling",
     "tenant_fairness",
     "fast_slow",
+    "sticky_cohort",
     "surge"
   ]
 
@@ -46,6 +47,7 @@ defmodule Docket.Bench.Scorecard.Config do
           slowdown_good: 1.5,
           slowdown_bad: 8.0
         },
+        "sticky_cohort" => %{n: 60, chain: 6, drain_moments: 2, concurrency: 8},
         "surge" => %{window_ms: 20_000, concurrency: 8}
       }
     },
@@ -64,6 +66,7 @@ defmodule Docket.Bench.Scorecard.Config do
           slowdown_good: 1.5,
           slowdown_bad: 8.0
         },
+        "sticky_cohort" => %{n: 200, chain: 8, drain_moments: 2, concurrency: 16},
         "surge" => %{window_ms: 60_000, concurrency: 16}
       }
     },
@@ -82,6 +85,7 @@ defmodule Docket.Bench.Scorecard.Config do
           slowdown_good: 1.5,
           slowdown_bad: 8.0
         },
+        "sticky_cohort" => %{n: 600, chain: 8, drain_moments: 2, concurrency: 32},
         "surge" => %{window_ms: 120_000, concurrency: 32}
       }
     }
@@ -151,6 +155,7 @@ defmodule Docket.Bench.Scorecard.Config do
       scenarios["claim_ceiling"].workers,
       scenarios["tenant_fairness"].concurrency,
       scenarios["fast_slow"].concurrency,
+      scenarios["sticky_cohort"].concurrency,
       scenarios["surge"].concurrency
     ]
 
@@ -219,6 +224,12 @@ defmodule Docket.Bench.Scorecard.Config do
     validate_scenario!(config.scenarios["claim_ceiling"], [:n, :workers, :target_claims_per_sec])
     validate_scenario!(config.scenarios["tenant_fairness"], [:tenants, :n, :concurrency])
     validate_scenario!(config.scenarios["fast_slow"], [:concurrency, :n_fast, :hold_ms])
+
+    validate_scenario!(
+      config.scenarios["sticky_cohort"],
+      [:n, :chain, :drain_moments, :concurrency]
+    )
+
     validate_scenario!(config.scenarios["surge"], [:window_ms, :concurrency])
 
     levels = config.scenarios["concurrency"].levels

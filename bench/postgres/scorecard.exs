@@ -17,6 +17,7 @@ for file <- [
       "scenarios/claim_ceiling.ex",
       "scenarios/tenant_fairness.ex",
       "scenarios/fast_slow.ex",
+      "scenarios/sticky_cohort.ex",
       "scenarios/surge.ex",
       "report.ex"
     ] do

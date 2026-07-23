@@ -10,6 +10,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     considered before any scope's second-ranked run. Expired-claim recovery
     is scope-blind and identical to `Docket.Postgres.ClaimPolicy.Legacy`.
 
+    Admission is sticky within a scope. A run's first claim installs
+    `tenant_admitted_at`, and admitted due work ranks ahead of unadmitted work
+    in that scope's page, so runs already in progress are re-acquired and
+    driven to completion before new runs start. A scope's in-flight cohort
+    therefore stays near its share of each claim batch, with no configured
+    cap: new work is admitted only when a batch slot reaches the scope and no
+    admitted run is due. Poisoning clears the marker. Unlike TenantFair,
+    promotion order is near-FIFO rather than strict: a locked or stale queue
+    head does not block later promotions.
+
     The engine runs under the `legacy` admission mode, holds no cursor, and
     takes no policy-row lock beyond the shared admission gate, so concurrent
     dispatchers admit in parallel. Fairness across tenants is statistical —
@@ -97,9 +107,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         FROM active_scopes
         CROSS JOIN LATERAL (
           SELECT page.id, page.eligible_at,
-                 ROW_NUMBER() OVER (ORDER BY page.eligible_at, page.id) AS scope_rank
+                 ROW_NUMBER() OVER (
+                   ORDER BY CASE WHEN page.admitted THEN 0 ELSE 1 END,
+                            page.eligible_at, page.id
+                 ) AS scope_rank
           FROM (
-            (SELECT runs.id, runs.wake_at AS eligible_at
+            (SELECT runs.id, runs.wake_at AS eligible_at, true AS admitted
              FROM #{table} AS runs
              WHERE runs.scope_key = active_scopes.scope_key
                AND runs.status = 'running'
@@ -110,7 +123,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              ORDER BY runs.wake_at, runs.id
              LIMIT $3)
             UNION ALL
-            (SELECT runs.id, runs.wake_at AS eligible_at
+            (SELECT runs.id, runs.wake_at AS eligible_at, false AS admitted
              FROM #{table} AS runs
              WHERE runs.scope_key = active_scopes.scope_key
                AND runs.status = 'running'
@@ -173,7 +186,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             claimed_at =
               CASE WHEN runs.claim_attempts < $4 THEN $1 ELSE NULL END,
             tenant_admitted_at =
-              CASE WHEN runs.claim_attempts < $4 THEN runs.tenant_admitted_at ELSE NULL END,
+              CASE
+                WHEN runs.claim_attempts < $4 THEN COALESCE(runs.tenant_admitted_at, $1)
+                ELSE NULL
+              END,
             wake_at = NULL,
             claim_attempts =
               CASE

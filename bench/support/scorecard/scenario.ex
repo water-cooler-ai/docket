@@ -13,10 +13,11 @@ defmodule Docket.Bench.Scorecard.Scenario do
     {"claim_ceiling", Docket.Bench.Scorecard.Scenarios.ClaimCeiling},
     {"tenant_fairness", Docket.Bench.Scorecard.Scenarios.TenantFairness},
     {"fast_slow", Docket.Bench.Scorecard.Scenarios.FastSlow},
+    {"sticky_cohort", Docket.Bench.Scorecard.Scenarios.StickyCohort},
     {"surge", Docket.Bench.Scorecard.Scenarios.Surge}
   ]
 
-  @policy_sensitive ["claim_ceiling", "tenant_fairness", "fast_slow"]
+  @policy_sensitive ["claim_ceiling", "tenant_fairness", "fast_slow", "sticky_cohort"]
 
   def registry, do: @registry
 
