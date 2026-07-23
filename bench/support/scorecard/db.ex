@@ -98,15 +98,11 @@ defmodule Docket.Bench.Scorecard.Db do
         Repo.query!("DELETE FROM #{partitions}")
 
         # Policy variants share this isolated scratch schema. With no runs or
-        # partitions left, restore its pre-admission state so Legacy and
-        # TenantFair trials remain independent.
+        # partitions left, restore its pre-admission state so policy trials
+        # remain independent.
         Repo.query!("""
         UPDATE #{policy}
         SET admission_mode = 'legacy',
-            max_active = NULL,
-            policy_version = 0,
-            scan_ring_position = 0,
-            initialized_at = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = 1
         """)

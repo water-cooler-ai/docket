@@ -99,12 +99,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert row.latest_checkpoint_type == :run_initialized
       assert row.updated_at == @committed_at
 
-      assert %ClaimPartition{
-               scope_key: "",
-               max_active: nil,
-               partition_version: 0,
-               admission_epoch: 0
-             } = claim_partition!("")
+      assert %ClaimPartition{scope_key: ""} = claim_partition!("")
 
       assert {:error, :already_exists} =
                RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
@@ -157,29 +152,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              }
     end
 
-    test "committed-row fast path preserves current override and cursor fields" do
-      admin_partition =
-        TestRepo.insert!(%ClaimPartition{
-          scope_key: "tenant",
-          max_active: 5,
-          partition_version: 7,
-          admission_epoch: 11
-        })
-
-      run = initialized_run("admin-owned-partition")
-
-      assert {:ok, ^run} =
-               RunStore.insert_run(TestRepo, {:tenant, "tenant"}, run, :run_initialized, @now)
-
-      persisted = claim_partition!("tenant")
-
-      assert Map.take(persisted, claim_partition_fields()) ==
-               Map.take(admin_partition, claim_partition_fields())
-
-      assert claim_schedule_count("tenant") == 1
-      assert claim_schedule_unfinished_count("tenant") == 1
-    end
-
     test "a committed partition remains unchanged after its last run is deleted" do
       run = initialized_run("dormant-partition")
 
@@ -223,11 +195,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert claim_partition_count("tenant") == 1
       assert claim_schedule_count("tenant") == 1
       assert claim_schedule_unfinished_count("tenant") == length(runs)
-
-      assert %ClaimPartition{
-               partition_version: 0,
-               admission_epoch: 0
-             } = claim_partition!("tenant")
+      assert %ClaimPartition{scope_key: "tenant"} = claim_partition!("tenant")
     end
 
     test "invalid, duplicate, and graph-FK failures roll back their partition insert" do
@@ -319,7 +287,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert claim_schedule_count("tenant") == 0
     end
 
-    test "an uncommitted admission epoch update and run lock do not block another insert" do
+    test "an uncommitted partition row lock and run lock do not block another insert" do
       existing = initialized_run("locked-existing")
 
       assert {:ok, ^existing} =
@@ -340,9 +308,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             TestRepo.query!(
               """
               UPDATE docket_claim_partitions
-              SET admission_epoch = admission_epoch + 1
+              SET updated_at = CURRENT_TIMESTAMP
               WHERE scope_key = $1
-              RETURNING admission_epoch
+              RETURNING scope_key
               """,
               ["tenant"]
             )
@@ -385,36 +353,29 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert insert_result == {:ok, {:ok, inserted}}
       assert Task.await(blocker, 2_000) == {:ok, :released}
       assert claim_partition_count("tenant") == 1
-      assert claim_partition!("tenant").admission_epoch == 1
     end
 
-    test "an uncommitted override first insert wins uniqueness arbitration unchanged" do
+    test "an uncommitted first partition insert wins uniqueness arbitration unchanged" do
       parent = self()
       ref = make_ref()
 
-      admin_writer =
+      first_writer =
         Task.async(fn ->
           TestRepo.transaction(fn ->
-            partition =
-              TestRepo.insert!(%ClaimPartition{
-                scope_key: "x",
-                max_active: 9,
-                partition_version: 12,
-                admission_epoch: 17
-              })
+            partition = TestRepo.insert!(%ClaimPartition{scope_key: "x"})
 
-            send(parent, {ref, :admin_inserted})
+            send(parent, {ref, :first_inserted})
 
             receive do
               {^ref, :commit} -> partition
             after
-              5_000 -> raise "Admin insert was not released"
+              5_000 -> raise "first partition insert was not released"
             end
           end)
         end)
 
-      assert_receive {^ref, :admin_inserted}, 2_000
-      run = initialized_run("admin-first-race")
+      assert_receive {^ref, :first_inserted}, 2_000
+      run = initialized_run("partition-first-race")
 
       lifecycle_writer =
         Task.async(fn ->
@@ -438,16 +399,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert_backend_lock_wait!(lifecycle_backend_pid)
         assert Task.yield(lifecycle_writer, 0) == nil
       after
-        send(admin_writer.pid, {ref, :commit})
+        send(first_writer.pid, {ref, :commit})
       end
 
-      assert {:ok, admin_partition} = Task.await(admin_writer, 2_000)
+      assert {:ok, first_partition} = Task.await(first_writer, 2_000)
       assert {:ok, ^run} = Task.await(lifecycle_writer, 2_000)
 
       persisted = claim_partition!("x")
 
       assert Map.take(persisted, claim_partition_fields()) ==
-               Map.take(admin_partition, claim_partition_fields())
+               Map.take(first_partition, claim_partition_fields())
 
       assert claim_schedule_count("x") == 1
     end
@@ -2596,14 +2557,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defp claim_partition_fields do
-      [
-        :scope_key,
-        :max_active,
-        :partition_version,
-        :admission_epoch,
-        :inserted_at,
-        :updated_at
-      ]
+      [:scope_key, :inserted_at, :updated_at]
     end
 
     defp assert_backend_lock_wait!(backend_pid) do

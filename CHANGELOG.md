@@ -8,37 +8,26 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- PostgreSQL schema version 2 adds the complete TenantFair engine: one
-  database-and-schema fairness domain, an authoritative trigger-maintained
-  unfinished-partition ring, a serialized circular cursor, bounded
-  cross-partition traversal, and exact sticky logical-run admission. FIFO
-  promotion and fresh marker counts enforce `max_active_runs`; cooperative
-  yield, refresh, reacquisition, and expired steal retain admission, while
-  future scheduling, external waiting, interruption, poison, and terminal
-  transitions release it. Cap decreases create non-preemptive debt. Run
-  creation atomically materializes its owner partition, and rollback leaves no
-  partition or wake behind. The stopped migration backfills healthy claims,
-  installs the indexes, engine interlock, and sole claim function, supports
-  custom prefixes and rollback to host schema V1, and makes stale schema shapes
-  fail closed. Required PostgreSQL tenancy selects TenantFair with an explicit
-  `default_max_active_runs`; homogeneous backend startup synchronizes that
-  configured field before dispatchers start, while claim traffic only reads
-  the initialized active policy. Runtime default changes survive restarts until
-  the configured value changes. The versioned public facade manages live
-  defaults and durable per-owner overrides and reports token-free queued,
-  admitted, and debt counts. ClaimPolicy implementations receive the quoted schema
-  identifiers needed to build prefix-local plans. See the
-  [TenantFair claim policy](docs/architecture/docket-tenant-fair.md).
-- Public TenantFair cap administration through
-  `fetch_claim_policy_default`, `put_claim_policy_default`,
-  `put_claim_policy_override`, `reset_claim_policy_override`, and
-  `inspect_claim_policy`. Top-level `Docket` calls accept a configured runtime;
-  `use Docket` generates same-named wrappers only when its static options select
-  TenantFair and the configured backend exposes the optional capability.
-  Results are normalized into
-  `Docket.ClaimPolicy` and `Docket.ClaimPolicyInfo`, CAS keeps `:stale`, and
-  unsupported backends return a typed capability error without exposing
-  storage contexts or PostgreSQL identifiers.
+- PostgreSQL schema version 2 adds the shared admission substrate: the
+  singleton claim-policy gate row with per-engine admission modes,
+  trigger-maintained `docket_claim_schedule` membership with exact
+  unfinished-run counts, `docket_claim_partitions` ownership rows, and the
+  scoped partial indexes serving per-scope admission reads. Run creation
+  atomically materializes its owner partition, and rollback leaves no
+  partition or wake behind. The stopped migration backfills scope membership,
+  supports custom prefixes and rollback to host schema V1, and makes stale
+  schema shapes fail closed. ClaimPolicy implementations receive the quoted
+  schema identifiers needed to build prefix-local plans.
+- `Docket.Postgres.ClaimPolicy.WindowedInterleave`, a set-based tenant-aware
+  claim policy under its own `windowed` admission mode: samples active scopes
+  in random order, admits breadth-first across scopes for statistical
+  cross-tenant fairness, and keeps admission sticky within a scope so runs
+  already in progress are re-acquired and driven to completion before new
+  runs start, bounding each scope's in-flight cohort at its share of the
+  claim batch with no configured cap. Required PostgreSQL tenancy selects
+  this engine. Every engine normalizes the persisted admission mode to its
+  own value at startup, writing only on drift; mixed-engine fleets are
+  last-boot-wins and unsupported.
 - `Docket.BackendTests`, a source-owned shared ExUnit suite under
   `test/support`. One explicit backend matrix generates identical black-box
   cases for the memory and PostgreSQL bundles; external backend projects can

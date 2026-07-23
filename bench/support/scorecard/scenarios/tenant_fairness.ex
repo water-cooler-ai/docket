@@ -123,9 +123,8 @@ defmodule Docket.Bench.Scorecard.Scenarios.TenantFairness do
     |> Enum.sort_by(& &1.tenant)
   end
 
-  defp evidence(light_p95_norm, score) do
-    base = "light p95 = #{round(light_p95_norm * 100)}% of drain"
-    if score < 30, do: base <> " (legacy tenant-blind policy)", else: base
+  defp evidence(light_p95_norm, _score) do
+    "light p95 = #{round(light_p95_norm * 100)}% of drain"
   end
 
   defp tenant_name(i), do: "tenant-" <> String.pad_leading(Integer.to_string(i), 2, "0")

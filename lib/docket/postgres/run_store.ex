@@ -59,10 +59,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     first wake.
 
     Before inserting the run, the same transaction ensures its canonical claim
-    partition exists with inherited, running, version-zero defaults. A
-    concurrent or Admin-created row wins unchanged. Failed inserts and caller
-    rollbacks remove both lifecycle writes; committed partition rows remain
-    dormant indefinitely when their last run is later pruned.
+    partition exists. A concurrently created row wins unchanged. Failed
+    inserts and caller rollbacks remove both lifecycle writes; committed
+    partition rows remain dormant indefinitely when their last run is later
+    pruned.
     """
     @impl true
     @spec insert_run(
@@ -419,7 +419,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       result = if matched == 1, do: {:ok, :rescheduled}, else: {:ok, :stale}
       emit_claim_operation(:abandon, started, result, %{reason: :host_incompatible})
-      maybe_emit_context_admission_release(ctx, matched == 1, :host_incompatible)
       result
     end
 
@@ -513,12 +512,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end
 
       emit_claim_operation(:abandon, started, result, %{})
-
-      maybe_emit_context_admission_release(
-        ctx,
-        result in [{:ok, :rescheduled}, {:ok, :poisoned}],
-        if(result == {:ok, :poisoned}, do: :poison, else: :abandon_backoff)
-      )
 
       if result == {:ok, :poisoned} do
         :telemetry.execute(
@@ -1036,7 +1029,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     # A plain MVCC read sees an already-committed partition without waiting for
     # an admission transaction's uncommitted update to its current tuple. The
     # absent case still uses uniqueness arbitration because another first
-    # writer or Admin may materialize the key after this observation.
+    # writer may materialize the key after this observation.
     defp ensure_claim_partition(repo, prefix, scope_key) do
       query =
         from(partition in ClaimPartition,
@@ -1052,10 +1045,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    # Supplying only the canonical key is intentional: PostgreSQL owns every
-    # version-zero default. `DO NOTHING` is also load-bearing because an Admin
-    # row may win the read/insert race with overrides, non-running state, or
-    # advanced versions.
+    # Supplying only the canonical key is intentional: PostgreSQL owns the
+    # row defaults. `DO NOTHING` is also load-bearing because a concurrent
+    # first writer may win the read/insert race.
     defp insert_claim_partition(repo, prefix, scope_key) do
       _ =
         repo.insert_all(
@@ -1076,17 +1068,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         %{operation: operation, result: claim_operation_result(result)}
       )
     end
-
-    defp maybe_emit_context_admission_release(ctx, released?, reason) do
-      if released? and tenant_fair_context?(ctx), do: emit_admission_release(reason)
-      :ok
-    end
-
-    defp tenant_fair_context?(%{claim_policy: claim_policy}) do
-      ClaimPolicy.implementation(claim_policy) == Docket.Postgres.ClaimPolicy.TenantFair
-    end
-
-    defp tenant_fair_context?(_ctx), do: false
 
     defp maybe_emit_admission_release(nil, _schedule, _origin), do: :ok
 

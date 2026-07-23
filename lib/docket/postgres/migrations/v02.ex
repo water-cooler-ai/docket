@@ -4,7 +4,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     use Ecto.Migration
 
-    alias Docket.Postgres.ClaimPolicy.TenantFair.RingFunction
     alias Docket.Postgres.Storage
 
     @membership_function "docket_claim_schedule_partition_v1"
@@ -31,27 +30,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       CREATE TABLE #{policy} (
         id smallint PRIMARY KEY DEFAULT 1,
         admission_mode varchar(16) NOT NULL DEFAULT 'legacy',
-        max_active integer NULL,
-        configured_max_active integer NULL,
-        policy_version bigint NOT NULL DEFAULT 0,
-        scan_ring_position bigint NOT NULL DEFAULT 0,
-        initialized_at timestamptz NULL,
         updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
         CONSTRAINT docket_claim_policy_singleton_check CHECK (id = 1),
         CONSTRAINT docket_claim_policy_mode_check CHECK (
-          admission_mode IN ('legacy', 'tenant_fair')
-        ),
-        CONSTRAINT docket_claim_policy_version_check CHECK (policy_version >= 0),
-        CONSTRAINT docket_claim_policy_configured_max_check CHECK (
-          configured_max_active IS NULL OR
-          (configured_max_active > 0 AND configured_max_active <= 2147483647)
-        ),
-        CONSTRAINT docket_claim_policy_scan_ring_position_check
-          CHECK (scan_ring_position >= 0),
-        CONSTRAINT docket_claim_policy_shape_check CHECK (
-          (max_active IS NULL AND policy_version = 0 AND initialized_at IS NULL) OR
-          (max_active > 0 AND max_active <= 2147483647 AND
-           policy_version >= 1 AND initialized_at IS NOT NULL)
+          admission_mode IN ('legacy', 'windowed')
         )
       )
       """)
@@ -59,24 +41,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       execute("""
       CREATE TABLE #{partitions} (
         scope_key text PRIMARY KEY,
-        max_active integer NULL,
-        partition_version bigint NOT NULL DEFAULT 0,
-        admission_epoch bigint NOT NULL DEFAULT 0,
         inserted_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        CONSTRAINT docket_claim_partitions_max_check CHECK (
-          max_active IS NULL OR (max_active > 0 AND max_active <= 2147483647)
-        ),
-        CONSTRAINT docket_claim_partitions_version_check CHECK (partition_version >= 0),
-        CONSTRAINT docket_claim_partitions_epoch_check CHECK (admission_epoch >= 0)
+        updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
       """)
 
       execute("INSERT INTO #{policy} (id) VALUES (1)")
 
-      # Install and backfill cap and unfinished-ring authority without a gap.
-      # The stopped homogeneous migration uses the same policy-before-partition-
-      # before-run order as admission.
+      # Install and backfill admission and unfinished-schedule authority
+      # without a gap. The stopped homogeneous migration uses the same
+      # policy-before-partition-before-run order as admission.
       execute("LOCK TABLE #{policy} IN SHARE ROW EXCLUSIVE MODE")
       execute("LOCK TABLE #{partitions} IN SHARE ROW EXCLUSIVE MODE")
       execute("LOCK TABLE #{runs} IN SHARE ROW EXCLUSIVE MODE")
@@ -341,8 +315,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       FOR EACH STATEMENT
       EXECUTE FUNCTION #{membership_guard_function}()
       """)
-
-      execute(RingFunction.create_sql(prefix))
     end
 
     def down(%{prefix: prefix}) do
@@ -353,7 +325,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       membership_guard_function = qualified_table(prefix, @membership_guard_function)
       activity_function = qualified_table(prefix, @activity_function)
 
-      execute(RingFunction.drop_sql(prefix))
       execute("DROP TRIGGER IF EXISTS #{@run_truncate_guard_trigger} ON #{runs}")
       execute("DROP TRIGGER IF EXISTS #{@activity_trigger} ON #{runs}")
       execute("DROP FUNCTION IF EXISTS #{activity_function}()")

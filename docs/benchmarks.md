@@ -59,16 +59,11 @@ fairness — are expanded from the `claim_policies` registry
 (`bench/support/scorecard/config.ex`) and carry the policy name in the
 scenario column, e.g. `60% hot tenant @16 [legacy]`. Each entry's config is
 passed straight through as the runtime's `claim_policy` backend option. The
-registry includes both Legacy and TenantFair. The TenantFair benchmark cap is
-set above the largest frozen-backlog fixture because claim efficiency retains
-claims by design; deterministic PostgreSQL tests, rather than scorecard rows,
-remain the sticky-cap correctness evidence.
+registry includes both Legacy and WindowedInterleave.
 
 The tenant-fairness scenario requires tenant-scoped storage and therefore runs
-only with TenantFair. Claim efficiency and fast/slow fairness run with both
-registered policies. The formal Legacy comparison is the logical trace in the
-[TenantFair Legacy separation](architecture/docket-tenant-fair.md#conditional-separation-from-legacy),
-not a timing score.
+only with WindowedInterleave. Claim efficiency, fast/slow fairness, and cohort
+stickiness run with all registered policies.
 
 Interpretation caveats:
 

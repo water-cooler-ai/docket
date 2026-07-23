@@ -262,24 +262,15 @@ event sequence regardless of retention, so a fully pruned history is detectable
 as `latest_seq > 0` with `latest_available_seq == nil`.
 
 For multi-tenant PostgreSQL applications, configure `tenant_mode: :required`,
-select `Docket.Postgres.ClaimPolicy.TenantFair` with an explicit
-`default_max_active_runs`, and pass a non-empty `tenant_id` to every run, read,
-and signal call. See the [TenantFair claim policy](docs/architecture/docket-tenant-fair.md)
-for the sticky-cap and fairness boundary, and the
+select `Docket.Postgres.ClaimPolicy.WindowedInterleave`, and pass a non-empty
+`tenant_id` to every run, read, and signal call. The windowed engine admits
+work breadth-first across tenants with sticky in-flight cohorts, so no tenant
+starves another and started runs are driven to completion first; see the
+module documentation and the
 [parent-application example](examples/parent-app-integration.md). To enable the
 LISTEN/NOTIFY latency fast path, remove `notifier: :none`; deployments behind
 PgBouncer transaction or statement pooling must give the notifier a direct or
 session-pooled connection. Polling always remains the correctness path.
-
-Authorized host code can change TenantFair caps at runtime through the public
-configured facade: `fetch_claim_policy_default`, `put_claim_policy_default`,
-`put_claim_policy_override`, `reset_claim_policy_override`, and
-`inspect_claim_policy`. Owner scopes are explicit (`:tenantless` or
-`{:tenant, id}`), changes are immediately shared by runtimes using the same
-database and prefix, and compare-and-set updates accept `expected_version:`.
-The host application remains responsible for authorizing the actor and owner
-scope; Docket accepts no authorization token and stores no actor identity. See
-the [parent-application example](examples/parent-app-integration.md#administer-tenantfair-caps).
 
 `save_graph` snapshots node configuration schemas, materializes their defaults,
 and validates and compiles the effective graph before storing its canonical,
@@ -444,9 +435,6 @@ the package page.
 - [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).
 - [PostgreSQL operations and correctness guide](docs/postgres-operations.md) —
   statuses, claims, poison recovery, configuration, and inspection.
-- [TenantFair claim policy](docs/architecture/docket-tenant-fair.md) — the
-  shipped state model, exact-cap and fair-rotation contract, release evidence,
-  rollout boundary, and explicit nonclaims.
 - [Future roadmap](docs/future-roadmap.md) — project-wide future features,
   improvements, investigations, and research.
 - [Telemetry](docs/telemetry.md) and [benchmarks](docs/benchmarks.md) —

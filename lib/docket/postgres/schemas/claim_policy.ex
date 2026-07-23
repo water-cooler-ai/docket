@@ -6,12 +6,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @primary_key {:id, :integer, autogenerate: false}
     schema "docket_claim_policy" do
-      field(:admission_mode, Ecto.Enum, values: [:legacy, :tenant_fair], default: :legacy)
-      field(:max_active, :integer)
-      field(:configured_max_active, :integer)
-      field(:policy_version, :integer, default: 0)
-      field(:scan_ring_position, :integer, default: 0)
-      field(:initialized_at, :utc_datetime_usec)
+      field(:admission_mode, Ecto.Enum, values: [:legacy, :windowed], default: :legacy)
       field(:updated_at, :utc_datetime_usec, read_after_writes: true)
     end
   end
@@ -23,9 +18,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @primary_key {:scope_key, :string, autogenerate: false}
     schema "docket_claim_partitions" do
-      field(:max_active, :integer)
-      field(:partition_version, :integer, default: 0)
-      field(:admission_epoch, :integer, default: 0)
       field(:inserted_at, :utc_datetime_usec, read_after_writes: true)
       field(:updated_at, :utc_datetime_usec, read_after_writes: true)
     end

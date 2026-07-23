@@ -11,12 +11,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     use Ecto.Repo, otp_app: :docket, adapter: Ecto.Adapters.Postgres
   end
 
-  defmodule Docket.Postgres.ClaimPolicyAdminTestRepo do
-    @moduledoc false
-
-    use Ecto.Repo, otp_app: :docket, adapter: Ecto.Adapters.Postgres
-  end
-
   defmodule Docket.Postgres.StorageTestRepo do
     @moduledoc false
 

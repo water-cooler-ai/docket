@@ -3,16 +3,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduledoc """
     Creates and versions the tables owned by Docket's PostgreSQL backend.
 
-    Schema version 1 contains durable graphs, runs, and events. Version 2 adds exact-cap
-    policy and partition authority, the authoritative unfinished-tenant ring,
-    sticky logical-run admission, the domain cursor, the sole TenantFair claim
-    function, and supporting indexes. Every step is an ordinary transactional
-    migration.
+    Schema version 1 contains durable graphs, runs, and events. Version 2 adds
+    the admission-mode policy row, claim partitions, the authoritative
+    unfinished-scope schedule, sticky logical-run admission, and supporting
+    indexes. Every step is an ordinary transactional migration.
     """
 
     use Ecto.Migration
 
-    alias Docket.Postgres.ClaimPolicy.TenantFair.RingFunction
     alias Docket.Postgres.Storage
 
     @initial_version 1
@@ -76,8 +74,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @doc false
     @spec current_shape_query() :: String.t()
     def current_shape_query do
-      identity_arguments = RingFunction.identity_arguments()
-
       """
       SELECT
         EXISTS (
@@ -89,22 +85,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
         AND EXISTS (
           SELECT 1
-          FROM information_schema.columns
+          FROM information_schema.tables
           WHERE table_schema = $1
-            AND table_name = 'docket_claim_policy'
-            AND column_name = 'configured_max_active'
-        )
-        AND (
-          SELECT
-            count(*) = 1
-            AND count(*) FILTER (
-              WHERE pg_get_function_identity_arguments(pg_proc.oid) = '#{identity_arguments}'
-            ) = 1
-          FROM pg_proc
-          JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
-          WHERE pg_namespace.nspname = $1
-            AND pg_proc.proname = '#{RingFunction.name()}'
-            AND pg_proc.prokind = 'f'
+            AND table_name = 'docket_claim_schedule'
         )
       """
     end

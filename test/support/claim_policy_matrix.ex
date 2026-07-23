@@ -8,23 +8,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           name: "Legacy",
           implementation: Docket.Postgres.ClaimPolicy.Legacy,
           options: [],
-          fixture: Docket.Test.LegacyClaimPolicyContract,
           query_marker: "ready_candidates AS MATERIALIZED"
         },
         %{
           name: "alternate",
           implementation: Docket.Test.AlternateClaimPolicy,
           options: [marker: :run_store_contract],
-          fixture: Docket.Test.AlternateClaimPolicyContract,
           query_marker: "independent alternate claim plan: run_store_contract"
         },
         %{
-          name: "TenantFair",
-          implementation: Docket.Postgres.ClaimPolicy.TenantFair,
-          options: [default_max_active_runs: 2],
-          fixture: Docket.Test.TenantFairClaimPolicyContract,
-          query_marker: "docket_tenant_fair_claim",
-          run_store_setup: Docket.Test.TenantFairRunStoreSetup
+          name: "Windowed",
+          implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave,
+          options: [],
+          query_marker: "active_scopes AS MATERIALIZED",
+          run_store_setup: Docket.Test.WindowedRunStoreSetup
         }
       ]
     end

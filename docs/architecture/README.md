@@ -15,11 +15,11 @@ individual function boundary.
   replay, external effects, event export, and best-effort callbacks.
 - [PostgreSQL operations](../postgres-operations.md) — production setup,
   configuration, migration, recovery, and inspection.
-- [TenantFair claim policy](docket-tenant-fair.md) — state model, sticky
-  admission, FIFO, bounded ring traversal, formal fair-rotation contract,
-  release evidence, rollout, and nonclaims.
+- [TenantFair claim policy](docket-tenant-fair.md) — historical: the engine
+  was removed from v0.1.0 in favor of `WindowedInterleave`; the document
+  records its design and the removal decision.
 - [ClaimPolicy boundary](docket-claim-policy.md) — the one-statement internal
-  seam and Legacy/TenantFair selection and interlock.
+  seam, engine selection, and the admission-mode interlock.
 - [0.0.1 to 0.1.0 migration](migration-0.0.1-to-0.1.0.md) — drain-and-cut-over
   instructions for old host-owned persistence adopters.
 
