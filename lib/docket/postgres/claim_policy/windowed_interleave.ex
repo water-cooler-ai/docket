@@ -49,6 +49,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def configure(%{prefix: prefix}, nil, query) do
       policy = Storage.qualified_table(prefix, "docket_claim_policy")
 
+      case query.("SELECT admission_mode FROM #{policy} WHERE id = 1", []) do
+        {:ok, %{rows: [["legacy"]]}} -> :ok
+        {:ok, %{rows: rows}} when length(rows) in 0..1 -> normalize_admission_mode(policy, query)
+        {:error, reason} -> {:error, reason}
+        other -> {:error, {:unexpected_startup_configuration_result, other}}
+      end
+    end
+
+    defp normalize_admission_mode(policy, query) do
       statement = """
       INSERT INTO #{policy} (id, admission_mode, updated_at)
       VALUES (1, 'legacy', CURRENT_TIMESTAMP)
