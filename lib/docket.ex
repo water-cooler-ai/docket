@@ -34,7 +34,7 @@ defmodule Docket do
   mechanisms.
   """
 
-  alias Docket.{ClaimPolicy, ClaimPolicyInfo, Error, Graph, GraphRef, Lifecycle, Run, RunInfo}
+  alias Docket.{Error, Graph, GraphRef, Lifecycle, Run, RunInfo}
   alias Docket.Runtime.{Clock, Instance, Loop}
   alias Docket.Runtime.RunMutation
 
@@ -437,96 +437,6 @@ defmodule Docket do
   end
 
   @doc """
-  Fetches the persisted max-active-run default for a configured runtime.
-
-  An unset persisted default is returned as a `Docket.ClaimPolicy` with
-  `max_active_runs: nil` and `version: 0`.
-  """
-  @spec fetch_claim_policy_default(term()) ::
-          {:ok, ClaimPolicy.t()} | {:error, term()}
-  def fetch_claim_policy_default(runtime) do
-    with {:ok, admin, context} <- claim_policy_admin(runtime, :fetch_claim_policy_default) do
-      admin.get_default(context)
-      |> normalize_claim_policy()
-    end
-  end
-
-  @doc """
-  Initializes or updates the persisted max-active-run default.
-
-  `max_active_runs` must be an integer in `1..2_147_483_647`. Pass
-  `expected_version: version` for compare-and-set behavior. A mismatch returns
-  `{:error, :stale}` without changing policy state.
-  """
-  @spec put_claim_policy_default(term(), ClaimPolicy.cap(), keyword()) ::
-          {:ok, ClaimPolicy.t()} | {:error, term()}
-  def put_claim_policy_default(runtime, max_active_runs, opts \\ []) do
-    with :ok <- validate_claim_policy_cap(max_active_runs),
-         :ok <- validate_claim_policy_options(opts),
-         {:ok, admin, context} <- claim_policy_admin(runtime, :put_claim_policy_default) do
-      admin.put_default(context, max_active_runs, opts)
-      |> normalize_claim_policy()
-    end
-  end
-
-  @doc """
-  Sets a max-active-run override for one explicit owner scope.
-
-  `owner_scope` is `:tenantless` or `{:tenant, non_empty_binary}`. Pass
-  `expected_version: 0` to create an override with compare-and-set behavior.
-  """
-  @spec put_claim_policy_override(
-          term(),
-          Docket.Backend.owner_scope(),
-          ClaimPolicy.cap(),
-          keyword()
-        ) :: {:ok, ClaimPolicy.t()} | {:error, term()}
-  def put_claim_policy_override(runtime, owner_scope, max_active_runs, opts \\ []) do
-    with :ok <- validate_claim_policy_owner_scope(owner_scope),
-         :ok <- validate_claim_policy_cap(max_active_runs),
-         :ok <- validate_claim_policy_options(opts),
-         {:ok, admin, context} <- claim_policy_admin(runtime, :put_claim_policy_override) do
-      admin.put_override(context, owner_scope, max_active_runs, opts)
-      |> normalize_claim_policy()
-    end
-  end
-
-  @doc """
-  Resets one owner scope to default inheritance.
-
-  Pass `expected_version: version` for compare-and-set behavior. A missing or
-  mismatched partition version returns `{:error, :stale}`.
-  """
-  @spec reset_claim_policy_override(term(), Docket.Backend.owner_scope(), keyword()) ::
-          {:ok, ClaimPolicy.t()} | {:error, term()}
-  def reset_claim_policy_override(runtime, owner_scope, opts \\ []) do
-    with :ok <- validate_claim_policy_owner_scope(owner_scope),
-         :ok <- validate_claim_policy_options(opts),
-         {:ok, admin, context} <- claim_policy_admin(runtime, :reset_claim_policy_override) do
-      admin.reset_override(context, owner_scope, opts)
-      |> normalize_claim_policy()
-    end
-  end
-
-  @doc """
-  Inspects one owner scope's effective cap and aggregate admission state.
-
-  The returned `Docket.ClaimPolicyInfo` contains token-free counts for due
-  queued, admitted-ready, and admitted-claimed logical runs, plus cap debt.
-  An unset persisted default returns `{:error, :not_initialized}`. A persisted
-  cap under an inactive engine returns `{:error, :inactive_engine}`.
-  """
-  @spec inspect_claim_policy(term(), Docket.Backend.owner_scope()) ::
-          {:ok, ClaimPolicyInfo.t()} | {:error, term()}
-  def inspect_claim_policy(runtime, owner_scope) do
-    with :ok <- validate_claim_policy_owner_scope(owner_scope),
-         {:ok, admin, context} <- claim_policy_admin(runtime, :inspect_claim_policy) do
-      admin.get_effective(context, owner_scope)
-      |> normalize_claim_policy_info()
-    end
-  end
-
-  @doc """
   Defines a host runtime module wrapping a named runtime instance:
 
       defmodule MyApp.Docket do
@@ -535,41 +445,11 @@ defmodule Docket do
 
   The options become immutable configuration for the runtime instance. The host module
   gets supervision and operational wrappers that call `Docket` with the
-  module as the runtime instance. When the static configuration selects
-  `Docket.Postgres.ClaimPolicy.TenantFair` and the declared backend exposes the
-  optional claim-policy administration capability, the host module also gets
-  the five same-named public policy wrappers. That export decision is made from
-  the `use Docket` options; if a startup override replaces the backend with an
-  incapable backend, those wrappers safely return
-  `%Docket.Error{type: :unsupported_capability}`.
+  module as the runtime instance.
   """
   defmacro __using__(default_opts) do
     quote bind_quoted: [default_opts: default_opts] do
       @docket_default_opts default_opts
-      @docket_claim_policy_admin_enabled (
-                                           backend =
-                                             Keyword.get(@docket_default_opts, :backend)
-
-                                           claim_policy =
-                                             Keyword.get(@docket_default_opts, :claim_policy, [])
-
-                                           tenant_fair? =
-                                             Keyword.keyword?(claim_policy) and
-                                               Keyword.get(claim_policy, :implementation) ==
-                                                 Docket.Postgres.ClaimPolicy.TenantFair
-
-                                           tenant_fair? and is_atom(backend) and
-                                             not is_nil(backend) and
-                                             match?(
-                                               {:module, _module},
-                                               Code.ensure_compiled(backend)
-                                             ) and
-                                             function_exported?(
-                                               backend,
-                                               :claim_policy_admin,
-                                               0
-                                             )
-                                         )
 
       def child_spec(overrides \\ []) do
         Docket.child_spec(__docket_instance_opts__(overrides))
@@ -625,28 +505,6 @@ defmodule Docket do
       def list_events(run_id, opts \\ []), do: Docket.list_events(__MODULE__, run_id, opts)
       def await_run(run_id, opts \\ []), do: Docket.await_run(__MODULE__, run_id, opts)
       def drain_runs(opts \\ []), do: Docket.drain_runs(__MODULE__, opts)
-
-      if @docket_claim_policy_admin_enabled do
-        def fetch_claim_policy_default do
-          Docket.fetch_claim_policy_default(__MODULE__)
-        end
-
-        def put_claim_policy_default(max_active_runs, opts \\ []) do
-          Docket.put_claim_policy_default(__MODULE__, max_active_runs, opts)
-        end
-
-        def put_claim_policy_override(owner_scope, max_active_runs, opts \\ []) do
-          Docket.put_claim_policy_override(__MODULE__, owner_scope, max_active_runs, opts)
-        end
-
-        def reset_claim_policy_override(owner_scope, opts \\ []) do
-          Docket.reset_claim_policy_override(__MODULE__, owner_scope, opts)
-        end
-
-        def inspect_claim_policy(owner_scope) do
-          Docket.inspect_claim_policy(__MODULE__, owner_scope)
-        end
-      end
     end
   end
 
@@ -767,104 +625,6 @@ defmodule Docket do
          Error.new(:invalid_backend, "runtime instance has an invalid durable backend context")}
     end
   end
-
-  defp claim_policy_admin(runtime, operation) do
-    with {:ok, opts} <- instance_opts(runtime, operation, []),
-         {:ok, {backend, context}} <- configured_backend(opts),
-         true <- function_exported?(backend, :claim_policy_admin, 0),
-         admin when is_atom(admin) <- backend.claim_policy_admin(),
-         true <- valid_claim_policy_admin?(admin) do
-      {:ok, admin, context}
-    else
-      {:error, _reason} = error -> error
-      false -> unsupported_claim_policy_admin(runtime)
-      _invalid_capability -> unsupported_claim_policy_admin(runtime)
-    end
-  end
-
-  defp valid_claim_policy_admin?(admin) do
-    Code.ensure_loaded?(admin) and
-      Enum.all?(
-        [get_default: 1, put_default: 3, put_override: 4, reset_override: 3, get_effective: 2],
-        fn {name, arity} -> function_exported?(admin, name, arity) end
-      )
-  end
-
-  defp unsupported_claim_policy_admin(runtime) do
-    {:error,
-     Error.new(
-       :unsupported_capability,
-       "runtime instance #{inspect(runtime)} does not support claim-policy administration",
-       details: %{capability: :claim_policy_administration}
-     )}
-  end
-
-  defp normalize_claim_policy({:ok, policy}) do
-    case ClaimPolicy.new(policy) do
-      {:ok, normalized} -> {:ok, normalized}
-      :error -> invalid_claim_policy_capability_result()
-    end
-  end
-
-  defp normalize_claim_policy({:error, _reason} = error), do: error
-  defp normalize_claim_policy(_other), do: invalid_claim_policy_capability_result()
-
-  defp normalize_claim_policy_info({:ok, policy}) do
-    case ClaimPolicyInfo.new(policy) do
-      {:ok, normalized} -> {:ok, normalized}
-      :error -> invalid_claim_policy_capability_result()
-    end
-  end
-
-  defp normalize_claim_policy_info({:error, _reason} = error), do: error
-  defp normalize_claim_policy_info(_other), do: invalid_claim_policy_capability_result()
-
-  defp invalid_claim_policy_capability_result do
-    {:error,
-     Error.new(
-       :invalid_backend_capability,
-       "claim-policy administration returned an invalid result",
-       details: %{capability: :claim_policy_administration}
-     )}
-  end
-
-  defp validate_claim_policy_cap(value)
-       when is_integer(value) and value > 0 and value <= 2_147_483_647,
-       do: :ok
-
-  defp validate_claim_policy_cap(_value), do: {:error, :invalid_max_active_runs}
-
-  defp validate_claim_policy_owner_scope(:tenantless), do: :ok
-
-  defp validate_claim_policy_owner_scope({:tenant, tenant_id})
-       when is_binary(tenant_id) and byte_size(tenant_id) > 0,
-       do: :ok
-
-  defp validate_claim_policy_owner_scope(_owner_scope), do: {:error, :invalid_owner_scope}
-
-  defp validate_claim_policy_options(opts) when is_list(opts) do
-    cond do
-      not Keyword.keyword?(opts) ->
-        {:error, :invalid_options}
-
-      Keyword.keys(opts) -- [:expected_version] != [] ->
-        {:error, :invalid_options}
-
-      true ->
-        validate_claim_policy_expected_version(Keyword.get(opts, :expected_version))
-    end
-  end
-
-  defp validate_claim_policy_options(_opts), do: {:error, :invalid_options}
-
-  defp validate_claim_policy_expected_version(nil), do: :ok
-
-  defp validate_claim_policy_expected_version(version)
-       when is_integer(version) and version >= 0 and version <= 9_223_372_036_854_775_807,
-       do: :ok
-
-  defp validate_claim_policy_expected_version(_version),
-    do: {:error, :invalid_expected_version}
 
   defp public_scope(opts) do
     case {Keyword.get(opts, :tenant_mode, :none), Keyword.fetch(opts, :tenant_id)} do

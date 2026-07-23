@@ -13,8 +13,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         future instant means a timer or retry backoff, and `nil` means
         claimed, externally parked, poisoned, or terminal.
       * `claim_token` / `claimed_at` — execution ownership.
-      * `tenant_admitted_at` — durable TenantFair cohort residency. It is
-        independent of the transient claim token and is never set by Legacy.
+      * `tenant_admitted_at` — durable windowed sticky-cohort residency. It
+        is independent of the transient claim token and is never set by
+        Legacy.
       * `checkpoint_seq` — the optimistic commit fence.
       * `claim_attempts` — consecutive claims consumed by launched execution
         without committed progress.

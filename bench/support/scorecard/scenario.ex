@@ -38,10 +38,7 @@ defmodule Docket.Bench.Scorecard.Scenario do
   end
 
   defp valid_policy_variant?("tenant_fairness", %{config: config}) do
-    Keyword.get(config, :implementation) in [
-      Docket.Postgres.ClaimPolicy.TenantFair,
-      Docket.Postgres.ClaimPolicy.WindowedInterleave
-    ]
+    Keyword.get(config, :implementation) == Docket.Postgres.ClaimPolicy.WindowedInterleave
   end
 
   defp valid_policy_variant?(_name, _policy), do: true

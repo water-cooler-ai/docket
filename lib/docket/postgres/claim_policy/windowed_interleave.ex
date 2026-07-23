@@ -1,7 +1,7 @@
 if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
   defmodule Docket.Postgres.ClaimPolicy.WindowedInterleave do
     @moduledoc """
-    Experimental statistically-fair PostgreSQL admission engine.
+    Statistically-fair PostgreSQL admission engine.
 
     One set-based claim statement samples up to `limit` active scopes from
     `docket_claim_schedule` in random order, reads a bounded per-scope page of
@@ -16,23 +16,22 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     driven to completion before new runs start. A scope's in-flight cohort
     therefore stays near its share of each claim batch, with no configured
     cap: new work is admitted only when a batch slot reaches the scope and no
-    admitted run is due. Poisoning clears the marker. Unlike TenantFair,
-    promotion order is near-FIFO rather than strict: a locked or stale queue
-    head does not block later promotions.
+    admitted run is due. Poisoning clears the marker. Promotion order is
+    near-FIFO rather than strict: a locked or stale queue head does not block
+    later promotions.
 
-    The engine runs under the `legacy` admission mode, holds no cursor, and
-    takes no policy-row lock beyond the shared admission gate, so concurrent
-    dispatchers admit in parallel. Startup configuration normalizes the
-    persisted admission mode back to `legacy` when a previous configuration
-    left it in another mode, so a rebooted instance always claims. Scope
-    sampling considers only scopes that currently hold due ready work, so a
-    single-claim call cannot land on a scope whose runs are all sleeping
-    while due work exists elsewhere. Fairness across tenants is statistical —
-    per fetch and across nodes — rather than the deterministic ring order and
-    per-tenant `max_active` cap enforcement that
-    `Docket.Postgres.ClaimPolicy.TenantFair` provides; per-tenant caps are
-    not enforced. Requires schema version 2 for `docket_claim_schedule` and
-    the scoped partial indexes.
+    The engine claims only under the `windowed` admission mode, holds no
+    cursor, and takes no policy-row lock beyond the shared admission gate, so
+    concurrent dispatchers admit in parallel. Startup configuration is
+    last-boot-wins: it normalizes the persisted admission mode to `windowed`
+    when a previous configuration left it in another mode, so a rebooted
+    instance always claims, while dispatchers still running another engine
+    fail closed. Scope sampling considers only scopes that currently hold due
+    ready work, so a single-claim call cannot land on a scope whose runs are
+    all sleeping while due work exists elsewhere. Fairness across tenants is
+    statistical — per fetch and across nodes — rather than deterministic, and
+    per-tenant caps are not enforced. Requires schema version 2 for
+    `docket_claim_schedule` and the scoped partial indexes.
     """
 
     @behaviour Docket.Postgres.ClaimPolicy
@@ -50,7 +49,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       policy = Storage.qualified_table(prefix, "docket_claim_policy")
 
       case query.("SELECT admission_mode FROM #{policy} WHERE id = 1", []) do
-        {:ok, %{rows: [["legacy"]]}} -> :ok
+        {:ok, %{rows: [["windowed"]]}} -> :ok
         {:ok, %{rows: rows}} when length(rows) in 0..1 -> normalize_admission_mode(policy, query)
         {:error, reason} -> {:error, reason}
         other -> {:error, {:unexpected_startup_configuration_result, other}}
@@ -60,11 +59,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp normalize_admission_mode(policy, query) do
       statement = """
       INSERT INTO #{policy} (id, admission_mode, updated_at)
-      VALUES (1, 'legacy', CURRENT_TIMESTAMP)
+      VALUES (1, 'windowed', CURRENT_TIMESTAMP)
       ON CONFLICT (id) DO UPDATE
-      SET admission_mode = 'legacy',
+      SET admission_mode = 'windowed',
           updated_at = CURRENT_TIMESTAMP
-      WHERE #{policy}.admission_mode IS DISTINCT FROM 'legacy'
+      WHERE #{policy}.admission_mode IS DISTINCT FROM 'windowed'
       RETURNING admission_mode
       """
 
@@ -124,14 +123,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           AND gate.id = 1
         FOR SHARE SKIP LOCKED
       ),
-      legacy_authority AS MATERIALIZED (
+      windowed_authority AS MATERIALIZED (
         SELECT admission_mode
         FROM admission_gate
-        WHERE admission_mode = 'legacy'
+        WHERE admission_mode = 'windowed'
       ),
       active_scopes AS MATERIALIZED (
         SELECT schedule.scope_key
-        FROM legacy_authority
+        FROM windowed_authority
         CROSS JOIN #{schedule} AS schedule
         WHERE schedule.unfinished_count > 0
           AND (
@@ -207,7 +206,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ),
       expired_candidates AS MATERIALIZED (
         SELECT runs.id, runs.claimed_at AS eligible_at
-        FROM legacy_authority
+        FROM windowed_authority
         CROSS JOIN #{table} AS runs
         WHERE status = 'running'
           AND poisoned_at IS NULL
@@ -304,7 +303,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         END,
         0
       FROM transaction_context
-      WHERE NOT EXISTS (SELECT 1 FROM legacy_authority)
+      WHERE NOT EXISTS (SELECT 1 FROM windowed_authority)
       ORDER BY run_id
       """
     end

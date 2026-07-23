@@ -6,11 +6,18 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     This module owns the complete legacy claim plan: ready and expired
     selection, class progress and preference, claim/steal/poison mutation,
     row decoding, selection statistics, and the established claim telemetry.
+
+    The engine claims only under the `legacy` admission mode. Startup
+    configuration is last-boot-wins: it normalizes the persisted admission
+    mode to `legacy` when a previous configuration left it in another mode,
+    so a rebooted instance always claims, while dispatchers still running
+    another engine fail closed.
     """
 
     @behaviour Docket.Postgres.ClaimPolicy
 
     alias Docket.Postgres.ClaimPolicy.Plan
+    alias Docket.Postgres.Storage
 
     @empty_claim_stats %{
       ready_candidates: 0,
@@ -25,6 +32,36 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @impl true
     def init([], _context), do: {:ok, nil}
     def init(options, _context), do: {:error, {:unknown_options, Keyword.keys(options)}}
+
+    @impl true
+    def configure(%{prefix: prefix}, nil, query) do
+      policy = Storage.qualified_table(prefix, "docket_claim_policy")
+
+      case query.("SELECT admission_mode FROM #{policy} WHERE id = 1", []) do
+        {:ok, %{rows: [["legacy"]]}} -> :ok
+        {:ok, %{rows: rows}} when length(rows) in 0..1 -> normalize_admission_mode(policy, query)
+        {:error, reason} -> {:error, reason}
+        other -> {:error, {:unexpected_startup_configuration_result, other}}
+      end
+    end
+
+    defp normalize_admission_mode(policy, query) do
+      statement = """
+      INSERT INTO #{policy} (id, admission_mode, updated_at)
+      VALUES (1, 'legacy', CURRENT_TIMESTAMP)
+      ON CONFLICT (id) DO UPDATE
+      SET admission_mode = 'legacy',
+          updated_at = CURRENT_TIMESTAMP
+      WHERE #{policy}.admission_mode IS DISTINCT FROM 'legacy'
+      RETURNING admission_mode
+      """
+
+      case query.(statement, []) do
+        {:ok, %{rows: rows}} when length(rows) in 0..1 -> :ok
+        {:error, reason} -> {:error, reason}
+        other -> {:error, {:unexpected_startup_configuration_result, other}}
+      end
+    end
 
     @impl true
     def build_plan(

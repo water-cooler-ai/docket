@@ -435,13 +435,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
     end
 
-    defp contention_phase(
-           Docket.Postgres.ClaimPolicy.TenantFair,
-           %{contention_phase: :policy_cursor},
-           {:error, {:claim_policy_unavailable, :lock_contention}}
-         ),
-         do: :policy_cursor
-
     defp contention_phase(_implementation, _decoded_observation, _result), do: :none
   end
 end
