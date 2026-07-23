@@ -1,10 +1,5 @@
 # PostgreSQL ClaimPolicy boundary
 
-> **Status note (2026-07-23):** the TenantFair engine formerly described here
-> was removed from v0.1.0; `WindowedInterleave` is the shipped tenant-aware
-> engine and holds its own `windowed` admission mode. The boundary, plan
-> validation, and mode-interlock mechanics are unchanged.
-
 `Docket.Postgres.RunStore.claim_due/3` is the only PostgreSQL admission
 entrypoint. ClaimPolicy is an internal engine seam behind RunStore, not a
 second store API and not a per-call option.
@@ -59,9 +54,7 @@ start — and no per-tenant cap is configured. The engine claims only under
 the `windowed` admission mode, which startup normalizes last-boot-wins, and
 takes no policy-row lock beyond the shared admission gate, so concurrent
 dispatchers admit in parallel. Fairness across tenants is statistical rather
-than deterministic. The module documentation is the authoritative contract;
-the removed TenantFair engine's design is recorded in the
-[TenantFair claim policy](docket-tenant-fair.md).
+than deterministic. The module documentation is the authoritative contract.
 
 Engine choice is instance-level. All instances sharing a domain must use one
 homogeneous version and claim-policy configuration. Deployments must not mix
@@ -73,6 +66,4 @@ in the [PostgreSQL operations guide](../postgres-operations.md).
 The shared ClaimPolicy and live RunStore matrices verify implementation
 selection, one-statement execution, decoded lease persistence, PostgreSQL error
 preservation, transaction behavior, and telemetry. Policy-specific coverage
-lives with each implementation's test modules; the removed TenantFair
-engine's evidence remains in its
-[design record](docket-tenant-fair.md#correctness-evidence).
+lives with each implementation's test modules.

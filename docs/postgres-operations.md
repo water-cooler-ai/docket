@@ -377,9 +377,7 @@ startup, so a rebooted single-engine deployment always claims. The change is
 last-boot-wins: fleets mixing engines against one database and prefix are
 unsupported in v0.1. `Docket.Postgres.ClaimPolicy.WindowedInterleave`
 documents admission ordering, sticky cohort residency, and the statistical
-fairness boundary; per-tenant `max_active` caps and their administration
-facade were removed with the TenantFair engine (see the
-[design record](architecture/docket-tenant-fair.md)).
+fairness boundary; per-tenant `max_active` caps are not part of v0.1.0.
 
 ### Existing schema V1 installations
 

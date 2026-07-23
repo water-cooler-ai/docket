@@ -12,8 +12,7 @@ the code, module documentation, and focused architecture and operations guides.
 - **Status:** exploring
 - **Horizon:** later
 - **Area:** PostgreSQL claim-policy admission (builds on reintroduced
-  per-tenant caps; the TenantFair engine that carried them was removed in
-  v0.1.0 — see the [design record](architecture/docket-tenant-fair.md))
+  per-tenant caps, which are not part of v0.1.0)
 
 **Summary:** Separate a tenant's preferred concurrency from its hard maximum.
 Allow tenants to borrow otherwise-idle capacity while giving newly backlogged
