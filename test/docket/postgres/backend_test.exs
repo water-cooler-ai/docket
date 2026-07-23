@@ -1009,7 +1009,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
 
       assert_raise ArgumentError,
-                   ~r/tenant_mode :required requires the TenantFair claim policy/,
+                   ~r/tenant_mode :required requires a tenant-aware claim policy/,
                    fn ->
                      postgres_init(
                        name: __MODULE__.TenantLegacyPolicy,
