@@ -90,6 +90,7 @@ defmodule Docket.Bench.Scorecard.Config do
     check: :boolean,
     keep_schema: :boolean,
     seed: :integer,
+    claim_workers: :integer,
     help: :boolean
   ]
 
@@ -128,7 +129,9 @@ defmodule Docket.Bench.Scorecard.Config do
         claim_policies: @claim_policies
       })
 
-    validate!(config)
+    config
+    |> apply_claim_workers(Keyword.get(opts, :claim_workers))
+    |> validate!()
   rescue
     KeyError ->
       raise ArgumentError,
@@ -163,9 +166,16 @@ defmodule Docket.Bench.Scorecard.Config do
       --check                       raise on any invariant violation (no timing gates)
       --keep-schema                 retain the generated scratch schema
       --seed N                      deterministic seed (default: #{@default_seed})
+      --claim-workers N             override claim_ceiling worker count (1 = uncontended probe)
 
     Scenarios: #{Enum.join(@scenario_names, ", ")}
     """
+  end
+
+  defp apply_claim_workers(config, nil), do: config
+
+  defp apply_claim_workers(config, workers) do
+    put_in(config, [:scenarios, "claim_ceiling", :workers], workers)
   end
 
   defp parse_only(nil), do: nil
