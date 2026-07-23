@@ -533,10 +533,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       if Keyword.get(opts, :tenant_mode, :none) == :required do
         implementation = context |> ClaimPolicy.resolve() |> ClaimPolicy.implementation()
 
-        unless implementation == Docket.Postgres.ClaimPolicy.TenantFair do
+        tenant_aware = [
+          Docket.Postgres.ClaimPolicy.TenantFair,
+          Docket.Postgres.ClaimPolicy.WindowedInterleave
+        ]
+
+        unless implementation in tenant_aware do
           raise ArgumentError,
-                ":tenant_mode :required requires the TenantFair claim policy with " <>
-                  ":default_max_active_runs configured"
+                ":tenant_mode :required requires a tenant-aware claim policy " <>
+                  "(TenantFair or WindowedInterleave)"
         end
       end
 

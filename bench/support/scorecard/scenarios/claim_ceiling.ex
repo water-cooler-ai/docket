@@ -117,22 +117,26 @@ defmodule Docket.Bench.Scorecard.Scenarios.ClaimCeiling do
 
     t0 = System.monotonic_time(:microsecond)
 
-    {:ok, %{leases: claimed, poisoned: poisoned_batch}} =
-      Docket.Postgres.RunStore.claim_due(ctx_pg, :system, policy)
+    case Docket.Postgres.RunStore.claim_due(ctx_pg, :system, policy) do
+      {:ok, %{leases: claimed, poisoned: poisoned_batch}} ->
+        t1 = System.monotonic_time(:microsecond)
 
-    t1 = System.monotonic_time(:microsecond)
+        count = length(claimed)
+        next_streak = if count == 0, do: streak + 1, else: 0
 
-    count = length(claimed)
-    next_streak = if count == 0, do: streak + 1, else: 0
+        drain_loop(
+          ctx_pg,
+          batch,
+          next_streak,
+          [t1 - t0 | times],
+          leases + count,
+          poisoned + length(poisoned_batch)
+        )
 
-    drain_loop(
-      ctx_pg,
-      batch,
-      next_streak,
-      [t1 - t0 | times],
-      leases + count,
-      poisoned + length(poisoned_batch)
-    )
+      {:error, {:claim_policy_unavailable, _reason}} ->
+        Process.sleep(5)
+        drain_loop(ctx_pg, batch, streak, times, leases, poisoned)
+    end
   end
 
   defp invariants(ctx, n, total_leases) do

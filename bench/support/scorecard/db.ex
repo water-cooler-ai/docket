@@ -41,6 +41,11 @@ defmodule Docket.Bench.Scorecard.Db do
         pool_size: pool_size,
         queue_target: 5_000,
         queue_interval: 5_000,
+        # Inter-scenario resets bulk-delete non-terminal runs, which fires the
+        # claim-schedule activity trigger per row and can hold a connection
+        # far beyond DBConnection's 15s default.
+        timeout: 300_000,
+        ownership_timeout: 300_000,
         types: Types,
         log: false
       )

@@ -14,6 +14,10 @@ defmodule Docket.Bench.Scorecard.Config do
         # not a sticky-cohort lifecycle test.
         default_max_active_runs: 2_147_483_647
       ]
+    },
+    %{
+      name: "windowed",
+      config: [implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave]
     }
   ]
 
@@ -23,6 +27,7 @@ defmodule Docket.Bench.Scorecard.Config do
     "claim_ceiling",
     "tenant_fairness",
     "fast_slow",
+    "sticky_cohort",
     "surge"
   ]
 
@@ -42,6 +47,7 @@ defmodule Docket.Bench.Scorecard.Config do
           slowdown_good: 1.5,
           slowdown_bad: 8.0
         },
+        "sticky_cohort" => %{n: 60, chain: 6, drain_moments: 2, concurrency: 8},
         "surge" => %{window_ms: 20_000, concurrency: 8}
       }
     },
@@ -60,6 +66,7 @@ defmodule Docket.Bench.Scorecard.Config do
           slowdown_good: 1.5,
           slowdown_bad: 8.0
         },
+        "sticky_cohort" => %{n: 200, chain: 8, drain_moments: 2, concurrency: 16},
         "surge" => %{window_ms: 60_000, concurrency: 16}
       }
     },
@@ -78,6 +85,7 @@ defmodule Docket.Bench.Scorecard.Config do
           slowdown_good: 1.5,
           slowdown_bad: 8.0
         },
+        "sticky_cohort" => %{n: 600, chain: 8, drain_moments: 2, concurrency: 32},
         "surge" => %{window_ms: 120_000, concurrency: 32}
       }
     }
@@ -90,6 +98,7 @@ defmodule Docket.Bench.Scorecard.Config do
     check: :boolean,
     keep_schema: :boolean,
     seed: :integer,
+    claim_workers: :integer,
     help: :boolean
   ]
 
@@ -128,7 +137,9 @@ defmodule Docket.Bench.Scorecard.Config do
         claim_policies: @claim_policies
       })
 
-    validate!(config)
+    config
+    |> apply_claim_workers(Keyword.get(opts, :claim_workers))
+    |> validate!()
   rescue
     KeyError ->
       raise ArgumentError,
@@ -144,6 +155,7 @@ defmodule Docket.Bench.Scorecard.Config do
       scenarios["claim_ceiling"].workers,
       scenarios["tenant_fairness"].concurrency,
       scenarios["fast_slow"].concurrency,
+      scenarios["sticky_cohort"].concurrency,
       scenarios["surge"].concurrency
     ]
 
@@ -163,9 +175,16 @@ defmodule Docket.Bench.Scorecard.Config do
       --check                       raise on any invariant violation (no timing gates)
       --keep-schema                 retain the generated scratch schema
       --seed N                      deterministic seed (default: #{@default_seed})
+      --claim-workers N             override claim_ceiling worker count (1 = uncontended probe)
 
     Scenarios: #{Enum.join(@scenario_names, ", ")}
     """
+  end
+
+  defp apply_claim_workers(config, nil), do: config
+
+  defp apply_claim_workers(config, workers) do
+    put_in(config, [:scenarios, "claim_ceiling", :workers], workers)
   end
 
   defp parse_only(nil), do: nil
@@ -205,6 +224,12 @@ defmodule Docket.Bench.Scorecard.Config do
     validate_scenario!(config.scenarios["claim_ceiling"], [:n, :workers, :target_claims_per_sec])
     validate_scenario!(config.scenarios["tenant_fairness"], [:tenants, :n, :concurrency])
     validate_scenario!(config.scenarios["fast_slow"], [:concurrency, :n_fast, :hold_ms])
+
+    validate_scenario!(
+      config.scenarios["sticky_cohort"],
+      [:n, :chain, :drain_moments, :concurrency]
+    )
+
     validate_scenario!(config.scenarios["surge"], [:window_ms, :concurrency])
 
     levels = config.scenarios["concurrency"].levels
