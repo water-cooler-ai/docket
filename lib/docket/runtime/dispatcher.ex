@@ -1,83 +1,220 @@
 defmodule Docket.Runtime.Dispatcher do
   @moduledoc false
 
-  # Internal task dispatch mechanics: builds the node context, calls the
-  # configured executor for each activation, normalizes every outcome shape
-  # into a final `TaskResult`, and runs the mechanical retry loop resolved
-  # into each activation by planning. It does not evaluate guards, apply
-  # reducers, commit checkpoints, or make retry policy decisions beyond
-  # attempt mechanics.
-  #
-  # Activations run serially in the calling process in v1; semantic
-  # parallelism is guaranteed by barrier visibility, not scheduling.
-
   alias Docket.Run.TaskState
-  alias Docket.Runtime.{Activation, TaskResult}
+  alias Docket.Runtime.{ExecutionPolicy, TaskResult}
 
-  @spec dispatch([Activation.t()], Docket.Runtime.Graph.t(), Docket.Run.t(), map()) ::
-          [TaskResult.t()]
+  def dispatch([], _rtg, _run, _config), do: []
+
   def dispatch(activations, rtg, run, config) do
-    Enum.map(activations, fn activation ->
-      node = Map.fetch!(rtg.nodes, activation.runtime_node_id)
-      attempt(activation, node, run, config, activation.attempt, [])
-    end)
+    collect(start_workers(activations, rtg, run, config), %{})
   end
 
-  defp attempt(activation, node, run, config, attempt_number, failures) do
-    outcome = execute(activation, node, run, config, attempt_number)
+  defp start_workers(activations, rtg, run, config) do
+    dispatch_ref = make_ref()
+    parent = self()
 
-    case classify(outcome) do
-      {:final, status, value} ->
-        %TaskResult{
-          task_id: activation.task_id,
-          node_id: activation.node_id,
-          attempt: attempt_number,
-          status: status,
-          value: value,
-          failures: Enum.reverse(failures)
-        }
+    workers =
+      activations
+      |> Enum.with_index()
+      |> Map.new(fn {activation, index} ->
+        node = Map.fetch!(rtg.nodes, activation.runtime_node_id)
 
-      {:failure, retryable?, reason} ->
-        failures = [%{attempt: attempt_number, reason: reason} | failures]
+        timeout =
+          ExecutionPolicy.effective_timeout(activation.timeout_ms, config.max_attempt_elapsed_ms)
 
-        if retryable? and attempt_number < activation.retry.max_attempts do
-          config.sleeper.(activation.retry.backoff_ms)
-          attempt(activation, node, run, config, attempt_number + 1, failures)
-        else
-          %TaskResult{
-            task_id: activation.task_id,
-            node_id: activation.node_id,
-            attempt: attempt_number,
-            status: :error,
-            value: reason,
-            failures: Enum.reverse(failures)
-          }
-        end
+        worker_ref = make_ref()
+        started = System.monotonic_time()
+
+        {pid, monitor} =
+          spawn_monitor(fn ->
+            result = attempt(activation, node, run, config, timeout, started)
+            send(parent, {dispatch_ref, worker_ref, result})
+          end)
+
+        _guardian = guard_worker(parent, pid)
+        timer = Process.send_after(parent, {dispatch_ref, :timeout, worker_ref}, timeout)
+
+        {worker_ref,
+         %{
+           index: index,
+           activation: activation,
+           pid: pid,
+           monitor: monitor,
+           timer: timer,
+           started: started
+         }}
+      end)
+
+    monitors = Map.new(workers, fn {worker_ref, worker} -> {worker.monitor, worker_ref} end)
+
+    %{ref: dispatch_ref, workers: workers, monitors: monitors, count: length(activations)}
+  end
+
+  defp collect(%{workers: workers, count: count}, results) when map_size(workers) == 0 do
+    for index <- 0..(count - 1), do: Map.fetch!(results, index)
+  end
+
+  # Dispatch runs in the embedding caller's process, so every clause is
+  # guarded to this dispatch's own refs and monitors; a message that is not
+  # ours must stay in the mailbox untouched.
+  defp collect(%{ref: ref, workers: workers, monitors: monitors} = state, results) do
+    receive do
+      {^ref, worker_ref, result} when is_map_key(workers, worker_ref) ->
+        worker = Map.fetch!(workers, worker_ref)
+        cancel_timer(worker.timer, ref, worker_ref)
+        await_down(worker.monitor, worker.pid)
+        finish_worker(state, results, worker_ref, worker, result)
+
+      {^ref, :timeout, worker_ref} when is_map_key(workers, worker_ref) ->
+        worker = Map.fetch!(workers, worker_ref)
+        Process.exit(worker.pid, :kill)
+        await_down(worker.monitor, worker.pid)
+        flush_result(ref, worker_ref)
+
+        finish_worker(
+          state,
+          results,
+          worker_ref,
+          worker,
+          timeout_result(worker.activation, worker.started)
+        )
+
+      {:DOWN, monitor, :process, _pid, reason} when is_map_key(monitors, monitor) ->
+        worker_ref = Map.fetch!(monitors, monitor)
+        worker = Map.fetch!(workers, worker_ref)
+        cancel_timer(worker.timer, ref, worker_ref)
+        result = failure_result(worker.activation, {:exited, reason}, worker.started)
+        finish_worker(state, results, worker_ref, worker, result)
     end
   end
 
-  defp execute(activation, node, run, config, attempt_number) do
+  defp finish_worker(
+         %{workers: workers, monitors: monitors} = state,
+         results,
+         worker_ref,
+         worker,
+         result
+       ) do
+    collect(
+      %{
+        state
+        | workers: Map.delete(workers, worker_ref),
+          monitors: Map.delete(monitors, worker.monitor)
+      },
+      Map.put(results, worker.index, result)
+    )
+  end
+
+  # A guardian couples an unlinked monitored worker to the caller lifetime.
+  # It prevents orphaned node work without allowing an abnormal node exit to
+  # take down the dispatcher before the DOWN can be normalized.
+  defp guard_worker(parent, worker) do
+    spawn(fn ->
+      parent_ref = Process.monitor(parent)
+      worker_ref = Process.monitor(worker)
+
+      receive do
+        {:DOWN, ^parent_ref, :process, ^parent, _reason} -> Process.exit(worker, :kill)
+        {:DOWN, ^worker_ref, :process, ^worker, _reason} -> :ok
+      end
+    end)
+  end
+
+  defp await_down(monitor, pid) do
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+    end
+  end
+
+  defp cancel_timer(timer, ref, worker_ref) do
+    if Process.cancel_timer(timer, async: false, info: false) == false do
+      receive do
+        {^ref, :timeout, ^worker_ref} -> :ok
+      after
+        0 -> :ok
+      end
+    end
+  end
+
+  defp flush_result(ref, worker_ref) do
+    receive do
+      {^ref, ^worker_ref, _result} -> :ok
+    after
+      0 -> :ok
+    end
+  end
+
+  defp attempt(activation, node, run, config, timeout, started) do
+    result = result(activation, classify(execute(activation, node, run, config, timeout)))
+    emit(result, activation, started)
+    result
+  end
+
+  defp timeout_result(activation, started) do
+    result = result(activation, {:failure, true, :timeout})
+    emit(result, activation, started)
+    result
+  end
+
+  defp failure_result(activation, reason, started) do
+    result = result(activation, {:failure, true, reason})
+    emit(result, activation, started)
+    result
+  end
+
+  defp result(activation, {:final, status, value}),
+    do: %TaskResult{
+      task_id: activation.task_id,
+      node_id: activation.node_id,
+      attempt: activation.attempt,
+      status: status,
+      value: value
+    }
+
+  defp result(activation, {:failure, retryable?, reason}) do
+    status =
+      if retryable? and activation.attempt < activation.retry.max_attempts,
+        do: :retry,
+        else: :error
+
+    %TaskResult{
+      task_id: activation.task_id,
+      node_id: activation.node_id,
+      attempt: activation.attempt,
+      status: status,
+      value: reason
+    }
+  end
+
+  defp emit(result, activation, started) do
+    :telemetry.execute(
+      [:docket, :node, :execution],
+      %{duration: System.monotonic_time() - started, attempt: activation.attempt},
+      %{result: result.status}
+    )
+  end
+
+  defp execute(activation, node, run, config, timeout) do
     task = %TaskState{
       task_id: activation.task_id,
       node_id: activation.node_id,
       step: activation.step,
-      attempt: attempt_number,
+      attempt: activation.attempt,
       status: :running,
       input_hash: activation.input_hash,
-      idempotency_key: Activation.idempotency_key(activation, attempt_number)
+      idempotency_key: activation.idempotency_key
     }
 
     context = %{
       run_id: run.id,
       node_id: activation.node_id,
       step: activation.step,
-      attempt: attempt_number,
+      attempt: activation.attempt,
       source_versions: activation.source_versions,
       idempotency_key: task.idempotency_key,
       application: config.context
     }
-
-    executor_opts = Keyword.put(config.executor_opts, :timeout_ms, activation.timeout_ms)
 
     config.executor.execute(
       task,
@@ -85,7 +222,7 @@ defmodule Docket.Runtime.Dispatcher do
       activation.snapshot,
       activation.config,
       context,
-      executor_opts
+      Keyword.put(config.executor_opts, :timeout_ms, timeout)
     )
   rescue
     exception -> {:raised, exception, __STACKTRACE__}
@@ -94,19 +231,14 @@ defmodule Docket.Runtime.Dispatcher do
     :throw, value -> {:thrown, value}
   end
 
-  # Node returns of {:error, reason}, raises, exits, and throws are retryable
-  # attempt failures. Reserved/invalid return shapes are deterministic and
-  # never retried. Update-map validation happens at the barrier, not here.
   defp classify({:ok, update}), do: {:final, :ok, update}
 
   defp classify({:interrupt, %Docket.Interrupt{} = interrupt}),
     do: {:final, :interrupt, interrupt}
 
-  defp classify({:interrupt, other}),
-    do: {:failure, false, {:invalid_interrupt, other}}
-
-  defp classify({:await, _await}), do: {:failure, false, :unsupported_await}
-  defp classify({:command, _command}), do: {:failure, false, :unsupported_command}
+  defp classify({:interrupt, other}), do: {:failure, false, {:invalid_interrupt, other}}
+  defp classify({:await, _}), do: {:failure, false, :unsupported_await}
+  defp classify({:command, _}), do: {:failure, false, :unsupported_command}
   defp classify({:error, reason}), do: {:failure, true, reason}
 
   defp classify({:raised, exception, stacktrace}),

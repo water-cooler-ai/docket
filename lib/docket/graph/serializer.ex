@@ -1,28 +1,28 @@
 defmodule Docket.Graph.Serializer do
   @moduledoc false
 
-  # Internal implementation of the canonical wire serialization for
-  # `Docket.Graph` documents. The only public entry/exit points for graph
-  # documents are `Docket.Graph.to_map/2` and `Docket.Graph.from_map/2` (and
-  # `from_map!/2`), which delegate here. Do not call this module from host
-  # applications.
+  # Internal implementation of the JSON-safe map interchange for `Docket.Graph`
+  # documents. The only public entry/exit points are `Docket.Graph.to_map/2`,
+  # `Docket.Graph.from_map/2`, and `Docket.Graph.from_map!/2`, which delegate
+  # here. Do not call this module from host applications.
   #
-  # This module owns three related concerns:
+  # This module owns two related concerns:
   #
-  # - `dump/2` produces a plain, JSON-safe map (the v1 wire format) from an
+  # - `dump/2` produces a plain, JSON-safe map (the v0.1 wire format) from an
   #   in-memory `Docket.Graph`. All keys are binaries and all values are
   #   durable JSON-safe terms (binaries, numbers, booleans, nil, lists,
   #   string-keyed maps).
   # - `load!/2` reconstructs a `Docket.Graph` from a wire map. It validates the
   #   document shape strictly and never creates new atoms from untrusted
   #   strings.
-  # - `canonical_json_encode/1` renders the wire map to a deterministic,
-  #   compact JSON binary used as the input to the graph hash.
   #
-  # Durability is handled only here, at the serialization boundary. Graphs
-  # are free-form in memory: the editing API stores content exactly as given
-  # and performs no validation or transformation (the one exception is the
-  # module / {module, function} implementation construction shorthand).
+  # Executable node implementations resolve through an explicit host registry
+  # passed as the `:implementations` option (a map of stable string identifiers
+  # to module implementations). `dump/2` looks up a node's normalized
+  # `%{type: :module, module: M, function: F}` implementation in the reverse
+  # registry and emits only the identifier; `load!/2` maps an identifier back to
+  # the registered implementation. No module, function, or type name is ever
+  # converted to an atom on load.
   #
   # dump/2 canonicalizes open content with Jason-style coercion: atoms become
   # strings (both map keys and values), silently. Terms with no JSON
@@ -31,32 +31,23 @@ defmodule Docket.Graph.Serializer do
   # document therefore always contains only binaries, numbers, booleans,
   # `nil`, lists, and string-keyed maps.
   #
-  # Because dump/2 re-canonicalizes on every call, the hash is stable across
-  # storage round trips for graphs built through the editing API:
-  # `hash(from_map!(to_map(graph))) == hash(graph)`. (A hand-built node
-  # implementation map that omits :function dumps without "function", but
-  # load! defaults it to :call, so the re-dump - and hash - differ.) Struct
-  # equality
-  # `from_map!(to_map(graph)) == graph` holds for graphs whose open content is
-  # already canonical (string keys/values); a graph built with atom content
-  # reloads in canonical string form, exactly as a Jason/JSONB round trip
-  # would return it. Map keys starting with "$" are reserved for wire-format
-  # tags (for example the "$guard" wrapper for guard expressions nested in
-  # plain argument positions).
+  # `to_map(from_map!(map)) == map` holds for any document dump/2 produces.
+  # Map keys starting with "$" are reserved for wire-format tags (for example
+  # the "$guard" wrapper for guard expressions nested in plain argument
+  # positions).
 
   alias Docket.Graph
   alias Docket.Graph.{Edge, Error, Field, Node, Output}
   alias Docket.{Guard, Reducer, Schema}
 
   @schema_version 1
-  @hash_algorithm :sha256
 
   @start_id "$start"
   @finish_id "$finish"
   @id_pattern ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
 
   @field_kinds %{"input" => :input, "state" => :state}
-  @field_kinds_out %{input: "input", state: "state"}
+  @field_kinds_out Map.new(@field_kinds, fn {k, v} -> {v, k} end)
 
   @schema_types %{
     "string" => :string,
@@ -68,16 +59,7 @@ defmodule Docket.Graph.Serializer do
     "object" => :object,
     "enum" => :enum
   }
-  @schema_types_out %{
-    string: "string",
-    float: "float",
-    integer: "integer",
-    boolean: "boolean",
-    map: "map",
-    list: "list",
-    object: "object",
-    enum: "enum"
-  }
+  @schema_types_out Map.new(@schema_types, fn {k, v} -> {v, k} end)
 
   @reducer_types %{
     "append" => :append,
@@ -87,14 +69,7 @@ defmodule Docket.Graph.Serializer do
     "sum" => :sum,
     "union" => :union
   }
-  @reducer_types_out %{
-    append: "append",
-    first_value: "first_value",
-    last_value: "last_value",
-    merge: "merge",
-    sum: "sum",
-    union: "union"
-  }
+  @reducer_types_out Map.new(@reducer_types, fn {k, v} -> {v, k} end)
 
   @guard_ops %{
     "all" => :all,
@@ -106,16 +81,7 @@ defmodule Docket.Graph.Serializer do
     "path" => :path,
     "version_at_least" => :version_at_least
   }
-  @guard_ops_out %{
-    all: "all",
-    any: "any",
-    changed: "changed",
-    equals: "equals",
-    exists: "exists",
-    not: "not",
-    path: "path",
-    version_at_least: "version_at_least"
-  }
+  @guard_ops_out Map.new(@guard_ops, fn {k, v} -> {v, k} end)
   @guard_recursive_ops [:all, :any, :not]
 
   @graph_keys ~w(schema_version id name description inputs fields outputs nodes edges policies metadata)
@@ -127,34 +93,34 @@ defmodule Docket.Graph.Serializer do
   @reducer_keys ~w(type opts)
   @guard_keys ~w(op args)
 
+  @module_impl_keys ~w(type implementation)
+
   # ---------------------------------------------------------------------------
   # Wire format (dump / load) - exposed as Docket.Graph.to_map/from_map
   # ---------------------------------------------------------------------------
 
-  # Dumps a graph to the plain, JSON-safe v1 wire map, canonicalizing open
-  # content (atoms become strings) and raising `Docket.Graph.Error` for terms
-  # with no JSON representation. This is the boundary where durability is
-  # handled.
   @doc false
   @spec dump(Graph.t(), keyword()) :: map()
-  def dump(%Graph{} = graph, _opts \\ []) do
+  def dump(%Graph{} = graph, opts \\ []) do
+    registry = build_registry!(opts)
+
     %{"schema_version" => @schema_version, "id" => graph.id}
     |> put_present_string("name", graph.name)
     |> put_present_string("description", graph.description)
     |> put_collection("inputs", graph.inputs, &dump_field/1)
     |> put_collection("fields", graph.fields, &dump_field/1)
     |> put_collection("outputs", graph.outputs, &dump_output/1)
-    |> put_collection("nodes", graph.nodes, &dump_node/1)
+    |> put_collection("nodes", graph.nodes, &dump_node(&1, registry))
     |> put_collection("edges", graph.edges, &dump_edge/1)
     |> put_open_map("policies", graph.policies)
     |> put_open_map("metadata", graph.metadata)
   end
 
-  # Loads a graph from a wire map, raising `Docket.Graph.Error` on invalid
-  # input.
   @doc false
   @spec load!(map(), keyword()) :: Graph.t()
-  def load!(map, _opts \\ []) do
+  def load!(map, opts \\ []) do
+    registry = build_registry!(opts)
+
     unless is_map(map) and not is_struct(map) do
       invalid!(:invalid_document, "graph document must be a plain map, got #{inspect(map)}")
     end
@@ -174,7 +140,7 @@ defmodule Docket.Graph.Serializer do
       inputs: load_collection!(map, "inputs", :input_id, &load_field(&1, &2, :input)),
       fields: load_collection!(map, "fields", :field_id, &load_field(&1, &2, :state)),
       outputs: load_collection!(map, "outputs", :output_id, &load_output/2),
-      nodes: load_collection!(map, "nodes", :node_id, &load_node/2),
+      nodes: load_collection!(map, "nodes", :node_id, &load_node(&1, &2, registry)),
       edges: load_collection!(map, "edges", :edge_id, &load_edge/2),
       policies: load_open_map!(map, "policies", "graph"),
       metadata: load_open_map!(map, "metadata", "graph"),
@@ -183,19 +149,105 @@ defmodule Docket.Graph.Serializer do
   end
 
   # ---------------------------------------------------------------------------
-  # Hash
+  # Implementation registry
   # ---------------------------------------------------------------------------
 
-  # Computes the lowercase 64-char hex SHA-256 hash of a graph: a SHA-256
-  # digest over the canonical JSON encoding of `dump/2`.
-  @doc false
-  @spec hash(Graph.t(), keyword()) :: String.t()
-  def hash(%Graph{} = graph, opts \\ []) do
-    graph
-    |> dump(opts)
-    |> canonical_json_encode()
-    |> then(&:crypto.hash(@hash_algorithm, &1))
-    |> Base.encode16(case: :lower)
+  defp build_registry!(opts) do
+    raw =
+      case Keyword.get(opts, :implementations, %{}) do
+        map when is_map(map) and not is_struct(map) ->
+          map
+
+        other ->
+          invalid!(
+            :invalid_registry,
+            "implementations must be a map of identifiers to implementations, got #{inspect(other)}"
+          )
+      end
+
+    {forward, reverse} =
+      Enum.reduce(raw, {%{}, %{}}, fn {id, value}, {forward, reverse} ->
+        assert_registry_id!(id)
+        impl = normalize_registry_value!(id, value)
+        key = {impl.module, impl.function}
+
+        case Map.fetch(reverse, key) do
+          {:ok, existing_id} ->
+            invalid!(
+              :invalid_registry,
+              "implementations #{inspect(id)} and #{inspect(existing_id)} both resolve to " <>
+                "#{inspect(key)}; identifiers must map to distinct implementations",
+              %{identifiers: [existing_id, id], implementation: inspect(key)}
+            )
+
+          :error ->
+            {Map.put(forward, id, impl), Map.put(reverse, key, id)}
+        end
+      end)
+
+    %{forward: forward, reverse: reverse}
+  end
+
+  defp assert_registry_id!(id) when is_binary(id) do
+    cond do
+      id == "" ->
+        invalid!(:invalid_registry, "implementation identifiers must be non-empty strings")
+
+      String.starts_with?(id, "$") ->
+        invalid!(
+          :invalid_registry,
+          "implementation identifier #{inspect(id)} must not start with \"$\""
+        )
+
+      true ->
+        :ok
+    end
+  end
+
+  defp assert_registry_id!(other) do
+    invalid!(
+      :invalid_registry,
+      "implementation identifiers must be strings, got #{inspect(other)}"
+    )
+  end
+
+  defp normalize_registry_value!(_id, module) when is_atom(module) and not is_nil(module) do
+    %{type: :module, module: module, function: :call}
+  end
+
+  defp normalize_registry_value!(_id, {module, function})
+       when is_atom(module) and not is_nil(module) and is_atom(function) do
+    %{type: :module, module: module, function: function}
+  end
+
+  defp normalize_registry_value!(id, %{type: :module} = impl) do
+    module = Map.get(impl, :module)
+    function = Map.get(impl, :function, :call)
+
+    cond do
+      not (is_atom(module) and not is_nil(module)) ->
+        invalid!(
+          :invalid_registry,
+          "implementation #{inspect(id)} module must be a module atom, got #{inspect(module)}"
+        )
+
+      not is_atom(function) ->
+        invalid!(
+          :invalid_registry,
+          "implementation #{inspect(id)} function must be an atom, got #{inspect(function)}"
+        )
+
+      true ->
+        %{type: :module, module: module, function: function}
+    end
+  end
+
+  defp normalize_registry_value!(id, other) do
+    invalid!(
+      :invalid_registry,
+      "implementation #{inspect(id)} must be a module, {module, function}, or module " <>
+        "implementation map, got #{inspect(other)}"
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -224,11 +276,11 @@ defmodule Docket.Graph.Serializer do
     |> put_open_map("metadata", output.metadata)
   end
 
-  defp dump_node(%Node{} = node) do
+  defp dump_node(%Node{} = node, registry) do
     %{}
     |> put_present_string("label", node.label)
     |> put_present_string("description", node.description)
-    |> put_present("implementation", dump_implementation(node.implementation))
+    |> put_present("implementation", dump_implementation(node.implementation, registry))
     |> put_open_map("branches", dump_branches(node.branches))
     |> put_open_map("config", node.config)
     |> put_open_map("policies", node.policies)
@@ -247,12 +299,9 @@ defmodule Docket.Graph.Serializer do
     |> put_open_map("metadata", edge.metadata)
   end
 
-  # Public so the run serializer can dump interrupt schemas with the same
-  # rules; not a host-facing API.
-  @doc false
-  def dump_schema(nil), do: nil
+  defp dump_schema(nil), do: nil
 
-  def dump_schema(%Schema{} = schema) do
+  defp dump_schema(%Schema{} = schema) do
     type = lookup!(@schema_types_out, schema.type, :invalid_schema, "schema type")
 
     %{"type" => type}
@@ -265,7 +314,7 @@ defmodule Docket.Graph.Serializer do
     |> put_open_map("metadata", schema.metadata)
   end
 
-  def dump_schema(other) do
+  defp dump_schema(other) do
     invalid!(:invalid_schema, "schema must be a Docket.Schema or nil, got #{inspect(other)}")
   end
 
@@ -322,9 +371,8 @@ defmodule Docket.Graph.Serializer do
 
   # Plain argument positions (changed/equals/exists/path/version_at_least) may
   # reference nested guard expressions, e.g. equals(path(...), value). Nested
-  # guards are wrapped in a reserved "$guard" tag so loading can distinguish
-  # them from plain map values; "$"-prefixed keys are rejected in durable
-  # values, which keeps the tag unambiguous.
+  # guards are wrapped in a reserved "$guard" tag; "$"-prefixed keys are
+  # rejected in durable values.
   defp dump_guard_args(_op, args) do
     Enum.map(args, fn
       %Guard{} = arg -> %{"$guard" => dump_guard(arg)}
@@ -332,9 +380,12 @@ defmodule Docket.Graph.Serializer do
     end)
   end
 
-  defp dump_implementation(nil), do: nil
+  # An executable module implementation is emitted as only its registered
+  # identifier; module and function names never reach the wire. Any other map
+  # is a passthrough implementation and round-trips as a plain durable value.
+  defp dump_implementation(nil, _registry), do: nil
 
-  defp dump_implementation(%{type: :module} = impl) do
+  defp dump_implementation(%{type: :module} = impl, registry) do
     case Map.keys(impl) -- [:type, :module, :function] do
       [] ->
         :ok
@@ -342,34 +393,42 @@ defmodule Docket.Graph.Serializer do
       extra ->
         invalid!(
           :invalid_implementation,
-          "module implementations support only :type, :module, and :function, got extra keys #{inspect(extra)}"
+          "module implementations support only :type, :module, and :function, " <>
+            "got extra keys #{inspect(extra)}"
         )
     end
 
     module = fetch_module!(impl)
-    base = %{"type" => "module", "module" => Atom.to_string(module)}
+    function = Map.get(impl, :function) || :call
 
-    case Map.get(impl, :function) do
-      nil -> base
-      function when is_atom(function) -> Map.put(base, "function", Atom.to_string(function))
-      other -> non_durable!(other, "implementation function must be an atom")
+    case Map.fetch(registry.reverse, {module, function}) do
+      {:ok, identifier} ->
+        %{"type" => "module", "implementation" => identifier}
+
+      :error ->
+        invalid!(
+          :unregistered_implementation,
+          "node implementation #{inspect({module, function})} is not registered; add it to " <>
+            ":implementations to serialize this graph",
+          %{module: inspect(module), function: function}
+        )
     end
   end
 
-  defp dump_implementation(%{type: type} = impl) when is_atom(type) do
-    base = %{"type" => Atom.to_string(type)}
-
-    impl
-    |> Map.delete(:type)
-    |> Enum.reduce(base, fn {key, value}, acc ->
-      Map.put(acc, durable_key!(key), durable!(value))
-    end)
-  end
-
-  defp dump_implementation(other) do
+  defp dump_implementation(%{"type" => "module"} = impl, _registry) when not is_struct(impl) do
     invalid!(
       :invalid_implementation,
-      "implementation must be a map with an atom :type, or nil, got #{inspect(other)}"
+      "passthrough implementation #{inspect(impl)} uses the reserved \"type\" => \"module\" " <>
+        "tag; the module tag is reserved for registered module implementations"
+    )
+  end
+
+  defp dump_implementation(%{} = impl, _registry) when not is_struct(impl), do: durable!(impl)
+
+  defp dump_implementation(other, _registry) do
+    invalid!(
+      :invalid_implementation,
+      "implementation must be a map or nil, got #{inspect(other)}"
     )
   end
 
@@ -455,7 +514,7 @@ defmodule Docket.Graph.Serializer do
     }
   end
 
-  defp load_node(id, map) do
+  defp load_node(id, map, registry) do
     assert_string_keys!(map, "node #{inspect(id)}")
     assert_known_keys!(map, @node_keys, "node #{inspect(id)}")
 
@@ -463,7 +522,7 @@ defmodule Docket.Graph.Serializer do
       id: id,
       label: load_optional_string!(map, "label", "node #{inspect(id)}"),
       description: load_optional_string!(map, "description", "node #{inspect(id)}"),
-      implementation: load_implementation!(Map.get(map, "implementation"), id),
+      implementation: load_implementation!(Map.get(map, "implementation"), id, registry),
       branches: load_branches!(Map.get(map, "branches"), id),
       config: load_open_map!(map, "config", "node #{inspect(id)}"),
       policies: load_open_map!(map, "policies", "node #{inspect(id)}"),
@@ -488,11 +547,9 @@ defmodule Docket.Graph.Serializer do
     }
   end
 
-  # Public counterpart of dump_schema/1 for the run serializer.
-  @doc false
-  def load_schema!(nil, _location), do: nil
+  defp load_schema!(nil, _location), do: nil
 
-  def load_schema!(map, location) when is_map(map) and not is_struct(map) do
+  defp load_schema!(map, location) when is_map(map) and not is_struct(map) do
     assert_string_keys!(map, "schema in #{location}")
     assert_known_keys!(map, @schema_keys, "schema in #{location}")
 
@@ -517,7 +574,7 @@ defmodule Docket.Graph.Serializer do
     }
   end
 
-  def load_schema!(other, location) do
+  defp load_schema!(other, location) do
     invalid!(:invalid_document, "schema in #{location} must be a map, got #{inspect(other)}")
   end
 
@@ -525,7 +582,11 @@ defmodule Docket.Graph.Serializer do
 
   defp load_schema_fields!(fields, location) when is_map(fields) and not is_struct(fields) do
     assert_string_keys!(fields, "schema fields in #{location}")
-    Map.new(fields, fn {name, schema} -> {name, load_schema!(schema, "#{location}.#{name}")} end)
+
+    Map.new(fields, fn {name, schema} ->
+      key = load_durable_key!(name, "schema fields in #{location}")
+      {key, load_schema!(schema, "#{location}.#{name}")}
+    end)
   end
 
   defp load_schema_fields!(other, location) do
@@ -602,54 +663,47 @@ defmodule Docket.Graph.Serializer do
     end)
   end
 
-  defp load_implementation!(nil, _id), do: nil
+  defp load_implementation!(nil, _id, _registry), do: nil
 
-  defp load_implementation!(map, id) when is_map(map) and not is_struct(map) do
+  defp load_implementation!(map, id, registry) when is_map(map) and not is_struct(map) do
     assert_string_keys!(map, "node #{inspect(id)} implementation")
-    type_string = fetch_required!(map, "type", "implementation")
 
-    case type_string do
-      "module" -> load_module_implementation!(map, id)
-      _other -> load_custom_implementation!(map, type_string, id)
+    case Map.get(map, "type") do
+      "module" -> load_module_implementation!(map, id, registry)
+      _other -> load_durable_value!(map, "node #{inspect(id)} implementation")
     end
   end
 
-  defp load_implementation!(other, id) do
+  defp load_implementation!(other, id, _registry) do
     invalid!(
       :invalid_document,
       "node #{inspect(id)} implementation must be a map, got #{inspect(other)}"
     )
   end
 
-  defp load_module_implementation!(map, id) do
-    assert_known_keys!(map, ~w(type module function), "node #{inspect(id)} implementation")
-    module_string = fetch_required!(map, "module", "implementation")
-    module = to_existing_atom!(module_string, :unknown_module, "implementation module")
+  defp load_module_implementation!(map, id, registry) do
+    assert_known_keys!(map, @module_impl_keys, "node #{inspect(id)} implementation")
+    identifier = fetch_required!(map, "implementation", "node #{inspect(id)} implementation")
 
-    base = %{type: :module, module: module}
+    unless is_binary(identifier) do
+      invalid!(
+        :invalid_document,
+        "node #{inspect(id)} implementation identifier must be a string, got #{inspect(identifier)}"
+      )
+    end
 
-    case Map.fetch(map, "function") do
-      {:ok, function_string} ->
-        function =
-          to_existing_atom!(function_string, :unknown_function, "implementation function")
-
-        Map.put(base, :function, function)
+    case Map.fetch(registry.forward, identifier) do
+      {:ok, impl} ->
+        impl
 
       :error ->
-        Map.put(base, :function, :call)
+        invalid!(
+          :unknown_implementation,
+          "node #{inspect(id)} references unregistered implementation #{inspect(identifier)}; " <>
+            "add it to :implementations to load this document",
+          %{node_id: id, identifier: identifier}
+        )
     end
-  end
-
-  defp load_custom_implementation!(map, type_string, id) do
-    type = to_existing_atom!(type_string, :unknown_implementation_type, "implementation type")
-    location = "node #{inspect(id)} implementation"
-
-    map
-    |> Map.delete("type")
-    |> Map.new(fn {key, value} ->
-      {load_durable_key!(key, location), load_durable_value!(value, location)}
-    end)
-    |> Map.put(:type, type)
   end
 
   defp load_branches!(nil, _id), do: %{}
@@ -658,7 +712,8 @@ defmodule Docket.Graph.Serializer do
     assert_string_keys!(branches, "node #{inspect(id)} branches")
 
     Map.new(branches, fn {name, group} ->
-      {name, load_branch_group!(group, id, name)}
+      key = load_durable_key!(name, "node #{inspect(id)} branches")
+      {key, load_branch_group!(group, id, name)}
     end)
   end
 
@@ -817,7 +872,7 @@ defmodule Docket.Graph.Serializer do
        do: value
 
   defp load_durable_value!(list, location) when is_list(list) do
-    Enum.map(list, &load_durable_value!(&1, location))
+    load_durable_list!(list, location)
   end
 
   defp load_durable_value!(map, location) when is_map(map) and not is_struct(map) do
@@ -831,6 +886,20 @@ defmodule Docket.Graph.Serializer do
       :invalid_document,
       "#{location} contains a non-durable value #{inspect(other)}",
       %{location: location, value: inspect(other)}
+    )
+  end
+
+  defp load_durable_list!([], _location), do: []
+
+  defp load_durable_list!([head | tail], location) when is_list(tail) do
+    [load_durable_value!(head, location) | load_durable_list!(tail, location)]
+  end
+
+  defp load_durable_list!([_head | tail], location) do
+    invalid!(
+      :non_durable_value,
+      "#{location} contains an improper list with non-list tail #{inspect(tail)}",
+      %{location: location, value: inspect(tail)}
     )
   end
 
@@ -911,24 +980,6 @@ defmodule Docket.Graph.Serializer do
     end
   end
 
-  defp to_existing_atom!(value, code, label) when is_binary(value) do
-    String.to_existing_atom(value)
-  rescue
-    ArgumentError ->
-      invalid!(
-        code,
-        "#{label} #{inspect(value)} is not a known/loaded atom",
-        %{label: label, value: value}
-      )
-  end
-
-  defp to_existing_atom!(other, code, label) do
-    invalid!(code, "#{label} must be a string, got #{inspect(other)}", %{
-      label: label,
-      value: other
-    })
-  end
-
   # ---------------------------------------------------------------------------
   # Document validation helpers
   # ---------------------------------------------------------------------------
@@ -948,10 +999,8 @@ defmodule Docket.Graph.Serializer do
   end
 
   defp assert_known_keys!(map, allowed, location) do
-    allowed_set = MapSet.new(allowed)
-
     Enum.each(Map.keys(map), fn key ->
-      unless MapSet.member?(allowed_set, key) do
+      unless key in allowed do
         invalid!(:invalid_document, "unknown #{location} key #{inspect(key)}", %{
           location: location,
           key: key
@@ -985,43 +1034,6 @@ defmodule Docket.Graph.Serializer do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Construction sugar
-  # ---------------------------------------------------------------------------
-  # Editing helpers do not validate durable content; graphs are free-form in
-  # memory (Ecto-style) and content is canonicalized where the document
-  # crosses the serialization boundary: dump/2 and hash/2. The only edit-time
-  # rewrite is `normalize_implementation/1`, which expands the
-  # module / {module, function} construction shorthand.
-
-  @doc false
-  @spec normalize_implementation(term()) :: map() | nil
-  def normalize_implementation(nil), do: nil
-
-  def normalize_implementation(module) when is_atom(module) do
-    %{type: :module, module: module, function: :call}
-  end
-
-  def normalize_implementation({module, function}) when is_atom(module) and is_atom(function) do
-    %{type: :module, module: module, function: function}
-  end
-
-  def normalize_implementation(%{type: :module} = impl) do
-    case Map.get(impl, :function) do
-      nil -> Map.put(impl, :function, :call)
-      _function -> impl
-    end
-  end
-
-  def normalize_implementation(%{} = impl), do: impl
-
-  def normalize_implementation(other) do
-    invalid!(
-      :invalid_implementation,
-      "implementation must be a module atom, {module, function}, map, or nil, got #{inspect(other)}"
-    )
-  end
-
   defp fetch_module!(%{module: module}) when is_atom(module), do: module
 
   defp fetch_module!(impl) do
@@ -1039,7 +1051,7 @@ defmodule Docket.Graph.Serializer do
 
   defp durable!(atom) when is_atom(atom), do: Atom.to_string(atom)
 
-  defp durable!(list) when is_list(list), do: Enum.map(list, &durable!/1)
+  defp durable!(list) when is_list(list), do: durable_list!(list)
 
   defp durable!(%_struct{} = struct) do
     non_durable!(struct, "structs are not durable values")
@@ -1051,6 +1063,16 @@ defmodule Docket.Graph.Serializer do
 
   defp durable!(value) do
     non_durable!(value, durable_hint(value))
+  end
+
+  defp durable_list!([]), do: []
+
+  defp durable_list!([head | tail]) when is_list(tail) do
+    [durable!(head) | durable_list!(tail)]
+  end
+
+  defp durable_list!([_head | tail]) do
+    non_durable!(tail, "improper lists are not durable")
   end
 
   defp durable_key!(key) when is_binary(key) do
@@ -1081,89 +1103,6 @@ defmodule Docket.Graph.Serializer do
       "graph contains a non-durable value #{inspect(value)}: #{hint}",
       %{value: inspect(value), hint: hint}
     )
-  end
-
-  # ---------------------------------------------------------------------------
-  # Canonical JSON encoder
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Encodes the wire-map domain into deterministic, compact JSON.
-
-  Object keys are sorted by binary byte order, there is no insignificant
-  whitespace, and floats use the shortest round-tripping representation. Only
-  the `dump/2` output domain is supported: any other term raises.
-  """
-  @spec canonical_json_encode(term()) :: binary()
-  def canonical_json_encode(term) do
-    IO.iodata_to_binary(encode_json(term))
-  end
-
-  defp encode_json(nil), do: "null"
-  defp encode_json(true), do: "true"
-  defp encode_json(false), do: "false"
-  defp encode_json(value) when is_integer(value), do: Integer.to_string(value)
-  defp encode_json(value) when is_float(value), do: :erlang.float_to_binary(value, [:short])
-  defp encode_json(value) when is_binary(value), do: encode_json_string(value)
-
-  defp encode_json(list) when is_list(list) do
-    ["[", encode_json_elements(list), "]"]
-  end
-
-  defp encode_json(map) when is_map(map) and not is_struct(map) do
-    entries =
-      map
-      |> Enum.map(fn {key, value} -> {encode_json_key!(key), value} end)
-      |> Enum.sort_by(fn {key, _value} -> key end)
-      |> Enum.map(fn {key, value} -> [encode_json_string(key), ":", encode_json(value)] end)
-      |> Enum.intersperse(",")
-
-    ["{", entries, "}"]
-  end
-
-  defp encode_json(other) do
-    raise ArgumentError, "canonical JSON encoder received a non-JSON term: #{inspect(other)}"
-  end
-
-  defp encode_json_elements([]), do: []
-
-  defp encode_json_elements(list) do
-    list
-    |> Enum.map(&encode_json/1)
-    |> Enum.intersperse(",")
-  end
-
-  defp encode_json_key!(key) when is_binary(key), do: key
-
-  defp encode_json_key!(other) do
-    raise ArgumentError, "canonical JSON object keys must be binaries, got #{inspect(other)}"
-  end
-
-  defp encode_json_string(string) do
-    [?", escape_json(string, []), ?"]
-  end
-
-  defp escape_json(<<>>, acc), do: Enum.reverse(acc)
-
-  defp escape_json(<<?", rest::binary>>, acc), do: escape_json(rest, ["\\\"" | acc])
-  defp escape_json(<<?\\, rest::binary>>, acc), do: escape_json(rest, ["\\\\" | acc])
-
-  defp escape_json(<<char::utf8, rest::binary>>, acc) when char < 0x20 do
-    escape_json(rest, [unicode_escape(char) | acc])
-  end
-
-  defp escape_json(<<char::utf8, rest::binary>>, acc) do
-    escape_json(rest, [<<char::utf8>> | acc])
-  end
-
-  defp unicode_escape(char) do
-    hex =
-      char
-      |> Integer.to_string(16)
-      |> String.downcase()
-      |> String.pad_leading(4, "0")
-
-    "\\u" <> hex
   end
 
   defp invalid!(code, message, details \\ %{}) do

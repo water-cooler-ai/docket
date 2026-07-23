@@ -2,31 +2,26 @@ defmodule Docket.Runtime.Loop do
   @moduledoc false
 
   # Processless transition functions over `Docket.Runtime.Graph` and
-  # `Docket.Run`, shared by the supervised Runtime and `Docket.Test`.
+  # `Docket.Run`, shared by backend vehicles and `Docket.Test`.
   #
-  # Every transition takes the runtime graph, the current committed run, and
-  # options, and returns a new committed run plus checkpoint effects - or a
-  # typed error with the previous run untouched. The loop owns checkpoint
-  # emission and barrier semantics; deterministic execution logic lives in
-  # `Docket.Runtime.Algorithm`.
-  #
-  # Checkpoint effects are `{:checkpoint, checkpoint, context, :accepted}`
-  # for sync checkpoints already delivered inside the transition, and
-  # `{:checkpoint, checkpoint, context, :pending}` for async checkpoints the
-  # shell must deliver. A processless module cannot own async execution, so
-  # async delivery belongs to the shell (inline: drained synchronously;
-  # supervised Runtime: background task).
+  # Every transition calculates exactly one pre-commit
+  # `Docket.Runtime.Moment`: the proposed run, its assigned events, the
+  # checkpoint type, and an explicit disposition. Calculation delivers no
+  # checkpoint and emits no telemetry. `propose_init/3` and
+  # `propose_advance/3` expose the raw moments to durable and processless
+  # drivers alike.
+  # Deterministic execution logic lives in `Docket.Runtime.Algorithm`.
 
-  alias Docket.{Checkpoint, Error, Event, Run, Schema, Wire}
-  alias Docket.Run.{ChannelState, InterruptState}
-  alias Docket.Runtime.{Algorithm, Config}
+  alias Docket.{Error, Run, Schema, Wire}
+  alias Docket.Run.{ChannelState, Failure, InterruptState, PendingWrite, TaskState, TimerState}
+  alias Docket.Runtime.{Algorithm, Config, Dispatcher, Moment, TaskResult}
 
   @doc false
   # Builds the fresh `:created` run document consumed by `init/3`. Shared by
-  # `Docket.run/4` and `Docket.Test.run_inline/3` so both entry points create
+  # backend lifecycle starts and `Docket.Test.run_inline/3` so both entry points create
   # byte-identical initial runs.
   def build_initial_run(rtg, input, opts) do
-    config = Config.resolve(opts)
+    config = Config.resolve_moment(opts)
 
     %Run{
       id: Keyword.get(opts, :run_id) || config.id_generator.(:run),
@@ -38,24 +33,19 @@ defmodule Docket.Runtime.Loop do
     }
   end
 
-  # ---------------------------------------------------------------------------
-  # init/3
-  # ---------------------------------------------------------------------------
-
   @doc """
-  Single loop entrypoint for a live run.
+  Calculates the initialization moment without delivering anything.
 
-  Infers fresh-versus-saved execution from the supplied run document: a
-  `:created` run is initialized (inputs validated and written, `$start`
-  edges evaluated); a `:running`/`:waiting` run continues as-is; a terminal
-  run is returned unchanged with no checkpoint and no execution restart.
-
-  For any run it is going to execute, emits the required sync
-  `:run_initialized` checkpoint before returning.
+  Same run-status inference as `init/3`, but the transition is returned as
+  one pre-commit `Docket.Runtime.Moment`: no observer is invoked and no
+  telemetry is emitted. Returns `{:ok, moment}`, `{:terminal, run}`
+  for an already-terminal run (nothing to commit), or `{:error, error}`.
   """
-  def init(rtg, %Run{} = run, opts) do
-    config = Config.resolve(opts)
+  def propose_init(rtg, %Run{} = run, opts) do
+    do_propose_init(rtg, run, Config.resolve_moment(opts))
+  end
 
+  defp do_propose_init(rtg, run, config) do
     cond do
       run.graph_id != rtg.graph_id or run.graph_hash != rtg.graph_hash ->
         {:error,
@@ -72,7 +62,7 @@ defmodule Docket.Runtime.Loop do
         init_fresh(rtg, run, config)
 
       Run.terminal?(run) ->
-        {:ok, run, []}
+        {:terminal, run}
 
       run.status in [:running, :waiting] ->
         init_saved(rtg, run, config)
@@ -115,7 +105,7 @@ defmodule Docket.Runtime.Loop do
             )
           end)
 
-      emit(run, :run_initialized, entries, config)
+      {:ok, propose(run, :run_initialized, entries, :continue, config)}
     end
   end
 
@@ -123,8 +113,14 @@ defmodule Docket.Runtime.Loop do
     _ = rtg
     run = %{run | updated_at: config.clock.()}
     entries = [entry(:run_initialized, run.step, payload: %{"resumed" => true})]
-    emit(run, :run_initialized, entries, config)
+    {:ok, propose(run, :run_initialized, entries, run_disposition(run), config)}
   end
+
+  # The disposition a committed non-terminal run needs next: a `:waiting`
+  # run is parked on its open interrupts; a `:running` run has dispatchable
+  # work (planning decides what, including re-parking on retry deadlines).
+  defp run_disposition(%Run{status: :waiting}), do: {:park, :external, :awaiting_interrupts}
+  defp run_disposition(%Run{status: :running}), do: :continue
 
   defp validate_input(rtg, input) when is_nil(input) or input == %{} do
     validate_input_map(rtg, %{})
@@ -207,28 +203,69 @@ defmodule Docket.Runtime.Loop do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Plans the next superstep from committed state.
+  Calculates the next commit-boundary moment for one advancement.
+
+  Plans, dispatches, and applies exactly one superstep attempt, returning
+  its commit boundary as one pre-commit `Docket.Runtime.Moment` - a
+  barrier, retry park, or terminal commit. Calculation never delivers a
+  checkpoint, never emits telemetry, and never speculatively drains a
+  second uncommitted step: the caller commits each moment before asking
+  for the next.
 
   Returns:
 
-  - `{:execute, run, activations}` - dispatch these, then call
-    `apply_results/4`; the run is unchanged (planning commits nothing)
-  - `{:wait, run, interrupt_ids}` - blocked on open interrupts
-  - `{:terminal, run, effects}` - the run just completed or failed (the
-    terminal checkpoint has been emitted), or was already terminal
-  - `{:error, error}` - sync checkpoint failure or uninitialized run; the
-    caller keeps the previous run
-  """
-  def plan(rtg, %Run{} = run, opts) do
-    config = Config.resolve(opts)
+  - `{:ok, moment}` - one commit-boundary moment; `moment.disposition`
+    says what the run needs after the commit
+  - `{:wait, run, interrupt_ids}` - blocked on open interrupts; nothing
+    to commit (the `:waiting` status was committed at its barrier)
+  - `{:park, run, park}` - the active superstep has no attempt due yet;
+    nothing to commit
+  - `{:terminal, run}` - the run is already terminal; nothing to commit
+  - `{:error, error}` - the run cannot advance (uninitialized or unknown
+    status); nothing was calculated
 
+  Accepts the same `:resume_floor` option as `plan/3`.
+  """
+  def propose_advance(rtg, %Run{} = run, opts) do
+    config = Config.resolve_moment(opts)
+
+    case do_propose_plan(rtg, run, opts, config) do
+      {:execute, run, activations} ->
+        results = Dispatcher.dispatch(activations, rtg, run, config)
+
+        case do_propose_results(rtg, run, config, activations, results) do
+          {:moment, moment} -> {:ok, moment}
+          {:moment, moment, _park} -> {:ok, moment}
+        end
+
+      {:moment, moment} ->
+        {:ok, moment}
+
+      {:wait, run, interrupt_ids} ->
+        {:wait, run, interrupt_ids}
+
+      {:park, run, park} ->
+        {:park, run, park}
+
+      {:already_terminal, run} ->
+        {:terminal, run}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  defp do_propose_plan(rtg, run, opts, config) do
     cond do
       run.status == :created ->
         {:error,
          Error.new(:invalid_run, "run #{inspect(run.id)} must be initialized before planning")}
 
       Run.terminal?(run) ->
-        {:terminal, run, []}
+        {:already_terminal, run}
+
+      map_size(run.active_tasks) > 0 ->
+        resume_superstep(rtg, run, opts, config)
 
       true ->
         case Algorithm.plan(rtg, run, config) do
@@ -241,8 +278,13 @@ defmodule Docket.Runtime.Loop do
           {:failed, :max_supersteps_exceeded} ->
             limit = Algorithm.max_supersteps(rtg, config)
 
-            terminal_fail(run, config, [],
-              reason: :max_supersteps_exceeded,
+            fail(run, config, [],
+              failure:
+                Failure.new(
+                  "max_supersteps_exceeded",
+                  "run exceeded the superstep limit of #{limit}",
+                  details: %{"limit" => limit}
+                ),
               payload: %{"reason" => "max_supersteps_exceeded", "limit" => limit}
             )
 
@@ -252,13 +294,68 @@ defmodule Docket.Runtime.Loop do
                 {:execute, run, activations}
 
               {:error, %Error{} = error} ->
-                terminal_fail(run, config, [],
-                  reason: error.type,
+                fail(run, config, [],
+                  failure: Failure.new(Atom.to_string(error.type), error.message),
                   payload: %{"reason" => Atom.to_string(error.type), "message" => error.message}
                 )
             end
         end
     end
+  end
+
+  # Resumes the durable active superstep: parked attempts whose retry
+  # deadline has arrived are rebuilt with their committed identity; when no
+  # attempt is due yet the shell is told when to wake. Rebuilding failures
+  # (unknown node, invalid policy) fail the run the same way fresh planning
+  # does.
+  defp resume_superstep(rtg, run, opts, config) do
+    now = resume_now(config, opts)
+    due_ids = run.active_tasks |> Map.keys() |> Enum.filter(&due?(run.timers, &1, now))
+
+    if due_ids == [] do
+      {:park, run, park_info(run.timers, now)}
+    else
+      case Algorithm.resume_activations(rtg, run) do
+        {:ok, activations} ->
+          due_set = MapSet.new(due_ids)
+          {:execute, run, Enum.filter(activations, &MapSet.member?(due_set, &1.task_id))}
+
+        {:error, %Error{} = error} ->
+          fail(run, config, [],
+            failure: Failure.new(Atom.to_string(error.type), error.message),
+            payload: %{"reason" => Atom.to_string(error.type), "message" => error.message}
+          )
+      end
+    end
+  end
+
+  # The instant deadline checks compare against: the injected clock, floored
+  # by the park deadline the shell reports it has already waited out.
+  defp resume_now(config, opts) do
+    now = config.clock.()
+
+    case Keyword.get(opts, :resume_floor) do
+      %DateTime{} = floor -> if DateTime.compare(floor, now) == :gt, do: floor, else: now
+      nil -> now
+    end
+  end
+
+  # An active task without a timer cannot wait on anything, so it is due;
+  # committed parks always write one timer per active task.
+  defp due?(timers, task_id, now) do
+    case Map.fetch(timers, task_id) do
+      {:ok, %TimerState{fires_at: fires_at}} -> DateTime.compare(fires_at, now) != :gt
+      :error -> true
+    end
+  end
+
+  defp park_info(timers, now) do
+    resume_at =
+      timers
+      |> Enum.map(fn {_task_id, timer} -> timer.fires_at end)
+      |> Enum.min(DateTime)
+
+    %{resume_at: resume_at, wait_ms: max(DateTime.diff(resume_at, now, :millisecond), 0)}
   end
 
   defp complete(rtg, run, config) do
@@ -270,77 +367,205 @@ defmodule Docket.Runtime.Loop do
       entry(:run_completed, run.step, payload: %{"outputs" => Enum.sort(Map.keys(output))})
     ]
 
-    case emit(run, :run_completed, entries, config) do
-      {:ok, run, effects} -> {:terminal, run, effects}
-      {:error, error} -> {:error, error}
-    end
+    {:moment, propose(run, :run_completed, entries, {:park, :terminal, :run_completed}, config)}
   end
 
-  defp terminal_fail(run, config, extra_entries, opts) do
-    case fail(run, config, extra_entries, opts) do
-      {:ok, run, effects} -> {:terminal, run, effects}
-      {:error, error} -> {:error, error}
-    end
-  end
-
+  # Terminal failure absorbs the active superstep: no parked attempt, pending
+  # write, or timer survives a failed run.
   defp fail(run, config, extra_entries, opts) do
     now = config.clock.()
-    run = %{run | status: :failed, finished_at: now, updated_at: now}
+    failure = Keyword.fetch!(opts, :failure)
+
+    run = %{
+      run
+      | status: :failed,
+        failure: failure,
+        finished_at: now,
+        updated_at: now,
+        active_tasks: %{},
+        pending_writes: [],
+        timers: %{}
+    }
 
     entries =
       extra_entries ++ [entry(:run_failed, run.step, payload: Keyword.fetch!(opts, :payload))]
 
-    emit(run, :run_failed, entries, config)
+    {:moment, propose(run, :run_failed, entries, {:park, :terminal, :run_failed}, config)}
   end
 
-  # ---------------------------------------------------------------------------
-  # apply_results/4
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  The update barrier: validates task results, applies reducers, evaluates
-  edge triggers, registers interrupts, and emits the barrier checkpoint.
-
-  Any permanent node failure fails the superstep: no writes from the
-  superstep commit and the run commits as `:failed` through a sync
-  `:run_failed` checkpoint. Returns `{:ok, run, effects}` (the run may be
-  terminal) or `{:error, error}` on sync checkpoint failure, keeping the
-  previous committed run.
-  """
-  def apply_results(rtg, %Run{} = run, results, opts) do
-    config = Config.resolve(opts)
+  defp do_propose_results(rtg, run, config, activations, results) do
     results = Enum.sort_by(results, & &1.node_id)
 
-    {oks, interrupt_results, errors} = partition_results(results)
+    {oks, interrupt_results, retries, errors} = partition_results(results)
     {validated_writes, write_errors} = validate_writes(rtg, oks)
     {interrupt_specs, interrupt_errors} = validate_interrupts(rtg, run, interrupt_results)
+    permanent = errors ++ write_errors ++ interrupt_errors
 
-    case errors ++ write_errors ++ interrupt_errors do
+    cond do
+      permanent != [] ->
+        fail_superstep(run, config, results, permanent)
+
+      retries != [] or remaining_active?(run, results) ->
+        park(run, config, activations, retries, validated_writes, interrupt_specs)
+
+      true ->
+        barrier(rtg, run, config, results, validated_writes, interrupt_specs)
+    end
+  end
+
+  # The update barrier: pending sibling results parked by earlier retry
+  # commits pass through the same validators as this dispatch's results.
+  # Validation is deterministic, so runtime-produced pending state validates
+  # identically to when it was parked; only corrupted durable state can
+  # fail here, and it fails the run through the typed permanent path
+  # instead of crashing the commit.
+  defp barrier(rtg, run, config, results, validated_writes, interrupt_specs) do
+    pending_results = rehydrate_pending(run)
+    {pending_oks, pending_interrupts, [], []} = partition_results(pending_results)
+    {pending_writes, pending_write_errors} = validate_writes(rtg, pending_oks)
+    {pending_specs, pending_interrupt_errors} = validate_interrupts(rtg, run, pending_interrupts)
+
+    case pending_write_errors ++ pending_interrupt_errors do
       [] ->
+        validated_writes =
+          Enum.sort_by(pending_writes ++ validated_writes, fn {result, _} -> result.node_id end)
+
+        interrupt_specs =
+          Enum.sort_by(pending_specs ++ interrupt_specs, fn {result, _} -> result.node_id end)
+
         commit(rtg, run, config, results, validated_writes, interrupt_specs)
 
       permanent ->
-        entries =
-          attempt_failure_entries(run.step, results) ++
-            Enum.map(permanent, fn failure ->
-              entry(:node_failed, run.step,
-                node_id: failure.node_id,
-                task_id: failure.task_id,
-                payload: %{
-                  "attempt" => failure.attempt,
-                  "reason" => inspect(failure.reason),
-                  "permanent" => true
-                }
-              )
-            end)
-
-        failed_nodes = permanent |> Enum.map(& &1.node_id) |> Enum.uniq() |> Enum.sort()
-
-        fail(run, config, entries,
-          reason: :node_failed,
-          payload: %{"reason" => "node_failed", "nodes" => failed_nodes}
-        )
+        fail_superstep(run, config, results, permanent)
     end
+  end
+
+  defp fail_superstep(run, config, results, permanent) do
+    entries =
+      attempt_failure_entries(run.step, results) ++
+        Enum.map(permanent, fn failure ->
+          entry(:node_failed, run.step,
+            node_id: failure.node_id,
+            task_id: failure.task_id,
+            payload: %{
+              "attempt" => failure.attempt,
+              "reason" => inspect(failure.reason),
+              "permanent" => true
+            }
+          )
+        end)
+
+    failed_nodes = permanent |> Enum.map(& &1.node_id) |> Enum.uniq() |> Enum.sort()
+
+    fail(run, config, entries,
+      failure: node_failure(permanent, failed_nodes),
+      payload: %{"reason" => "node_failed", "nodes" => failed_nodes}
+    )
+  end
+
+  # True when active tasks beyond this dispatch's results remain parked
+  # (their retry deadlines were not due), so the barrier cannot commit yet.
+  defp remaining_active?(run, results) do
+    dispatched = MapSet.new(results, & &1.task_id)
+    run.active_tasks |> Map.keys() |> Enum.any?(&(not MapSet.member?(dispatched, &1)))
+  end
+
+  # Commits the retry park: completed results move to pending writes, each
+  # retrying task's next attempt (with its full activation identity and
+  # accumulated failures) and retry deadline become durable, and the graph
+  # step does not advance. The checkpoint is sync so a crash during backoff
+  # resumes from this state instead of resetting the attempt position.
+  defp park(run, config, activations, retries, validated_writes, interrupt_specs) do
+    now = config.clock.()
+    activations_by_task = Map.new(activations, &{&1.task_id, &1})
+
+    new_pending =
+      Enum.sort_by(
+        Enum.map(validated_writes, fn {result, update} ->
+          pending_write(result, :update, update)
+        end) ++
+          Enum.map(interrupt_specs, fn {result, interrupt} ->
+            pending_write(result, :interrupt, %{interrupt | node_id: result.node_id})
+          end),
+        & &1.node_id
+      )
+
+    finalized_ids = Enum.map(new_pending, & &1.task_id)
+
+    {parked_tasks, parked_timers} =
+      Enum.reduce(retries, {%{}, %{}}, fn result, {tasks, timers} ->
+        activation = Map.fetch!(activations_by_task, result.task_id)
+        next_attempt = activation.attempt + 1
+
+        prior_failures =
+          case Map.fetch(run.active_tasks, result.task_id) do
+            {:ok, %TaskState{failures: failures}} -> failures
+            :error -> []
+          end
+
+        task = %TaskState{
+          task_id: result.task_id,
+          node_id: result.node_id,
+          step: activation.step,
+          attempt: next_attempt,
+          status: :retry_scheduled,
+          input_hash: activation.input_hash,
+          idempotency_key: TaskState.idempotency_key(result.task_id, next_attempt),
+          snapshot: activation.snapshot,
+          source_versions: activation.source_versions,
+          failures: prior_failures ++ [%{attempt: result.attempt, reason: inspect(result.value)}]
+        }
+
+        timer = %TimerState{
+          kind: :retry,
+          fires_at: DateTime.add(now, activation.retry.backoff_ms, :millisecond)
+        }
+
+        {Map.put(tasks, result.task_id, task), Map.put(timers, result.task_id, timer)}
+      end)
+
+    parked = %{
+      run
+      | active_tasks: run.active_tasks |> Map.drop(finalized_ids) |> Map.merge(parked_tasks),
+        pending_writes: run.pending_writes ++ new_pending,
+        timers: run.timers |> Map.drop(finalized_ids) |> Map.merge(parked_timers),
+        updated_at: now
+    }
+
+    park = park_info(parked.timers, now)
+    entries = attempt_failure_entries(parked.step, retries)
+    disposition = {:park, {:at, park.resume_at}, :retry_backoff}
+
+    {:moment,
+     propose(parked, :retry_scheduled, entries, disposition, config,
+       pending_attempts: new_pending
+     ), park}
+  end
+
+  defp pending_write(result, kind, value) do
+    %PendingWrite{
+      task_id: result.task_id,
+      node_id: result.node_id,
+      attempt: result.attempt,
+      kind: kind,
+      value: value
+    }
+  end
+
+  # Rehydrates pending sibling results committed by earlier retry parks back
+  # into task results. Their retried attempts' failure events were emitted by
+  # the parks that recorded them, so they contribute no failure entries at
+  # the barrier.
+  defp rehydrate_pending(run) do
+    Enum.map(run.pending_writes, fn %PendingWrite{} = pending ->
+      %TaskResult{
+        task_id: pending.task_id,
+        node_id: pending.node_id,
+        attempt: pending.attempt,
+        status: if(pending.kind == :update, do: :ok, else: :interrupt),
+        value: pending.value
+      }
+    end)
   end
 
   defp failure(result, reason) do
@@ -352,21 +577,41 @@ defmodule Docket.Runtime.Loop do
     }
   end
 
+  # The durable cause for a permanent node failure. Per-node reasons remain in
+  # the run's details independently of retained event history.
+  defp node_failure(permanent, failed_nodes) do
+    errors = Map.new(permanent, fn failure -> {failure.node_id, inspect(failure.reason)} end)
+
+    node_id =
+      case failed_nodes do
+        [node_id] -> node_id
+        _multiple -> nil
+      end
+
+    Failure.new("node_failed", "node(s) #{Enum.join(failed_nodes, ", ")} failed permanently",
+      node_id: node_id,
+      details: %{"nodes" => failed_nodes, "errors" => errors}
+    )
+  end
+
   defp partition_results(results) do
-    Enum.reduce(results, {[], [], []}, fn result, {oks, interrupts, errors} ->
+    Enum.reduce(results, {[], [], [], []}, fn result, {oks, interrupts, retries, errors} ->
       case result.status do
         :ok ->
-          {[result | oks], interrupts, errors}
+          {[result | oks], interrupts, retries, errors}
 
         :interrupt ->
-          {oks, [result | interrupts], errors}
+          {oks, [result | interrupts], retries, errors}
+
+        :retry ->
+          {oks, interrupts, [result | retries], errors}
 
         :error ->
-          {oks, interrupts, [failure(result, result.value) | errors]}
+          {oks, interrupts, retries, [failure(result, result.value) | errors]}
       end
     end)
-    |> then(fn {oks, interrupts, errors} ->
-      {Enum.reverse(oks), Enum.reverse(interrupts), Enum.reverse(errors)}
+    |> then(fn {oks, interrupts, retries, errors} ->
+      {Enum.reverse(oks), Enum.reverse(interrupts), Enum.reverse(retries), Enum.reverse(errors)}
     end)
   end
 
@@ -438,7 +683,12 @@ defmodule Docket.Runtime.Loop do
     case Algorithm.evaluate_edge_triggers(rtg, channels, ok_node_ids, changed_fields) do
       {:error, {edge_id, reasons}} ->
         fail(run, config, [],
-          reason: :guard_evaluation_failed,
+          failure:
+            Failure.new(
+              "guard_evaluation_failed",
+              "edge #{edge_id} guard evaluation failed",
+              details: %{"edge_id" => edge_id, "reasons" => reasons}
+            ),
           payload: %{
             "reason" => "guard_evaluation_failed",
             "edge_id" => edge_id,
@@ -449,7 +699,9 @@ defmodule Docket.Runtime.Loop do
       {:ok, %{channels: channels, triggered: triggered, finish: finish}} ->
         now = config.clock.()
         channels = clear_consumed_activations(rtg, channels, run.changed_channels)
-        {interrupts, interrupt_node_ids} = build_interrupts(run, config, interrupt_specs, now)
+
+        {interrupts, interrupt_node_ids, interrupt_results} =
+          build_interrupts(config, interrupt_specs, now)
 
         changed_channels =
           MapSet.new(
@@ -468,6 +720,9 @@ defmodule Docket.Runtime.Loop do
             changed_channels: changed_channels,
             pending_nodes: pending_nodes,
             interrupts: Map.merge(run.interrupts, interrupts),
+            active_tasks: %{},
+            pending_writes: [],
+            timers: %{},
             step: run.step + 1,
             status: :running,
             updated_at: now
@@ -479,11 +734,12 @@ defmodule Docket.Runtime.Loop do
           commit_entries(rtg, run.step, results, validated_writes, changed_fields, writers,
             triggered: triggered,
             finish: finish,
-            interrupts: interrupts
+            interrupts: interrupts,
+            interrupt_results: interrupt_results
           )
 
         type = if map_size(interrupts) == 0, do: :step_committed, else: :interrupt_requested
-        emit(committed, type, entries, config)
+        {:moment, propose(committed, type, entries, run_disposition(committed), config)}
     end
   end
 
@@ -497,8 +753,9 @@ defmodule Docket.Runtime.Loop do
     end
   end
 
-  defp build_interrupts(run, config, interrupt_specs, now) do
-    Enum.reduce(interrupt_specs, {%{}, []}, fn {result, interrupt}, {states, node_ids} ->
+  defp build_interrupts(config, interrupt_specs, now) do
+    Enum.reduce(interrupt_specs, {%{}, [], %{}}, fn {result, interrupt},
+                                                    {states, node_ids, results} ->
       id = interrupt.id || config.id_generator.(:interrupt)
 
       state = %InterruptState{
@@ -506,16 +763,20 @@ defmodule Docket.Runtime.Loop do
         node_id: result.node_id,
         status: :open,
         resume_channel: interrupt.resume_channel,
-        prompt: interrupt.prompt,
         schema: interrupt.schema,
         created_at: now,
         metadata: interrupt.metadata || %{}
       }
 
-      _ = run
-      {Map.put(states, id, state), [result.node_id | node_ids]}
+      {
+        Map.put(states, id, state),
+        [result.node_id | node_ids],
+        Map.put(results, id, result)
+      }
     end)
-    |> then(fn {states, node_ids} -> {states, Enum.reverse(node_ids)} end)
+    |> then(fn {states, node_ids, results} ->
+      {states, Enum.reverse(node_ids), results}
+    end)
   end
 
   # Edge activation channels are visible for one step: values consumed by
@@ -560,162 +821,43 @@ defmodule Docket.Runtime.Loop do
         )
       end) ++
       Enum.map(Enum.sort(Keyword.fetch!(extra, :interrupts)), fn {id, state} ->
+        result = Map.fetch!(Keyword.fetch!(extra, :interrupt_results), id)
+
         entry(:interrupt_requested, step,
           node_id: state.node_id,
-          payload: %{"interrupt_id" => id, "resume_channel" => state.resume_channel}
-        )
-      end)
-  end
-
-  defp attempt_failure_entries(step, results) do
-    Enum.flat_map(results, fn result ->
-      retried =
-        case result.status do
-          # The final permanent failure is reported separately by the caller.
-          :error -> Enum.drop(result.failures, -1)
-          _other -> result.failures
-        end
-
-      Enum.map(retried, fn failure ->
-        entry(:node_failed, step,
-          node_id: result.node_id,
           task_id: result.task_id,
           payload: %{
-            "attempt" => failure.attempt,
-            "reason" => inspect(failure.reason),
-            "permanent" => false
+            "attempt" => result.attempt,
+            "interrupt_id" => id,
+            "resume_channel" => state.resume_channel
           }
         )
       end)
-    end)
+  end
+
+  # One dispatch executes at most one attempt per task, so the only
+  # non-permanent failure to record is a :retry result's; an :error result's
+  # permanent failure is reported separately by the caller.
+  defp attempt_failure_entries(step, results) do
+    for result <- results, result.status == :retry do
+      entry(:node_failed, step,
+        node_id: result.node_id,
+        task_id: result.task_id,
+        payload: %{
+          "attempt" => result.attempt,
+          "reason" => inspect(result.value),
+          "permanent" => false
+        }
+      )
+    end
   end
 
   # ---------------------------------------------------------------------------
-  # resolve_interrupt/5
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Resolves an open interrupt: validates the value, writes it to the resume
-  field, marks the interrupt resolved, and emits the sync
-  `:interrupt_resolved` checkpoint.
-
-  The interrupted node stays in `pending_nodes` and re-executes in the next
-  superstep with the resolved value in its snapshot.
-  """
-  def resolve_interrupt(rtg, %Run{} = run, interrupt_id, value, opts) do
-    config = Config.resolve(opts)
-
-    cond do
-      Run.terminal?(run) ->
-        {:error,
-         Error.new(:inactive_run, "run #{inspect(run.id)} is #{run.status} and cannot be resumed")}
-
-      not match?({:ok, %InterruptState{status: :open}}, Map.fetch(run.interrupts, interrupt_id)) ->
-        {:error, Error.new(:not_found, "no open interrupt #{inspect(interrupt_id)}")}
-
-      true ->
-        interrupt = Map.fetch!(run.interrupts, interrupt_id)
-        do_resolve_interrupt(rtg, run, interrupt, value, config)
-    end
-  end
-
-  defp do_resolve_interrupt(rtg, run, interrupt, value, config) do
-    with {:ok, value} <- durable_resolution(value),
-         :ok <- validate_resolution_schema(interrupt, value),
-         {:ok, update} <- validate_resolution_write(rtg, interrupt, value) do
-      now = config.clock.()
-
-      {channels, changed_fields, _writers} =
-        Algorithm.apply_state_writes(rtg, run.channels, [{interrupt.node_id, update}])
-
-      resolved = %{interrupt | status: :resolved, resolved_at: now}
-      changed_channel_ids = Enum.map(changed_fields, &("state:" <> &1))
-
-      run = %{
-        run
-        | channels: channels,
-          changed_channels:
-            Enum.reduce(changed_channel_ids, run.changed_channels, &MapSet.put(&2, &1)),
-          interrupts: Map.put(run.interrupts, interrupt.id, resolved),
-          status: :running,
-          updated_at: now
-      }
-
-      entries =
-        [
-          entry(:interrupt_resolved, run.step,
-            node_id: interrupt.node_id,
-            payload: %{
-              "interrupt_id" => interrupt.id,
-              "resume_channel" => interrupt.resume_channel
-            }
-          )
-        ] ++
-          Enum.map(changed_channel_ids, fn channel_id ->
-            entry(:channel_updated, run.step,
-              channel_id: channel_id,
-              payload: %{"writers" => [interrupt.node_id]}
-            )
-          end)
-
-      emit(run, :interrupt_resolved, entries, config)
-    end
-  end
-
-  defp durable_resolution(value) do
-    case Wire.dump_value(value) do
-      {:ok, coerced} ->
-        {:ok, coerced}
-
-      {:error, reason} ->
-        {:error,
-         Error.new(:invalid_input, "interrupt resolution value is not durable: #{reason}")}
-    end
-  end
-
-  defp validate_resolution_schema(%InterruptState{schema: nil}, _value), do: :ok
-
-  defp validate_resolution_schema(%InterruptState{schema: schema}, value) do
-    case Schema.validate(schema, value) do
-      :ok ->
-        :ok
-
-      {:error, reasons} ->
-        {:error, invalid_resolution(reasons)}
-    end
-  end
-
-  defp validate_resolution_write(rtg, interrupt, value) do
-    case Algorithm.validate_state_update(rtg, interrupt.node_id, %{
-           interrupt.resume_channel => value
-         }) do
-      {:ok, update} ->
-        {:ok, update}
-
-      {:error, reasons} ->
-        {:error, invalid_resolution(reasons)}
-    end
-  end
-
-  defp invalid_resolution(reasons) do
-    Error.new(:invalid_input, "interrupt resolution value is invalid",
-      details: %{reasons: reasons}
-    )
-  end
-
-  # ---------------------------------------------------------------------------
-  # Events and checkpoint emission
+  # Moment production
   # ---------------------------------------------------------------------------
 
   defp entry(type, step, opts) do
-    %{
-      type: type,
-      step: step,
-      node_id: Keyword.get(opts, :node_id),
-      channel_id: Keyword.get(opts, :channel_id),
-      task_id: Keyword.get(opts, :task_id),
-      payload: Keyword.get(opts, :payload, %{})
-    }
+    Moment.event_entry(type, step, opts)
   end
 
   defp guard_error(edge_id, reasons, phase) do
@@ -725,77 +867,11 @@ defmodule Docket.Runtime.Loop do
     )
   end
 
-  # Builds events with sequential seqs, bumps the run's counters, and emits
-  # the checkpoint. Only this function constructs and delivers checkpoints;
+  # Assigns event identities from the run's sequences, bumps its counters,
+  # and builds the one pre-commit moment for the transition. Pure
+  # calculation: no storage write, no checkpoint delivery, no telemetry;
   # no executor work is ever in flight when it runs.
-  defp emit(run, type, entries, config) do
-    now = config.clock.()
-
-    {events, event_seq} =
-      Enum.map_reduce(entries, run.event_seq, fn entry, seq ->
-        seq = seq + 1
-
-        {%Event{
-           run_id: run.id,
-           seq: seq,
-           type: entry.type,
-           step: entry.step,
-           node_id: entry.node_id,
-           channel_id: entry.channel_id,
-           task_id: entry.task_id,
-           timestamp: now,
-           payload: entry.payload
-         }, seq}
-      end)
-
-    run = %{run | event_seq: event_seq, checkpoint_seq: run.checkpoint_seq + 1}
-    delivery = Checkpoint.delivery(type, config.checkpoint_overrides)
-
-    checkpoint = %Checkpoint{
-      type: type,
-      delivery: delivery,
-      seq: run.checkpoint_seq,
-      run: run,
-      events: events,
-      created_at: now
-    }
-
-    context = %Checkpoint.Context{
-      run_id: run.id,
-      graph_id: run.graph_id,
-      graph_hash: run.graph_hash,
-      application: config.context
-    }
-
-    case delivery do
-      :sync ->
-        case deliver_checkpoint(config.checkpoint, checkpoint, context) do
-          :ok ->
-            Docket.Telemetry.emit_events(run, events)
-            {:ok, run, [{:checkpoint, checkpoint, context, :accepted}]}
-
-          {:error, reason} ->
-            {:error,
-             Error.new(:checkpoint_failed, "sync #{type} checkpoint was not accepted",
-               phase: type,
-               reason: reason
-             )}
-        end
-
-      :async ->
-        Docket.Telemetry.emit_events(run, events)
-        {:ok, run, [{:checkpoint, checkpoint, context, :pending}]}
-    end
-  end
-
-  @doc false
-  def deliver_checkpoint(module, checkpoint, context) do
-    case module.handle(checkpoint, context) do
-      :ok -> :ok
-      {:error, reason} -> {:error, reason}
-      other -> {:error, {:invalid_checkpoint_return, other}}
-    end
-  rescue
-    exception -> {:error, {:raised, exception}}
+  defp propose(run, type, entries, disposition, config, identity_opts \\ []) do
+    Moment.propose(run, type, entries, disposition, config.clock.(), identity_opts)
   end
 end

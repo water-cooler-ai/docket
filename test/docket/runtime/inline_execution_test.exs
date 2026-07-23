@@ -177,8 +177,25 @@ defmodule Docket.Runtime.InlineExecutionTest do
       assert run.step == 3
       assert List.last(checkpoint_types(checkpoints)) == :run_failed
 
+      assert %Docket.Run.Failure{code: "max_supersteps_exceeded", details: %{"limit" => 3}} =
+               run.failure
+
       run_failed = List.last(checkpoints)
       assert Enum.any?(run_failed.events, &(&1.payload["reason"] == "max_supersteps_exceeded"))
+    end
+
+    test "a host can limit a graph that is canonically unbounded" do
+      graph =
+        Graphs.cycle_counter()
+        |> Map.update!(:policies, &Map.delete(&1, "max_supersteps"))
+
+      assert {:ok, run, _checkpoints} =
+               Docket.Test.run_inline(graph, %{}, max_supersteps: 3)
+
+      assert run.status == :failed
+      assert run.step == 3
+      assert run.failure.code == "max_supersteps_exceeded"
+      assert run.failure.details == %{"limit" => 3}
     end
   end
 

@@ -18,7 +18,7 @@ defmodule Docket.Graph do
   records back through the same editing API.
   """
 
-  alias Docket.Graph.{Diagnostic, Edge, Error, Field, Node, Output, Serializer}
+  alias Docket.Graph.{Diagnostic, Edge, Error, Field, Node, Output}
 
   @id_pattern ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
   @start_id "$start"
@@ -224,10 +224,10 @@ defmodule Docket.Graph do
   @doc """
   Stores a graph-level policy value, raising on malformed arguments.
 
-  Content is stored as given. When the graph crosses the serialization
-  boundary (`to_map/2`, `hash/2`), atom keys and values are canonicalized to
-  strings and terms with no JSON representation are rejected. Keys starting
-  with `"$"` are reserved for the wire format.
+  Content is stored as given. Public interchange and publication normalize
+  open atom keys and values to strings through the same runtime value
+  boundary; terms without a portable representation are rejected. Keys
+  starting with `"$"` are reserved.
   """
   @spec policy!(t(), binary() | atom(), term(), keyword()) :: t()
   def policy!(graph, key, value, opts \\ [])
@@ -253,10 +253,10 @@ defmodule Docket.Graph do
   @doc """
   Stores graph-level application metadata, raising on malformed arguments.
 
-  Content is stored as given. When the graph crosses the serialization
-  boundary (`to_map/2`, `hash/2`), atom keys and values are canonicalized to
-  strings and terms with no JSON representation are rejected. Keys starting
-  with `"$"` are reserved for the wire format.
+  Content is stored as given. Public interchange and publication normalize
+  open atom keys and values to strings through the same runtime value
+  boundary; terms without a portable representation are rejected. Keys
+  starting with `"$"` are reserved.
   """
   @spec metadata!(t(), binary() | atom(), term(), keyword()) :: t()
   def metadata!(graph, key, value, opts \\ [])
@@ -280,62 +280,102 @@ defmodule Docket.Graph do
   end
 
   @doc """
-  Dumps the graph to a plain, JSON-safe map (the v1 wire format).
-
-  Keys are strings and values are durable JSON-safe terms. Compiler diagnostics
-  are transient and are never serialized.
-
-  Graphs are free-form in memory; this is the boundary where content is
-  canonicalized. Open content (metadata, policies, config, defaults, enum
-  values, guard arguments, branch groups) is coerced the way `Jason` would
-  encode it: atom keys and atom values become strings, silently. Terms with no
-  JSON representation - tuples, keyword lists, pids, refs, functions, structs -
-  raise `Docket.Graph.Error` (`:non_durable_value` and friends).
-
-  The graph hash is computed from this document, so for graphs built through
-  the editing API it is stable across storage round trips:
-  `hash(from_map!(to_map(graph))) == hash(graph)`. Graphs whose open content
-  is already canonical (string keys and values) also round-trip on struct
-  equality: `from_map!(to_map(graph)) == graph`.
-  """
-  @spec to_map(t(), keyword()) :: map()
-  def to_map(%__MODULE__{} = graph, opts \\ []) do
-    Serializer.dump(graph, opts)
-  end
-
-  @doc """
-  Loads a graph from a v1 wire map.
-  """
-  @spec from_map(map(), keyword()) :: edit_result()
-  def from_map(map, opts \\ []) do
-    edit_result(fn -> Serializer.load!(map, opts) end)
-  end
-
-  @doc """
-  Loads a graph from a v1 wire map, raising `Docket.Graph.Error` on invalid input.
-  """
-  @spec from_map!(map(), keyword()) :: t()
-  def from_map!(map, opts \\ []) do
-    Serializer.load!(map, opts)
-  end
-
-  @doc """
-  Computes the SHA-256 graph hash used to bind runs to graph content.
-
-  The hash is a SHA-256 digest over the canonical JSON encoding of
-  `to_map/1`. It excludes host-owned versioning and compiler diagnostics.
-  """
-  @spec hash(t(), keyword()) :: String.t()
-  def hash(%__MODULE__{} = graph, opts \\ []) do
-    Serializer.hash(graph, opts)
-  end
-
-  @doc """
   Verifies the graph and returns it with compiler diagnostics attached.
   """
   @spec verify(t(), keyword()) :: {:ok, t()} | {:error, t()}
   def verify(%__MODULE__{} = graph, opts \\ []) do
     Docket.Graph.Compiler.verify(graph, opts)
+  end
+
+  @doc """
+  Encodes the authored graph as a plain, JSON-safe map.
+
+  The returned map uses string keys everywhere and only JSON-safe values
+  (binaries, numbers, booleans, `nil`, lists, and string-keyed maps), so a host
+  can persist or transmit it with any JSON codec. Atom keys and values in open
+  content (metadata, policies, config, schema defaults, reducer opts) are
+  coerced to strings; terms with no JSON representation (tuples, keyword lists,
+  PIDs, references, functions, `MapSet`s, structs) raise
+  `Docket.Graph.Error`. Keys starting with `"$"` are reserved for the wire
+  format and are rejected in open content. Transient `diagnostics` are omitted,
+  and `"schema_version"` is always present.
+
+  Executable node implementations are resolved through the `:implementations`
+  registry: a map of stable, host-defined string identifiers to module
+  implementations. Each value may be a module (`MyNode`), a `{module, function}`
+  tuple, or a `%{type: :module, module: MyNode, function: :call}` map. The
+  registry must be unambiguous - two identifiers may not resolve to the same
+  `{module, function}` pair. A module implementation that is absent from the
+  registry raises. Passthrough (non-module) implementation maps round-trip as
+  plain durable values.
+
+  ## Options
+
+  - `:implementations` - registry of identifiers to module implementations,
+    defaulting to `%{}`. Required only when a graph actually uses module
+    implementations.
+
+  ## Example
+
+      registry = %{
+        "watercooler.agent" => WaterCooler.Workflows.Nodes.SpawnAgent,
+        "watercooler.tap" => {WaterCooler.Workflows.Nodes.Tap, :call}
+      }
+
+      json =
+        graph
+        |> Docket.Graph.to_map(implementations: registry)
+        |> Jason.encode!()
+
+      {:ok, graph} =
+        json
+        |> Jason.decode!()
+        |> Docket.Graph.from_map(implementations: registry)
+
+  This is the editable AUTHORED graph document. It neither contains nor
+  recomputes a `Docket.GraphRef` hash: `Docket.save_graph/3` materializes node
+  defaults and privately encodes and hashes the effective graph to produce a
+  content-addressed reference. Re-saving an authored graph after a node's
+  defaults change may therefore produce a different effective graph reference
+  even when this document is unchanged.
+  """
+  @spec to_map(t(), keyword()) :: map()
+  def to_map(%__MODULE__{} = graph, opts \\ []) do
+    Docket.Graph.Serializer.dump(graph, opts)
+  end
+
+  @doc """
+  Decodes a JSON-safe map into an authored graph, returning a tagged result.
+
+  Returns `{:ok, graph}` or `{:error, %Docket.Graph.Error{}}`. The document is
+  validated strictly: unknown structural keys, unknown enum values, malformed
+  tagged expressions, an unsupported `schema_version`, and non-portable values
+  are all rejected. Loading never creates atoms from the document - module
+  implementation identifiers are looked up in the `:implementations` registry,
+  and an identifier absent from the registry is a typed error.
+
+  See `to_map/2` for the registry format and a full round-trip example.
+
+  ## Options
+
+  - `:implementations` - registry of identifiers to module implementations,
+    defaulting to `%{}`.
+  """
+  @spec from_map(map(), keyword()) :: edit_result()
+  def from_map(document, opts \\ []) do
+    edit_result(fn -> from_map!(document, opts) end)
+  end
+
+  @doc """
+  Decodes a JSON-safe map into an authored graph, raising on invalid input.
+
+  Behaves like `from_map/2` but returns the graph directly and raises
+  `Docket.Graph.Error` on a malformed document or unknown implementation
+  identifier.
+  """
+  @spec from_map!(map(), keyword()) :: t()
+  def from_map!(document, opts \\ []) do
+    Docket.Graph.Serializer.load!(document, opts)
   end
 
   @doc """
@@ -842,7 +882,7 @@ defmodule Docket.Graph do
   defp existing_kind(_field), do: "state"
 
   defp node_from_attrs(%Node{} = node, _id) do
-    Map.update!(node, :implementation, &Serializer.normalize_implementation/1)
+    Map.update!(node, :implementation, &normalize_implementation/1)
   end
 
   defp node_from_attrs(attrs, id) do
@@ -850,7 +890,31 @@ defmodule Docket.Graph do
     |> attrs_to_map()
     |> Map.put_new(:id, id)
     |> then(&struct(Node, &1))
-    |> Map.update!(:implementation, &Serializer.normalize_implementation/1)
+    |> Map.update!(:implementation, &normalize_implementation/1)
+  end
+
+  defp normalize_implementation(nil), do: nil
+
+  defp normalize_implementation(module) when is_atom(module) do
+    %{type: :module, module: module, function: :call}
+  end
+
+  defp normalize_implementation({module, function})
+       when is_atom(module) and is_atom(function) do
+    %{type: :module, module: module, function: function}
+  end
+
+  defp normalize_implementation(%{type: :module} = implementation) do
+    Map.put_new(implementation, :function, :call)
+  end
+
+  defp normalize_implementation(%{} = implementation), do: implementation
+
+  defp normalize_implementation(other) do
+    invalid!(
+      :invalid_implementation,
+      "implementation must be a module atom, {module, function}, map, or nil, got #{inspect(other)}"
+    )
   end
 
   defp edge_from_attrs(%Edge{} = edge, _id), do: edge

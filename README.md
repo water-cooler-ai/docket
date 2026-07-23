@@ -1,166 +1,263 @@
 # Docket
 
-Docket is an Elixir library for durable, graph-based workflow execution —
-built for long-running, interruptible work like agentic LLM sessions, where a
-run may pause for a human decision, survive a deploy, and resume exactly where
-it left off.
+[![Hex Version](https://img.shields.io/hexpm/v/docket.svg)](https://hex.pm/packages/docket)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/docket)
+[![CI](https://github.com/water-cooler-ai/docket/actions/workflows/ci.yml/badge.svg)](https://github.com/water-cooler-ai/docket/actions/workflows/ci.yml)
+[![License](https://img.shields.io/hexpm/l/docket.svg)](https://github.com/water-cooler-ai/docket/blob/main/LICENSE)
+
+Durable, graph-based workflow execution for Elixir — built for long-running,
+interruptible work like agentic LLM sessions, where a run may pause for an
+external resolution, survive a deploy, and resume exactly where it left off.
 
 You describe a workflow as a graph document: nodes that do work, shared state
 fields they read and write, and edges (optionally guarded) that decide what
-runs next. Docket executes the graph in deterministic supersteps, emitting a
-checkpoint after every committed transition. Your application persists those
-checkpoints; Docket can rebuild a live run from the last one at any time.
+runs next. Docket executes the graph in deterministic supersteps and commits
+a checkpoint at every durable transition.
 
-## Goals
+**Design lineage:** Docket's execution model draws on
+[Google's Pregel](https://research.google/pubs/pregel-a-system-for-large-scale-graph-processing/)
+and [LangGraph's Pregel runtime](https://docs.langchain.com/oss/python/langgraph/pregel):
+the established bulk-synchronous pattern of computation separated by commit
+barriers. That model fits the BEAM naturally: Docket fans each superstep into
+isolated, monitored node processes, gathers their results at a mailbox barrier,
+and uses supervision for fault containment while PostgreSQL—not process
+identity—remains the recovery authority.
 
-- **Durable by contract.** The source of truth for a run is the last accepted
-  checkpoint in *your* storage, not memory in a process. Kill the node,
-  redeploy, resume.
-- **Deterministic semantics.** Superstep planning, write conflict resolution,
-  and guard evaluation are pure and ordered; replanning after a crash produces
-  byte-identical task identities, so external effects can be deduplicated.
-- **Host-owned boundaries.** Docket owns execution semantics. Your application
-  owns persistence, graph versioning, authorization, tenancy, and UI. Graphs
-  and runs are plain documents with a JSON-safe wire format, so they store
-  anywhere.
-- **One interpreter.** The supervised runtime and the inline test runtime run
-  the same loop code — tests exercise real semantics, synchronously, in the
-  calling process.
+## Features
 
-## Inspirations
+- **Durable supersteps** — runs advance in Pregel-style plan/execute/commit
+  steps; the claim-fenced run update, schedule change, and retained events
+  commit together in one PostgreSQL transaction.
+- **External interrupts** — a node parks its run as `:waiting` with no live
+  process; when the outside world answers, `resolve_interrupt` writes the
+  value and the run continues in the next superstep.
+- **Crash-safe recovery** — claim fencing admits exactly one durable winner
+  per transition, and recovery reclaims persisted runs after a process or
+  node failure without host-owned resume code.
+- **Graphs as data** — an authored graph is a plain document that round-trips
+  through any JSON codec; publishing stores an immutable, content-addressed
+  version, and every run records the graph ID and hash it started from.
+- **Rich control flow** — fan-out, fan-in barriers, guarded branches, and
+  cycles with optional superstep bounds; node failures retry per node policy.
+- **Processless testing** — `Docket.Test.run_inline/2` exercises full graph
+  semantics in a unit test with no processes and no PostgreSQL.
+- **Multi-tenant fairness** — optional tenant scoping with claim policies
+  that admit due work breadth-first across tenants, so one tenant cannot
+  starve another.
+- **Small core** — the core depends only on `telemetry`; the PostgreSQL
+  backend compiles when the host already uses `ecto_sql` and `postgrex`, and
+  Docket takes no JSON dependency.
 
-- **[Pregel](https://research.google/pubs/pregel-a-system-for-large-scale-graph-processing/)** —
-  execution proceeds in supersteps with barrier semantics: every node
-  activated in a step sees the same committed state snapshot, all writes
-  commit together at the step boundary, and same-step conflicts resolve
-  deterministically.
-- **[LangGraph](https://github.com/langchain-ai/langgraph)** — the
-  programming model: a graph of nodes over shared state channels with
-  reducers, checkpointing as the durability primitive, and first-class
-  human-in-the-loop interrupts.
-- **OTP** — where Python-based graph runtimes have to bolt on persistence,
-  queues, and schedulers, the BEAM already is the scheduler. Each run is one
-  supervised, addressable process; node code can execute in an isolated task
-  process with real timeouts; a million concurrent waiting sessions is a
-  normal Tuesday for the runtime.
+Docket guarantees one atomic durable winner for each committed run
+transition — and is explicit about where that guarantee ends. A node attempt
+that proposes a transition may execute more than once after a crash, timeout,
+or claim steal, even though only one proposal commits, so external effects
+need a cooperating idempotency scheme. Checkpoint observers, notifications,
+and telemetry are best effort. See the
+[delivery and execution guarantees](docs/delivery-guarantees.md) for the full
+matrix.
 
-## Quick start
+## Requirements
 
-Define a node — a module that declares its config schema and does one unit of
-work against the shared state:
+- Elixir 1.18+.
+- The graph core and `Docket.Test` have no database requirement.
+- The durable backend requires PostgreSQL 13 or newer and host-declared
+  `ecto_sql ~> 3.10` and `postgrex ~> 0.17` dependencies.
+
+## Installation
+
+The graph and execution core needs only Docket:
 
 ```elixir
-defmodule MyApp.Nodes.Shout do
+def deps do
+  [
+    {:docket, "~> 0.1.0"}
+  ]
+end
+```
+
+That is enough to build graphs and execute them processless with `Docket.Test`;
+it installs no Ecto or PostgreSQL dependency. Durable operation adds the
+optional database dependencies later in this guide.
+
+## Quickstart
+
+Define a node — a module that declares its config schema and does one unit
+of work against the shared state:
+
+```elixir
+defmodule MyApp.Nodes.ExcludeAllergens do
   @behaviour Docket.Node
 
   @impl true
   def config_schema do
     Docket.Schema.object(%{
-      "from" => Docket.Schema.string(required: true),
+      "recipes" => Docket.Schema.string(required: true),
+      "avoid" => Docket.Schema.string(required: true),
       "to" => Docket.Schema.string(required: true)
     })
   end
 
   @impl true
   def call(state, config, _context) do
-    {:ok, %{config["to"] => String.upcase(state[config["from"]])}}
+    avoid = MapSet.new(state[config["avoid"]])
+
+    safe_recipes =
+      Enum.reject(state[config["recipes"]], fn recipe ->
+        Enum.any?(recipe["allergens"], &MapSet.member?(avoid, &1))
+      end)
+
+    {:ok, %{config["to"] => safe_recipes}}
   end
 end
 ```
 
-Build a graph document:
+Build a graph document wiring the node between `$start` and `$finish`:
 
 ```elixir
+recipe_schema =
+  Docket.Schema.object(%{
+    "name" => Docket.Schema.string(required: true),
+    "allergens" => Docket.Schema.list(:string, required: true)
+  })
+
 graph =
-  Docket.Graph.new!(id: "shout")
-  |> Docket.Graph.put_input!("message", schema: Docket.Schema.string(), required: true)
-  |> Docket.Graph.put_field!("result", schema: Docket.Schema.string())
-  |> Docket.Graph.put_node!("shout",
-    implementation: MyApp.Nodes.Shout,
-    config: %{from: "message", to: "result"}
+  Docket.Graph.new!(id: "recipe_safety")
+  |> Docket.Graph.put_input!("recipes",
+    schema: Docket.Schema.list(recipe_schema),
+    required: true
   )
-  |> Docket.Graph.put_edge!("edge_start_shout", from: "$start", to: "shout")
-  |> Docket.Graph.put_edge!("edge_shout_finish", from: "shout", to: "$finish")
-  |> Docket.Graph.put_output!("result", [])
+  |> Docket.Graph.put_input!("avoid", schema: {:list, :string}, required: true)
+  |> Docket.Graph.put_field!("safe_recipes", schema: Docket.Schema.list(recipe_schema))
+  |> Docket.Graph.put_node!("exclude_allergens",
+    implementation: MyApp.Nodes.ExcludeAllergens,
+    config: %{"recipes" => "recipes", "avoid" => "avoid", "to" => "safe_recipes"}
+  )
+  |> Docket.Graph.put_edge!("start_filter", from: "$start", to: "exclude_allergens")
+  |> Docket.Graph.put_edge!("filter_finish", from: "exclude_allergens", to: "$finish")
+  |> Docket.Graph.put_output!("safe_recipes", [])
 ```
 
-Run it inline (no processes — great for tests and exploration):
+Run the graph processless, with no supervision tree or database:
 
 ```elixir
-{:ok, run, checkpoints} = Docket.Test.run_inline(graph, %{"message" => "hello world"})
+input = %{
+  "recipes" => [
+    %{"name" => "Pesto pasta", "allergens" => ["dairy", "nuts"]},
+    %{"name" => "Salsa", "allergens" => []}
+  ],
+  "avoid" => ["dairy"]
+}
+
+{:ok, run, checkpoints} = Docket.Test.run_inline(graph, input)
 
 run.status  #=> :done
-run.output  #=> %{"result" => "HELLO WORLD"}
+run.output  #=> %{"safe_recipes" => [%{"name" => "Salsa", "allergens" => []}]}
 Enum.map(checkpoints, & &1.type)
 #=> [:run_initialized, :step_committed, :run_completed]
 ```
 
-Or run it supervised. Implement a checkpoint handler (your persistence
-boundary) and a runtime module, and add the runtime to your supervision tree:
+## Durable PostgreSQL
+
+PostgreSQL support is opt-in. Docket does not install Ecto or Postgrex for
+core-only applications. The application that owns the Repo should declare all
+three dependencies directly:
 
 ```elixir
-defmodule MyApp.DocketCheckpoint do
-  @behaviour Docket.Checkpoint
-
-  @impl true
-  def handle(%Docket.Checkpoint{run: run}, _context) do
-    MyApp.Workflows.upsert_run!(run.id, Docket.Run.to_map(run))
-    :ok
-  end
+def deps do
+  [
+    {:docket, "~> 0.1.0"},
+    {:ecto_sql, "~> 3.10"},
+    {:postgrex, "~> 0.17"}
+  ]
 end
+```
 
+Install the tables through a host-owned migration:
+
+```sh
+mix deps.get
+mix docket.gen.migration -r MyApp.Repo
+mix ecto.migrate -r MyApp.Repo
+```
+
+Configure a tenantless, poll-only runtime with explicit retention:
+
+```elixir
 defmodule MyApp.Docket do
-  use Docket, checkpoint: MyApp.DocketCheckpoint
+  use Docket,
+    tenant_mode: :none,
+    backend:
+      {Docket.Postgres,
+       repo: MyApp.Repo,
+       notifier: :none,
+       pruner: [
+         interval_ms: :timer.hours(1),
+         event_retention_ms: :timer.hours(24 * 30),
+         run_retention_ms: :timer.hours(24 * 90),
+         batch_size: 1_000
+       ]}
 end
 
-# in your application supervision tree
-children = [MyApp.Docket]
+children = [MyApp.Repo, MyApp.Docket]
+Supervisor.start_link(children, strategy: :one_for_one)
 ```
+
+The generated migration delegates to Docket's pinned schema version; commit
+it with the application rather than running migrations at application startup.
+
+Publish an immutable graph version, then start durable work from the
+returned reference:
 
 ```elixir
-{:ok, run} = MyApp.Docket.run(graph, %{"message" => "hello world"})
-{:ok, live} = MyApp.Docket.get_run(run.id)
+{:ok, graph_ref} = MyApp.Docket.save_graph(graph)
+
+{:ok, run} = MyApp.Docket.start_run(graph_ref, input)
+
+{:ok, finished} = MyApp.Docket.await_run(run.id, timeout: 5_000)
+finished.status #=> :done
+finished.output #=> run.output
 ```
 
-`run/3` returns once the run is durably initialized — the synchronous
-`:run_initialized` checkpoint has been accepted by your handler — and
-execution continues in a supervised process. Progress arrives through
-checkpoints (the durable truth); `get_run/2` reads the live in-memory
-snapshot while the run is active.
+`start_run` returns after the initialized run is durably committed;
+production advancement is asynchronous, and `await_run` is a bounded
+convenience for callers that need to wait until a run pauses or terminates.
+The facade also provides paged run, event, and graph-version readers plus
+`fetch_run`, `inspect_run`, `cancel_run`, and `retry_poisoned_run`; the
+`Docket` module docs are the authoritative API reference.
 
-To resume after a crash, restart, or deploy, load what you persisted and hand
-it back:
+Multi-tenant applications configure `tenant_mode: :required` with a fair
+claim policy such as `Docket.Postgres.ClaimPolicy.WindowedInterleave`, and
+durable integration tests use the production lifecycle through
+`testing: :inline` or `testing: :manual`. See the
+[parent-application example](examples/parent-app-integration.md) and the
+[PostgreSQL operations guide](docs/postgres-operations.md).
 
-```elixir
-run = Docket.Run.from_map!(stored_run_map)
-{:ok, run} = MyApp.Docket.resume(graph, run)
-```
+## External interrupts
 
-## Human-in-the-loop interrupts
-
-A node pauses the run by returning an interrupt naming the state field the
-answer should land in:
+A node pauses the run by returning an interrupt naming the state field where
+the external resolution should be written:
 
 ```elixir
 def call(state, _config, _context) do
   case state["decision"] do
-    nil -> {:interrupt, %Docket.Interrupt{prompt: "Approve this draft?", resume_channel: "decision"}}
+    nil -> {:interrupt, %Docket.Interrupt{resume_channel: "decision"}}
     decision -> {:ok, %{"applied" => decision}}
   end
 end
 ```
 
-The run checkpoints as `:waiting` and its process sits idle — a paused
-agentic session is just a cheap BEAM process (or no process at all: you can
-let it finish and resume later). When the human answers:
+The run commits as `:waiting` without retaining a per-run process. When the
+external system resolves it:
 
 ```elixir
-{:ok, run} = MyApp.Docket.resolve_interrupt(run_id, interrupt_id, "approved")
+{:ok, run} =
+  MyApp.Docket.resolve_interrupt(run_id, interrupt_id, "approved")
 ```
 
 The value is validated against the interrupt's schema (if any), written to
 the resume field, and the interrupted node re-executes in the next superstep
-with the answer visible in its state.
+with the resolved value visible in its state.
 
 ## Execution model
 
@@ -174,76 +271,32 @@ A run advances in Pregel-style supersteps:
    resolve same-step conflicts in sorted node order, evaluate edge guards and
    fan-in barriers, and commit the step atomically with a checkpoint.
 
-Edges carry the control flow: fan-out (multiple edges from one node), fan-in
-joins (multi-source barrier edges that fire when every source has completed),
-guarded branches (durable, serializable guard expressions over state), and
-cycles (bounded by a `max_supersteps` policy). Node failures retry per node
-policy; a permanently failed superstep commits none of its writes.
+## Current boundaries
 
-Everything that crosses a boundary is a document. `Docket.Graph` and
-`Docket.Run` both serialize to a canonical JSON-safe wire format; graphs are
-content-hashed, and every run records the graph ID and hash it was started
-from, so a resume against the wrong graph version is rejected.
+Docket deliberately leaves these to the host application:
 
-## Built on OTP
-
-Each runtime instance is one supervision tree:
-
-```text
-MyApp.Docket (Supervisor, :one_for_all)
-├── Registry            — run_id → runtime process; pids never leave the library
-├── Task.Supervisor     — isolated node execution, async checkpoint delivery
-└── DynamicSupervisor   — one Docket.Runtime process per active run
-    ├── Docket.Runtime (run "a3f…")
-    └── Docket.Runtime (run "9c1…")
-```
-
-This shape is what makes durable agentic sessions natural on the BEAM:
-
-- **A session is a process.** Each run is owned by exactly one lightweight
-  GenServer that drives the loop on self-scheduled ticks, staying responsive
-  to `get_run` and `resolve_interrupt` between supersteps. Thousands of
-  concurrent sessions are just thousands of processes.
-- **Isolation where it matters.** With `Docket.Executor.Task`, node code runs
-  in a separate supervised task process — a hung LLM call gets a real
-  timeout, and a crashing node fails one activation, not the runtime.
-- **Crash recovery is resume.** Because every committed transition was
-  checkpointed to host storage first, the failure story has one answer at
-  every level: node crash → retry policy; runtime crash → resume from the
-  last checkpoint; whole-tree restart → resume from the last checkpoint.
-- **No external orchestrator.** No queue, no scheduler service, no polling
-  loop. The BEAM's preemptive scheduler runs the sessions; your database
-  holds the truth.
-
-## What Docket does not do
-
-Docket deliberately leaves to the host application:
-
-- Persistence — checkpoints hand you the run document; you store it.
-- Graph versioning and publish workflows.
-- Authorization, tenancy, and ownership (attach identity via run `metadata`).
+- Authorization and ownership checks before calling a Docket facade.
+- Graph publish workflows and application-level version selection.
 - UI projections for editors and live run views.
 - External effects — nodes call your code; Docket never talks to the network.
 
-## Installation
-
-Docket is not yet published to Hex. Add it as a git dependency:
-
-```elixir
-def deps do
-  [
-    {:docket, github: "water-cooler-ai/docket"}
-  ]
-end
-```
+The configured backend exclusively owns graph/run persistence, scheduling,
+recovery, signals, and production supervision.
 
 ## Learn more
 
+- [PostgreSQL operations and correctness guide](docs/postgres-operations.md) —
+  statuses, claims, poison recovery, configuration, testing modes, and
+  inspection.
+- [Delivery and execution guarantees](docs/delivery-guarantees.md) — the full
+  guarantee matrix, partition behavior, and integration rules.
 - [examples/parent-app-integration.md](examples/parent-app-integration.md) —
-  wiring Docket runs to your users, accounts, and database rows.
+  the durable parent-application integration boundary.
 - [examples/llm-node.md](examples/llm-node.md) — a generic, configurable LLM
   node implementation.
-- [docs/architecture/](docs/architecture/) — design rationale: the graph
-  document contract, compiler, execution contract, and runtime background.
+- [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).
+- [Backend test guide](docs/backend-conformance.md) — the shared source test
+  suite and backend-specific coverage boundary.
+- [Telemetry](docs/telemetry.md) — operational signals and bounded labels.
 - Module docs — `Docket`, `Docket.Graph`, `Docket.Run`, `Docket.Node`,
   `Docket.Checkpoint`, and `Docket.Test` are the authoritative API reference.

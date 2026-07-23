@@ -1,57 +1,94 @@
 # Docket Architecture Docs
 
-These documents record the design rationale behind Docket. The code and its
-module docs are the authoritative reference for the current API; read these
-when you want to understand *why* the contracts are shaped the way they are.
+Operational instrumentation and correctness boundaries are documented in the
+[telemetry guide](../telemetry.md).
+Production status, configuration, failure recovery, and inspection are in the
+[PostgreSQL operations guide](../postgres-operations.md).
 
-## Reading Order
+Module docs are authoritative for the current API. Architecture documents
+capture cross-module contracts and the rationale that is not useful at an
+individual function boundary.
 
-1. `docket-graph-construction-design.md`
-   - The public `Docket.Graph` document: editing API, serialization and hash
-     contract, ID rules, and the host storage boundary.
-2. `docket-compiler-design.md`
-   - Compiler verification, diagnostics, and lowering from the public graph
-     to the internal runtime graph.
-3. `docket-graph-execution-contract-design.md`
-   - The execution contract: runtime loop, public run APIs, checkpoints,
-     executors, guards, failures, and interrupts.
-4. `docket-reducers-design.md`
-   - Why the v1.1 reducer contract folds the prior committed value, and the
-     rationale behind list-write concatenation, natural zeros, and
-     reducer-aware write validation.
-5. `docket-runtime-design.md`
-   - Long-form research and background: goals, alternatives considered
-     (Pregel, LangGraph, Temporal), and future design space.
+## Current guides and contracts
 
-## Canonical v1 Shape
+- [Delivery guarantees](../delivery-guarantees.md) — durable transactions,
+  replay, external effects, event export, and best-effort callbacks.
+- [PostgreSQL operations](../postgres-operations.md) — production setup,
+  configuration, migration, recovery, and inspection.
+- [ClaimPolicy boundary](docket-claim-policy.md) — the one-statement internal
+  seam, engine selection, and the admission-mode interlock.
+- [0.0.1 to 0.1.0 migration](migration-0.0.1-to-0.1.0.md) — drain-and-cut-over
+  instructions for old host-owned persistence adopters.
+
+Graph and compiler internals are documented in
+[graph construction](docket-graph-construction-design.md),
+[compiler design](docket-compiler-design.md), and
+[reducers](docket-reducers-design.md).
+
+## Future planning
+
+- [Future roadmap](../future-roadmap.md) — the general project-wide home for
+  future features, improvements, investigations, and research across every
+  Docket area.
+- [Composability roadmap](../composability-roadmap.md) — graph authoring,
+  composition, and runtime follow-up themes.
+
+## Historical and research material
+
+- [Historical graph execution contract](docket-graph-execution-contract-design.md)
+  records the 0.0.1 resident-runtime boundary and the execution semantics that
+  carried forward.
+- [Runtime rationale](docket-runtime-design.md) summarizes the current runtime
+  shape, its research influences, and the retired 0.0.1 process boundary.
+
+## Release-Line Boundary
+
+The graph programming model is continuous across the release lines: node
+modules, graphs, schemas, reducers, interrupts, executors, and `Docket.Test`
+helpers carry forward. The lifecycle owner changes:
+
+- `0.0.1`: the host checkpoint callback persisted runs and the host explicitly
+  resumed resident per-run processes.
+- `0.1.0`: one required backend owns persistence, scheduling, recovery, and
+  signals. The old supervised `run` / `resume` / `get_run` path is absent.
+
+The historical execution contract is not production guidance. The runtime
+rationale labels the retired 0.0.1 boundary separately from its current
+architecture summary. Graph construction and compiler design are current.
+
+## Current Core Shape
 
 Durable public documents:
 
 - `Docket.Graph`: the graph definition document that host applications build,
-  edit, verify, publish, store, and later pass to Docket. Public topology is
+  edit, and verify, and that the backend publishes as an immutable effective
+  version before starting a run. Public topology is
   represented by edge records; fan-in joins are multi-source edges, and branch
   groups live on source nodes.
-- `Docket.Run`: the durable execution state document that Docket emits through
-  checkpoints and host applications persist for reads, resume, audit, and
-  recovery.
+- `Docket.Run`: the durable execution state document encoded by the backend's
+  run store and returned through committed reads.
+
+Public read projection:
+
+- `Docket.GraphVersion` and `Docket.GraphVersionPage`: lightweight,
+  tenant-scoped metadata for retained graph versions and their stable
+  newest-first keyset page. Exact documents are read separately with a
+  `Docket.GraphRef`.
+- `Docket.RunSummary` and `Docket.RunPage`: lightweight, tenant-scoped run
+  collection rows and their stable newest-first keyset page.
+- `Docket.EventPage`: a keyset page of a run's retained events, returned by the
+  tenant-scoped `Docket.list_events/3` reader alongside the retention bounds and
+  the run's latest committed event sequence from one snapshot.
 
 Derived internal runtime values:
 
 - `Docket.Runtime.Graph`: compiled executable form of a `Docket.Graph`.
 - `Docket.Runtime.Loop`: processless transition functions over
-  `Docket.Runtime.Graph` and `Docket.Run`, shared by the supervised Runtime and
+  `Docket.Runtime.Graph` and `Docket.Run`, shared by backend vehicles and
   inline tests.
 
-Host-owned surfaces:
+Application-owned surfaces:
 
-- Graph and run persistence.
-- Graph versioning and publish workflow.
 - Authorization and tenant/project ownership.
 - UI projections for editors and live run overlays.
 - External effects performed by node code or adapters.
-
-## Documentation Rule
-
-When an implementation decision changes a contract, update the focused design
-doc if the rationale changed; keep API details in module docs, not here. Keep
-this index small: it should route people, not repeat the design.

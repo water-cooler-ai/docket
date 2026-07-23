@@ -1,7 +1,7 @@
 defmodule Docket.Graph.Compiler.RuntimeValidation do
   @moduledoc false
 
-  # Phase 9.12: internal invariant checks over the lowered runtime graph.
+  # Internal invariant checks over the lowered runtime graph.
   # Failures here are compiler bugs or unsupported graph shapes, but they
   # still surface as diagnostics rather than exceptions.
 

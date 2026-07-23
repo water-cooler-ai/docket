@@ -5,7 +5,7 @@ defmodule Docket.SchemaTest do
 
   # Validation engine: type checks, required object fields, enum membership,
   # unknown object key rejection (unless open), list items, and stored
-  # constraint enforcement (v1.1).
+  # constraint enforcement.
 
   describe "validate/2 primitives" do
     test "validates strings" do

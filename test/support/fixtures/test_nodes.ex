@@ -87,6 +87,21 @@ defmodule Docket.Test.Fixtures.Nodes do
     def call(_state, _config, _context), do: {:ok, %{}}
   end
 
+  defmodule AtomEnumDefault do
+    @moduledoc false
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{
+        level: Docket.Schema.enum([:low, :high], default: :low)
+      })
+    end
+
+    @impl true
+    def call(_state, _config, _context), do: {:ok, %{}}
+  end
+
   defmodule StatefulConfigSchema do
     @moduledoc false
     # Returns a valid schema on the first call in a process and raises on
@@ -127,6 +142,17 @@ defmodule Docket.Test.Fixtures.Nodes do
 
     @impl true
     def config_schema, do: :not_a_schema
+
+    @impl true
+    def call(_state, _config, _context), do: {:ok, %{}}
+  end
+
+  defmodule NilConfigSchema do
+    @moduledoc false
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: nil
 
     @impl true
     def call(_state, _config, _context), do: {:ok, %{}}
@@ -176,7 +202,6 @@ defmodule Docket.Test.Fixtures.Nodes do
         empty when empty in [nil, [], %{}] ->
           {:interrupt,
            %Docket.Interrupt{
-             prompt: "value for #{config["resume_field"]}?",
              resume_channel: config["resume_field"]
            }}
 
@@ -221,7 +246,6 @@ defmodule Docket.Test.Fixtures.Nodes do
         :error ->
           {:interrupt,
            %Docket.Interrupt{
-             prompt: "value for #{config["resume_field"]}?",
              schema: Docket.Schema.string(),
              resume_channel: config["resume_field"]
            }}
@@ -255,6 +279,51 @@ defmodule Docket.Test.Fixtures.Nodes do
       else
         {:ok, %{config["field"] => config["value"]}}
       end
+    end
+  end
+
+  defmodule NotifyingFlaky do
+    @moduledoc false
+    # FlakyThenSucceeds that also reports every attempt - with its
+    # idempotency identity and the state snapshot it observed - to
+    # `context.application.notify`, so tests can assert attempt identity and
+    # snapshot stability across retry parks and crash-resume. Delegates the
+    # flaky contract itself so the two fixtures cannot drift.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: FlakyThenSucceeds.config_schema()
+
+    @impl true
+    def call(state, config, context) do
+      send(
+        Map.fetch!(context.application, :notify),
+        {:attempted, context.node_id, context.attempt, context.idempotency_key, state}
+      )
+
+      FlakyThenSucceeds.call(state, config, context)
+    end
+  end
+
+  defmodule NotifyingWrite do
+    @moduledoc false
+    # WriteStatic that reports every execution to
+    # `context.application.notify`, so tests can prove a committed sibling
+    # result is never re-executed across parks and recovery. Delegates the
+    # write itself so the two fixtures cannot drift.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema, do: WriteStatic.config_schema()
+
+    @impl true
+    def call(state, config, context) do
+      send(
+        Map.fetch!(context.application, :notify),
+        {:executed, context.node_id, context.attempt}
+      )
+
+      WriteStatic.call(state, config, context)
     end
   end
 
@@ -293,7 +362,7 @@ defmodule Docket.Test.Fixtures.Nodes do
 
   defmodule Awaits do
     @moduledoc false
-    # {:await, _} is a reserved post-v1 return shape.
+    # {:await, _} is a reserved post-v0.1 return shape.
     @behaviour Docket.Node
 
     @impl true

@@ -2,16 +2,14 @@ defmodule Docket.Runtime.ResumeTest do
   use Docket.Test.Case, async: true
 
   describe "resume_inline/3" do
-    test "resumes a mid-flight run from its persisted document" do
+    test "resumes a mid-flight run from its durable state" do
       graph = Graphs.simple_edge()
 
       {:ok, run, _} = Docket.Test.run_inline(graph, %{"topic" => "graphs"}, max_steps: 1)
       assert run.status == :running
       assert run.step == 1
 
-      restored = Docket.Run.from_map!(Docket.Run.to_map(run))
-
-      assert {:ok, resumed, checkpoints} = Docket.Test.resume_inline(graph, restored)
+      assert {:ok, resumed, checkpoints} = Docket.Test.resume_inline(graph, run)
 
       assert resumed.status == :done
       assert resumed.step == 2

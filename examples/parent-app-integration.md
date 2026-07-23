@@ -1,229 +1,146 @@
 # Parent App Integration Example
 
-This example shows how a host application can connect Docket runs to its own
-users, accounts, workflows, and database rows.
+Durable Docket runs can reference app-owned users, accounts, and workflow rows
+without making the parent application a second persistence driver.
 
-The core idea is simple: the parent app passes app-owned identity in
-`Docket.Run.metadata` when it starts a run. Docket includes that metadata in the
-initial `:run_initialized` checkpoint, and the app checkpoint handler persists
-the run under the right user/account before node execution begins.
-
-## Flow
-
-1. The parent app receives a request from an authenticated user.
-2. The app chooses or creates an app-owned run ID.
-3. The app starts Docket with workflow input and app-owned metadata.
-4. Docket builds the initial `Docket.Run`.
-5. Docket emits a synchronous `:run_initialized` checkpoint.
-6. The app checkpoint handler upserts the parent app row by `Docket.Run.id`.
-7. Docket starts node execution only after the checkpoint handler returns `:ok`.
-
-That first checkpoint is the durable ownership handoff. If it fails, execution
-has not started and no node code has run.
-
-## Runtime Module
-
-A parent app normally configures Docket once:
+## Configure one backend
 
 ```elixir
 defmodule MyApp.Docket do
   use Docket,
-    checkpoint: MyApp.DocketCheckpoint,
-    executor: Docket.Executor.Local
+    tenant_mode: :required,
+    checkpoint_observers: [MyApp.DocketProjection],
+    backend:
+      {Docket.Postgres,
+       repo: MyApp.Repo,
+       claim_policy: [
+         implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave
+       ],
+       pruner: [
+         interval_ms: :timer.hours(1),
+         event_retention_ms: :timer.hours(24 * 30),
+         run_retention_ms: :timer.hours(24 * 90),
+         batch_size: 1_000
+       ]}
 end
 ```
 
-`MyApp.DocketCheckpoint` becomes the app-owned persistence boundary for run
-snapshots, events, and projections.
-
-## Starting A Run
-
-The parent app should keep workflow business input separate from app ownership
-metadata:
+Start the Repo before the facade in the application's supervision tree:
 
 ```elixir
-defmodule MyApp.Workflows do
-  alias MyApp.Repo
-  alias MyApp.Workflows.WorkflowRun
-
-  def run_workflow(user_id, workflow_id, attrs) do
-    user = MyApp.Accounts.get_user!(user_id)
-    workflow = get_workflow!(workflow_id)
-    graph = load_published_graph!(workflow)
-    run_id = Ecto.UUID.generate()
-    input = Map.new(attrs)
-
-    metadata = %{
-      "user_id" => user.id,
-      "account_id" => user.account_id,
-      "workflow_id" => workflow.id,
-      "app_run_id" => run_id
-    }
-
-    with {:ok, run} <- MyApp.Docket.run(graph, input, run_id: run_id, metadata: metadata) do
-      Repo.get_by!(WorkflowRun, docket_run_id: run.id)
-    end
-  end
-end
+children = [MyApp.Repo, MyApp.Docket]
+Supervisor.start_link(children, strategy: :one_for_one)
 ```
 
-`input` belongs to the workflow graph. It is the data nodes read and transform.
+`Docket.Postgres` owns graph/run persistence, claiming,
+scheduling, and cold recovery. The private ETF state stored by the existing
+PostgreSQL stores is not an application wire format.
 
-`metadata` belongs to the parent app. It is durable identifying context for
-authorization, tenancy, database relationships, projections, and support tools.
-Docket stores and re-emits it, but does not interpret it. Use string keys:
-metadata crosses the JSON-safe wire format, so a run loaded through
-`Docket.Run.from_map!/1` always carries string-keyed metadata.
+## Publish, then start
 
-## Persisting Checkpoints
-
-The checkpoint handler should be idempotent. It should create the row if the
-first checkpoint arrives before any parent app row exists, and update the row if
-the same checkpoint is delivered again.
+Publish an effective graph once and retain its stable reference on the
+application's workflow record. Given an application-built `graph` and workflow
+record:
 
 ```elixir
-defmodule MyApp.DocketCheckpoint do
-  @behaviour Docket.Checkpoint
+tenant_id = to_string(workflow.account_id)
+{:ok, graph_ref} = MyApp.Docket.save_graph(graph, tenant_id: tenant_id)
 
-  alias MyApp.Repo
-  alias MyApp.Workflows.WorkflowRun
-
-  def handle(%Docket.Checkpoint{run: run} = checkpoint, _context) do
-    metadata = run.metadata || %{}
-
-    with {:ok, user_id} <- fetch_metadata(metadata, "user_id"),
-         {:ok, account_id} <- fetch_metadata(metadata, "account_id"),
-         {:ok, workflow_id} <- fetch_metadata(metadata, "workflow_id") do
-      attrs = %{
-        docket_run_id: run.id,
-        user_id: user_id,
-        account_id: account_id,
-        workflow_id: workflow_id,
-        status: run.status,
-        docket_run: Docket.Run.to_map(run),
-        latest_checkpoint_seq: checkpoint.seq,
-        latest_checkpoint_type: checkpoint.type
-      }
-
-      Repo.insert!(
-        WorkflowRun.changeset(%WorkflowRun{}, attrs),
-        on_conflict:
-          {:replace,
-           [
-             :status,
-             :docket_run,
-             :latest_checkpoint_seq,
-             :latest_checkpoint_type,
-             :updated_at
-           ]},
-        conflict_target: :docket_run_id
-      )
-
-      :ok
-    end
-  end
-
-  defp fetch_metadata(metadata, key) do
-    case Map.fetch(metadata, key) do
-      {:ok, value} -> {:ok, value}
-      :error -> {:error, {:missing_run_metadata, key}}
-    end
-  end
-end
+workflow =
+  MyApp.Workflows.update_graph_ref!(workflow, %{
+    graph_id: graph_ref.graph_id,
+    graph_hash: graph_ref.graph_hash
+  })
 ```
 
-For apps that need replay, audit, or UI timelines, the same callback can append
-`checkpoint.events` in the same database transaction or enqueue them through an
-outbox.
-
-## Example Schema
-
-The parent app owns its table shape. A minimal Ecto schema might look like this:
+Keep graph input separate from app-owned metadata when starting a run:
 
 ```elixir
-defmodule MyApp.Workflows.WorkflowRun do
-  use Ecto.Schema
-  import Ecto.Changeset
+def run_workflow(user, workflow, attrs) do
+  # Authorization must establish that this workflow belongs to the user's
+  # account before its ID becomes the durable storage scope.
+  tenant_id = to_string(user.account_id)
 
-  @primary_key {:id, :binary_id, autogenerate: true}
-  schema "workflow_runs" do
-    field :docket_run_id, :binary_id
-    field :user_id, :binary_id
-    field :account_id, :binary_id
-    field :workflow_id, :binary_id
-    field :status, Ecto.Enum, values: [:running, :waiting, :done, :failed, :cancelled]
-    field :docket_run, :map
-    field :latest_checkpoint_seq, :integer
-    field :latest_checkpoint_type, Ecto.Enum,
-      values: [
-        :run_initialized,
-        :step_committed,
-        :interrupt_requested,
-        :interrupt_resolved,
-        :run_completed,
-        :run_failed
-      ]
+  graph_ref = %Docket.GraphRef{
+    graph_id: workflow.graph_id,
+    graph_hash: workflow.graph_hash
+  }
 
-    timestamps()
-  end
+  metadata = %{
+    "user_id" => user.id,
+    "account_id" => user.account_id,
+    "workflow_id" => workflow.id
+  }
 
-  def changeset(run, attrs) do
-    run
-    |> cast(attrs, [
-      :docket_run_id,
-      :user_id,
-      :account_id,
-      :workflow_id,
-      :status,
-      :docket_run,
-      :latest_checkpoint_seq,
-      :latest_checkpoint_type
-    ])
-    |> validate_required([
-      :docket_run_id,
-      :user_id,
-      :account_id,
-      :workflow_id,
-      :status,
-      :docket_run,
-      :latest_checkpoint_seq,
-      :latest_checkpoint_type
-    ])
-    |> unique_constraint(:docket_run_id)
+  with {:ok, run} <-
+         MyApp.Docket.start_run(graph_ref, Map.new(attrs),
+           tenant_id: tenant_id,
+           metadata: metadata
+         ) do
+    MyApp.Workflows.link_docket_run!(workflow, run.id)
   end
 end
 ```
 
-The corresponding table should enforce a unique index on `docket_run_id`.
-Apps that use multi-tenant storage will usually also add indexes such as
-`[:account_id, :user_id]`, `[:account_id, :workflow_id]`, and
-`[:account_id, :status]`.
+`input` is workflow data. `metadata` is durable app context that Docket
+preserves but does not interpret. Applications should keep metadata terms
+portable and free of processes, references, ports, and functions.
+The linked workflow must remain in the same authorized account; reads and
+signals must derive their tenant ID from that trusted ownership relationship,
+not from caller-controlled input.
 
-## Resuming A Run
+## Read and inspect
 
-On restart or crash recovery, the app loads its durable row, restores the
-public `Docket.Run`, and passes both the graph and run back to Docket:
+Application rows store the Docket run ID and business projections, not a copy
+of Docket's durable run state:
 
 ```elixir
-defmodule MyApp.Workflows do
-  def resume_run!(%WorkflowRun{} = workflow_run) do
-    run = Docket.Run.from_map!(workflow_run.docket_run)
-    graph = load_published_graph!(workflow_run.workflow_id, run.graph_hash)
+tenant_id = to_string(workflow.account_id)
 
-    MyApp.Docket.resume(graph, run)
+{:ok, run} =
+  MyApp.Docket.fetch_run(workflow.docket_run_id,
+    tenant_id: tenant_id
+  )
+
+{:ok, info} =
+  MyApp.Docket.inspect_run(workflow.docket_run_id,
+    tenant_id: tenant_id
+  )
+```
+
+`fetch_run` returns the last committed `%Docket.Run{}`. `inspect_run` adds
+token-free scheduling and operational health facts.
+
+## Project after commit
+
+Checkpoint observers are suitable for best-effort UI projections and
+notifications. They run after the durable transaction and cannot veto it:
+
+```elixir
+defmodule MyApp.DocketProjection do
+  @behaviour Docket.Checkpoint.Observer
+
+  @impl true
+  def observe(%Docket.Checkpoint{run: run}, _context) do
+    MyApp.Workflows.project_status(run.id, run.status, run.updated_at)
+    :ok
   end
 end
 ```
 
-The restored run still contains the original metadata, so future checkpoints
-continue to carry the same parent app identity.
+Observers may be lost or duplicated around a crash. Consumers that require a
+durable delivery guarantee should consume retained events rather than treating
+the observer as an outbox.
 
-## Important Boundaries
+## Important boundaries
 
-- Store authorization and ownership data in `metadata`, not in workflow `input`.
-- Treat `run.id` as the Docket run identity and the natural checkpoint upsert
-  key.
-- Treat `run.metadata` as app-owned opaque data that Docket preserves.
-- Persist `checkpoint.run` as the resume source of truth.
-- Make checkpoint handling idempotent by `run.id` and `checkpoint.seq`.
-- Do not require a parent app row to exist before the first checkpoint.
+- Use a stable, non-empty binary `tenant_id` for storage authorization and
+  scope; convert integer application IDs explicitly.
+- Store business identity in Run metadata, not graph input.
+- Store `run.id` and app projections in parent tables; do not duplicate the
+  private Run state blob.
+- Publish graphs explicitly and start runs only from the returned `GraphRef`.
+- Use `fetch_run`/`inspect_run`; v0.1.0 has no host-owned Run map codec or
+  resume orchestration.
+- Docket does not provide actor persistence, audit history, hold/drain states,
+  bulk policy changes, weights, borrowing, or preemption.

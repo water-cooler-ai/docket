@@ -2,6 +2,12 @@ defmodule Docket.MixProject do
   use Mix.Project
 
   @version "0.1.0"
+  @source_url "https://github.com/water-cooler-ai/docket"
+
+  # Set by the core-only CI leg to build and test without the optional
+  # Postgres dependencies, mirroring a host application that uses only the
+  # dependency-free core. See CONTRIBUTING.md.
+  @core_only? System.get_env("DOCKET_CORE_ONLY") in ["1", "true"]
 
   def project do
     [
@@ -10,7 +16,13 @@ defmodule Docket.MixProject do
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      description:
+        "Durable, graph-based workflow execution for long-running, " <>
+          "interruptible work like agentic LLM sessions.",
+      docs: docs(),
+      package: package(),
+      source_url: @source_url
     ]
   end
 
@@ -27,6 +39,50 @@ defmodule Docket.MixProject do
     [
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false, warn_if_outdated: true}
+    ] ++ postgres_deps()
+  end
+
+  # The Postgres backend (`Docket.Postgres.*`) compiles only when the host
+  # application already depends on ecto_sql and postgrex; core-only hosts
+  # pull in nothing beyond telemetry.
+  defp postgres_deps do
+    if @core_only? do
+      []
+    else
+      [
+        {:ecto_sql, "~> 3.10", optional: true},
+        {:postgrex, "~> 0.17", optional: true}
+      ]
+    end
+  end
+
+  defp package do
+    [
+      licenses: ["Apache-2.0"],
+      links: %{"GitHub" => @source_url},
+      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE docs examples)
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      source_ref: "v#{@version}",
+      extras: [
+        {"README.md", filename: "readme"},
+        {"CHANGELOG.md", []},
+        {"docs/delivery-guarantees.md", []},
+        {"docs/postgres-operations.md", []},
+        {"docs/telemetry.md", []},
+        {"docs/backend-conformance.md", []},
+        {"docs/architecture/docket-claim-policy.md",
+         filename: "architecture-docket-claim-policy"},
+        {"docs/architecture/migration-0.0.1-to-0.1.0.md",
+         filename: "architecture-migration-0.0.1-to-0.1.0"},
+        {"examples/parent-app-integration.md", filename: "example-parent-app-integration"},
+        {"examples/llm-node.md", filename: "example-llm-node"}
+      ],
+      skip_undefined_reference_warnings_on: ["CHANGELOG.md"]
     ]
   end
 end
