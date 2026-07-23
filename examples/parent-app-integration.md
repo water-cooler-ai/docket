@@ -8,19 +8,20 @@ without making the parent application a second persistence driver.
 ```elixir
 defmodule MyApp.Docket do
   use Docket,
-    repo: MyApp.Repo,
-    backend: Docket.Postgres,
     tenant_mode: :required,
-    claim_policy: [
-      implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave
-    ],
     checkpoint_observers: [MyApp.DocketProjection],
-    pruner: [
-      interval_ms: :timer.hours(1),
-      event_retention_ms: :timer.hours(24 * 30),
-      run_retention_ms: :timer.hours(24 * 90),
-      batch_size: 1_000
-    ]
+    backend:
+      {Docket.Postgres,
+       repo: MyApp.Repo,
+       claim_policy: [
+         implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave
+       ],
+       pruner: [
+         interval_ms: :timer.hours(1),
+         event_retention_ms: :timer.hours(24 * 30),
+         run_retention_ms: :timer.hours(24 * 90),
+         batch_size: 1_000
+       ]}
 end
 ```
 
@@ -141,6 +142,5 @@ the observer as an outbox.
 - Publish graphs explicitly and start runs only from the returned `GraphRef`.
 - Use `fetch_run`/`inspect_run`; v0.1.0 has no host-owned Run map codec or
   resume orchestration.
-- Authorize claim-policy changes in the parent application before calling the
-  five public cap operations. Docket does not provide actor persistence, audit
-  history, hold/drain states, bulk changes, weights, borrowing, or preemption.
+- Docket does not provide actor persistence, audit history, hold/drain states,
+  bulk policy changes, weights, borrowing, or preemption.

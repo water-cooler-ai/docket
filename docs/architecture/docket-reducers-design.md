@@ -1,28 +1,26 @@
-# Docket Reducers — v0.1.1 Contract Rationale
+# Docket Reducers — 0.1 Contract Rationale
 
-The v0.1.1 contract extends reduction to the prior committed value so aggregate
-fields can accumulate across steps.
+The 0.1 contract reduces against the prior committed value so aggregate fields
+can accumulate across steps.
 
-## The contract change
+## Reduction contract
 
-v0.1 applied reducers only to resolve same-step write conflicts: the runtime
-folded the step's writes and replaced the committed value. Aggregates
-(chat histories, usage counters, merged metadata) need the reducer to fold
-the **prior committed value** as well:
+Aggregates such as chat histories, usage counters, and merged metadata need the
+reducer to fold the **prior committed value** as well as the current step's
+writes:
 
     new_value = reduce(reducer, current_committed_value, sorted_step_writes)
 
-`last_value` is the degenerate case that ignores `current`, so the v0.1
-behavior is unchanged for every existing graph. This is the only semantic
-extension in v0.1.1; everything else layered on it (built-in reducer types,
-options, shorthand) is additive descriptor data on the wire.
+`last_value` is the degenerate case that ignores `current`, preserving ordinary
+replacement semantics. Built-in reducer types, options, and shorthand remain
+descriptor data on the wire.
 
 ## Why the runtime owns reduction
 
 Reduction lives in `Docket.Reducer.reduce/3`, a pure function called from
 the update barrier (`apply_state_writes`) and from interrupt resolution.
 Reducers are part of the determinism contract: replanning after a crash must
-reproduce identical commits, which is why v0.1.1 ships only built-in reducers
+reproduce identical commits, which is why 0.1 ships only built-in reducers
 and defers module-referenced custom reducers until a real host graph
 exhausts the built-ins (every custom reducer hands the purity obligation to
 the host and makes a module name durable graph content).
@@ -60,5 +58,5 @@ the host and makes a module name durable graph content).
 
 ## Wire compatibility
 
-Reducers already serialized as `type` + open `opts`; the new types and
-options are additive, so v0.1 documents load unchanged and hash identically.
+Reducers serialize as `type` plus open `opts`; built-in types and options remain
+additive descriptor data.

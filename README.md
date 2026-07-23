@@ -14,6 +14,15 @@ fields they read and write, and edges (optionally guarded) that decide what
 runs next. Docket executes the graph in deterministic supersteps and commits
 a checkpoint at every durable transition.
 
+**Design lineage:** Docket's execution model draws on
+[Google's Pregel](https://research.google/pubs/pregel-a-system-for-large-scale-graph-processing/)
+and [LangGraph's Pregel runtime](https://docs.langchain.com/oss/python/langgraph/pregel):
+the established bulk-synchronous pattern of computation separated by commit
+barriers. That model fits the BEAM naturally: Docket fans each superstep into
+isolated, monitored node processes, gathers their results at a mailbox barrier,
+and uses supervision for fault containment while PostgreSQL—not process
+identity—remains the recovery authority.
+
 ## Features
 
 - **Durable supersteps** — runs advance in Pregel-style plan/execute/commit
@@ -52,13 +61,107 @@ matrix.
 
 - Elixir 1.18+.
 - The graph core and `Docket.Test` have no database requirement.
-- The durable backend requires PostgreSQL 13 or newer through the optional
+- The durable backend requires PostgreSQL 13 or newer and host-declared
   `ecto_sql ~> 3.10` and `postgrex ~> 0.17` dependencies.
 
 ## Installation
 
-Add Docket and, for the durable backend, its optional PostgreSQL
-dependencies:
+The graph and execution core needs only Docket:
+
+```elixir
+def deps do
+  [
+    {:docket, "~> 0.1.0"}
+  ]
+end
+```
+
+That is enough to build graphs and execute them processless with `Docket.Test`;
+it installs no Ecto or PostgreSQL dependency. Durable operation adds the
+optional database dependencies later in this guide.
+
+## Quickstart
+
+Define a node — a module that declares its config schema and does one unit
+of work against the shared state:
+
+```elixir
+defmodule MyApp.Nodes.ExcludeAllergens do
+  @behaviour Docket.Node
+
+  @impl true
+  def config_schema do
+    Docket.Schema.object(%{
+      "recipes" => Docket.Schema.string(required: true),
+      "avoid" => Docket.Schema.string(required: true),
+      "to" => Docket.Schema.string(required: true)
+    })
+  end
+
+  @impl true
+  def call(state, config, _context) do
+    avoid = MapSet.new(state[config["avoid"]])
+
+    safe_recipes =
+      Enum.reject(state[config["recipes"]], fn recipe ->
+        Enum.any?(recipe["allergens"], &MapSet.member?(avoid, &1))
+      end)
+
+    {:ok, %{config["to"] => safe_recipes}}
+  end
+end
+```
+
+Build a graph document wiring the node between `$start` and `$finish`:
+
+```elixir
+recipe_schema =
+  Docket.Schema.object(%{
+    "name" => Docket.Schema.string(required: true),
+    "allergens" => Docket.Schema.list(:string, required: true)
+  })
+
+graph =
+  Docket.Graph.new!(id: "recipe_safety")
+  |> Docket.Graph.put_input!("recipes",
+    schema: Docket.Schema.list(recipe_schema),
+    required: true
+  )
+  |> Docket.Graph.put_input!("avoid", schema: {:list, :string}, required: true)
+  |> Docket.Graph.put_field!("safe_recipes", schema: Docket.Schema.list(recipe_schema))
+  |> Docket.Graph.put_node!("exclude_allergens",
+    implementation: MyApp.Nodes.ExcludeAllergens,
+    config: %{"recipes" => "recipes", "avoid" => "avoid", "to" => "safe_recipes"}
+  )
+  |> Docket.Graph.put_edge!("start_filter", from: "$start", to: "exclude_allergens")
+  |> Docket.Graph.put_edge!("filter_finish", from: "exclude_allergens", to: "$finish")
+  |> Docket.Graph.put_output!("safe_recipes", [])
+```
+
+Run the graph processless, with no supervision tree or database:
+
+```elixir
+input = %{
+  "recipes" => [
+    %{"name" => "Pesto pasta", "allergens" => ["dairy", "nuts"]},
+    %{"name" => "Salsa", "allergens" => []}
+  ],
+  "avoid" => ["dairy"]
+}
+
+{:ok, run, checkpoints} = Docket.Test.run_inline(graph, input)
+
+run.status  #=> :done
+run.output  #=> %{"safe_recipes" => [%{"name" => "Salsa", "allergens" => []}]}
+Enum.map(checkpoints, & &1.type)
+#=> [:run_initialized, :step_committed, :run_completed]
+```
+
+## Durable PostgreSQL
+
+PostgreSQL support is opt-in. Docket does not install Ecto or Postgrex for
+core-only applications. The application that owns the Repo should declare all
+three dependencies directly:
 
 ```elixir
 def deps do
@@ -70,7 +173,7 @@ def deps do
 end
 ```
 
-Then install the tables through a host-owned migration:
+Install the tables through a host-owned migration:
 
 ```sh
 mix deps.get
@@ -78,104 +181,42 @@ mix docket.gen.migration -r MyApp.Repo
 mix ecto.migrate -r MyApp.Repo
 ```
 
-The generated migration delegates to Docket's pinned schema version. Commit
-it with the application; do not call the migration module directly from
-application startup.
-
-## Quickstart
-
-This starts a durable, tenantless runtime in an existing Ecto application,
-using polling only; the LISTEN/NOTIFY fast path can be enabled later without
-changing correctness. Retention is required and explicit:
+Configure a tenantless, poll-only runtime with explicit retention:
 
 ```elixir
-defmodule MyApp.DurableDocket do
+defmodule MyApp.Docket do
   use Docket,
-    repo: MyApp.Repo,
-    backend: Docket.Postgres,
     tenant_mode: :none,
-    notifier: :none,
-    pruner: [
-      interval_ms: :timer.hours(1),
-      event_retention_ms: :timer.hours(24 * 30),
-      run_retention_ms: :timer.hours(24 * 90),
-      batch_size: 1_000
-    ]
+    backend:
+      {Docket.Postgres,
+       repo: MyApp.Repo,
+       notifier: :none,
+       pruner: [
+         interval_ms: :timer.hours(1),
+         event_retention_ms: :timer.hours(24 * 30),
+         run_retention_ms: :timer.hours(24 * 90),
+         batch_size: 1_000
+       ]}
 end
-```
 
-Start the Repo before Docket in the application's supervision tree:
-
-```elixir
-children = [
-  MyApp.Repo,
-  MyApp.DurableDocket
-]
-
+children = [MyApp.Repo, MyApp.Docket]
 Supervisor.start_link(children, strategy: :one_for_one)
 ```
 
-Define a node — a module that declares its config schema and does one unit
-of work against the shared state:
-
-```elixir
-defmodule MyApp.Nodes.Shout do
-  @behaviour Docket.Node
-
-  @impl true
-  def config_schema do
-    Docket.Schema.object(%{
-      "from" => Docket.Schema.string(required: true),
-      "to" => Docket.Schema.string(required: true)
-    })
-  end
-
-  @impl true
-  def call(state, config, _context) do
-    {:ok, %{config["to"] => String.upcase(state[config["from"]])}}
-  end
-end
-```
-
-Build a graph document wiring the node between `$start` and `$finish`:
-
-```elixir
-graph =
-  Docket.Graph.new!(id: "shout")
-  |> Docket.Graph.put_input!("message", schema: Docket.Schema.string(), required: true)
-  |> Docket.Graph.put_field!("result", schema: Docket.Schema.string())
-  |> Docket.Graph.put_node!("shout",
-    implementation: MyApp.Nodes.Shout,
-    config: %{from: "message", to: "result"}
-  )
-  |> Docket.Graph.put_edge!("edge_start_shout", from: "$start", to: "shout")
-  |> Docket.Graph.put_edge!("edge_shout_finish", from: "shout", to: "$finish")
-  |> Docket.Graph.put_output!("result", [])
-```
-
-Before publishing, the same graph can run processlessly in a unit test:
-
-```elixir
-{:ok, run, checkpoints} = Docket.Test.run_inline(graph, %{"message" => "hello world"})
-
-run.status  #=> :done
-run.output  #=> %{"result" => "HELLO WORLD"}
-Enum.map(checkpoints, & &1.type)
-#=> [:run_initialized, :step_committed, :run_completed]
-```
+The generated migration delegates to Docket's pinned schema version; commit
+it with the application rather than running migrations at application startup.
 
 Publish an immutable graph version, then start durable work from the
 returned reference:
 
 ```elixir
-{:ok, graph_ref} = MyApp.DurableDocket.save_graph(graph)
+{:ok, graph_ref} = MyApp.Docket.save_graph(graph)
 
-{:ok, run} =
-  MyApp.DurableDocket.start_run(graph_ref, %{"message" => "hello world"})
+{:ok, run} = MyApp.Docket.start_run(graph_ref, input)
 
-{:ok, finished} = MyApp.DurableDocket.await_run(run.id, timeout: 5_000)
+{:ok, finished} = MyApp.Docket.await_run(run.id, timeout: 5_000)
 finished.status #=> :done
-finished.output #=> %{"result" => "HELLO WORLD"}
+finished.output #=> run.output
 ```
 
 `start_run` returns after the initialized run is durably committed;
@@ -211,7 +252,7 @@ external system resolves it:
 
 ```elixir
 {:ok, run} =
-  MyApp.DurableDocket.resolve_interrupt(run_id, interrupt_id, "approved")
+  MyApp.Docket.resolve_interrupt(run_id, interrupt_id, "approved")
 ```
 
 The value is validated against the interrupt's schema (if any), written to
@@ -256,12 +297,6 @@ recovery, signals, and production supervision.
 - [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).
 - [Backend test guide](docs/backend-conformance.md) — the shared source test
   suite and backend-specific coverage boundary.
-- [Telemetry](docs/telemetry.md) and [benchmarks](docs/benchmarks.md) —
-  operational signals and non-oracle regression measurements.
-- [Future roadmap](docs/future-roadmap.md) — future features, improvements,
-  investigations, and research.
-- [Architecture guide index](docs/architecture/README.md) — design rationale:
-  the graph document contract, compiler, execution contract, and runtime
-  background.
+- [Telemetry](docs/telemetry.md) — operational signals and bounded labels.
 - Module docs — `Docket`, `Docket.Graph`, `Docket.Run`, `Docket.Node`,
   `Docket.Checkpoint`, and `Docket.Test` are the authoritative API reference.

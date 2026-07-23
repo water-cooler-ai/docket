@@ -88,6 +88,9 @@ project follows [Semantic Versioning](https://semver.org/).
   privately encodes and hashes the effective graph, so re-saving after defaults
   change may yield a different effective reference. `Docket.Run.to_map/from_map`
   and the public `Docket.Graph.hash` remain removed.
+- Expanded the graph contract with nested object/list schemas, reducer-backed
+  fields that fold prior committed values, inline node field declarations,
+  graph editing helpers, and post-commit domain telemetry.
 - Finite runtime-owned node attempt deadlines across Local, Task, and custom
   executors. Missing node timeouts inherit the host maximum; larger explicit
   graph limits are rejected before execution and rescheduled without poison,
@@ -297,18 +300,22 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Backend-specific startup configuration is nested as
+  `backend: {BackendModule, options}`. Core runtime policy remains top-level,
+  unknown flat options fail early, and an optionless backend may still use its
+  module directly.
 - PostgreSQL wall-clock injection is now a testing-only, top-level,
   instance-owned option shared by facade operations, synchronous claims, and
   vehicles; nested and per-call overrides are rejected or ignored. Runtime
   clocks validate `DateTime` results, and the ClaimPolicy boundary normalizes
   `now` to UTC microsecond precision before every implementation receives it.
-- The main README now leads with a complete Docket.Postgres quickstart covering
-  dependencies, migration, supervision, retention, publication, and durable
-  execution. Release documentation consistently describes the backend-owned
-  v0.1.0 lifecycle, processless waiting, required tenant scope, deterministic
-  testing modes, and current production vehicles. The Hex package and ExDoc
-  output include the linked operational, architecture, roadmap, and example
-  guides.
+- The main README now leads with the database-free graph quickstart, followed
+  by complete Docket.Postgres setup covering dependencies, migration,
+  supervision, retention, publication, and durable execution. Release
+  documentation consistently describes the backend-owned v0.1.0 lifecycle,
+  processless waiting, required tenant scope, deterministic testing modes, and
+  current production vehicles. HexDocs keeps the linked onboarding,
+  operational, migration, and example guides concise.
 - Runtime dispatch now executes every node selected for a superstep
   concurrently against the same committed snapshot, then collects results in
   deterministic activation order before crossing the existing update barrier.

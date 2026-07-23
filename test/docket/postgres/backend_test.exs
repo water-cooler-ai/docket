@@ -84,12 +84,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ]
 
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
-        notifier: :none,
-        dispatcher: [concurrency: 2, poll_interval_ms: 10],
         checkpoint_observers: [FailingObserver],
-        pruner: @pruner
+        backend:
+          {Docket.Postgres,
+           repo: TestRepo,
+           notifier: :none,
+           dispatcher: [concurrency: 2, poll_interval_ms: 10],
+           pruner: @pruner}
     end
 
     defmodule NotifyHost do
@@ -101,11 +102,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ]
 
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
         context: %{coordinator: :docket_backend_vehicle_relay},
-        dispatcher: [concurrency: 1, poll_interval_ms: 60_000],
-        pruner: @pruner
+        backend:
+          {Docket.Postgres,
+           repo: TestRepo, dispatcher: [concurrency: 1, poll_interval_ms: 60_000], pruner: @pruner}
     end
 
     defmodule TenantHost do
@@ -117,13 +117,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ]
 
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
         tenant_mode: :required,
-        claim_policy: [implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave],
-        notifier: :none,
-        dispatcher: [concurrency: 1, poll_interval_ms: 60_000],
-        pruner: @pruner
+        backend:
+          {Docket.Postgres,
+           repo: TestRepo,
+           claim_policy: [implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave],
+           notifier: :none,
+           dispatcher: [concurrency: 1, poll_interval_ms: 60_000],
+           pruner: @pruner}
     end
 
     defmodule PoisonHost do
@@ -135,68 +136,63 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ]
 
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
-        notifier: :none,
-        dispatcher: [concurrency: 1, poll_interval_ms: 60_000],
-        pruner: @pruner
+        backend:
+          {Docket.Postgres,
+           repo: TestRepo,
+           notifier: :none,
+           dispatcher: [concurrency: 1, poll_interval_ms: 60_000],
+           pruner: @pruner}
     end
 
     defmodule InlineHost do
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
         testing: :inline,
-        notifier: :none
+        backend: {Docket.Postgres, repo: TestRepo, notifier: :none}
     end
 
     defmodule ManualHost do
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
         testing: :manual,
-        notifier: :none
+        backend: {Docket.Postgres, repo: TestRepo, notifier: :none}
     end
 
     defmodule ConcurrentManualHost do
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
         testing: :manual,
-        notifier: :none
+        backend: {Docket.Postgres, repo: TestRepo, notifier: :none}
     end
 
     defmodule ClockedManualHost do
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
         testing: :manual,
         clock: &FixedClock.now/0,
-        notifier: :none
+        backend: {Docket.Postgres, repo: TestRepo, notifier: :none}
     end
 
     defmodule AlternatePolicyManualHost do
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
         testing: :manual,
-        notifier: :none,
-        claim_policy: [
-          implementation: Docket.Test.AlternateClaimPolicy,
-          marker: :manual_runtime
-        ]
+        backend:
+          {Docket.Postgres,
+           repo: TestRepo,
+           notifier: :none,
+           claim_policy: [
+             implementation: Docket.Test.AlternateClaimPolicy,
+             marker: :manual_runtime
+           ]}
     end
 
     defmodule RelayOptionsManualHost do
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
         testing: :manual,
-        notifier: :none,
-        claim_policy: [
-          implementation: Docket.Test.RelayOptionsClaimPolicy,
-          relayed_option: 4
-        ]
+        backend:
+          {Docket.Postgres,
+           repo: TestRepo,
+           notifier: :none,
+           claim_policy: [
+             implementation: Docket.Test.RelayOptionsClaimPolicy,
+             relayed_option: 4
+           ]}
     end
 
     defmodule RelayOptionsSupervisedHost do
@@ -208,44 +204,41 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       ]
 
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
-        notifier: :none,
-        dispatcher: [concurrency: 1, poll_interval_ms: 10],
-        pruner: @pruner,
-        claim_policy: [
-          implementation: Docket.Test.RelayOptionsClaimPolicy,
-          relayed_option: 4
-        ]
+        backend:
+          {Docket.Postgres,
+           repo: TestRepo,
+           notifier: :none,
+           dispatcher: [concurrency: 1, poll_interval_ms: 10],
+           pruner: @pruner,
+           claim_policy: [
+             implementation: Docket.Test.RelayOptionsClaimPolicy,
+             relayed_option: 4
+           ]}
     end
 
     defmodule SandboxInlineHost do
       use Docket,
-        backend: Docket.Postgres,
-        repo: SandboxRepo,
-        prefix: "public",
         testing: :inline,
-        notifier: :none
+        backend: {Docket.Postgres, repo: SandboxRepo, prefix: "public", notifier: :none}
     end
 
     defmodule SandboxWindowedHost do
       use Docket,
-        backend: Docket.Postgres,
-        repo: SandboxRepo,
-        prefix: "public",
         tenant_mode: :required,
-        claim_policy: [implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave],
         testing: :manual,
-        notifier: :none
+        backend:
+          {Docket.Postgres,
+           repo: SandboxRepo,
+           prefix: "public",
+           claim_policy: [implementation: Docket.Postgres.ClaimPolicy.WindowedInterleave],
+           notifier: :none}
     end
 
     defmodule ObserverInlineHost do
       use Docket,
-        backend: Docket.Postgres,
-        repo: TestRepo,
         testing: :inline,
-        notifier: :none,
-        checkpoint_observers: [RelayObserver]
+        checkpoint_observers: [RelayObserver],
+        backend: {Docket.Postgres, repo: TestRepo, notifier: :none}
     end
 
     setup_all do

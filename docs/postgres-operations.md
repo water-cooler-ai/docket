@@ -1,6 +1,6 @@
 # Docket.Postgres Operations and Correctness Guide
 
-Complete the [README quickstart](../README.md) before configuring production,
+Complete the package README quickstart before configuring production,
 inspecting the runtime, or recovering failures.
 
 ## Fresh application setup
@@ -38,16 +38,17 @@ Define one complete facade. Production retention has no implicit defaults:
 ```elixir
 defmodule MyApp.Docket do
   use Docket,
-    repo: MyApp.Repo,
-    backend: Docket.Postgres,
     tenant_mode: :none,
-    notifier: :none,
-    pruner: [
-      interval_ms: :timer.hours(1),
-      event_retention_ms: :timer.hours(24 * 30),
-      run_retention_ms: :timer.hours(24 * 90),
-      batch_size: 1_000
-    ]
+    backend:
+      {Docket.Postgres,
+       repo: MyApp.Repo,
+       notifier: :none,
+       pruner: [
+         interval_ms: :timer.hours(1),
+         event_retention_ms: :timer.hours(24 * 30),
+         run_retention_ms: :timer.hours(24 * 90),
+         batch_size: 1_000
+       ]}
 end
 ```
 
@@ -58,10 +59,11 @@ children = [MyApp.Repo, MyApp.Docket]
 Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
 ```
 
-This setup uses polling and tenantless storage. Removing `notifier: :none`
-enables LISTEN/NOTIFY. Changing to `tenant_mode: :required` also requires the
-WindowedInterleave claim policy, plus the same authorized non-empty binary
-tenant ID on every run, read, and signal call.
+This setup uses polling and tenantless storage. Removing the backend's
+`notifier: :none` enables LISTEN/NOTIFY. Changing to
+`tenant_mode: :required` also requires the WindowedInterleave claim policy
+under the backend, plus the same authorized non-empty binary tenant ID on
+every run, read, and signal call.
 
 ## Persistence and transaction ownership
 
@@ -282,30 +284,30 @@ the prior success. There is no public `resume_run` or graph-semantic
 
 | Option | Default | Guidance |
 | --- | --- | --- |
-| `repo:` | required | A started Ecto PostgreSQL Repo owned by the host. |
-| `backend:` | required | Use the complete `Docket.Postgres` bundle. |
-| `prefix:` | `public` | Must match both directions of the generated migration. |
+| `backend:` | required | Use `{Docket.Postgres, options}` so backend-specific configuration stays under the selected backend. |
+| `backend.repo` | required | A started Ecto PostgreSQL Repo owned by the host. |
+| `backend.prefix` | `public` | Must match both directions of the generated migration. |
 | `tenant_mode:` | `:none` | Use `:required` for tenant-scoped rows; all calls then require a non-empty binary ID. |
-| `claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` for `tenant_mode: :none` | Required PostgreSQL tenancy must select `Docket.Postgres.ClaimPolicy.WindowedInterleave`; implementations are validated before startup and cannot be selected per call. |
-| `dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
-| `dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
-| `dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
-| `dispatcher.max_claim_attempts` | `5` | Launches allowed before the next recovery need poisons. |
-| `dispatcher.drain_timeout_ms` | `30_000` | Shutdown wait for tracked vehicles. |
+| `backend.claim_policy.implementation` | `Docket.Postgres.ClaimPolicy.Legacy` for `tenant_mode: :none` | Required PostgreSQL tenancy must select `Docket.Postgres.ClaimPolicy.WindowedInterleave`; implementations are validated before startup and cannot be selected per call. |
+| `backend.dispatcher.concurrency` | `10` | Maximum active vehicles per runtime instance. |
+| `backend.dispatcher.poll_interval_ms` | `1_000` | Correctness fallback and poll-only wake latency. |
+| `backend.dispatcher.orphan_ttl_ms` | `60_000` | Crash-recovery lease TTL; must exceed the finite drain residency limit with operational headroom. |
+| `backend.dispatcher.max_claim_attempts` | `5` | Launches allowed before the next recovery need poisons. |
+| `backend.dispatcher.drain_timeout_ms` | `30_000` | Shutdown wait for tracked vehicles. |
 | `max_attempt_elapsed_ms` | `2_000` | Instance-owned finite host maximum inherited by nodes without `timeout_ms`; larger explicit graph timeouts are rejected before execution. |
-| `vehicle.drain_budget` | 100 moments / 3 seconds | Cooperative moment-boundary yield; `max_elapsed_ms` must be finite, at least the attempt maximum, and below orphan TTL. |
-| `vehicle.abandon_backoff_ms` | `30_000` | Base delay before retrying a pre-execution incompatibility; host-limit handbacks double it per consecutive abandon. |
-| `vehicle.abandon_backoff_cap_ms` | `3_600_000` | Ceiling on the exponential host-incompatibility backoff. |
-| `vehicle.max_claim_abandons` | `5` | Abandons allowed before incompatibility poison; host-limit handbacks share the counter but never poison. |
+| `backend.vehicle.drain_budget` | 100 moments / 3 seconds | Cooperative moment-boundary yield; `max_elapsed_ms` must be finite, at least the attempt maximum, and below orphan TTL. |
+| `backend.vehicle.abandon_backoff_ms` | `30_000` | Base delay before retrying a pre-execution incompatibility; host-limit handbacks double it per consecutive abandon. |
+| `backend.vehicle.abandon_backoff_cap_ms` | `3_600_000` | Ceiling on the exponential host-incompatibility backoff. |
+| `backend.vehicle.max_claim_abandons` | `5` | Abandons allowed before incompatibility poison; host-limit handbacks share the counter but never poison. |
 | `executor` | `Docket.Executor.Local` | Instance-owned executor used by inline, manual, and supervised vehicles. All executors run inside runtime-owned per-activation processes with the same hard deadline. |
 | `executor_opts` | `[]` | Instance-owned options passed to the configured executor. |
 | `max_supersteps` | unbounded | Optional host safety ceiling; publish a graph policy when it is graph identity. |
 | `clock` | system clock | Testing-only deterministic wall clock shared by public lifecycle operations, admission, and vehicles; requires `testing: :inline` or `:manual` and cannot be nested or overridden per call. |
-| dispatcher/vehicle `jitter` | random jitter | Separate polling and abandon-backoff injection points; production overrides should distribute work. |
-| `dispatcher.on_poisoned` | no-op | Best-effort operational callback for newly poisoned claims; inspect durable rows for truth. |
-| `notifier:` | enabled | Use `:none` for poll-only. LISTEN needs a direct/session-pooled endpoint. |
-| `notifier.connection` | derived from Repo | Override only to use a direct/session-pooled LISTEN endpoint. |
-| `pruner:` | required, no defaults | Supply interval, event/run retention, and batch size. Event retention must not exceed run retention. |
+| backend dispatcher/vehicle `jitter` | random jitter | Separate polling and abandon-backoff injection points; production overrides should distribute work. |
+| `backend.dispatcher.on_poisoned` | no-op | Best-effort operational callback for newly poisoned claims; inspect durable rows for truth. |
+| `backend.notifier` | enabled | Use `:none` for poll-only. LISTEN needs a direct/session-pooled endpoint. |
+| `backend.notifier.connection` | derived from Repo | Override only to use a direct/session-pooled LISTEN endpoint. |
+| `backend.pruner` | required, no defaults | Supply interval, event/run retention, and batch size. Event retention must not exceed run retention. |
 | `checkpoint_observers:` | `[]` | Best-effort after commit; delivery may be lost or duplicated. |
 | `testing:` | production | `:inline` drains synchronously; `:manual` advances only through bounded `drain_runs`. |
 
@@ -411,7 +413,7 @@ regression diagnostics.
 Use `inspect_run` for per-run scheduling, claim age, attempt counts, and poison
 health. Use the [telemetry guide](telemetry.md) for dispatcher backlog/claim
 activity, vehicle outcomes, observer failures, notifier health, and pruning
-passes, and the [benchmark guide](benchmarks.md) for regression diagnostics.
+passes. The repository's benchmark guide covers regression diagnostics.
 Database tables and opaque binary columns are backend implementation details
 rather than an application query API.
 
@@ -437,8 +439,9 @@ semantic tests carry forward. Durable run serialization does not: host-defined
 row conversion.
 
 Drain or terminate old runs, stop old writers, remove the host checkpoint
-handler and persistence, install the Docket migration, configure `repo:` and
-`backend: Docket.Postgres`, publish each graph to a `Docket.GraphRef`, replace
-`run`/`get_run` with `start_run` and `fetch_run`/`inspect_run`, and remove host
-`resume` orchestration. The detailed sequence is in the
+handler and persistence, install the Docket migration, configure
+`backend: {Docket.Postgres, repo: MyApp.Repo, ...}`, publish each graph to a
+`Docket.GraphRef`, replace `run`/`get_run` with `start_run` and
+`fetch_run`/`inspect_run`, and remove host `resume` orchestration. The detailed
+sequence is in the
 [migration guide](architecture/migration-0.0.1-to-0.1.0.md).

@@ -269,7 +269,7 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       |> assert_diagnostic(:invalid_field_default, path: [:fields, "count", :default])
     end
 
-    test "accepts v0.1.1 schema types on fields" do
+    test "accepts supported schema types on fields" do
       graph =
         Graphs.minimal_linear()
         |> Graph.put_field!("count", schema: Schema.integer(min: 0), default: 0)

@@ -9,10 +9,11 @@ defmodule Docket.Backend do
   assemble capabilities from unrelated backends.
 
   The backend also owns its supervision entry point. `child_spec/2` receives
-  the backend options selected by the host application and the already-resolved
-  opaque context as separate arguments. It returns the single child
-  specification the host places in its supervision tree. Keeping the context
-  separate prevents core from injecting private keys into backend-owned options.
+  the options nested under `{BackendModule, options}`, the small set of
+  runtime-owned policies needed for execution, and the runtime-generated name.
+  The already-resolved opaque context remains a separate argument. The callback
+  returns the single child specification the host places in its supervision
+  tree.
 
   Testing execution is also explicit. `drain_runs/2` receives the same resolved
   context separately; `:manual` instances invoke it only through the public

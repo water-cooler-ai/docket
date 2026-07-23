@@ -30,12 +30,13 @@ defmodule Docket.Bench.Scorecard.Seed do
   defp manual_runtime_opts(ctx, tenant_mode) do
     [
       name: @runtime_name,
-      backend: Docket.Postgres,
-      repo: ctx.repo,
-      prefix: ctx.prefix,
       tenant_mode: tenant_mode,
-      claim_policy: Docket.Bench.Scorecard.Config.claim_policy_config(ctx),
-      testing: :manual
+      testing: :manual,
+      backend:
+        {Docket.Postgres,
+         repo: ctx.repo,
+         prefix: ctx.prefix,
+         claim_policy: Docket.Bench.Scorecard.Config.claim_policy_config(ctx)}
     ]
   end
 

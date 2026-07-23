@@ -21,14 +21,15 @@ backend that owns persistence, scheduling, recovery, and signals.
    ```elixir
    defmodule MyApp.Docket do
      use Docket,
-       repo: MyApp.Repo,
-       backend: Docket.Postgres,
-       pruner: [
-         interval_ms: :timer.hours(1),
-         event_retention_ms: :timer.hours(24 * 30),
-         run_retention_ms: :timer.hours(24 * 90),
-         batch_size: 1_000
-       ]
+       backend:
+         {Docket.Postgres,
+          repo: MyApp.Repo,
+          pruner: [
+            interval_ms: :timer.hours(1),
+            event_retention_ms: :timer.hours(24 * 30),
+            run_retention_ms: :timer.hours(24 * 90),
+            batch_size: 1_000
+          ]}
    end
    ```
 
