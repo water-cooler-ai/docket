@@ -5,7 +5,7 @@ defmodule Docket.Bench.Scorecard.Scenarios.StickyCohort do
   alias Docket.Bench.Scorecard.{Db, Invariants, Runtime, Seed, Stats}
   alias Docket.Bench.Scorecard.Nodes.NoopNode
 
-  @sample_interval_ms 150
+  @sample_interval_ms 25
 
   @impl true
   def name, do: "sticky_cohort"
