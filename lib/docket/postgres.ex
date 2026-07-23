@@ -9,14 +9,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     pruner:
 
         use Docket,
-          backend: Docket.Postgres,
-          repo: MyApp.Repo,
-          pruner: [
-            interval_ms: :timer.hours(1),
-            event_retention_ms: :timer.hours(24 * 30),
-            run_retention_ms: :timer.hours(24 * 90),
-            batch_size: 1_000
-          ]
+          backend:
+            {Docket.Postgres,
+             repo: MyApp.Repo,
+             pruner: [
+               interval_ms: :timer.hours(1),
+               event_retention_ms: :timer.hours(24 * 30),
+               run_retention_ms: :timer.hours(24 * 90),
+               batch_size: 1_000
+             ]}
 
     `notifier: :none` selects poll-only operation. Retention is deliberately
     explicit: starting the bundle without a complete `:pruner` policy fails

@@ -7,8 +7,7 @@ defmodule Docket do
 
       defmodule MyApp.Docket do
         use Docket,
-          repo: MyApp.Repo,
-          backend: Docket.Postgres
+          backend: {MyApp.DocketBackend, backend_option: :value}
       end
 
       # in the application supervision tree
@@ -38,29 +37,17 @@ defmodule Docket do
   alias Docket.Runtime.{Clock, Instance, Loop}
   alias Docket.Runtime.RunMutation
 
-  @instance_owned_options [
+  @core_instance_owned_options [
     :backend,
+    :backend_options,
     :backend_context,
     :tenant_mode,
     :testing,
-    :repo,
-    :prefix,
-    :claim_policy,
-    :dispatcher,
-    :notifier,
-    :pruner,
-    :vehicle,
     :executor,
     :executor_opts,
     :clock,
     :sleeper,
     :id_generator,
-    :monotonic_clock,
-    :drain_budget,
-    :jitter,
-    :abandon_backoff_ms,
-    :abandon_backoff_cap_ms,
-    :max_claim_abandons,
     :max_attempt_elapsed_ms,
     :max_supersteps,
     :context,
@@ -298,7 +285,7 @@ defmodule Docket do
   def drain_runs(runtime, opts \\ []) do
     with {:ok, opts} <- instance_opts(runtime, :drain_runs, opts),
          {:ok, {backend, context}} <- configured_backend(opts) do
-      backend.drain_runs(context, Keyword.delete(opts, :backend_context))
+      backend.drain_runs(context, backend_call_options(opts))
     end
   end
 
@@ -440,12 +427,13 @@ defmodule Docket do
   Defines a host runtime module wrapping a named runtime instance:
 
       defmodule MyApp.Docket do
-        use Docket, backend: Docket.Postgres, repo: MyApp.Repo
+        use Docket, backend: {MyApp.DocketBackend, backend_option: :value}
       end
 
-  The options become immutable configuration for the runtime instance. The host module
-  gets supervision and operational wrappers that call `Docket` with the
-  module as the runtime instance.
+  Docket runtime policy remains at the top level. Backend-specific
+  configuration belongs in `{BackendModule, backend_options}` and is immutable
+  for the runtime instance. The host module gets supervision and operational
+  wrappers that call `Docket` with the module as the runtime instance.
   """
   defmacro __using__(default_opts) do
     quote bind_quoted: [default_opts: default_opts] do
@@ -596,12 +584,17 @@ defmodule Docket do
   end
 
   defp preserve_instance_options(opts, defaults) do
-    Enum.reduce(@instance_owned_options, opts, fn key, resolved ->
+    Enum.reduce(@core_instance_owned_options, opts, fn key, resolved ->
       case Keyword.fetch(defaults, key) do
         {:ok, value} -> Keyword.put(resolved, key, value)
         :error -> Keyword.delete(resolved, key)
       end
     end)
+  end
+
+  defp backend_call_options(opts) do
+    call_options = Keyword.drop(opts, [:backend, :backend_options, :backend_context])
+    Keyword.merge(call_options, Keyword.fetch!(opts, :backend_options))
   end
 
   defp durable_access(opts) do
@@ -837,7 +830,7 @@ defmodule Docket do
 
   defp maybe_inline_drain({backend, context} = backend_ref, opts, scope, run) do
     if not Run.terminal?(run) and Keyword.get(opts, :testing) == :inline do
-      case backend.drain_runs(context, Keyword.delete(opts, :backend_context)) do
+      case backend.drain_runs(context, backend_call_options(opts)) do
         {:ok, summary} -> inline_result(backend_ref, opts, scope, run.id, summary)
         {:error, reason} -> {:error, reason}
       end

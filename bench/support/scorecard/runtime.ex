@@ -61,24 +61,25 @@ defmodule Docket.Bench.Scorecard.Runtime do
 
     [
       name: @runtime_name,
-      backend: Docket.Postgres,
-      repo: ctx.repo,
-      prefix: ctx.prefix,
       tenant_mode: tenant_mode,
-      notifier: :none,
-      claim_policy: Docket.Bench.Scorecard.Config.claim_policy_config(ctx),
       max_attempt_elapsed_ms: max_attempt_elapsed_ms,
-      dispatcher: [
-        concurrency: concurrency,
-        poll_interval_ms: ctx.config.poll_interval_ms,
-        orphan_ttl_ms: orphan_ttl_ms,
-        max_claim_attempts: 5,
-        drain_timeout_ms: 30_000
-      ],
-      vehicle: [
-        drain_budget: [max_moments: drain_max_moments, max_elapsed_ms: drain_max_elapsed_ms]
-      ],
-      pruner: @pruner
+      backend:
+        {Docket.Postgres,
+         repo: ctx.repo,
+         prefix: ctx.prefix,
+         notifier: :none,
+         claim_policy: Docket.Bench.Scorecard.Config.claim_policy_config(ctx),
+         dispatcher: [
+           concurrency: concurrency,
+           poll_interval_ms: ctx.config.poll_interval_ms,
+           orphan_ttl_ms: orphan_ttl_ms,
+           max_claim_attempts: 5,
+           drain_timeout_ms: 30_000
+         ],
+         vehicle: [
+           drain_budget: [max_moments: drain_max_moments, max_elapsed_ms: drain_max_elapsed_ms]
+         ],
+         pruner: @pruner}
     ]
   end
 end

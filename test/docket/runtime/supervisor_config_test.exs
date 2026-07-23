@@ -32,7 +32,7 @@ defmodule Docket.Runtime.SupervisorConfigTest do
   defmodule StrictBackend do
     @behaviour Docket.Backend
 
-    @allowed_options [:backend, :custom, :name, :test_pid]
+    @allowed_options [:custom, :name, :test_pid]
 
     @impl true
     def transaction(context, fun), do: fun.(context)
@@ -93,19 +93,20 @@ defmodule Docket.Runtime.SupervisorConfigTest do
              Enum.find(children, &(&1.id == Docket.Runtime.Instance))
 
     assert Keyword.fetch!(defaults, :backend) == MemoryBackend
+    assert Keyword.fetch!(defaults, :backend_options) == []
     assert Keyword.fetch!(defaults, :backend_context) == Module.concat(@runtime, Backend)
   end
 
   test "resolved context is separate from strict backend-owned options" do
     assert {:ok, {_flags, children}} =
              Docket.Runtime.Supervisor.init(
-               {@runtime, backend: StrictBackend, custom: :accepted, test_pid: self()}
+               {@runtime, backend: {StrictBackend, custom: :accepted, test_pid: self()}}
              )
 
     assert %{start: {StrictBackend, :start_link, [backend_opts, context]}} =
              Enum.find(children, &(&1.id == StrictBackend))
 
-    assert Keyword.keys(backend_opts) |> Enum.sort() == [:backend, :custom, :name, :test_pid]
+    assert Keyword.keys(backend_opts) |> Enum.sort() == [:custom, :name, :test_pid]
     assert {:strict, runtime_backend, _identity} = context
     assert runtime_backend == Module.concat(@runtime, Backend)
     assert_receive {:strict_context_resolved, ^context}
@@ -115,7 +116,30 @@ defmodule Docket.Runtime.SupervisorConfigTest do
     assert %{start: {Docket.Runtime.Instance, :start_link, [{@runtime, defaults}]}} =
              Enum.find(children, &(&1.id == Docket.Runtime.Instance))
 
+    assert Keyword.fetch!(defaults, :backend) == StrictBackend
+
+    assert Keyword.fetch!(defaults, :backend_options) == [
+             custom: :accepted,
+             test_pid: self()
+           ]
+
     assert Keyword.fetch!(defaults, :backend_context) === context
+  end
+
+  test "backend options must be nested under the backend" do
+    assert_raise ArgumentError, ~r/unknown Docket runtime options: \[:custom, :test_pid\]/, fn ->
+      Docket.Runtime.Supervisor.init(
+        {@runtime, backend: StrictBackend, custom: :accepted, test_pid: self()}
+      )
+    end
+
+    assert_raise ArgumentError, ~r/:backend options must be a keyword list/, fn ->
+      Docket.Runtime.Supervisor.init({@runtime, backend: {StrictBackend, %{custom: :invalid}}})
+    end
+
+    assert_raise ArgumentError, ~r/cannot redefine Docket runtime options: \[:testing\]/, fn ->
+      Docket.Runtime.Supervisor.init({@runtime, backend: {StrictBackend, testing: :manual}})
+    end
   end
 
   test "runtime configuration cannot spoof the internally resolved backend context" do
@@ -153,7 +177,7 @@ defmodule Docket.Runtime.SupervisorConfigTest do
   end
 
   test "backend must be a loaded Docket.Backend module" do
-    assert_raise ArgumentError, ~r/:backend must be one Docket.Backend module/, fn ->
+    assert_raise ArgumentError, ~r/:backend must be a Docket.Backend module or/, fn ->
       Docket.Runtime.Supervisor.init({@runtime, backend: %{module: MemoryBackend}})
     end
 

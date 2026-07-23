@@ -30,8 +30,8 @@ Graph and compiler internals are documented in
 - [Future roadmap](../future-roadmap.md) — the general project-wide home for
   future features, improvements, investigations, and research across every
   Docket area.
-- [v0.1.1 roadmap](../roadmap-v0.1.1.md) — version-focused composability,
-  ergonomics, and runtime follow-up themes.
+- [Composability roadmap](../composability-roadmap.md) — graph authoring,
+  composition, and runtime follow-up themes.
 
 ## Historical and research material
 

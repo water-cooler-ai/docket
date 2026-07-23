@@ -14,6 +14,8 @@ defmodule Docket.Runtime.Config do
     :context,
     :checkpoint_observers
   ]
+  @runtime_keys @instance_keys ++
+                  [:backend, :backend_options, :backend_context, :tenant_mode, :testing]
 
   # Resolves loop/dispatcher options into one config map. All nondeterminism
   # enters here: the clock, ID generation, and the sleeper the inline shell
@@ -40,6 +42,16 @@ defmodule Docket.Runtime.Config do
 
   @doc false
   def instance_keys, do: @instance_keys
+
+  @doc false
+  def validate_runtime!(opts) do
+    case Keyword.keys(opts) -- @runtime_keys do
+      [] -> :ok
+      unknown -> raise ArgumentError, "unknown Docket runtime options: #{inspect(unknown)}"
+    end
+
+    validate_instance!(opts)
+  end
 
   @doc false
   def validate_instance!(opts) do

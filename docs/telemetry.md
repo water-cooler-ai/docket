@@ -3,9 +3,10 @@
 Docket emits operational spans and durable domain facts below `[:docket, ...]`.
 Span and pruner durations use native monotonic units; reporters convert them.
 Counts and gauges are measurements. Use
-`Docket.Telemetry.metric_metadata/2` for metric labels. Raw domain events may
-contain identities for logs and traces, but those values must never become
-labels. Claim tokens are never emitted.
+`Docket.Telemetry.metric_metadata/2` for core metric labels and
+`Docket.Postgres.Telemetry.metric_metadata/2` for PostgreSQL labels. Raw
+domain events may contain identities for logs and traces, but those values
+must never become labels. Claim tokens are never emitted.
 
 ## Operational catalog
 
@@ -69,8 +70,8 @@ metric labels.
 Admission release counts use the bounded reasons `future`, `external`,
 `terminal`, and `signal`; they never carry tenant or run identity.
 
-Timing and query-plan measurements in the [benchmark guide](benchmarks.md)
-are regression evidence for admission behavior, including the cross-scope
+Repository timing and query-plan benchmarks are regression evidence for
+admission behavior, including the cross-scope
 fairness and cohort-stickiness scenarios that exercise the windowed engine.
 
 ## Benchmark derivations

@@ -8,16 +8,17 @@ defmodule Docket.Runtime.Supervisor do
       children = [
         {Docket.Runtime.Supervisor,
          name: MyApp.DocketRuntime,
-         backend: Docket.Postgres,
-         repo: MyApp.Repo}
+         backend: {MyApp.DocketBackend, backend_option: :value}}
       ]
 
   `:name` is required and becomes the runtime identity passed to
   durable facade functions. All other options are stored as the instance's
   instance configuration. Execution policy is resolved once at startup and
   cannot be replaced by per-call options. A configured
-  `backend: BackendModule` contributes its own supervised child and is the
-  only public durable backend substitution point; individual stores cannot be mixed.
+  `backend: {BackendModule, options}` contributes its own supervised child
+  and keeps backend-specific configuration under that substitution point.
+  An optionless backend may use `backend: BackendModule`; individual stores
+  cannot be mixed.
 
   A production instance always owns one backend bundle. The tree also owns a
   small instance-configuration process and a `Task.Supervisor` used by backend
@@ -25,6 +26,14 @@ defmodule Docket.Runtime.Supervisor do
   """
 
   use Supervisor
+
+  @backend_runtime_options [:tenant_mode, :testing] ++ Docket.Runtime.Config.instance_keys()
+  @reserved_backend_options [
+                              :name,
+                              :backend,
+                              :backend_options,
+                              :backend_context
+                            ] ++ @backend_runtime_options
 
   @doc "Task.Supervisor name for node tasks and after-commit observer delivery."
   def task_supervisor(runtime) when is_atom(runtime), do: Module.concat(runtime, TaskSupervisor)
@@ -56,30 +65,66 @@ defmodule Docket.Runtime.Supervisor do
 
   defp backend_children(name, defaults) do
     reject_component_configuration!(defaults)
-    Docket.Runtime.Config.validate_instance!(defaults)
+    {backend, configured_options} = normalize_backend!(Keyword.get(defaults, :backend))
 
-    case Keyword.get(defaults, :backend) do
-      nil ->
-        raise ArgumentError,
-              "Docket.Runtime.Supervisor requires one :backend implementing Docket.Backend"
+    defaults =
+      defaults
+      |> Keyword.put(:backend, backend)
+      |> Keyword.put(:backend_options, configured_options)
 
-      backend when is_atom(backend) ->
-        validate_backend!(backend)
-        backend_opts = Keyword.put(defaults, :name, Module.concat(name, Backend))
-        context = backend.context(backend_opts)
+    Docket.Runtime.Config.validate_runtime!(defaults)
+    validate_backend!(backend)
 
-        {[backend.child_spec(backend_opts, context)],
-         Keyword.put(defaults, :backend_context, context)}
+    backend_opts =
+      configured_options
+      |> Keyword.merge(Keyword.take(defaults, @backend_runtime_options))
+      |> Keyword.put(:name, Module.concat(name, Backend))
 
-      other ->
-        raise ArgumentError, ":backend must be one Docket.Backend module, got: #{inspect(other)}"
+    context = backend.context(backend_opts)
+
+    {[backend.child_spec(backend_opts, context)],
+     Keyword.put(defaults, :backend_context, context)}
+  end
+
+  defp normalize_backend!(nil) do
+    raise ArgumentError,
+          "Docket.Runtime.Supervisor requires one :backend implementing Docket.Backend"
+  end
+
+  defp normalize_backend!({backend, options}) when is_atom(backend) do
+    unless Keyword.keyword?(options) do
+      raise ArgumentError,
+            ":backend options must be a keyword list, got: #{inspect(options)}"
     end
+
+    case Enum.filter(Keyword.keys(options), &(&1 in @reserved_backend_options)) do
+      [] ->
+        :ok
+
+      reserved ->
+        raise ArgumentError,
+              ":backend options cannot redefine Docket runtime options: #{inspect(reserved)}"
+    end
+
+    {backend, options}
+  end
+
+  defp normalize_backend!(backend) when is_atom(backend), do: {backend, []}
+
+  defp normalize_backend!(other) do
+    raise ArgumentError,
+          ":backend must be a Docket.Backend module or {module, options}, got: #{inspect(other)}"
   end
 
   defp reject_component_configuration!(defaults) do
     if Keyword.has_key?(defaults, :backend_context) do
       raise ArgumentError,
             ":backend_context is resolved internally and cannot be configured on a runtime"
+    end
+
+    if Keyword.has_key?(defaults, :backend_options) do
+      raise ArgumentError,
+            ":backend_options is resolved from :backend and cannot be configured separately"
     end
 
     if Keyword.has_key?(defaults, :checkpoint) do

@@ -93,8 +93,33 @@ defmodule Docket.LifecycleTest do
       checkpoint_observers: [BlockingObserver]
   end
 
+  defmodule DrainProbeBackend do
+    @behaviour Docket.Backend
+
+    @impl true
+    defdelegate transaction(context, fun), to: Docket.Test.MemoryBackend
+
+    @impl true
+    defdelegate graphs(), to: Docket.Test.MemoryBackend
+
+    @impl true
+    defdelegate runs(), to: Docket.Test.MemoryBackend
+
+    @impl true
+    defdelegate events(), to: Docket.Test.MemoryBackend
+
+    @impl true
+    defdelegate context(opts), to: Docket.Test.MemoryBackend
+
+    @impl true
+    defdelegate child_spec(opts, context), to: Docket.Test.MemoryBackend
+
+    @impl true
+    defdelegate drain_runs(context, opts), to: Docket.Test.MemoryBackend
+  end
+
   defmodule DrainProbeHost do
-    use Docket, backend: Docket.Test.MemoryBackend
+    use Docket, backend: {DrainProbeBackend, drain_probe: :docket_lifecycle_relay}
   end
 
   setup do
@@ -331,13 +356,14 @@ defmodule Docket.LifecycleTest do
   end
 
   test "drain receives the resolved context separately and ignores per-call instance policy" do
-    start_supervised!({DrainProbeHost, drain_probe: self()})
+    start_supervised!(DrainProbeHost)
     {_backend, context} = backend_ref(DrainProbeHost)
 
     assert {:error, %Docket.Error{type: :unsupported_operation}} =
              DrainProbeHost.drain_runs(
                backend_context: :spoofed,
-               executor: __MODULE__.NotAnExecutor
+               executor: __MODULE__.NotAnExecutor,
+               drain_probe: nil
              )
 
     assert_receive {:memory_backend_drain, ^context, opts}

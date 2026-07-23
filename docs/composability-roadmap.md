@@ -1,9 +1,8 @@
-# Docket v0.1.1 Roadmap — Composability and Ergonomics
+# Docket Composability and Ergonomics Roadmap
 
-The current development tree includes the schema, reducer, graph-editing,
-and telemetry work summarized below. The remaining
-sections describe open work only. Module documentation defines the implemented
-API.
+Docket 0.1.0 includes the schema, reducer, graph-editing, and telemetry work
+summarized below. The remaining sections describe open work only. Module
+documentation defines the implemented API.
 
 ## Implemented outcomes
 

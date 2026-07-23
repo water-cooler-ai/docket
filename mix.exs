@@ -65,30 +65,24 @@ defmodule Docket.MixProject do
   end
 
   defp docs do
-    extras =
-      [{"README.md", filename: "readme"}, {"CHANGELOG.md", []}] ++
-        extra_pages("docs/*.md", "") ++
-        extra_pages("docs/architecture/*.md", "architecture-") ++
-        extra_pages("examples/*.md", "example-")
-
     [
       main: "readme",
       source_ref: "v#{@version}",
-      extras: extras,
-      skip_undefined_reference_warnings_on: [
-        "README.md",
-        "CHANGELOG.md",
-        "docs/architecture/README.md",
-        "docs/architecture/docket-compiler-design.md",
-        "docs/architecture/docket-graph-execution-contract-design.md",
-        "docs/architecture/docket-runtime-design.md"
-      ]
+      extras: [
+        {"README.md", filename: "readme"},
+        {"CHANGELOG.md", []},
+        {"docs/delivery-guarantees.md", []},
+        {"docs/postgres-operations.md", []},
+        {"docs/telemetry.md", []},
+        {"docs/backend-conformance.md", []},
+        {"docs/architecture/docket-claim-policy.md",
+         filename: "architecture-docket-claim-policy"},
+        {"docs/architecture/migration-0.0.1-to-0.1.0.md",
+         filename: "architecture-migration-0.0.1-to-0.1.0"},
+        {"examples/parent-app-integration.md", filename: "example-parent-app-integration"},
+        {"examples/llm-node.md", filename: "example-llm-node"}
+      ],
+      skip_undefined_reference_warnings_on: ["CHANGELOG.md"]
     ]
-  end
-
-  defp extra_pages(pattern, prefix) do
-    Enum.map(Path.wildcard(pattern), fn path ->
-      {path, filename: prefix <> Path.basename(path, ".md")}
-    end)
   end
 end
