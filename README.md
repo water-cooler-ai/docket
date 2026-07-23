@@ -14,6 +14,13 @@ fields they read and write, and edges (optionally guarded) that decide what
 runs next. Docket executes the graph in deterministic supersteps and commits
 a checkpoint at every durable transition.
 
+**Design lineage:** Docket's execution model draws on
+[Google's Pregel](https://research.google/pubs/pregel-a-system-for-large-scale-graph-processing/)
+and [LangGraph's Pregel runtime](https://docs.langchain.com/oss/python/langgraph/pregel):
+the established bulk-synchronous pattern of computation separated by commit
+barriers. Docket adapts that lineage to an Elixir-native graph API and durable
+execution model.
+
 ## Features
 
 - **Durable supersteps** — runs advance in Pregel-style plan/execute/commit
