@@ -22,7 +22,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     The engine runs under the `legacy` admission mode, holds no cursor, and
     takes no policy-row lock beyond the shared admission gate, so concurrent
-    dispatchers admit in parallel. Fairness across tenants is statistical —
+    dispatchers admit in parallel. Startup configuration normalizes the
+    persisted admission mode back to `legacy` when a previous configuration
+    left it in another mode, so a rebooted instance always claims. Scope
+    sampling considers only scopes that currently hold due ready work, so a
+    single-claim call cannot land on a scope whose runs are all sleeping
+    while due work exists elsewhere. Fairness across tenants is statistical —
     per fetch and across nodes — rather than the deterministic ring order and
     per-tenant `max_active` cap enforcement that
     `Docket.Postgres.ClaimPolicy.TenantFair` provides; per-tenant caps are
@@ -39,6 +44,27 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @impl true
     def init([], _context), do: {:ok, nil}
     def init(options, _context), do: {:error, {:unknown_options, Keyword.keys(options)}}
+
+    @impl true
+    def configure(%{prefix: prefix}, nil, query) do
+      policy = Storage.qualified_table(prefix, "docket_claim_policy")
+
+      statement = """
+      INSERT INTO #{policy} (id, admission_mode, updated_at)
+      VALUES (1, 'legacy', CURRENT_TIMESTAMP)
+      ON CONFLICT (id) DO UPDATE
+      SET admission_mode = 'legacy',
+          updated_at = CURRENT_TIMESTAMP
+      WHERE #{policy}.admission_mode IS DISTINCT FROM 'legacy'
+      RETURNING admission_mode
+      """
+
+      case query.(statement, []) do
+        {:ok, %{rows: rows}} when length(rows) in 0..1 -> :ok
+        {:error, reason} -> {:error, reason}
+        other -> {:error, {:unexpected_startup_configuration_result, other}}
+      end
+    end
 
     @impl true
     def build_plan(
@@ -99,6 +125,26 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         FROM legacy_authority
         CROSS JOIN #{schedule} AS schedule
         WHERE schedule.unfinished_count > 0
+          AND (
+            EXISTS (
+              SELECT 1 FROM #{table} AS probe
+              WHERE probe.scope_key = schedule.scope_key
+                AND probe.status = 'running'
+                AND probe.poisoned_at IS NULL
+                AND probe.tenant_admitted_at IS NULL
+                AND probe.claim_token IS NULL
+                AND probe.wake_at IS NOT NULL AND probe.wake_at <= $1
+            )
+            OR EXISTS (
+              SELECT 1 FROM #{table} AS probe
+              WHERE probe.scope_key = schedule.scope_key
+                AND probe.status = 'running'
+                AND probe.poisoned_at IS NULL
+                AND probe.tenant_admitted_at IS NOT NULL
+                AND probe.claim_token IS NULL
+                AND probe.wake_at IS NOT NULL AND probe.wake_at <= $1
+            )
+          )
         ORDER BY random()
         LIMIT $3
       ),
