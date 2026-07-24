@@ -255,6 +255,47 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                Enum.map(initial.events ++ next.events, & &1.type)
     end
 
+    test "fused Postgres commit accepts already-persisted identical events" do
+      {graph_id, graph_hash, _document} = publish_graph!("fused-idempotent-graph")
+      initial = initialization_moment("fused-idempotent-run", graph_id, graph_hash)
+      backend = {Docket.Postgres, %{repo: TestRepo}}
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
+
+      assert {:ok, %{leases: [lease], poisoned: []}} =
+               RunStore.claim_due(admission_context(), :system, %{
+                 now: @now,
+                 limit: 1,
+                 orphan_ttl_ms: 60_000,
+                 max_claim_attempts: 3
+               })
+
+      next =
+        Moment.propose(
+          initial.run,
+          :step_committed,
+          [Moment.event_entry(:node_completed, 1, node_id: "node")],
+          :continue,
+          DateTime.add(@now, 1, :second)
+        )
+
+      assert :ok = EventStore.append_events(TestRepo, :tenantless, next.run.id, next.events)
+      event_count = TestRepo.aggregate(Event, :count)
+
+      assert {:ok, ^next} =
+               Docket.Lifecycle.commit_moment(
+                 backend,
+                 :tenantless,
+                 next,
+                 initial.run.checkpoint_seq,
+                 lease.claim_token
+               )
+
+      expected_run = next.run
+      assert {:ok, ^expected_run} = RunStore.fetch_run(TestRepo, :tenantless, next.run.id)
+      assert TestRepo.aggregate(Event, :count) == event_count
+    end
+
     test "fused Postgres event conflict leaves the claimed run unchanged" do
       {graph_id, graph_hash, _document} = publish_graph!("fused-conflict-graph")
       initial = initialization_moment("fused-conflict-run", graph_id, graph_hash)

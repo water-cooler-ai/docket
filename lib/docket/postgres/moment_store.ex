@@ -177,7 +177,73 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           AND run.claim_token = $8::uuid
         RETURNING run.run_id, target.tenant_admitted_at
       ),
+      proposed_events AS MATERIALIZED (
+        SELECT *
+        FROM unnest(
+          $20::bigint[],
+          $21::text[],
+          $22::integer[],
+          $23::text[],
+          $24::text[],
+          $25::text[],
+          $26::bytea[],
+          $27::bytea[],
+          $28::timestamptz[]
+        ) AS event(
+          seq,
+          type,
+          step,
+          node_id,
+          channel_id,
+          task_id,
+          payload,
+          metadata,
+          occurred_at
+        )
+      ),
       inserted_events AS (
+        INSERT INTO #{events} AS stored_event (
+          run_id,
+          seq,
+          type,
+          step,
+          node_id,
+          channel_id,
+          task_id,
+          payload,
+          metadata,
+          occurred_at,
+          inserted_at
+        )
+        SELECT
+          updated_run.run_id,
+          event.seq,
+          event.type,
+          event.step,
+          event.node_id,
+          event.channel_id,
+          event.task_id,
+          event.payload,
+          event.metadata,
+          event.occurred_at,
+          clock_timestamp()
+        FROM updated_run
+        CROSS JOIN proposed_events AS event
+        ON CONFLICT (run_id, seq) DO UPDATE
+        SET run_id = EXCLUDED.run_id
+        WHERE stored_event.type = EXCLUDED.type
+          AND stored_event.step = EXCLUDED.step
+          AND stored_event.node_id IS NOT DISTINCT FROM EXCLUDED.node_id
+          AND stored_event.channel_id IS NOT DISTINCT FROM EXCLUDED.channel_id
+          AND stored_event.task_id IS NOT DISTINCT FROM EXCLUDED.task_id
+          AND stored_event.payload = EXCLUDED.payload
+          AND stored_event.metadata = EXCLUDED.metadata
+          AND stored_event.occurred_at = EXCLUDED.occurred_at
+        RETURNING seq
+      ),
+      -- A mismatched conflict is not returned above. Re-inserting one proposed
+      -- key raises the existing unique violation and rolls the statement back.
+      event_conflict_guard AS (
         INSERT INTO #{events} (
           run_id,
           seq,
@@ -204,27 +270,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           event.occurred_at,
           clock_timestamp()
         FROM updated_run
-        CROSS JOIN unnest(
-          $20::bigint[],
-          $21::text[],
-          $22::integer[],
-          $23::text[],
-          $24::text[],
-          $25::text[],
-          $26::bytea[],
-          $27::bytea[],
-          $28::timestamptz[]
-        ) AS event(
-          seq,
-          type,
-          step,
-          node_id,
-          channel_id,
-          task_id,
-          payload,
-          metadata,
-          occurred_at
-        )
+        CROSS JOIN LATERAL (
+          SELECT *
+          FROM proposed_events
+          LIMIT 1
+        ) AS event
+        WHERE (SELECT count(*) FROM inserted_events) <>
+              (SELECT count(*) FROM proposed_events)
         RETURNING seq
       ),
       notification AS (
@@ -240,7 +292,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         (SELECT count(*)::bigint FROM updated_run),
         (SELECT count(*)::bigint FROM inserted_events),
         (SELECT tenant_admitted_at FROM updated_run LIMIT 1),
-        (SELECT count(*)::bigint FROM notification)
+        (SELECT count(*)::bigint FROM notification) +
+          (SELECT count(*)::bigint FROM event_conflict_guard)
       """
     end
 

@@ -33,8 +33,8 @@ RUN mix archive.install github hexpm/hex tag v2.4.2 --force \
 ENV MIX_REBAR3=/root/.mix/rebar3
 
 COPY mix.exs mix.lock ./
-COPY deps deps
-RUN MIX_ENV=prod mix deps.compile
+RUN MIX_ENV=prod mix deps.get \
+    && MIX_ENV=prod mix deps.compile
 
 COPY . .
 RUN MIX_ENV=prod mix compile
