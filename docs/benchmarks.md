@@ -1,18 +1,24 @@
 # Benchmarks
 
-Docket ships one source-checkout benchmark suite under `bench/`. It is not part
-of the public API or Hex package contract and requires a dedicated PostgreSQL
-database via `DOCKET_BENCH_DATABASE_URL`.
+Docket ships source-checkout benchmark suites under `bench/`. They are not part
+of the public API or Hex package contract.
 
 - **Scorecard** (`bench/postgres/scorecard.exs`): system-level
   scenarios against the real supervised runtime, condensed into named 0–100
-  scores with invariant gates.
+  scores with invariant gates. Requires a dedicated PostgreSQL database via
+  `DOCKET_BENCH_DATABASE_URL`.
+- **LangGraph comparison** (`bench/compare/run.py`): matched in-memory graph
+  microbenchmarks and a durable PostgreSQL matrix against a pinned LangGraph
+  release. The PostgreSQL comparison defaults to LangGraph `sync` durability;
+  `async` and `exit` are optional throughput references with weaker checkpoint
+  timing. See `bench/compare/README.md` for setup, methodology, and
+  interpretation.
 
 ## Scorecard
 
 ```sh
 DOCKET_BENCH_DATABASE_URL=postgres://user@localhost:5432/docket_bench \
-  mix run bench/postgres/scorecard.exs -- --profile local
+  mix run bench/postgres/scorecard.exs --profile local
 ```
 
 Options:

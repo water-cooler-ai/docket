@@ -531,8 +531,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def commit(ctx, scope, proposal) do
       {repo, prefix} = Storage.context!(ctx)
 
-      with :ok <- validate_commit(proposal),
-           {:ok, attrs} <- RunCodec.dump(proposal.run),
+      with {:ok, attrs} <- prepare_commit(proposal),
            {:ok, stored} <- fetch_scoped_row(repo, prefix, scope, proposal.run.id),
            :ok <- validate_immutable_binding(stored, proposal.run) do
         query =
@@ -561,6 +560,44 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {:error, :not_found} -> {:error, :not_found}
         _ -> {:error, :invalid_commit}
       end
+    end
+
+    @doc false
+    @spec prepare_commit(Docket.Backend.RunStore.commit_proposal()) ::
+            {:ok, RunCodec.row_attrs()} | {:error, :invalid_commit}
+    def prepare_commit(proposal) do
+      with :ok <- validate_commit(proposal),
+           {:ok, attrs} <- RunCodec.dump(proposal.run) do
+        {:ok, attrs}
+      else
+        _ -> {:error, :invalid_commit}
+      end
+    end
+
+    @doc false
+    @spec classify_commit_miss(
+            Docket.Backend.ctx(),
+            Docket.Backend.scope(),
+            Docket.Backend.RunStore.commit_proposal()
+          ) :: {:error, :not_found | :invalid_commit | :stale_fence}
+    def classify_commit_miss(ctx, scope, %{run: %Docket.Run{} = proposed}) do
+      {repo, prefix} = Storage.context!(ctx)
+
+      case fetch_scoped_row(repo, prefix, scope, proposed.id) do
+        {:error, :not_found} ->
+          {:error, :not_found}
+
+        {:ok, stored} ->
+          case validate_immutable_binding(stored, proposed) do
+            :ok -> {:error, :stale_fence}
+            {:error, :invalid_commit} -> {:error, :invalid_commit}
+          end
+      end
+    end
+
+    def classify_commit_miss(_ctx, scope, _proposal) do
+      validate_scope!(scope)
+      {:error, :invalid_commit}
     end
 
     @doc "Serializes and applies one pure run mutation without requiring a claim fence."

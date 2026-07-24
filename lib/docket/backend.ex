@@ -77,6 +77,27 @@ defmodule Docket.Backend do
   @doc "Returns the backend's `Docket.Backend.EventStore` implementation."
   @callback events() :: capability()
 
+  @doc """
+  Optionally commits one claim-fenced run transition and its assigned events
+  through a backend-native fused operation.
+
+  Lifecycle invokes this callback directly when the backend exports it. The
+  proposal and events carry the same substrate-neutral values otherwise sent
+  to `RunStore.commit/3` and `EventStore.append_events/4`. The callback itself
+  must be atomic; it must not require an outer `transaction/2` merely to make
+  the run and event writes indivisible. Implementations must preserve those
+  callbacks' validation, scope, fencing, conflict, and failure semantics.
+
+  Backends that do not implement this optional callback retain the portable
+  composed store path.
+  """
+  @callback commit_transition(
+              ctx(),
+              scope(),
+              Docket.Backend.RunStore.commit_proposal(),
+              [Docket.Event.t()]
+            ) :: {:ok, Docket.Run.t()} | {:error, term()}
+
   @doc "Builds the backend's supervision child specification from options and its resolved context."
   @callback child_spec(opts :: keyword(), ctx()) :: Supervisor.child_spec()
 
@@ -86,4 +107,6 @@ defmodule Docket.Backend do
   @doc "Synchronously claims and drains due runs using the resolved backend context."
   @callback drain_runs(ctx(), opts :: keyword()) ::
               {:ok, drain_summary()} | {:error, term()}
+
+  @optional_callbacks commit_transition: 4
 end

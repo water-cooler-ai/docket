@@ -1,7 +1,7 @@
 defmodule Docket.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.1.1"
   @source_url "https://github.com/water-cooler-ai/docket"
 
   # Set by the core-only CI leg to build and test without the optional

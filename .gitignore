@@ -19,5 +19,9 @@ docket-*.tar
 # Temporary files, for example, from tests.
 /tmp/
 
+# Python benchmark bytecode.
+__pycache__/
+*.py[cod]
+
 # Local Claude workspace state and worktrees.
 /.claude/
