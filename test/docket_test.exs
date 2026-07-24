@@ -15,6 +15,7 @@ defmodule DocketTest do
             Ecto.Adapters.SQL,
             Postgrex,
             Docket.Postgres,
+            Docket.Postgres.MomentStore,
             Docket.Postgres.Telemetry,
             Mix.Tasks.Docket.Gen.Migration
           ] do

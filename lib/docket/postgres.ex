@@ -43,6 +43,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       EventStore,
       GraphStore,
       Migration,
+      MomentStore,
       Notifier,
       Pruner,
       RunStore,
@@ -96,6 +97,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl Docket.Backend
     def events, do: EventStore
+
+    @impl Docket.Backend
+    defdelegate commit_transition(ctx, scope, proposal, events), to: MomentStore, as: :commit
 
     @impl Docket.Backend
     def context(opts) do

@@ -34,9 +34,9 @@ defmodule Docket.Bench.Scorecard.Db do
       raise "DOCKET_BENCH_DATABASE_URL must name a dedicated benchmark-capable database"
   end
 
-  def start_repo!(url, pool_size) do
-    {:ok, _pid} =
-      Repo.start_link(
+  def start_repo!(url, pool_size, extra_options \\ []) do
+    options =
+      [
         url: url,
         pool_size: pool_size,
         queue_target: 5_000,
@@ -48,7 +48,11 @@ defmodule Docket.Bench.Scorecard.Db do
         ownership_timeout: 300_000,
         types: Types,
         log: false
-      )
+      ]
+      |> Keyword.merge(extra_options)
+
+    {:ok, _pid} =
+      Repo.start_link(options)
 
     :ok
   end

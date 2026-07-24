@@ -20,7 +20,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {repo, prefix} = Storage.context!(ctx)
 
       result =
-        with {:ok, attrs} <- encode_events(events, run_id) do
+        with {:ok, attrs} <- prepare_events(run_id, events) do
           transactional_append(repo, prefix, scope, run_id, attrs)
         end
 
@@ -46,6 +46,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       validate_scope!(scope)
       {:error, :invalid_events}
     end
+
+    @doc false
+    @spec prepare_events(String.t(), [Docket.Event.t()]) ::
+            {:ok, [map()]} | {:error, term()}
+    def prepare_events(run_id, events) when is_binary(run_id) and is_list(events),
+      do: encode_events(events, run_id)
+
+    def prepare_events(_run_id, _events), do: {:error, :invalid_events}
 
     @impl Docket.Backend.EventStore
     def fetch_event(ctx, scope, run_id, seq) when is_integer(seq) and seq > 0 do

@@ -27,7 +27,7 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     assert {:context, 1} in callbacks
     assert {:child_spec, 2} in callbacks
     assert {:drain_runs, 2} in callbacks
-    assert optional_callbacks == []
+    assert {:commit_transition, 4} in optional_callbacks
     refute {:storage, 0} in callbacks
     refute Code.ensure_loaded?(Docket.Storage)
     refute Code.ensure_loaded?(Docket.Storage.Graphs)

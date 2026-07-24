@@ -64,18 +64,29 @@ defmodule Docket.Lifecycle do
     }
 
     Docket.Telemetry.lifecycle_span(:moment, fn ->
-      backend.transaction(context, fn tx ->
-        with {:ok, _run} <- store_span(:run_commit, fn -> runs.commit(tx, scope, proposal) end),
-             :ok <-
-               store_span(
-                 :event_append,
-                 fn ->
-                   events.append_events(tx, scope, moment.run.id, moment.events)
-                 end
-               ) do
-          {:ok, moment}
+      if function_exported?(backend, :commit_transition, 4) do
+        case store_span(
+               :transition_commit,
+               fn -> backend.commit_transition(context, scope, proposal, moment.events) end
+             ) do
+          {:ok, _run} -> {:ok, moment}
+          {:error, reason} -> {:error, reason}
         end
-      end)
+      else
+        backend.transaction(context, fn tx ->
+          with {:ok, _run} <-
+                 store_span(:run_commit, fn -> runs.commit(tx, scope, proposal) end),
+               :ok <-
+                 store_span(
+                   :event_append,
+                   fn ->
+                     events.append_events(tx, scope, moment.run.id, moment.events)
+                   end
+                 ) do
+            {:ok, moment}
+          end
+        end)
+      end
     end)
   end
 

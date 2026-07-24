@@ -4,6 +4,29 @@ All notable changes to `docket` are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## 0.1.1 — 2026-07-24
+
+### Added
+
+- Reproducible in-memory and PostgreSQL comparison suites against pinned
+  LangGraph releases, including order-balanced repeated trials, synchronous
+  durability, queue-drain completion percentiles, row and logical-byte
+  accounting, invariant gates, and owned-schema cleanup.
+- An optional backend-native `Docket.Backend.commit_transition/4` callback.
+  Backends without a fused implementation retain the portable transaction
+  composition.
+
+### Changed
+
+- PostgreSQL now commits a successful claim-fenced run transition, its
+  assigned events, schedule update, and immediate wake notification with one
+  atomic SQL statement and one database exchange. Conflict and fence failures
+  preserve the existing public error distinctions and transaction rollback
+  semantics.
+- The PostgreSQL comparison harness waits for local post-commit terminal
+  notifications and performs one final durable read instead of injecting
+  repeated `inspect_run` queries into the measured workload.
+
 ## 0.1.0 — 2026-07-23
 
 ### Added

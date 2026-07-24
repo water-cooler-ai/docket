@@ -215,6 +215,90 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert TestRepo.aggregate(Event, :count) == 4
     end
 
+    test "Postgres backend fuses a fenced run advance and its assigned events" do
+      {graph_id, graph_hash, _document} = publish_graph!("fused-commit-graph")
+      initial = initialization_moment("fused-commit-run", graph_id, graph_hash)
+      backend = {Docket.Postgres, %{repo: TestRepo}}
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
+
+      assert {:ok, %{leases: [lease], poisoned: []}} =
+               RunStore.claim_due(admission_context(), :system, %{
+                 now: @now,
+                 limit: 1,
+                 orphan_ttl_ms: 60_000,
+                 max_claim_attempts: 3
+               })
+
+      next =
+        Moment.propose(
+          initial.run,
+          :step_committed,
+          [Moment.event_entry(:node_completed, 1, node_id: "node")],
+          :continue,
+          DateTime.add(@now, 1, :second)
+        )
+
+      assert {:ok, ^next} =
+               Docket.Lifecycle.commit_moment(
+                 backend,
+                 :tenantless,
+                 next,
+                 initial.run.checkpoint_seq,
+                 lease.claim_token
+               )
+
+      expected_run = next.run
+      assert {:ok, ^expected_run} = RunStore.fetch_run(TestRepo, :tenantless, next.run.id)
+
+      assert Enum.map(TestRepo.all(from(event in Event, order_by: event.seq)), & &1.type) ==
+               Enum.map(initial.events ++ next.events, & &1.type)
+    end
+
+    test "fused Postgres event conflict leaves the claimed run unchanged" do
+      {graph_id, graph_hash, _document} = publish_graph!("fused-conflict-graph")
+      initial = initialization_moment("fused-conflict-run", graph_id, graph_hash)
+      backend = {Docket.Postgres, %{repo: TestRepo}}
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
+
+      assert {:ok, %{leases: [lease], poisoned: []}} =
+               RunStore.claim_due(admission_context(), :system, %{
+                 now: @now,
+                 limit: 1,
+                 orphan_ttl_ms: 60_000,
+                 max_claim_attempts: 3
+               })
+
+      next =
+        Moment.propose(
+          initial.run,
+          :step_committed,
+          [Moment.event_entry(:node_completed, 1, node_id: "node")],
+          :continue,
+          DateTime.add(@now, 1, :second)
+        )
+
+      [event | _rest] = next.events
+      conflicting = %{event | payload: %{"different" => true}}
+      assert :ok = EventStore.append_events(TestRepo, :tenantless, next.run.id, [conflicting])
+
+      before = TestRepo.get_by!(Run, run_id: initial.run.id)
+
+      assert {:error, :event_conflict} =
+               Docket.Lifecycle.commit_moment(
+                 backend,
+                 :tenantless,
+                 next,
+                 initial.run.checkpoint_seq,
+                 lease.claim_token
+               )
+
+      assert TestRepo.get_by!(Run, run_id: initial.run.id) == before
+      expected_run = initial.run
+      assert {:ok, ^expected_run} = RunStore.fetch_run(TestRepo, :tenantless, initial.run.id)
+    end
+
     test "event failure rolls a successful advance back to its prior claim and run" do
       {graph_id, graph_hash, _document} = publish_graph!("advance-rollback-graph")
       initial = initialization_moment("advance-rollback-run", graph_id, graph_hash)

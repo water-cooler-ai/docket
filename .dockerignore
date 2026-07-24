@@ -1,0 +1,10 @@
+**/__pycache__
+*.py[cod]
+.git
+_build
+deps
+tmp
+.cover
+cover
+doc
+docket-*.tar
