@@ -203,7 +203,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:error, :event_conflict} =
                EventStore.append_events(TestRepo, :tenantless, next.run.id, [conflicting])
 
-      assert {:error, :stale_fence} =
+      assert {:error, :conflict} =
                Docket.Lifecycle.commit_moment(
                  backend,
                  :tenantless,
@@ -529,29 +529,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       task_supervisor =
         start_supervised!({Task.Supervisor, name: Module.concat(__MODULE__, Effects)})
 
-      advance_commit =
-        Task.async(fn ->
-          commit_moment_with_effects(
-            backend,
-            advance,
-            initial.run.checkpoint_seq,
-            lease.claim_token,
-            checkpoint_observers: [RecordingObserver],
-            task_supervisor: task_supervisor,
-            context: %{notify: parent}
-          )
-        end)
-
-      refute Task.yield(advance_commit, 50)
       send(cancellation.pid, :commit_cancellation)
 
       assert {:ok, %Moment{run: %{status: :cancelled} = cancelled}} =
                Task.await(cancellation, 1_000)
 
-      assert {:error, :stale_fence} = Task.await(advance_commit, 1_000)
+      assert {:error, :conflict} =
+               commit_moment_with_effects(
+                 backend,
+                 advance,
+                 initial.run.checkpoint_seq,
+                 lease.claim_token,
+                 checkpoint_observers: [RecordingObserver],
+                 task_supervisor: task_supervisor,
+                 context: %{notify: parent}
+               )
 
       assert_receive {:committed_telemetry, [:docket, :lifecycle, :transaction, :stop],
-                      %{duration: duration}, %{operation: :moment, result: :stale_fence}}
+                      %{duration: duration}, %{operation: :moment, result: :conflict}}
 
       assert is_integer(duration) and duration >= 0
       refute_receive {:committed_telemetry, [:docket, :checkpoint, :committed], _, _}
@@ -705,11 +700,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           end)
         end)
 
-      refute Task.yield(second, 50)
+      assert {:ok, %Moment{run: cancelled}} = Task.await(second, 1_000)
       send(first.pid, :commit_first_cancel)
 
-      assert {:ok, %Moment{run: cancelled}} = Task.await(first, 1_000)
-      assert {:ok, ^cancelled} = Task.await(second, 1_000)
+      assert_receive :first_cancel_locked
+      send(first.pid, :commit_first_cancel)
+
+      assert {:ok, ^cancelled} = Task.await(first, 1_000)
       assert cancelled.status == :cancelled
       assert cancelled.checkpoint_seq == initial.run.checkpoint_seq + 1
 

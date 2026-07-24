@@ -226,7 +226,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {run, lease} = start_claimed!(backend_ref, Graphs.minimal_linear(), %{"value" => "x"})
       {:ok, pre_drain} = Host.fetch_run(run.id)
 
-      assert {:ok, {:discarded, :stale_fence}} =
+      assert {:ok, {:discarded, :conflict}} =
                Vehicle.drain(
                  lease,
                  vehicle_opts({StaleCommitBackend, context}, observer_opts())
@@ -678,7 +678,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {run, lease} = start_claimed!(backend_ref, Graphs.endless_cycle(), %{})
         {:ok, pre_drain} = Host.fetch_run(run.id)
 
-        assert {:ok, {:discarded, :stale_fence}} =
+        assert {:ok, {:discarded, :conflict}} =
                  Vehicle.drain(
                    lease,
                    vehicle_opts({StaleCommitBackend, context}, drain_budget: [max_moments: 1])

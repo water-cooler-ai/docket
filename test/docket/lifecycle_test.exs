@@ -277,7 +277,7 @@ defmodule Docket.LifecycleTest do
     [event | events] = waiting_moment.events
     invalid_moment = %{waiting_moment | events: [%{event | run_id: "other"} | events]}
 
-    assert {:error, :event_run_mismatch} =
+    assert {:error, :invalid_transition} =
              Docket.Lifecycle.commit_moment(
                {backend, context},
                :tenantless,
@@ -428,7 +428,7 @@ defmodule Docket.LifecycleTest do
 
     assert {:ok, reference} = Host.save_graph(graph)
 
-    assert {:error, :event_run_mismatch} =
+    assert {:error, :invalid_transition} =
              Docket.Lifecycle.start({backend, context}, :tenantless, invalid_start)
 
     assert {:error, :not_found} = backend.runs().fetch_run(context, :system, "bad-start")
@@ -436,9 +436,17 @@ defmodule Docket.LifecycleTest do
     assert {:ok, %Docket.Graph{}} =
              backend.graphs().fetch_graph(context, :tenantless, graph.id, rtg.graph_hash)
 
+    assert {:ok, ^start_moment} =
+             Docket.Lifecycle.start({backend, context}, :tenantless, start_moment)
+
+    assert {:ok, ^start_moment} =
+             Docket.Lifecycle.start({backend, context}, :tenantless, start_moment)
+
+    assert MemoryBackend.events(context, "bad-start") == start_moment.events
+
     assert {:ok, started} = Host.start_run(reference, %{"value" => "x"})
 
-    assert {:error, :event_run_mismatch} =
+    assert {:error, :invalid_transition} =
              Docket.Lifecycle.signal({backend, context}, :tenantless, started.id, fn run ->
                {:ok, moment} =
                  Docket.Runtime.RunMutation.cancel_run(run, ~U[2026-07-10 22:00:00Z])

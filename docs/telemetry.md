@@ -43,9 +43,9 @@ must never become labels. Claim tokens are never emitted.
 
 Lifecycle and nested store spans share a raw `lifecycle_ref`; the metric
 projection drops it. Committed facts and observer work start only after the
-outer transaction succeeds. Stale fences and rollbacks therefore emit no
-committed fact. Observer completion means only that the callback returned
-after durable success, not that an external system durably accepted an effect.
+semantic transition succeeds. Lost fences and rollbacks therefore emit no
+committed fact. Observer completion means only that the callback returned after
+durable success, not that an external system durably accepted an effect.
 Claim selection/attempt and store events are operational attempt facts and may
 describe work later rolled back; only `[:docket, :lifecycle, :committed]` and
 the domain events are durable-success facts.

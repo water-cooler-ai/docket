@@ -19,6 +19,8 @@ individual function boundary.
   seam, engine selection, and the admission-mode interlock.
 - [0.0.1 to 0.1.0 migration](migration-0.0.1-to-0.1.0.md) — drain-and-cut-over
   instructions for old host-owned persistence adopters.
+- [0.1.1 to 0.1.2 transition migration](migration-0.1.1-to-0.1.2.md) —
+  semantic lifecycle writes and the 0.1.x compatibility window.
 
 Graph and compiler internals are documented in
 [graph construction](docket-graph-construction-design.md),

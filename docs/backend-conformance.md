@@ -3,8 +3,8 @@
 `Docket.BackendTests` is Docket's shared black-box test suite for backend
 implementations. It lives under `test/support`, not in the shipped library API.
 The production contract is defined by `Docket.Backend`,
-`Docket.Backend.GraphStore`, `Docket.Backend.RunStore`, and
-`Docket.Backend.EventStore`.
+`Docket.Backend.TransitionStore`, `Docket.Backend.GraphStore`,
+`Docket.Backend.RunStore`, and `Docket.Backend.EventStore`.
 
 ## Docket-owned backends
 
@@ -77,6 +77,7 @@ resolves focused stores exclusively through the returned backend.
 
 Each failure includes a stable invariant ID. The shared cases currently cover:
 
+- explicit transition contract negotiation and transition-store completeness;
 - mandatory backend and focused-store callbacks;
 - commit, rollback, nested participation, rollback-only propagation,
   concurrent publication outcomes, and completed-read visibility;

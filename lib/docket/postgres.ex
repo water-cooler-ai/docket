@@ -47,7 +47,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       Notifier,
       Pruner,
       RunStore,
-      Storage
+      Storage,
+      TransitionStore
     }
 
     @default_dispatcher [
@@ -90,6 +91,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defdelegate transaction(ctx, fun), to: Storage
 
     @impl Docket.Backend
+    def capabilities do
+      %{
+        contract_version: 2,
+        transitions: %{
+          version: Docket.Backend.TransitionStore.version(),
+          limits: Docket.Backend.TransitionStore.portable_limits(),
+          replay: :canonical_events,
+          durability: :postgres_commit,
+          topology: :single_database_transaction
+        }
+      }
+    end
+
+    @impl Docket.Backend
+    def transitions, do: TransitionStore
+
+    @impl Docket.Backend
     def graphs, do: GraphStore
 
     @impl Docket.Backend
@@ -99,6 +117,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def events, do: EventStore
 
     @impl Docket.Backend
+    @deprecated "use Docket.Postgres.transitions().commit_claimed/4"
     defdelegate commit_transition(ctx, scope, proposal, events), to: MomentStore, as: :commit
 
     @impl Docket.Backend

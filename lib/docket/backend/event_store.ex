@@ -2,14 +2,15 @@ defmodule Docket.Backend.EventStore do
   @moduledoc """
   Persistence contract for append-only run events.
 
-  Event retention is a backend policy. Lifecycle orchestration calls this
-  store in the same backend transaction as the corresponding run
-  insert or commit so durable state and its retained facts cannot diverge.
+  Event retention is a backend policy. Since 0.1.2 lifecycle orchestration
+  appends events through `Docket.Backend.TransitionStore`; this focused write
+  remains temporarily for the 0.1.x compatibility adapter.
   """
 
   @type ctx :: Docket.Backend.ctx()
   @type scope :: Docket.Backend.scope()
 
+  @doc deprecated: "lifecycle event composition is deprecated; append through TransitionStore"
   @doc """
   Appends retained events for `run_id` in sequence order.
 

@@ -1,7 +1,7 @@
 defmodule Docket.MixProject do
   use Mix.Project
 
-  @version "0.1.1"
+  @version "0.1.2"
   @source_url "https://github.com/water-cooler-ai/docket"
 
   # Set by the core-only CI leg to build and test without the optional
@@ -79,6 +79,8 @@ defmodule Docket.MixProject do
          filename: "architecture-docket-claim-policy"},
         {"docs/architecture/migration-0.0.1-to-0.1.0.md",
          filename: "architecture-migration-0.0.1-to-0.1.0"},
+        {"docs/architecture/migration-0.1.1-to-0.1.2.md",
+         filename: "architecture-migration-0.1.1-to-0.1.2"},
         {"examples/parent-app-integration.md", filename: "example-parent-app-integration"},
         {"examples/llm-node.md", filename: "example-llm-node"}
       ],

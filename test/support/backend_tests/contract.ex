@@ -1,7 +1,7 @@
 defmodule Docket.BackendTests.Contract do
   @moduledoc false
 
-  @capabilities [
+  @focused_capabilities [
     graphs: Docket.Backend.GraphStore,
     runs: Docket.Backend.RunStore,
     events: Docket.Backend.EventStore
@@ -27,7 +27,7 @@ defmodule Docket.BackendTests.Contract do
   end
 
   defp capability_violations(backend) do
-    Enum.flat_map(@capabilities, fn {accessor, behaviour} ->
+    Enum.flat_map(capabilities(backend), fn {accessor, behaviour} ->
       if exported?(backend, accessor, 0) do
         capability = apply(backend, accessor, [])
 
@@ -55,6 +55,18 @@ defmodule Docket.BackendTests.Contract do
         []
       end
     end)
+  end
+
+  defp capabilities(backend) do
+    case Docket.Backend.declared_capabilities(backend) do
+      %{contract_version: 2} ->
+        @focused_capabilities ++ [transitions: Docket.Backend.TransitionStore]
+
+      _legacy ->
+        @focused_capabilities
+    end
+  rescue
+    ArgumentError -> @focused_capabilities
   end
 
   defp required_callbacks(behaviour) do

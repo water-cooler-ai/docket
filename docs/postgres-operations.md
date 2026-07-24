@@ -11,7 +11,7 @@ Add Docket plus the optional PostgreSQL dependencies to the host, configure
 ```elixir
 def deps do
   [
-    {:docket, "~> 0.1.0"},
+    {:docket, "~> 0.1.2"},
     {:ecto_sql, "~> 3.10"},
     {:postgrex, "~> 0.17"}
   ]
@@ -68,13 +68,13 @@ every run, read, and signal call.
 ## Persistence and transaction ownership
 
 `Docket.Postgres` is one fixed `Docket.Backend` bundle. It supplies compatible
-transaction, graph, run, event, and supervision capabilities. The focused
-store modules are capability and backend-test boundaries, not public
-mix-and-match configuration.
+transition, graph, run, event, and supervision capabilities. The focused store
+modules are capability and backend-test boundaries, not public mix-and-match
+configuration.
 
 `Docket.Runtime.Moment` is a pre-commit proposal containing the next run,
 assigned events, checkpoint metadata, and scheduling disposition.
-The lifecycle layer is the single transaction composer: it persists the run,
+The lifecycle layer submits one semantic transition that persists the run,
 schedule, and events atomically, then invokes best-effort observers only after
 commit. A failed event append or lost claim fence commits none of the moment.
 
@@ -325,7 +325,7 @@ Without a retry policy, a node gets one attempt and no backoff. A configured
 retry policy defaults `max_attempts` to `1` and `backoff_ms` to `0`; raise the
 attempt count and choose a positive backoff to enable durable retry parking.
 Testing modes start no dispatcher, notifier, vehicle supervisor, or pruner;
-their caller-owned drain still uses the production lifecycle transactions.
+their caller-owned drain still uses the production lifecycle transitions.
 Manual and inline drains call the same `RunStore.claim_due/3` entrypoint as the
 supervised dispatcher. One backend-instance admission phase alternates
 demand-one ready/expired preference across supervised, manual, and inline

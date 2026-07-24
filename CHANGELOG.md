@@ -4,6 +4,41 @@ All notable changes to `docket` are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## 0.1.2 — 2026-07-24
+
+### Added
+
+- `Docket.Backend.TransitionStore`, a versioned, data-only lifecycle contract
+  with named initialization, claimed, and optimistic unclaimed operations.
+- Explicit `Docket.Backend.capabilities/0` negotiation and `transitions/0`
+  resolution. Contract-v2 declarations are validated at startup so partially
+  upgraded backends fail with the missing transition callback instead of
+  silently selecting a path through `function_exported?/3`.
+- A 0.1.x legacy adapter for undeclared 0.1.0/0.1.1 backends, plus portable
+  transition limits, a closed transition error vocabulary, deterministic
+  transition IDs, and durable replay receipts in the shared in-memory backend.
+
+### Changed
+
+- Core lifecycle initialization, claimed moments, and signal/admin moments now
+  call semantic transitions. Core no longer composes production lifecycle
+  writes through public arbitrary backend transactions.
+- Signals now use scoped fetch, pure evaluation, optimistic unclaimed commit,
+  and a bounded refetch/re-evaluation loop on transition conflicts. Signal
+  mutation functions may run more than once and must not perform external side
+  effects.
+- PostgreSQL exposes the fused claimed-moment implementation through
+  `Docket.Postgres.TransitionStore`; its initialization and unclaimed paths use
+  backend-private PostgreSQL transactions.
+
+### Deprecated
+
+- Public lifecycle composition through `Docket.Backend.transaction/2`,
+  `Docket.Backend.RunStore.insert_run/5`, `commit/3`, and `mutate_run/4`,
+  `Docket.Backend.EventStore.append_events/4`, and
+  `Docket.Backend.commit_transition/4`. They remain available through the
+  0.1.x compatibility adapter and are scheduled for removal in 0.2.
+
 ## 0.1.1 — 2026-07-24
 
 ### Added

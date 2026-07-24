@@ -744,6 +744,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Code.ensure_loaded?(Docket.Postgres)
       assert function_exported?(Docket.Postgres, :transaction, 2)
       refute function_exported?(Docket.Postgres, :storage, 0)
+      assert Docket.Postgres.capabilities().contract_version == 2
+      assert Docket.Postgres.transitions() == Docket.Postgres.TransitionStore
       assert Docket.Postgres.graphs() == Docket.Postgres.GraphStore
       assert Docket.Postgres.runs() == Docket.Postgres.RunStore
       assert Docket.Postgres.events() == Docket.Postgres.EventStore
