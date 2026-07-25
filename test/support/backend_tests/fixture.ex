@@ -75,26 +75,18 @@ defmodule Docket.BackendTests.Fixture do
     {graph, graph_hash}
   end
 
-  @spec insert_run(Docket.BackendTests.subject(), Docket.Backend.owner_scope(), Run.t()) ::
-          Docket.Backend.TransitionStore.result()
-  def insert_run(instance, owner_scope, run) do
-    initialize(instance, owner_scope, run, [])
-  end
-
   @spec initialize(Docket.BackendTests.subject(), Docket.Backend.owner_scope(), Run.t(), [
           Event.t()
         ]) ::
           Docket.Backend.TransitionStore.result()
   def initialize(instance, owner_scope, run, events \\ []) do
-    {store, ctx} = Docket.Backend.transition_store(instance.backend, instance.context)
-
     proposal = %{
       run: run,
       checkpoint_type: :run_initialized,
       wake_at: instance.now
     }
 
-    store.initialize(ctx, owner_scope, proposal, events)
+    instance.backend.transitions().initialize(instance.context, owner_scope, proposal, events)
   end
 
   @spec claim(Docket.BackendTests.subject(), keyword()) ::

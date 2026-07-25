@@ -320,11 +320,10 @@ defmodule Docket.PublicFacadeTest do
 
   defp insert_run!(backend, context, scope, run, events \\ []) do
     run = publish_for_run!(backend, context, scope, run)
-    {store, ctx} = Docket.Backend.transition_store(backend, context)
 
     assert {:ok, ^run} =
-             store.initialize(
-               ctx,
+             backend.transitions().initialize(
+               context,
                scope,
                %{run: run, checkpoint_type: :run_initialized, wake_at: run.started_at},
                events

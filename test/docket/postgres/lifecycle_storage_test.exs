@@ -626,7 +626,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           handler_id,
           [
             [:docket, :checkpoint, :committed],
-            [:docket, :lifecycle, :transaction, :stop]
+            [:docket, :lifecycle, :transition, :stop]
           ],
           &Docket.Test.TelemetryRelay.tagged_event/4,
           {self(), :committed_telemetry}
@@ -653,7 +653,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  context: %{notify: parent}
                )
 
-      assert_receive {:committed_telemetry, [:docket, :lifecycle, :transaction, :stop],
+      assert_receive {:committed_telemetry, [:docket, :lifecycle, :transition, :stop],
                       %{duration: duration}, %{operation: :moment, result: :stale_fence}}
 
       assert is_integer(duration) and duration >= 0

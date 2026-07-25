@@ -145,14 +145,6 @@ defmodule Docket.Test.MemoryBackend do
         with {:ok, record} <- fetch_scoped_record(state, scope, proposal.run.id),
              :ok <- validate_immutable_binding(record.run, proposal.run),
              true <- record.run.checkpoint_seq == expected_checkpoint_seq,
-             true <-
-               valid_mutation?(
-                 record,
-                 proposal.run.id,
-                 proposal.run,
-                 proposal.checkpoint_type,
-                 proposal.schedule
-               ),
              {:ok, merged_events} <- merge_events(record.events, proposal.run.id, events) do
           record =
             record
@@ -862,24 +854,6 @@ defmodule Docket.Test.MemoryBackend do
     end
   end
 
-  defp valid_schedule?(:retain_claim), do: true
-  defp valid_schedule?({:release_claim, :immediate}), do: true
-  defp valid_schedule?({:release_claim, :external}), do: true
-  defp valid_schedule?({:release_claim, :terminal}), do: true
-  defp valid_schedule?({:release_claim, {:at, %DateTime{}}}), do: true
-  defp valid_schedule?(_schedule), do: false
-
-  defp schedule_matches_status?(:retain_claim, :running), do: true
-  defp schedule_matches_status?({:release_claim, :immediate}, :running), do: true
-  defp schedule_matches_status?({:release_claim, {:at, %DateTime{}}}, :running), do: true
-  defp schedule_matches_status?({:release_claim, :external}, :waiting), do: true
-
-  defp schedule_matches_status?({:release_claim, :terminal}, status)
-       when status in [:done, :failed, :cancelled],
-       do: true
-
-  defp schedule_matches_status?(_schedule, _status), do: false
-
   defp apply_schedule(record, :retain_claim, now) do
     %{record | wake_at: nil, claimed_at: now}
   end
@@ -895,18 +869,6 @@ defmodule Docket.Test.MemoryBackend do
   defp apply_schedule(record, {:release_claim, reason}, _now)
        when reason in [:external, :terminal] do
     %{record | wake_at: nil, claim_token: nil, claimed_at: nil}
-  end
-
-  defp valid_mutation?(record, run_id, proposed_run, checkpoint_type, schedule) do
-    is_struct(proposed_run, Docket.Run) and proposed_run.id == run_id and
-      proposed_run.id == record.run.id and
-      proposed_run.graph_id == record.run.graph_id and
-      proposed_run.graph_hash == record.run.graph_hash and
-      proposed_run.started_at == record.run.started_at and
-      proposed_run.checkpoint_seq == record.run.checkpoint_seq + 1 and
-      checkpoint_type in Docket.Checkpoint.types() and schedule != :retain_claim and
-      valid_schedule?(schedule) and schedule_matches_status?(schedule, proposed_run.status) and
-      Docket.Run.validate_failure(proposed_run) == :ok
   end
 
   defp reset_operational_health(record) do
@@ -1017,9 +979,7 @@ defmodule Docket.Test.MemoryBackend do
 
   defp normalize_transition_error(reason)
        when reason in [
-              :invalid_run,
               :invalid_commit,
-              :invalid_mutation,
               :invalid_events,
               :invalid_event_sequence,
               :event_run_mismatch

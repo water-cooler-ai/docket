@@ -25,7 +25,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     telemetry remains a trusted instrumentation boundary and may observe bind
     parameters, like any other database telemetry subscriber.
 
-    Run insertion, moment commit, signal mutation, and poison recovery
+    Run insertion, signal mutation, and poison recovery
     announce a wake due at or before the database clock with `pg_notify` on
     the `docket_wake` channel, carrying the context prefix (empty string when
     unprefixed) as payload. The notification runs on the write's connection
@@ -51,6 +51,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def wake_channel, do: @wake_channel
 
     @doc false
+    @spec insert_transition(
+            ctx(),
+            Docket.Backend.owner_scope(),
+            Docket.Run.t(),
+            Docket.Checkpoint.type(),
+            DateTime.t() | nil
+          ) :: {:ok, Docket.Run.t()} | {:error, term()}
     def insert_transition(ctx, owner_scope, run, checkpoint_type, wake_at) do
       _ = Storage.context!(ctx)
       tenant_id = owner_tenant_id!(owner_scope)
@@ -542,6 +549,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     @doc false
+    @spec mutate_transition(
+            ctx(),
+            Docket.Backend.scope(),
+            String.t(),
+            (Docket.Run.t() -> term())
+          ) :: {:ok, {:committed, term()} | {:unchanged, term()}} | {:error, term()}
     def mutate_transition(ctx, scope, run_id, mutation) when is_function(mutation, 1) do
       {repo, prefix} = Storage.context!(ctx)
       validate_scope!(scope)
@@ -719,12 +732,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
            {:ok, attrs} <- RunCodec.dump(proposed_run) do
         case repo.update_all(
                scoped_row_query(row, scope, prefix),
-               commit_updates(attrs, checkpoint_type, schedule, :unclaimed),
+               commit_updates(attrs, checkpoint_type, schedule),
                log: false
              ) do
           {1, _} ->
             notify_wake(repo, prefix, schedule)
-            maybe_emit_admission_release(row.tenant_admitted_at, schedule, :unclaimed)
+            maybe_emit_admission_release(row.tenant_admitted_at, schedule)
             {:ok, {:committed, opaque}}
 
           {0, _} ->
@@ -786,7 +799,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp schedule_matches_status?(_, _), do: false
 
-    defp commit_updates(attrs, checkpoint_type, schedule, claim_origin) do
+    defp commit_updates(attrs, checkpoint_type, schedule) do
       base = [
         graph_id: attrs.graph_id,
         graph_hash: attrs.graph_hash,
@@ -806,16 +819,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       schedule_updates =
         case schedule do
-          :retain_claim ->
-            [wake_at: nil, claimed_at: dynamic([_run], fragment("CURRENT_TIMESTAMP"))]
-
-          {:release_claim, :immediate} when claim_origin == :claimed ->
-            [
-              claim_token: nil,
-              claimed_at: nil,
-              wake_at: dynamic([_run], fragment("CURRENT_TIMESTAMP"))
-            ]
-
           {:release_claim, :immediate} ->
             [
               claim_token: nil,
@@ -1032,18 +1035,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
     end
 
-    defp maybe_emit_admission_release(nil, _schedule, _origin), do: :ok
+    defp maybe_emit_admission_release(nil, _schedule), do: :ok
 
-    defp maybe_emit_admission_release(_admitted_at, schedule, origin) do
-      case {origin, schedule} do
-        {:claimed, {:release_claim, {:at, _at}}} -> emit_admission_release(:future)
-        {:claimed, {:release_claim, :external}} -> emit_admission_release(:external)
-        {:claimed, {:release_claim, :terminal}} -> emit_admission_release(:terminal)
-        {:unclaimed, {:release_claim, :immediate}} -> emit_admission_release(:signal)
-        {:unclaimed, {:release_claim, {:at, _at}}} -> emit_admission_release(:future)
-        {:unclaimed, {:release_claim, :external}} -> emit_admission_release(:external)
-        {:unclaimed, {:release_claim, :terminal}} -> emit_admission_release(:terminal)
-        _retained -> :ok
+    defp maybe_emit_admission_release(_admitted_at, schedule) do
+      case schedule do
+        {:release_claim, :immediate} -> emit_admission_release(:signal)
+        {:release_claim, {:at, _at}} -> emit_admission_release(:future)
+        {:release_claim, :external} -> emit_admission_release(:external)
+        {:release_claim, :terminal} -> emit_admission_release(:terminal)
       end
     end
 

@@ -215,8 +215,8 @@ defmodule Docket.BackendTests.Cases do
                  })
       end
 
-      @tag docket_invariant: "EVENT-IDEMPOTENCY-CURSOR-GAPS"
-      test "[EVENT-IDEMPOTENCY-CURSOR-GAPS] assigned events preserve scope, ordering, and sparse bounds",
+      @tag docket_invariant: "EVENT-CURSOR-GAPS"
+      test "[EVENT-CURSOR-GAPS] assigned events preserve scope, ordering, and sparse bounds",
            %{backend_test: instance} do
         events = instance.backend.events()
         {graph, graph_hash} = Fixture.publish_graph(instance, :tenantless, "event-graph")
@@ -464,8 +464,8 @@ defmodule Docket.BackendTests.Cases do
         assert recovered_info.claim_abandons == 0
       end
 
-      @tag docket_invariant: "RUN-READS-MUTATION-RESULTS"
-      test "[RUN-READS-MUTATION-RESULTS] list cursors and scoped reads are preserved",
+      @tag docket_invariant: "RUN-READS-CURSORS"
+      test "[RUN-READS-CURSORS] list cursors and scoped reads are preserved",
            %{backend_test: instance} do
         runs = instance.backend.runs()
         {graph, graph_hash} = Fixture.publish_graph(instance, :tenantless, "run-read-graph")

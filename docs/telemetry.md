@@ -12,7 +12,7 @@ must never become labels. Claim tokens are never emitted.
 
 | Event | Measurements | Bounded metric metadata |
 | --- | --- | --- |
-| `[:docket, :lifecycle, :transaction, :stop|:exception]` | `duration` | `operation`, `result` |
+| `[:docket, :lifecycle, :transition, :stop|:exception]` | `duration` | `operation`, `result` |
 | `[:docket, :store, :operation, :stop|:exception]` | `duration` | `operation`, `result` |
 | `[:docket, :checkpoint, :observer, :stop]` | `duration` | `checkpoint_type`, `result`, `durable_success` |
 | `[:docket, :checkpoint, :observer, :failure]` | `count` | `checkpoint_type`, `result`, `durable_success` |

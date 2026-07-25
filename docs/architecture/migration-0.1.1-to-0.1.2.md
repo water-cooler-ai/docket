@@ -1,5 +1,10 @@
 # Migrating backends from Docket 0.1.1 to 0.1.2
 
+> Superseded: the 0.1.x compatibility window this guide describes closed in
+> 0.2.0, which removed `Docket.Backend.LegacyTransitionStore` and the
+> deprecated composition APIs. Continue with the
+> [0.1.2 to 0.2.0 migration](migration-0.1.2-to-0.2.0.md).
+
 Docket 0.1.2 replaces lifecycle use of callback transactions with the
 versioned `Docket.Backend.TransitionStore` contract. There is no database
 schema change: 0.1.2 runs on the same schema version 2 as 0.1.0 and 0.1.1.
@@ -48,12 +53,12 @@ Startup validates all three transition callbacks. A version-2 declaration with
 a missing accessor or incomplete store is rejected; Docket never silently
 downgrades a partially upgraded backend.
 
-Backends that omit `capabilities/0` are treated as legacy contract version 1.
-Core routes their lifecycle operations through
-`Docket.Backend.LegacyTransitionStore`, which composes the existing
-`transaction/2`, run-store, and event-store writes. That adapter preserves
-source compatibility; it cannot fuse a legacy backend's writes into one
-round trip.
+In 0.1.2, backends that omitted `capabilities/0` were treated as legacy
+contract version 1: core routed their lifecycle operations through
+`Docket.Backend.LegacyTransitionStore`, which composed the existing
+`transaction/2`, run-store, and event-store writes. The adapter preserved
+source compatibility; it could not fuse a legacy backend's writes into one
+round trip. 0.2.0 removed the adapter and this fallback.
 
 ## Deprecated 0.1.x APIs
 

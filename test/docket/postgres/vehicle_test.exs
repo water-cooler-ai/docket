@@ -87,6 +87,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defmodule DoneRunBackend do
       def graphs, do: Docket.Test.MemoryBackend
       def events, do: Docket.Test.MemoryBackend
+      def capabilities, do: Docket.Test.MemoryBackend.capabilities()
+      def transitions, do: Docket.Test.MemoryBackend
       def runs, do: __MODULE__.Runs
 
       defmodule Runs do
@@ -100,6 +102,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defmodule MissingRunBackend do
       def graphs, do: Docket.Test.MemoryBackend
       def events, do: Docket.Test.MemoryBackend
+      def capabilities, do: Docket.Test.MemoryBackend.capabilities()
+      def transitions, do: Docket.Test.MemoryBackend
       def runs, do: __MODULE__.Runs
 
       defmodule Runs do

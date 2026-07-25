@@ -2,11 +2,11 @@
 
 ## Release lines and PR targets
 
-- `main` is the current stable line.
-- `v0.1.0` is the active release branch for the 0.1.0 operational runtime
-  (see [docs/postgres-operations.md](docs/postgres-operations.md)).
-  **All 0.1.0 work targets `v0.1.0`, not `main`.** The release branch merges
-  back to `main` when 0.1.0 ships.
+- `main` is the current stable line. Release work branches from and targets
+  `main`.
+- `v0.1.0` was the release branch for the 0.1.0 operational runtime
+  (see [docs/postgres-operations.md](docs/postgres-operations.md)); it has
+  merged back into `main` and receives no new work.
 
 ## Optional Postgres dependencies
 

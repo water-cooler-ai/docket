@@ -48,8 +48,8 @@ defmodule Docket.Telemetry do
   @lifecycle_key {__MODULE__, :lifecycle}
 
   @metric_metadata %{
-    [:docket, :lifecycle, :transaction, :stop] => [:operation, :result],
-    [:docket, :lifecycle, :transaction, :exception] => [:operation, :result],
+    [:docket, :lifecycle, :transition, :stop] => [:operation, :result],
+    [:docket, :lifecycle, :transition, :exception] => [:operation, :result],
     [:docket, :store, :operation, :stop] => [:operation, :result],
     [:docket, :store, :operation, :exception] => [:operation, :result],
     [:docket, :checkpoint, :observer, :stop] => [:checkpoint_type, :result, :durable_success],
@@ -104,7 +104,7 @@ defmodule Docket.Telemetry do
 
     try do
       span(
-        [:docket, :lifecycle, :transaction],
+        [:docket, :lifecycle, :transition],
         %{operation: operation, lifecycle_ref: lifecycle_ref},
         fn ->
           result = fun.()

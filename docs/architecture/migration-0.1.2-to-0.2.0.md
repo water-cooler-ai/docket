@@ -3,9 +3,13 @@
 Docket 0.2.0 removes the deprecated 0.1.x lifecycle composition APIs and makes
 `Docket.Backend.TransitionStore` mandatory. There is no database schema
 change: 0.2.0 runs on the same schema version 2 as every 0.1.x release, so no
-migration needs to be generated or run. Applications using `Docket.Postgres`
-need no changes. Third-party backends that already declare contract version 2
-and implement `Docket.Backend.TransitionStore` need no changes either.
+migration needs to be generated or run. Applications that configure
+`Docket.Postgres` and write through the public `Docket` facade need no
+changes beyond the telemetry rename below. Third-party backends that already
+declare contract version 2 keep their declaration and transition store
+unchanged, but must delete their implementations of the removed callbacks
+listed below: 0.1.2 still required those callbacks, and `@impl` attributes on
+them now produce compile warnings against the slimmed behaviours.
 
 ## Removed APIs
 
@@ -19,11 +23,29 @@ public backend contract:
 - `Docket.Backend.RunStore.mutate_run/4`;
 - `Docket.Backend.EventStore.append_events/4`;
 - `Docket.Backend.LegacyTransitionStore`, the adapter that routed undeclared
-  0.1.x backends through the composed write path.
+  0.1.x backends through the composed write path;
+- the public types the removed callbacks carried:
+  `Docket.Backend.transaction_fun/0`, `Docket.Backend.transaction_result/0`,
+  and `Docket.Backend.RunStore.commit_proposal/0`, `mutation/0`,
+  `mutation_decision/0`, `mutation_result/0`, and `checkpoint_type/0`. The
+  transition `schedule` type is now defined on
+  `Docket.Backend.TransitionStore`;
+- the deprecated delegates on the bundled PostgreSQL backend:
+  `Docket.Postgres.transaction/2`, `Docket.Postgres.commit_transition/4`,
+  `Docket.Postgres.RunStore.insert_run/5`, `commit/3`, `mutate_run/4`, and
+  `Docket.Postgres.EventStore.append_events/4`.
 
 Focused graph, run, and event reads and the claim operations remain part of
 their contracts unchanged. Backend-native transactions remain private
 implementation details; they simply never cross the public contract.
+
+## Renamed telemetry
+
+The lifecycle write span is
+`[:docket, :lifecycle, :transition, :start | :stop | :exception]`, renamed
+from `[:docket, :lifecycle, :transaction, ...]` now that transactions are no
+longer part of the public contract. Measurements and metadata are unchanged.
+Reattach any handler or reporter subscribed to the old event name.
 
 ## Mandatory declaration
 

@@ -83,19 +83,17 @@ defmodule Docket.Backend do
               {:ok, drain_summary()} | {:error, term()}
 
   @doc false
-  @spec transition_store(module(), ctx()) :: {module(), ctx()}
-  def transition_store(backend, context) when is_atom(backend) do
+  @spec validate_contract!(module()) :: :ok
+  def validate_contract!(backend) when is_atom(backend) do
     case declared_capabilities(backend) do
-      %{contract_version: 2, transitions: %{version: version}} when version == 1 ->
+      %{contract_version: 2, transitions: %{version: 1}} ->
         unless function_exported?(backend, :transitions, 0) do
           raise ArgumentError,
                 "backend #{inspect(backend)} declares transition contract version 2 " <>
                   "but does not export transitions/0"
         end
 
-        store = backend.transitions()
-        validate_transition_store!(backend, store)
-        {store, context}
+        validate_transition_store!(backend, backend.transitions())
 
       capabilities ->
         raise ArgumentError,
@@ -105,15 +103,11 @@ defmodule Docket.Backend do
   end
 
   @doc false
-  @spec validate_contract!(module()) :: :ok
-  def validate_contract!(backend) when is_atom(backend) do
-    _resolved = transition_store(backend, :validation_context)
-    :ok
-  end
-
-  @doc false
   @spec declared_capabilities(module()) :: capabilities()
   def declared_capabilities(backend) when is_atom(backend) do
+    Code.ensure_loaded?(backend) ||
+      raise ArgumentError, "backend #{inspect(backend)} could not be loaded"
+
     unless function_exported?(backend, :capabilities, 0) do
       raise ArgumentError,
             "backend #{inspect(backend)} does not export capabilities/0; " <>

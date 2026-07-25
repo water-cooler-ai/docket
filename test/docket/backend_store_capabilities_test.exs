@@ -115,10 +115,10 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     end
   end
 
-  test "an undeclared backend cannot resolve a transition store" do
+  test "an undeclared backend fails contract validation" do
     error =
       assert_raise ArgumentError, fn ->
-        Docket.Backend.transition_store(IncompleteBundle, :context)
+        Docket.Backend.validate_contract!(IncompleteBundle)
       end
 
     assert error.message =~ "does not export capabilities/0"
@@ -127,7 +127,7 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
   test "a contract version 1 backend is rejected as removed" do
     error =
       assert_raise ArgumentError, fn ->
-        Docket.Backend.transition_store(ContractV1Bundle, :context)
+        Docket.Backend.validate_contract!(ContractV1Bundle)
       end
 
     assert error.message =~ "declares contract version 1, which was removed in 0.2"

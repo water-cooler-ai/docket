@@ -144,6 +144,10 @@ defmodule Docket.Backend.TransitionStore do
               [Docket.Event.t()]
             ) :: result()
 
+  @doc """
+  The transition contract version backends declare in `capabilities/0`
+  under `transitions: %{version: ...}`.
+  """
   @spec version() :: pos_integer()
   def version, do: @version
 

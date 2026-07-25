@@ -99,6 +99,78 @@ defmodule Docket.BackendTests.TransitionCases do
                  )
       end
 
+      @tag docket_invariant: "TRANSITION-INITIALIZE-REJECTIONS"
+      test "[TRANSITION-INITIALIZE-REJECTIONS] initialization accepts only a scheduled initialized running run",
+           %{backend_test: instance} do
+        transitions = instance.backend.transitions()
+
+        {graph, graph_hash} =
+          Fixture.publish_graph(instance, :tenantless, "transition-init-reject")
+
+        base = Fixture.run(instance, "transition-init-reject-run", graph, graph_hash)
+
+        proposal = fn run ->
+          %{run: run, checkpoint_type: :run_initialized, wake_at: instance.now}
+        end
+
+        for status <- [:created, :waiting, :done, :failed, :cancelled] do
+          assert {:error, :invalid_transition} =
+                   transitions.initialize(
+                     instance.context,
+                     :tenantless,
+                     proposal.(%{base | status: status}),
+                     []
+                   )
+        end
+
+        assert {:error, :invalid_transition} =
+                 transitions.initialize(
+                   instance.context,
+                   :tenantless,
+                   proposal.(%{base | checkpoint_seq: 0}),
+                   []
+                 )
+
+        assert {:error, :invalid_transition} =
+                 transitions.initialize(
+                   instance.context,
+                   :tenantless,
+                   proposal.(%{base | updated_at: nil}),
+                   []
+                 )
+
+        assert {:error, :invalid_transition} =
+                 transitions.initialize(
+                   instance.context,
+                   :tenantless,
+                   %{run: base, checkpoint_type: :step_committed, wake_at: instance.now},
+                   []
+                 )
+
+        assert {:error, :invalid_transition} =
+                 transitions.initialize(
+                   instance.context,
+                   :tenantless,
+                   %{run: base, checkpoint_type: nil, wake_at: instance.now},
+                   []
+                 )
+
+        assert {:error, :invalid_transition} =
+                 transitions.initialize(
+                   instance.context,
+                   :tenantless,
+                   %{run: base, checkpoint_type: :run_initialized, wake_at: nil},
+                   []
+                 )
+
+        assert_raise ArgumentError, fn ->
+          transitions.initialize(instance.context, {:tenant, ""}, proposal.(base), [])
+        end
+
+        assert {:error, :not_found} =
+                 instance.backend.runs().fetch_run(instance.context, :tenantless, base.id)
+      end
+
       @tag docket_invariant: "TRANSITION-CLAIMED-FENCES"
       test "[TRANSITION-CLAIMED-FENCES] claimed writes fence state and accept identical stored events",
            %{backend_test: instance} do
@@ -336,6 +408,15 @@ defmodule Docket.BackendTests.TransitionCases do
                    []
                  )
 
+        assert {:error, :claim_lost} =
+                 instance.backend.runs().refresh_claim(
+                   instance.context,
+                   :system,
+                   initial.id,
+                   lease.claim_token,
+                   DateTime.add(instance.now, 4, :microsecond)
+                 )
+
         assert {:error, :stale_checkpoint} =
                  transitions.commit_unclaimed(
                    instance.context,
@@ -420,6 +501,59 @@ defmodule Docket.BackendTests.TransitionCases do
 
         assert {:error, :not_found} =
                  instance.backend.events().fetch_event(instance.context, :tenantless, fresh.id, 2)
+
+        rebound = %{
+          fresh
+          | checkpoint_seq: 4,
+            updated_at: DateTime.add(instance.now, 5, :microsecond),
+            graph_hash: "immutable-rebound-hash"
+        }
+
+        assert {:error, :invalid_transition} =
+                 transitions.commit_unclaimed(
+                   instance.context,
+                   :tenantless,
+                   3,
+                   %{
+                     run: rebound,
+                     checkpoint_type: :step_committed,
+                     schedule: {:release_claim, :immediate}
+                   },
+                   []
+                 )
+
+        contradictory = %{
+          fresh
+          | checkpoint_seq: 4,
+            updated_at: DateTime.add(instance.now, 6, :microsecond)
+        }
+
+        assert {:error, :event_conflict} =
+                 transitions.commit_unclaimed(
+                   instance.context,
+                   :tenantless,
+                   3,
+                   %{
+                     run: contradictory,
+                     checkpoint_type: :step_committed,
+                     schedule: {:release_claim, :immediate}
+                   },
+                   [
+                     Fixture.event(contradictory, 1, instance.now,
+                       payload: %{"different" => true}
+                     )
+                   ]
+                 )
+
+        assert {:ok, %Docket.Run{checkpoint_seq: 3}} =
+                 instance.backend.runs().fetch_run(instance.context, :tenantless, fresh.id)
+
+        assert {:ok, ^fresh_event} =
+                 instance.backend.events().fetch_latest_event(
+                   instance.context,
+                   :tenantless,
+                   fresh.id
+                 )
       end
 
       @tag docket_invariant: "TRANSITION-UNCLAIMED-RACE"
@@ -631,7 +765,47 @@ defmodule Docket.BackendTests.TransitionCases do
 
           assert stored.status == advanced.status
           assert stored.checkpoint_seq == 2
+
+          assert {:ok, info} =
+                   instance.backend.runs().inspect_run(
+                     instance.context,
+                     :tenantless,
+                     advanced.id
+                   )
+
+          refresh =
+            instance.backend.runs().refresh_claim(
+              instance.context,
+              :system,
+              initial.id,
+              lease.claim_token,
+              DateTime.add(instance.now, 60, :second)
+            )
+
+          case schedule do
+            :retain_claim ->
+              assert %DateTime{} = info.claimed_at
+              assert info.wake_at == nil
+              assert refresh == :ok
+
+            {:release_claim, :immediate} ->
+              assert info.claimed_at == nil
+              assert %DateTime{} = info.wake_at
+              assert refresh == {:error, :claim_lost}
+
+            {:release_claim, {:at, at}} ->
+              assert info.claimed_at == nil
+              assert DateTime.compare(info.wake_at, at) == :eq
+              assert refresh == {:error, :claim_lost}
+
+            {:release_claim, park} when park in [:external, :terminal] ->
+              assert info.claimed_at == nil
+              assert info.wake_at == nil
+              assert refresh == {:error, :claim_lost}
+          end
         end
+
+        commit_with.("retain", & &1, :retain_claim)
 
         commit_with.(
           "at",
@@ -650,6 +824,8 @@ defmodule Docket.BackendTests.TransitionCases do
           &%{&1 | status: :done, finished_at: DateTime.add(instance.now, 1, :microsecond)},
           {:release_claim, :terminal}
         )
+
+        commit_with.("immediate", & &1, {:release_claim, :immediate})
       end
 
       @tag docket_invariant: "TRANSITION-EVENT-CANONICAL"

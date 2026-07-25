@@ -81,8 +81,9 @@ Each failure includes a stable invariant ID. The shared cases currently cover:
 - explicit transition contract negotiation and transition-store completeness;
 - initialization, claimed, and unclaimed transition success, duplicate-run
   conflicts, tenant concealment, immutable/fence ordering, canonical event
-  idempotency, concurrent same-fence winners, schedule variants, malformed
-  proposals, and zero-write rejection;
+  idempotency, concurrent same-fence and unclaimed CAS winners, schedule
+  variants and their durable claim/wake effects, malformed proposals, and
+  zero-write rejection;
 - mandatory backend and focused-store callbacks;
 - graph ownership and run/event tenant isolation;
 - graph content addressing, idempotence, latest/version reads, and pagination;

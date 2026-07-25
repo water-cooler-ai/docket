@@ -97,6 +97,8 @@ defmodule Docket.MemoryBackendTest do
 
   test "backend is one bundle for compatible capabilities", %{backend: backend} do
     refute function_exported?(MemoryBackend, :storage, 0)
+    assert MemoryBackend.capabilities().contract_version == 2
+    assert MemoryBackend.transitions() == MemoryBackend
     assert MemoryBackend.graphs() == MemoryBackend
     assert MemoryBackend.runs() == MemoryBackend
     assert MemoryBackend.events() == MemoryBackend
