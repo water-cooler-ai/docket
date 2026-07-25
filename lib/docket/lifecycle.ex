@@ -74,17 +74,18 @@ defmodule Docket.Lifecycle do
   def signal({backend, context}, scope, run_id, mutation) when is_function(mutation, 1) do
     {transitions, transition_context} = Docket.Backend.transition_store(backend, context)
 
+    request = %{
+      runs: backend.runs(),
+      context: context,
+      transitions: transitions,
+      transition_context: transition_context,
+      scope: scope,
+      run_id: run_id,
+      mutation: mutation
+    }
+
     Docket.Telemetry.lifecycle_span(:signal, fn ->
-      signal_attempt(
-        backend.runs(),
-        context,
-        transitions,
-        transition_context,
-        scope,
-        run_id,
-        mutation,
-        @signal_conflict_retries
-      )
+      retry_stale(1 + @signal_conflict_retries, fn -> signal_attempt(request) end)
     end)
   end
 
@@ -144,68 +145,50 @@ defmodule Docket.Lifecycle do
     end
   end
 
-  defp signal_attempt(
-         runs,
-         context,
-         transitions,
-         transition_context,
-         scope,
-         run_id,
-         mutation,
-         retries_left
-       ) do
+  defp retry_stale(1, attempt), do: attempt.()
+
+  defp retry_stale(attempts_left, attempt) do
+    case attempt.() do
+      {:error, :stale_checkpoint} -> retry_stale(attempts_left - 1, attempt)
+      result -> result
+    end
+  end
+
+  defp signal_attempt(request) do
     with {:ok, current} <-
            store_span(:run_fetch_for_transition, fn ->
-             runs.fetch_run(context, scope, run_id)
+             request.runs.fetch_run(request.context, request.scope, request.run_id)
            end) do
-      case mutation.(current) do
-        {:ok, %Moment{} = moment} ->
-          proposal = %{
-            run: moment.run,
-            checkpoint_type: moment.checkpoint_type,
-            schedule: schedule(moment.disposition, :unclaimed)
-          }
-
-          result =
-            store_span(:transition_commit_unclaimed, fn ->
-              transitions.commit_unclaimed(
-                transition_context,
-                scope,
-                current.checkpoint_seq,
-                proposal,
-                moment.events
-              )
-            end)
-
-          case result do
-            {:ok, _run} ->
-              {:ok, moment}
-
-            {:error, :stale_checkpoint} when retries_left > 0 ->
-              signal_attempt(
-                runs,
-                context,
-                transitions,
-                transition_context,
-                scope,
-                run_id,
-                mutation,
-                retries_left - 1
-              )
-
-            {:error, reason} ->
-              {:error, reason}
-          end
-
-        {:unchanged, %Docket.Run{} = run} ->
-          {:ok, run}
-
-        {:error, reason} ->
-          {:error, reason}
-
-        other ->
-          {:error, {:invalid_lifecycle_mutation, other}}
+      case request.mutation.(current) do
+        {:ok, %Moment{} = moment} -> commit_signal_moment(request, current, moment)
+        {:unchanged, %Docket.Run{} = run} -> {:ok, run}
+        {:error, reason} -> {:error, reason}
+        other -> {:error, {:invalid_lifecycle_mutation, other}}
       end
+    end
+  end
+
+  defp commit_signal_moment(request, current, moment) do
+    proposal = %{
+      run: moment.run,
+      checkpoint_type: moment.checkpoint_type,
+      schedule: schedule(moment.disposition, :unclaimed)
+    }
+
+    committed =
+      store_span(:transition_commit_unclaimed, fn ->
+        request.transitions.commit_unclaimed(
+          request.transition_context,
+          request.scope,
+          current.checkpoint_seq,
+          proposal,
+          moment.events
+        )
+      end)
+
+    case committed do
+      {:ok, _run} -> {:ok, moment}
+      {:error, reason} -> {:error, reason}
     end
   end
 
