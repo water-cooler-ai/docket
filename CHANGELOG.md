@@ -15,8 +15,12 @@ project follows [Semantic Versioning](https://semver.org/).
   upgraded backends fail with the missing transition callback instead of
   silently selecting a path through `function_exported?/3`.
 - A 0.1.x legacy adapter for undeclared 0.1.0/0.1.1 backends, plus portable
-  transition limits, a closed transition error vocabulary, deterministic
-  transition IDs, and durable replay receipts in the shared in-memory backend.
+  transition limits, a closed transition error vocabulary, stable logical
+  transition IDs, and durable replay receipts in both bundled backends.
+- PostgreSQL schema version 3, adding a durable event-sequence fence and
+  transition receipts that survive retained-event pruning.
+- A shared v2 semantic conformance matrix covering replay, tenancy, validation,
+  fences, concurrency, canonical events, limits, and zero-write rejection.
 
 ### Changed
 
@@ -24,12 +28,13 @@ project follows [Semantic Versioning](https://semver.org/).
   call semantic transitions. Core no longer composes production lifecycle
   writes through public arbitrary backend transactions.
 - Signals now use scoped fetch, pure evaluation, optimistic unclaimed commit,
-  and a bounded refetch/re-evaluation loop on transition conflicts. Signal
+  and a bounded refetch/re-evaluation loop only on `:stale_checkpoint`. Signal
   mutation functions may run more than once and must not perform external side
   effects.
 - PostgreSQL exposes the fused claimed-moment implementation through
-  `Docket.Postgres.TransitionStore`; its initialization and unclaimed paths use
-  backend-private PostgreSQL transactions.
+  `Docket.Postgres.TransitionStore`; the fused statement includes receipt
+  arbitration, while initialization and unclaimed paths use backend-private
+  PostgreSQL transactions.
 
 ### Deprecated
 

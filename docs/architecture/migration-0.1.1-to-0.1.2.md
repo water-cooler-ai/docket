@@ -19,7 +19,8 @@ callback, or `Docket.Runtime.Moment`. Backend-native transactions remain
 private implementation details.
 
 Signals now perform scoped fetch, pure mutation evaluation, and an optimistic
-unclaimed commit. A conflict causes a bounded refetch and re-evaluation.
+unclaimed commit. `:stale_checkpoint` causes a bounded refetch and
+re-evaluation; permanent transition-ID `:conflict` does not.
 Mutation functions may therefore run more than once and must be deterministic,
 bounded, and free of external side effects. A no-change or error decision does
 not invoke storage and publishes nothing.
@@ -70,7 +71,9 @@ the compatibility adapter and focused backend-internal use:
 - `Docket.Backend.EventStore.append_events/4`;
 - `Docket.Backend.commit_transition/4`.
 
-They are scheduled for removal from the public backend contract in 0.2.
+Version-2 backends retain these callbacks throughout the 0.1.x compatibility
+window because the behavior and legacy adapter still require them. They are
+scheduled for removal from the public backend contract in 0.2.
 Focused graph/run/event reads and claim operations remain.
 
 ## Required semantics
@@ -86,8 +89,10 @@ returns `:conflict`. If events may be pruned, use a durable receipt independent
 of retained events.
 
 The portable permanent errors are `:not_found`, `:invalid_transition`,
-`:conflict`, `:event_conflict`, and `:too_large`. Retryable infrastructure
-failures use `{:retryable, reason}`. Core does not automatically retry an
+`:conflict`, `:event_conflict`, and `:too_large`. A lost checkpoint or event
+fence is `:stale_checkpoint`. Retryable infrastructure failures use
+`{:retryable, reason}` and non-retryable infrastructure failures use
+`{:permanent, reason}`. Core does not automatically retry an
 ambiguous infrastructure result; retry the exact transition only when the
 backend can distinguish replay from a stale fence.
 
@@ -97,3 +102,6 @@ transition or reject clustered mode. SQLite implementations must document busy,
 journal, synchronous, and reopen behavior. DynamoDB implementations must
 normalize transaction cancellation and throttling while respecting item and
 transaction limits.
+
+See [Transition backend feasibility](../transition-backend-feasibility.md) for
+the required substrate-specific declarations and recovery gates.

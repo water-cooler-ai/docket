@@ -10,12 +10,17 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @behaviour Docket.Backend.EventStore
 
     @impl true
-    def append_events(_ctx, scope, _run_id, []) do
+    @deprecated "use Docket.Postgres.TransitionStore for lifecycle event publication"
+    def append_events(ctx, scope, run_id, events),
+      do: append_transition_events(ctx, scope, run_id, events)
+
+    @doc false
+    def append_transition_events(_ctx, scope, _run_id, []) do
       validate_scope!(scope)
       :ok
     end
 
-    def append_events(ctx, scope, run_id, events) when is_list(events) do
+    def append_transition_events(ctx, scope, run_id, events) when is_list(events) do
       started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)
 
@@ -42,7 +47,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       result
     end
 
-    def append_events(_ctx, scope, _run_id, _events) do
+    def append_transition_events(_ctx, scope, _run_id, _events) do
       validate_scope!(scope)
       {:error, :invalid_events}
     end

@@ -360,7 +360,7 @@ re-execution, not a partial durable moment.
 
 ## Claim policy schema state
 
-Schema version 2 contains the shared admission substrate: the singleton
+Schema version 2 introduced the shared admission substrate: the singleton
 `docket_claim_policy` gate row, trigger-maintained `docket_claim_schedule`
 membership with exact unfinished-run counts, `docket_claim_partitions`
 ownership rows, and the scoped partial indexes that serve per-scope admission
@@ -393,15 +393,17 @@ mix ecto.migrate -r MyApp.Repo
 Stop dispatchers and all Docket run writers before the upgrade, deploy one
 homogeneous binary version, migrate, and restart. The migration locks the runs
 table against inserts while it backfills owner partitions and schedule rows.
-The current binary requires schema version 2 and checks it before starting
-backend children. Rolling back a generated host-schema-V1 upgrade removes the
-version 2 admission schema and returns to schema version 1. Online migrations,
+Schema version 3 adds the durable transition receipt table and the run-row
+event-sequence fence. The current binary requires schema version 3 and checks
+it before starting backend children. Rolling back a generated host-schema-V1
+upgrade removes the version 3 receipt/event fence and version 2 admission
+schema, returning to schema version 1. Online migrations,
 readiness ledgers, fleet
 attestations, and audited activation are intentionally outside the v0.1.0
 contract.
 
-Fresh installations generated without an upgrade flag install V01 and V02 in
-one host migration. Use the same explicit prefix in both migration
+Fresh installations generated without an upgrade flag install V01 through V03
+in one host migration. Use the same explicit prefix in both migration
 directions and runtime configuration.
 
 Claim-policy correctness is covered by the checked-in windowed engine suite

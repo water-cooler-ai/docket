@@ -37,6 +37,18 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     def transitions, do: IncompleteTransitionStore
   end
 
+  defmodule MissingTransitionAccessorBundle do
+    def capabilities do
+      %{
+        contract_version: 2,
+        transitions: %{
+          version: 1,
+          limits: Docket.Backend.TransitionStore.portable_limits()
+        }
+      }
+    end
+  end
+
   test "the backend owns versioned transitions and focused stores" do
     callbacks = Docket.Backend.behaviour_info(:callbacks)
     optional_callbacks = Docket.Backend.behaviour_info(:optional_callbacks)
@@ -98,6 +110,15 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     assert error.message =~ "missing"
     assert error.message =~ "commit_claimed/4"
     assert error.message =~ "commit_unclaimed/5"
+  end
+
+  test "a declared transition contract without transitions/0 fails clearly" do
+    error =
+      assert_raise ArgumentError, fn ->
+        Docket.Backend.validate_contract!(MissingTransitionAccessorBundle)
+      end
+
+    assert error.message =~ "does not export transitions/0"
   end
 
   test "shared backend completeness failures name the accessor and exact callback" do

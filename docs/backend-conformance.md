@@ -38,7 +38,8 @@ for file <- [
       "test/support/backend_tests.ex",
       "test/support/backend_tests/contract.ex",
       "test/support/backend_tests/fixture.ex",
-      "test/support/backend_tests/cases.ex"
+      "test/support/backend_tests/cases.ex",
+      "test/support/backend_tests/transition_cases.ex"
     ] do
   Code.require_file(Path.join(docket_source, file))
 end
@@ -78,6 +79,10 @@ resolves focused stores exclusively through the returned backend.
 Each failure includes a stable invariant ID. The shared cases currently cover:
 
 - explicit transition contract negotiation and transition-store completeness;
+- initialization, claimed, and unclaimed transition success, exact durable
+  replay, conflicting ID reuse, tenant concealment, immutable/fence ordering,
+  canonical event replay, concurrent same-fence winners, malformed sequences,
+  portable batch limits, and zero-write rejection;
 - mandatory backend and focused-store callbacks;
 - commit, rollback, nested participation, rollback-only propagation,
   concurrent publication outcomes, and completed-read visibility;
@@ -93,8 +98,10 @@ Each failure includes a stable invariant ID. The shared cases currently cover:
 Passing is evidence for the portable cases above, not a claim that every
 backend is operationally equivalent. In particular, the shared suite does not
 currently establish the complete `claim_due` selection matrix, all run-list
-filters, restart durability, migrations, substrate configuration, deterministic
-lock timing, or end-to-end runtime advancement.
+filters, restart/failover durability, migrations, substrate configuration,
+deterministic lock timing, or end-to-end runtime advancement. Backend-owned
+fault suites additionally cover timeout-after-commit and the declared
+durability policy.
 
 ## Backend-specific coverage
 

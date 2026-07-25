@@ -88,6 +88,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @testing_modes [:inline, :manual]
 
     @impl Docket.Backend
+    @deprecated "use Docket.Postgres.transitions() for lifecycle writes"
     defdelegate transaction(ctx, fun), to: Storage
 
     @impl Docket.Backend
@@ -97,7 +98,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         transitions: %{
           version: Docket.Backend.TransitionStore.version(),
           limits: Docket.Backend.TransitionStore.portable_limits(),
-          replay: :canonical_events,
+          replay: :durable_receipts,
           durability: :postgres_commit,
           topology: :single_database_transaction
         }

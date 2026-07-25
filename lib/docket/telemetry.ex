@@ -138,6 +138,7 @@ defmodule Docket.Telemetry do
   def result_kind({:ok, _}), do: :ok
   def result_kind(:ok), do: :ok
   def result_kind({:error, :stale_fence}), do: :stale_fence
+  def result_kind({:error, :stale_checkpoint}), do: :conflict
   def result_kind({:error, :conflict}), do: :conflict
   def result_kind({:error, _}), do: :error
   def result_kind({:skipped, _}), do: :skipped

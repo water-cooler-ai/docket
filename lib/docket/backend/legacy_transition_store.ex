@@ -20,7 +20,9 @@ defmodule Docket.Backend.LegacyTransitionStore do
         events
       ) do
     with :ok <-
-           Docket.Backend.TransitionStore.validate_limits(
+           Docket.Backend.TransitionStore.validate(
+             :initialize,
+             0,
              proposal,
              events,
              Docket.Backend.TransitionStore.portable_limits()
@@ -53,7 +55,9 @@ defmodule Docket.Backend.LegacyTransitionStore do
         events
       ) do
     with :ok <-
-           Docket.Backend.TransitionStore.validate_limits(
+           Docket.Backend.TransitionStore.validate(
+             :claimed,
+             Map.get(proposal, :expected_checkpoint_seq, -1),
              proposal,
              events,
              Docket.Backend.TransitionStore.portable_limits()
@@ -88,7 +92,9 @@ defmodule Docket.Backend.LegacyTransitionStore do
       )
       when is_integer(expected_checkpoint_seq) and expected_checkpoint_seq >= 0 do
     with :ok <-
-           Docket.Backend.TransitionStore.validate_limits(
+           Docket.Backend.TransitionStore.validate(
+             :unclaimed,
+             expected_checkpoint_seq,
              proposal,
              events,
              Docket.Backend.TransitionStore.portable_limits()
@@ -103,7 +109,7 @@ defmodule Docket.Backend.LegacyTransitionStore do
             if current.checkpoint_seq == expected_checkpoint_seq do
               {:commit, run, proposal.checkpoint_type, proposal.schedule, run}
             else
-              {:error, :conflict}
+              {:error, :stale_checkpoint}
             end
           end
 
@@ -132,7 +138,7 @@ defmodule Docket.Backend.LegacyTransitionStore do
             ],
        do: {:error, :invalid_transition}
 
-  defp normalize_error({:error, :stale_fence}), do: {:error, :conflict}
+  defp normalize_error({:error, :stale_fence}), do: {:error, :stale_checkpoint}
   defp normalize_error({:error, :already_exists}), do: {:error, :conflict}
   defp normalize_error(result), do: result
 end

@@ -52,6 +52,7 @@ defmodule Docket.Lifecycle do
       transition_id: TransitionStore.transition_id(:claimed, moment.run),
       run: moment.run,
       expected_checkpoint_seq: expected_checkpoint_seq,
+      expected_event_seq: previous_event_seq(moment),
       claim_token: claim_token,
       checkpoint_type: moment.checkpoint_type,
       schedule: schedule(moment.disposition, :claimed)
@@ -76,6 +77,7 @@ defmodule Docket.Lifecycle do
         ) :: {:ok, Moment.t() | Docket.Run.t()} | {:error, term()}
   def signal({backend, context}, scope, run_id, mutation) when is_function(mutation, 1) do
     {transitions, transition_context} = Docket.Backend.transition_store(backend, context)
+    transition_id = TransitionStore.unique_transition_id(:unclaimed, run_id)
 
     Docket.Telemetry.lifecycle_span(:signal, fn ->
       signal_attempt(
@@ -86,6 +88,7 @@ defmodule Docket.Lifecycle do
         scope,
         run_id,
         mutation,
+        transition_id,
         @signal_conflict_retries
       )
     end)
@@ -155,6 +158,7 @@ defmodule Docket.Lifecycle do
          scope,
          run_id,
          mutation,
+         transition_id,
          retries_left
        ) do
     with {:ok, current} <-
@@ -164,8 +168,9 @@ defmodule Docket.Lifecycle do
       case mutation.(current) do
         {:ok, %Moment{} = moment} ->
           proposal = %{
-            transition_id: TransitionStore.transition_id(:unclaimed, moment.run),
+            transition_id: transition_id,
             run: moment.run,
+            expected_event_seq: current.event_seq,
             checkpoint_type: moment.checkpoint_type,
             schedule: schedule(moment.disposition, :unclaimed)
           }
@@ -185,7 +190,7 @@ defmodule Docket.Lifecycle do
             {:ok, _run} ->
               {:ok, moment}
 
-            {:error, :conflict} when retries_left > 0 ->
+            {:error, :stale_checkpoint} when retries_left > 0 ->
               signal_attempt(
                 runs,
                 context,
@@ -194,6 +199,7 @@ defmodule Docket.Lifecycle do
                 scope,
                 run_id,
                 mutation,
+                transition_id,
                 retries_left - 1
               )
 
@@ -211,6 +217,10 @@ defmodule Docket.Lifecycle do
           {:error, {:invalid_lifecycle_mutation, other}}
       end
     end
+  end
+
+  defp previous_event_seq(%Moment{run: run, events: events}) do
+    run.event_seq - (events |> Enum.map(& &1.seq) |> Enum.uniq() |> length())
   end
 
   defp disposition_kind(%Moment{checkpoint_type: :retry_scheduled}), do: :retry

@@ -75,6 +75,7 @@ defmodule Docket.MixProject do
         {"docs/postgres-operations.md", []},
         {"docs/telemetry.md", []},
         {"docs/backend-conformance.md", []},
+        {"docs/transition-backend-feasibility.md", []},
         {"docs/architecture/docket-claim-policy.md",
          filename: "architecture-docket-claim-policy"},
         {"docs/architecture/migration-0.0.1-to-0.1.0.md",

@@ -36,7 +36,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                "defmodule Docket.Postgres.TestRepo.Migrations.AddDocketTables do"
 
       assert content =~ "use Ecto.Migration"
-      assert content =~ "Docket.Postgres.Migration.up(version: 2, prefix: \"public\")"
+      assert content =~ "Docket.Postgres.Migration.up(version: 3, prefix: \"public\")"
       assert content =~ "Docket.Postgres.Migration.down(version: 1, prefix: \"public\")"
 
       # The generated file must at least parse.
@@ -54,14 +54,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ])
 
       assert Path.dirname(file) == @tmp_path
-      assert Path.basename(file) =~ ~r/^\d{14}_upgrade_docket_to_v2\.exs$/
+      assert Path.basename(file) =~ ~r/^\d{14}_upgrade_docket_to_v3\.exs$/
 
       content = File.read!(file)
 
       assert content =~
-               "defmodule Docket.Postgres.TestRepo.Migrations.UpgradeDocketToV2 do"
+               "defmodule Docket.Postgres.TestRepo.Migrations.UpgradeDocketToV3 do"
 
-      assert content =~ "Docket.Postgres.Migration.up(version: 2, prefix: \"public\")"
+      assert content =~ "Docket.Postgres.Migration.up(version: 3, prefix: \"public\")"
       assert content =~ "Docket.Postgres.Migration.down(version: 2, prefix: \"public\")"
       refute content =~ "down(version: 1,"
       assert {:ok, _ast} = Code.string_to_quoted(content)

@@ -60,7 +60,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defmodule HostV1ToCurrent do
       use Ecto.Migration
-      def up, do: Docket.Postgres.Migration.up(version: 2)
+      def up, do: Docket.Postgres.Migration.up(version: 3)
       def down, do: Docket.Postgres.Migration.down(version: 2)
     end
 
@@ -413,7 +413,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       insert_v1_graph_and_run("tenant-a", "run-a")
 
       :ok = Ecto.Migrator.up(TestRepo, @host_v1_to_current, HostV1ToCurrent, log: false)
-      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 3
 
       :ok = Ecto.Migrator.down(TestRepo, @host_v1_to_current, HostV1ToCurrent, log: false)
 

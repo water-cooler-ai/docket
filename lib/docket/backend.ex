@@ -151,6 +151,12 @@ defmodule Docket.Backend do
         {Docket.Backend.LegacyTransitionStore, {backend, context}}
 
       %{contract_version: 2, transitions: %{version: version}} when version == 1 ->
+        unless function_exported?(backend, :transitions, 0) do
+          raise ArgumentError,
+                "backend #{inspect(backend)} declares transition contract version 2 " <>
+                  "but does not export transitions/0"
+        end
+
         store = backend.transitions()
         validate_transition_store!(backend, store)
         {store, context}

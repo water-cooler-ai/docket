@@ -94,6 +94,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     setup do
+      TestRepo.query!("DELETE FROM docket_transition_receipts")
       TestRepo.delete_all(Event)
       TestRepo.delete_all(Run)
       TestRepo.delete_all(ClaimPartition)
@@ -203,7 +204,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:error, :event_conflict} =
                EventStore.append_events(TestRepo, :tenantless, next.run.id, [conflicting])
 
-      assert {:error, :conflict} =
+      assert {:error, :stale_checkpoint} =
                Docket.Lifecycle.commit_moment(
                  backend,
                  :tenantless,
@@ -253,6 +254,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert Enum.map(TestRepo.all(from(event in Event, order_by: event.seq)), & &1.type) ==
                Enum.map(initial.events ++ next.events, & &1.type)
+    end
+
+    test "Postgres initialization receipt survives retained-event pruning" do
+      {graph_id, graph_hash, _document} = publish_graph!("receipt-pruning-graph")
+      initial = initialization_moment("receipt-pruning-run", graph_id, graph_hash)
+      backend = {Docket.Postgres, %{repo: TestRepo}}
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
+      assert TestRepo.aggregate(Event, :count) == length(initial.events)
+
+      TestRepo.delete_all(Event)
+      assert TestRepo.aggregate(Event, :count) == 0
+
+      assert {:ok, ^initial} = Docket.Lifecycle.start(backend, :tenantless, initial)
+      assert TestRepo.aggregate(Event, :count) == 0
+
+      assert [[1]] =
+               TestRepo.query!("SELECT count(*) FROM docket_transition_receipts").rows
     end
 
     test "fused Postgres commit accepts already-persisted identical events" do
@@ -534,7 +553,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, %Moment{run: %{status: :cancelled} = cancelled}} =
                Task.await(cancellation, 1_000)
 
-      assert {:error, :conflict} =
+      assert {:error, :stale_checkpoint} =
                commit_moment_with_effects(
                  backend,
                  advance,

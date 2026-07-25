@@ -53,6 +53,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             required(:step) => non_neg_integer(),
             required(:state) => binary(),
             required(:checkpoint_seq) => non_neg_integer(),
+            required(:event_seq) => non_neg_integer(),
             required(:started_at) => DateTime.t() | nil,
             required(:updated_at) => DateTime.t() | nil,
             required(:finished_at) => DateTime.t() | nil
@@ -84,7 +85,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           end)
 
         state = Map.take(run, @state_fields)
-        {:ok, Map.put(attrs, :state, DurableCodec.encode!(:run, state))}
+
+        {:ok,
+         attrs
+         |> Map.put(:event_seq, run.event_seq)
+         |> Map.put(:state, DurableCodec.encode!(:run, state))}
       end
     rescue
       error in Docket.Error -> {:error, error}

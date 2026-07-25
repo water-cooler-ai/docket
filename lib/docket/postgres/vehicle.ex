@@ -380,7 +380,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                 )
 
         {:error, reason} ->
-          if reason == :stale_fence,
+          if reason in [:stale_fence, :stale_checkpoint],
             do: emit_fence_loss(:commit, reason),
             else: emit_discard(:commit, reason)
 

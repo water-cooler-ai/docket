@@ -38,6 +38,7 @@ defmodule Docket.BackendTests do
       end
 
       use Docket.BackendTests.Cases
+      use Docket.BackendTests.TransitionCases
     end
   end
 

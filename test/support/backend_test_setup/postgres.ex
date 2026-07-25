@@ -25,6 +25,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     def setup(%{backend_test_suite: TestRepo}) do
+      TestRepo.query!("DELETE FROM docket_transition_receipts")
       TestRepo.delete_all(Event)
       TestRepo.delete_all(Run)
       TestRepo.delete_all(GraphVersion)
