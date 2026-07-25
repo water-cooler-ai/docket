@@ -8,6 +8,17 @@
   (see [docs/postgres-operations.md](docs/postgres-operations.md)); it has
   merged back into `main` and receives no new work.
 
+## Releasing
+
+Releases publish automatically (`.github/workflows/publish.yml`). On every
+push to `main` the workflow compares `@version` in `mix.exs` against hex.pm;
+when the version is not yet published it runs the default test suite,
+publishes the package and its documentation via `mix hex.publish`, and
+creates the `v<version>` tag and GitHub release using that version's
+CHANGELOG section as the notes. Merges that do not bump the version are
+no-ops. The workflow requires the `HEX_API_KEY` repository secret — a
+hex.pm key with the `api:write` permission.
+
 ## Optional Postgres dependencies
 
 Docket is one package. The core runtime depends only on `telemetry`; the
