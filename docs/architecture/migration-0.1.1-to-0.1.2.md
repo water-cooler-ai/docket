@@ -60,12 +60,12 @@ round trip.
 The following lifecycle composition APIs remain available in 0.1.2 only for
 the compatibility adapter and focused backend-internal use:
 
-- `Docket.Backend.transaction/2`;
-- `Docket.Backend.RunStore.insert_run/5`;
-- `Docket.Backend.RunStore.commit/3`;
-- `Docket.Backend.RunStore.mutate_run/4`;
-- `Docket.Backend.EventStore.append_events/4`;
-- `Docket.Backend.commit_transition/4`.
+- `c:Docket.Backend.transaction/2`;
+- `c:Docket.Backend.RunStore.insert_run/5`;
+- `c:Docket.Backend.RunStore.commit/3`;
+- `c:Docket.Backend.RunStore.mutate_run/4`;
+- `c:Docket.Backend.EventStore.append_events/4`;
+- `c:Docket.Backend.commit_transition/4`.
 
 Version-2 backends retain these callbacks throughout the 0.1.x compatibility
 window because the behavior and legacy adapter still require them. They are
