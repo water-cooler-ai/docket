@@ -13,8 +13,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     successful hot path performs exactly one database exchange.
     """
 
-    alias Docket.Backend.TransitionStore
-    alias Docket.Postgres.{EventStore, RunStore, Storage, TransitionReceipt}
+    alias Docket.Postgres.{EventStore, RunStore, Storage}
 
     @wake_channel "docket_wake"
 
@@ -26,30 +25,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             [Docket.Event.t()]
           ) :: {:ok, Docket.Run.t()} | {:error, term()}
     def commit(ctx, scope, %{run: %Docket.Run{} = run} = proposal, events) do
-      transition_id = TransitionStore.transition_id(:claimed, run)
-
-      transition_proposal =
-        proposal
-        |> Map.put(:transition_id, transition_id)
-        |> Map.put_new(:expected_event_seq, previous_event_seq(run, events))
-
-      Docket.Postgres.TransitionStore.commit_claimed(ctx, scope, transition_proposal, events)
-    end
-
-    def commit(_ctx, scope, _proposal, _events) do
-      _ = scope_values(scope)
-      {:error, :invalid_commit}
-    end
-
-    @doc false
-    @spec commit(
-            Docket.Backend.ctx(),
-            Docket.Backend.scope(),
-            Docket.Backend.RunStore.commit_proposal(),
-            [Docket.Event.t()],
-            map()
-          ) :: {:ok, Docket.Run.t()} | {:error, term()}
-    def commit(ctx, scope, %{run: %Docket.Run{} = run} = proposal, events, receipt) do
       started = System.monotonic_time()
       {repo, prefix} = Storage.context!(ctx)
 
@@ -58,76 +33,42 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              {:ok, event_attrs} <- EventStore.prepare_events(run.id, events),
              {:ok, scope_system?, scope_key} <- scope_values(scope) do
           params =
-            statement_params(
-              attrs,
-              proposal,
-              event_attrs,
-              scope_system?,
-              scope_key,
-              prefix,
-              receipt
-            )
+            statement_params(attrs, proposal, event_attrs, scope_system?, scope_key, prefix)
 
-          execute(repo, prefix, ctx, scope, proposal, event_attrs, receipt, params)
+          execute(repo, prefix, ctx, scope, proposal, event_attrs, params)
         end
 
       emit_store_telemetry(result, events, started)
       result
     end
 
-    def commit(_ctx, scope, _proposal, _events, _receipt) do
+    def commit(_ctx, scope, _proposal, _events) do
       _ = scope_values(scope)
       {:error, :invalid_commit}
     end
 
-    defp execute(repo, prefix, ctx, scope, proposal, event_attrs, receipt, params) do
+    defp execute(repo, prefix, ctx, scope, proposal, event_attrs, params) do
       case Ecto.Adapters.SQL.query!(repo, statement(prefix), params, log: false).rows do
-        [[1, inserted, admitted_at, _guards, 1, true]] when inserted == length(event_attrs) ->
+        [[1, inserted, admitted_at, _guards]] when inserted == length(event_attrs) ->
           maybe_emit_admission_release(admitted_at, proposal.schedule)
           {:ok, proposal.run}
 
-        [[0, 0, nil, _guards, 1, false]] ->
-          {:ok, proposal.run}
-
-        [[0, 0, nil, 0, 0, false]] ->
-          TransitionReceipt.classify(
-            ctx,
-            scope,
-            receipt.operation,
-            receipt.transition_id,
-            receipt.digest
-          )
-          |> case do
-            :replay -> {:ok, proposal.run}
-            {:error, reason} -> {:error, reason}
-          end
+        [[0, 0, nil, _guards]] ->
+          RunStore.classify_commit_miss(ctx, scope, proposal)
 
         rows ->
           raise "fused Docket moment commit returned unexpected rows: #{inspect(rows)}"
       end
     rescue
       error in Postgrex.Error ->
-        case {unique_constraint(error), unique_violation?(error)} do
-          {"docket_transition_receipts_pkey", true} ->
-            RunStore.classify_commit_miss(ctx, scope, proposal)
-
-          {_event_constraint, true} ->
-            {:error, :event_conflict}
-
-          _other ->
-            reraise error, __STACKTRACE__
+        if unique_violation?(error) do
+          {:error, :event_conflict}
+        else
+          reraise error, __STACKTRACE__
         end
     end
 
-    defp statement_params(
-           attrs,
-           proposal,
-           events,
-           scope_system?,
-           scope_key,
-           prefix,
-           receipt
-         ) do
+    defp statement_params(attrs, proposal, events, scope_system?, scope_key, prefix) do
       {schedule_code, schedule_at} = schedule_values(proposal.schedule)
 
       [
@@ -158,62 +99,24 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         Enum.map(events, & &1.task_id),
         Enum.map(events, & &1.payload),
         Enum.map(events, & &1.metadata),
-        Enum.map(events, & &1.occurred_at),
-        receipt.transition_id,
-        receipt.scope_key,
-        Atom.to_string(receipt.operation),
-        receipt.digest,
-        receipt.result,
-        dump_uuid!(receipt.attempt_id),
-        proposal.expected_event_seq,
-        attrs.event_seq
+        Enum.map(events, & &1.occurred_at)
       ]
     end
 
     defp statement(prefix) do
       runs = Storage.qualified_table(prefix, "docket_runs")
       events = Storage.qualified_table(prefix, "docket_events")
-      receipts = Storage.qualified_table(prefix, "docket_transition_receipts")
 
       """
-      WITH receipt_upsert AS MATERIALIZED (
-        INSERT INTO #{receipts} AS stored (
-          transition_id,
-          scope_key,
-          operation,
-          digest,
-          result,
-          attempt_id,
-          inserted_at
-        )
-        VALUES (
-          $29::text,
-          $30::text,
-          $31::text,
-          $32::bytea,
-          $33::bytea,
-          $34::uuid,
-          clock_timestamp()
-        )
-        ON CONFLICT (transition_id) DO UPDATE
-        SET transition_id = stored.transition_id
-        WHERE stored.scope_key = EXCLUDED.scope_key
-          AND stored.operation = EXCLUDED.operation
-          AND stored.digest = EXCLUDED.digest
-        RETURNING attempt_id = $34::uuid AS fresh
-      ),
-      target AS MATERIALIZED (
+      WITH target AS MATERIALIZED (
         SELECT run.id, run.tenant_admitted_at
         FROM #{runs} AS run
-        CROSS JOIN receipt_upsert AS receipt
         WHERE run.run_id = $1::text
-          AND receipt.fresh
           AND ($2::boolean OR run.scope_key = $3::text)
           AND run.graph_id = $4::text
           AND run.graph_hash = $5::text
           AND run.started_at = $6::timestamptz
           AND run.checkpoint_seq = $7::bigint
-          AND run.event_seq = $35::bigint
           AND run.claim_token = $8::uuid
       ),
       updated_run AS (
@@ -225,7 +128,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           step = $10::integer,
           state = $11::bytea,
           checkpoint_seq = $12::bigint,
-          event_seq = $36::bigint,
           latest_checkpoint_type = $13::text,
           claim_attempts = 0,
           claim_abandons = 0,
@@ -363,29 +265,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               (SELECT count(*) FROM proposed_events)
         RETURNING seq
       ),
-      receipt_failure_guard AS (
-        INSERT INTO #{receipts} (
-          transition_id,
-          scope_key,
-          operation,
-          digest,
-          result,
-          attempt_id,
-          inserted_at
-        )
-        SELECT
-          $29::text,
-          $30::text,
-          $31::text,
-          $32::bytea,
-          $33::bytea,
-          $34::uuid,
-          clock_timestamp()
-        FROM receipt_upsert
-        WHERE fresh
-          AND (SELECT count(*) FROM updated_run) = 0
-        RETURNING transition_id
-      ),
       notification AS (
         SELECT pg_notify($18::text, $19::text)
         FROM updated_run
@@ -400,24 +279,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         (SELECT count(*)::bigint FROM inserted_events),
         (SELECT tenant_admitted_at FROM updated_run LIMIT 1),
         (SELECT count(*)::bigint FROM notification) +
-          (SELECT count(*)::bigint FROM event_conflict_guard) +
-          (SELECT count(*)::bigint FROM receipt_failure_guard),
-        (SELECT count(*)::bigint FROM receipt_upsert),
-        COALESCE((SELECT bool_or(fresh) FROM receipt_upsert), false)
+          (SELECT count(*)::bigint FROM event_conflict_guard)
       """
     end
 
     defp unique_violation?(%Postgrex.Error{postgres: %{code: :unique_violation}}), do: true
     defp unique_violation?(_error), do: false
-
-    defp unique_constraint(%Postgrex.Error{postgres: %{constraint: constraint}}),
-      do: constraint
-
-    defp unique_constraint(_error), do: nil
-
-    defp previous_event_seq(run, events) do
-      run.event_seq - (events |> Enum.map(& &1.seq) |> Enum.uniq() |> length())
-    end
 
     defp dump_uuid!(token) do
       case Ecto.UUID.dump(token) do

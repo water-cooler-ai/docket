@@ -44,9 +44,6 @@ defmodule Docket.Backend do
           required(:contract_version) => 1 | 2,
           optional(:transitions) => %{
             required(:version) => pos_integer(),
-            required(:limits) => Docket.Backend.TransitionStore.limits(),
-            required(:replay) => atom(),
-            required(:durability) => atom(),
             optional(atom()) => term()
           }
         }
@@ -90,12 +87,9 @@ defmodule Docket.Backend do
   Declares the backend contract and semantic transition capability.
 
   Version 2 requires `transitions/0`, transition version 1, and a module that
-  implements every `Docket.Backend.TransitionStore` callback. The transitions
-  declaration also names the backend's replay mechanism (for example
-  `:durable_receipts`) and its acknowledged durability boundary (for example
-  `:postgres_commit` or `:process_lifetime`); a declaration without both is
-  rejected. Backends written against 0.1.0 or 0.1.1 may omit this callback and
-  are treated as contract version 1 during the 0.1.x compatibility window.
+  implements every `Docket.Backend.TransitionStore` callback. Backends written
+  against 0.1.0 or 0.1.1 may omit this callback and are treated as contract
+  version 1 during the 0.1.x compatibility window.
   """
   @callback capabilities() :: capabilities()
 
@@ -190,11 +184,9 @@ defmodule Docket.Backend do
 
         %{
           contract_version: 2,
-          transitions: %{version: version, limits: limits} = transitions
+          transitions: %{version: version}
         } = capabilities
         when is_integer(version) and version > 0 ->
-          validate_limits!(backend, limits)
-          validate_transition_metadata!(backend, transitions)
           capabilities
 
         capabilities ->
@@ -205,22 +197,6 @@ defmodule Docket.Backend do
     else
       :legacy
     end
-  end
-
-  defp validate_transition_metadata!(backend, transitions) do
-    missing =
-      Enum.reject([:replay, :durability], fn key ->
-        is_atom(Map.get(transitions, key)) and not is_nil(Map.get(transitions, key))
-      end)
-
-    if missing != [] do
-      raise ArgumentError,
-            "backend #{inspect(backend)} transition capability must declare " <>
-              Enum.map_join(missing, " and ", &"#{&1}") <>
-              " as a non-nil atom, got: #{inspect(transitions)}"
-    end
-
-    :ok
   end
 
   defp validate_transition_store!(backend, store) when is_atom(store) do
@@ -247,31 +223,5 @@ defmodule Docket.Backend do
     raise ArgumentError,
           "backend #{inspect(backend)} transitions/0 must return a module, got: " <>
             inspect(store)
-  end
-
-  defp validate_limits!(backend, limits) when is_map(limits) do
-    floor = Docket.Backend.TransitionStore.portable_limits()
-
-    below_floor =
-      Enum.flat_map(floor, fn {name, minimum} ->
-        case Map.get(limits, name) do
-          value when is_integer(value) and value >= minimum -> []
-          value -> ["#{name}=#{inspect(value)} (minimum #{minimum})"]
-        end
-      end)
-
-    if below_floor != [] do
-      raise ArgumentError,
-            "backend #{inspect(backend)} transition limits do not satisfy the portable floor: " <>
-              Enum.join(below_floor, ", ")
-    end
-
-    :ok
-  end
-
-  defp validate_limits!(backend, limits) do
-    raise ArgumentError,
-          "backend #{inspect(backend)} transition limits must be a map, got: " <>
-            inspect(limits)
   end
 end

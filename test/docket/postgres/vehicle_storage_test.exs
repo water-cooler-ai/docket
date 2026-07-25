@@ -83,7 +83,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     setup do
-      TestRepo.query!("DELETE FROM docket_transition_receipts")
       TestRepo.delete_all(Event)
       TestRepo.delete_all(Run)
       TestRepo.delete_all(GraphVersion)

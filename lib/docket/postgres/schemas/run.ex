@@ -46,7 +46,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             step: non_neg_integer(),
             state: binary() | nil,
             checkpoint_seq: non_neg_integer(),
-            event_seq: non_neg_integer(),
             latest_checkpoint_type: Docket.Checkpoint.type() | nil,
             claim_token: Ecto.UUID.t() | nil,
             claimed_at: DateTime.t() | nil,
@@ -72,7 +71,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       field(:step, :integer, default: 0)
       field(:state, :binary, redact: true)
       field(:checkpoint_seq, :integer, default: 0)
-      field(:event_seq, :integer, default: 0)
       field(:latest_checkpoint_type, Ecto.Enum, values: Docket.Checkpoint.types())
       field(:claim_token, Ecto.UUID, redact: true)
       field(:claimed_at, :utc_datetime_usec)
@@ -97,7 +95,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :step,
       :state,
       :checkpoint_seq,
-      :event_seq,
       :latest_checkpoint_type,
       :claim_token,
       :claimed_at,
@@ -126,7 +123,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       |> validate_length(:tenant_id, min: 1)
       |> validate_number(:step, greater_than_or_equal_to: 0)
       |> validate_number(:checkpoint_seq, greater_than_or_equal_to: 0)
-      |> validate_number(:event_seq, greater_than_or_equal_to: 0)
       |> validate_number(:claim_attempts, greater_than_or_equal_to: 0)
       |> validate_number(:claim_abandons, greater_than_or_equal_to: 0)
       |> unique_constraint(:run_id)

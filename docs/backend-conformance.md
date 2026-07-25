@@ -79,10 +79,10 @@ resolves focused stores exclusively through the returned backend.
 Each failure includes a stable invariant ID. The shared cases currently cover:
 
 - explicit transition contract negotiation and transition-store completeness;
-- initialization, claimed, and unclaimed transition success, exact durable
-  replay, conflicting ID reuse, tenant concealment, immutable/fence ordering,
-  canonical event replay, concurrent same-fence winners, malformed sequences,
-  portable batch limits, and zero-write rejection;
+- initialization, claimed, and unclaimed transition success, duplicate-run
+  conflicts, tenant concealment, immutable/fence ordering, canonical event
+  idempotency, concurrent same-fence winners, schedule variants, malformed
+  proposals, and zero-write rejection;
 - mandatory backend and focused-store callbacks;
 - commit, rollback, nested participation, rollback-only propagation,
   concurrent publication outcomes, and completed-read visibility;

@@ -3,11 +3,10 @@ defmodule Docket.BackendTests.TransitionCases do
 
   defmacro __using__(_opts) do
     quote location: :keep do
-      alias Docket.Backend.TransitionStore
       alias Docket.BackendTests.Fixture
 
-      @tag docket_invariant: "TRANSITION-INITIALIZE-REPLAY-TENANCY"
-      test "[TRANSITION-INITIALIZE-REPLAY-TENANCY] initialization is atomic, replayable, and concealed",
+      @tag docket_invariant: "TRANSITION-INITIALIZE-TENANCY"
+      test "[TRANSITION-INITIALIZE-TENANCY] initialization is atomic, collision-safe, and concealed",
            %{backend_test: instance} do
         transitions = instance.backend.transitions()
         {graph, graph_hash} = Fixture.publish_graph(instance, :tenantless, "transition-init")
@@ -21,7 +20,6 @@ defmodule Docket.BackendTests.TransitionCases do
         event = Fixture.event(run, 1, instance.now, type: :run_initialized)
 
         proposal = %{
-          transition_id: Fixture.id(instance, "transition-init-id"),
           run: run,
           checkpoint_type: :run_initialized,
           wake_at: instance.now
@@ -30,7 +28,7 @@ defmodule Docket.BackendTests.TransitionCases do
         assert {:ok, ^run} =
                  transitions.initialize(instance.context, :tenantless, proposal, [event])
 
-        assert {:ok, ^run} =
+        assert {:error, :conflict} =
                  transitions.initialize(instance.context, :tenantless, proposal, [event])
 
         conflicting = %{proposal | run: %{run | metadata: %{"different" => true}}}
@@ -44,7 +42,6 @@ defmodule Docket.BackendTests.TransitionCases do
           )
 
         missing_proposal = %{
-          transition_id: Fixture.id(instance, "transition-missing-id"),
           run: missing,
           checkpoint_type: :run_initialized,
           wake_at: instance.now
@@ -79,31 +76,37 @@ defmodule Docket.BackendTests.TransitionCases do
             checkpoint_seq: 1
           )
 
-        tenant_a = %{
-          transition_id: Fixture.id(instance, "transition-tenant-a"),
+        tenant_proposal = %{
           run: tenant_run,
           checkpoint_type: :run_initialized,
           wake_at: instance.now
         }
 
         assert {:ok, ^tenant_run} =
-                 transitions.initialize(instance.context, {:tenant, "tenant-a"}, tenant_a, [])
+                 transitions.initialize(
+                   instance.context,
+                   {:tenant, "tenant-a"},
+                   tenant_proposal,
+                   []
+                 )
 
-        tenant_b = %{tenant_a | transition_id: Fixture.id(instance, "transition-tenant-b")}
-
-        assert {:error, :not_found} =
-                 transitions.initialize(instance.context, {:tenant, "tenant-b"}, tenant_b, [])
+        assert {:error, :conflict} =
+                 transitions.initialize(
+                   instance.context,
+                   {:tenant, "tenant-b"},
+                   tenant_proposal,
+                   []
+                 )
       end
 
-      @tag docket_invariant: "TRANSITION-CLAIMED-FENCES-REPLAY"
-      test "[TRANSITION-CLAIMED-FENCES-REPLAY] claimed writes fence state and replay canonical events",
+      @tag docket_invariant: "TRANSITION-CLAIMED-FENCES"
+      test "[TRANSITION-CLAIMED-FENCES] claimed writes fence state and accept identical stored events",
            %{backend_test: instance} do
         transitions = instance.backend.transitions()
         {graph, graph_hash} = Fixture.publish_graph(instance, :tenantless, "transition-claimed")
         initial = Fixture.run(instance, "transition-claimed-run", graph, graph_hash)
 
         init = %{
-          transition_id: Fixture.id(instance, "transition-claimed-init"),
           run: initial,
           checkpoint_type: :run_initialized,
           wake_at: instance.now
@@ -123,10 +126,8 @@ defmodule Docket.BackendTests.TransitionCases do
         event = Fixture.event(advanced, 1, instance.now, payload: %{"canonical" => true})
 
         proposal = %{
-          transition_id: Fixture.id(instance, "transition-claimed-id"),
           run: advanced,
           expected_checkpoint_seq: 1,
-          expected_event_seq: 0,
           claim_token: lease.claim_token,
           checkpoint_type: :step_committed,
           schedule: :retain_claim
@@ -143,16 +144,8 @@ defmodule Docket.BackendTests.TransitionCases do
         assert {:ok, ^advanced} =
                  transitions.commit_claimed(instance.context, :tenantless, proposal, [event])
 
-        assert {:ok, ^advanced} =
+        assert {:error, :stale_checkpoint} =
                  transitions.commit_claimed(instance.context, :tenantless, proposal, [event])
-
-        assert {:error, :conflict} =
-                 transitions.commit_claimed(
-                   instance.context,
-                   :tenantless,
-                   %{proposal | run: %{advanced | metadata: %{"winner" => 2}}},
-                   [event]
-                 )
 
         next = %{
           advanced
@@ -162,10 +155,8 @@ defmodule Docket.BackendTests.TransitionCases do
 
         stale = %{
           proposal
-          | transition_id: Fixture.id(instance, "transition-stale-token"),
-            run: next,
+          | run: next,
             expected_checkpoint_seq: 2,
-            expected_event_seq: 1,
             claim_token: "00000000-0000-0000-0000-000000000000"
         }
 
@@ -186,7 +177,6 @@ defmodule Docket.BackendTests.TransitionCases do
         initial = Fixture.run(instance, "transition-race-run", graph, graph_hash)
 
         init = %{
-          transition_id: Fixture.id(instance, "transition-race-init"),
           run: initial,
           checkpoint_type: :run_initialized,
           wake_at: instance.now
@@ -207,10 +197,8 @@ defmodule Docket.BackendTests.TransitionCases do
               }
 
               proposal = %{
-                transition_id: Fixture.id(instance, "transition-race-#{winner}"),
                 run: advanced,
                 expected_checkpoint_seq: 1,
-                expected_event_seq: 0,
                 claim_token: lease.claim_token,
                 checkpoint_type: :step_committed,
                 schedule: :retain_claim
@@ -228,14 +216,13 @@ defmodule Docket.BackendTests.TransitionCases do
       end
 
       @tag docket_invariant: "TRANSITION-UNCLAIMED-CAS"
-      test "[TRANSITION-UNCLAIMED-CAS] optimistic writes distinguish replay, ID conflict, and stale state",
+      test "[TRANSITION-UNCLAIMED-CAS] optimistic writes apply once and reject stale fences",
            %{backend_test: instance} do
         transitions = instance.backend.transitions()
         {graph, graph_hash} = Fixture.publish_graph(instance, :tenantless, "transition-unclaimed")
         initial = Fixture.run(instance, "transition-unclaimed-run", graph, graph_hash)
 
         init = %{
-          transition_id: Fixture.id(instance, "transition-unclaimed-init"),
           run: initial,
           checkpoint_type: :run_initialized,
           wake_at: instance.now
@@ -263,9 +250,7 @@ defmodule Docket.BackendTests.TransitionCases do
         }
 
         proposal = %{
-          transition_id: Fixture.id(instance, "transition-unclaimed-id"),
           run: advanced,
-          expected_event_seq: 0,
           checkpoint_type: :step_committed,
           schedule: {:release_claim, :immediate}
         }
@@ -279,7 +264,7 @@ defmodule Docket.BackendTests.TransitionCases do
                    []
                  )
 
-        assert {:ok, ^advanced} =
+        assert {:error, :stale_checkpoint} =
                  transitions.commit_unclaimed(
                    instance.context,
                    :tenantless,
@@ -288,25 +273,11 @@ defmodule Docket.BackendTests.TransitionCases do
                    []
                  )
 
-        assert {:error, :conflict} =
-                 transitions.commit_unclaimed(
-                   instance.context,
-                   :tenantless,
-                   1,
-                   %{proposal | run: %{advanced | metadata: %{"signal" => 2}}},
-                   []
-                 )
-
         stale_run = %{
           advanced
           | checkpoint_seq: 2,
-            updated_at: DateTime.add(instance.now, 2, :microsecond)
-        }
-
-        stale = %{
-          proposal
-          | transition_id: Fixture.id(instance, "transition-unclaimed-stale"),
-            run: stale_run
+            updated_at: DateTime.add(instance.now, 2, :microsecond),
+            metadata: %{"signal" => 2}
         }
 
         assert {:error, :stale_checkpoint} =
@@ -314,127 +285,8 @@ defmodule Docket.BackendTests.TransitionCases do
                    instance.context,
                    :tenantless,
                    1,
-                   stale,
+                   %{proposal | run: stale_run},
                    []
-                 )
-      end
-
-      @tag docket_invariant: "TRANSITION-EVENT-VALIDATION-LIMITS"
-      test "[TRANSITION-EVENT-VALIDATION-LIMITS] malformed sequences and oversized batches write nothing",
-           %{backend_test: instance} do
-        transitions = instance.backend.transitions()
-        {graph, graph_hash} = Fixture.publish_graph(instance, :tenantless, "transition-invalid")
-
-        run =
-          Fixture.run(instance, "transition-invalid-run", graph, graph_hash,
-            checkpoint_seq: 1,
-            event_seq: 2
-          )
-
-        proposal = %{
-          transition_id: Fixture.id(instance, "transition-invalid-id"),
-          run: run,
-          checkpoint_type: :run_initialized,
-          wake_at: instance.now
-        }
-
-        sparse = [
-          Fixture.event(run, 1, instance.now),
-          Fixture.event(run, 3, instance.now)
-        ]
-
-        assert {:error, :invalid_transition} =
-                 transitions.initialize(instance.context, :tenantless, proposal, sparse)
-
-        assert {:error, :not_found} =
-                 instance.backend.runs().fetch_run(instance.context, :tenantless, run.id)
-
-        oversized_run = %{
-          run
-          | id: Fixture.id(instance, "transition-oversized-run"),
-            event_seq: 1
-        }
-
-        oversized_event =
-          Fixture.event(oversized_run, 1, instance.now,
-            payload: %{"bytes" => :binary.copy(<<0>>, 64_001)}
-          )
-
-        oversized = %{
-          proposal
-          | transition_id: Fixture.id(instance, "transition-oversized-id"),
-            run: oversized_run
-        }
-
-        assert {:error, :too_large} =
-                 transitions.initialize(
-                   instance.context,
-                   :tenantless,
-                   oversized,
-                   [oversized_event]
-                 )
-
-        assert {:error, :not_found} =
-                 instance.backend.runs().fetch_run(
-                   instance.context,
-                   :tenantless,
-                   oversized_run.id
-                 )
-
-        malformed = %{proposal | transition_id: Fixture.id(instance, "transition-malformed")}
-
-        assert {:error, :invalid_transition} =
-                 transitions.initialize(instance.context, :tenantless, malformed, [:not_an_event])
-
-        exact_run =
-          Fixture.run(instance, "transition-exact-event-count", graph, graph_hash,
-            checkpoint_seq: 1,
-            event_seq: 100
-          )
-
-        exact_events = Enum.map(1..100, &Fixture.event(exact_run, &1, instance.now))
-
-        exact = %{
-          proposal
-          | transition_id: Fixture.id(instance, "transition-exact-event-count-id"),
-            run: exact_run
-        }
-
-        assert {:ok, ^exact_run} =
-                 transitions.initialize(
-                   instance.context,
-                   :tenantless,
-                   exact,
-                   exact_events
-                 )
-
-        too_many_run =
-          Fixture.run(instance, "transition-too-many-events", graph, graph_hash,
-            checkpoint_seq: 1,
-            event_seq: 101
-          )
-
-        too_many_events = Enum.map(1..101, &Fixture.event(too_many_run, &1, instance.now))
-
-        too_many = %{
-          proposal
-          | transition_id: Fixture.id(instance, "transition-too-many-events-id"),
-            run: too_many_run
-        }
-
-        assert {:error, :too_large} =
-                 transitions.initialize(
-                   instance.context,
-                   :tenantless,
-                   too_many,
-                   too_many_events
-                 )
-
-        assert {:error, :not_found} =
-                 instance.backend.runs().fetch_run(
-                   instance.context,
-                   :tenantless,
-                   too_many_run.id
                  )
       end
 
@@ -453,10 +305,8 @@ defmodule Docket.BackendTests.TransitionCases do
           )
 
         well_formed = %{
-          transition_id: Fixture.id(instance, "transition-claimed-ghost-id"),
           run: ghost,
           expected_checkpoint_seq: 1,
-          expected_event_seq: 0,
           claim_token: token,
           checkpoint_type: :step_committed,
           schedule: :retain_claim
@@ -481,7 +331,6 @@ defmodule Docket.BackendTests.TransitionCases do
           Fixture.run(instance, "transition-claimed-tenant-run", graph, graph_hash)
 
         init = %{
-          transition_id: Fixture.id(instance, "transition-claimed-tenant-init"),
           run: tenant_run,
           checkpoint_type: :run_initialized,
           wake_at: instance.now
@@ -497,10 +346,8 @@ defmodule Docket.BackendTests.TransitionCases do
         }
 
         cross_tenant = %{
-          transition_id: Fixture.id(instance, "transition-claimed-cross-tenant"),
           run: advanced,
           expected_checkpoint_seq: 1,
-          expected_event_seq: 0,
           claim_token: token,
           checkpoint_type: :step_committed,
           schedule: :retain_claim
@@ -518,11 +365,9 @@ defmodule Docket.BackendTests.TransitionCases do
               {"graph-id", &%{&1 | graph_id: "immutable-other-graph"}},
               {"started-at", &%{&1 | started_at: DateTime.add(instance.now, 7, :second)}}
             ] do
-          mismatch = %{
-            cross_tenant
-            | transition_id: Fixture.id(instance, "transition-immutable-#{suffix}"),
-              run: mutate.(advanced)
-          }
+          _ = suffix
+
+          mismatch = %{cross_tenant | run: mutate.(advanced)}
 
           assert {:error, :invalid_transition} =
                    transitions.commit_claimed(
@@ -553,7 +398,6 @@ defmodule Docket.BackendTests.TransitionCases do
           initial = Fixture.run(instance, "transition-schedule-#{suffix}", graph, graph_hash)
 
           init = %{
-            transition_id: Fixture.id(instance, "transition-schedule-#{suffix}-init"),
             run: initial,
             checkpoint_type: :run_initialized,
             wake_at: instance.now
@@ -573,10 +417,8 @@ defmodule Docket.BackendTests.TransitionCases do
             })
 
           proposal = %{
-            transition_id: Fixture.id(instance, "transition-schedule-#{suffix}-id"),
             run: advanced,
             expected_checkpoint_seq: 1,
-            expected_event_seq: 0,
             claim_token: lease.claim_token,
             checkpoint_type: :step_committed,
             schedule: schedule
@@ -615,8 +457,8 @@ defmodule Docket.BackendTests.TransitionCases do
         )
       end
 
-      @tag docket_invariant: "TRANSITION-EVENT-CANONICAL-REPLAY"
-      test "[TRANSITION-EVENT-CANONICAL-REPLAY] replay and duplicates compare canonical event content",
+      @tag docket_invariant: "TRANSITION-EVENT-CANONICAL"
+      test "[TRANSITION-EVENT-CANONICAL] events compare canonical content and reject conflicts atomically",
            %{backend_test: instance} do
         transitions = instance.backend.transitions()
 
@@ -627,7 +469,6 @@ defmodule Docket.BackendTests.TransitionCases do
           Fixture.run(instance, "transition-stored-conflict-run", graph, graph_hash)
 
         stored_init = %{
-          transition_id: Fixture.id(instance, "transition-stored-conflict-init"),
           run: stored_conflict,
           checkpoint_type: :run_initialized,
           wake_at: instance.now
@@ -655,10 +496,8 @@ defmodule Docket.BackendTests.TransitionCases do
         }
 
         conflicting = %{
-          transition_id: Fixture.id(instance, "transition-stored-conflict-id"),
           run: conflicted_advance,
           expected_checkpoint_seq: 1,
-          expected_event_seq: 0,
           claim_token: lease.claim_token,
           checkpoint_type: :step_committed,
           schedule: :retain_claim
@@ -681,41 +520,6 @@ defmodule Docket.BackendTests.TransitionCases do
                    stored_conflict.id
                  )
 
-        run =
-          Fixture.run(instance, "transition-canonical-run", graph, graph_hash,
-            checkpoint_seq: 1,
-            event_seq: 2
-          )
-
-        first = Fixture.event(run, 1, instance.now, type: :run_initialized)
-        second = Fixture.event(run, 2, instance.now)
-
-        proposal = %{
-          transition_id: Fixture.id(instance, "transition-canonical-id"),
-          run: run,
-          checkpoint_type: :run_initialized,
-          wake_at: instance.now
-        }
-
-        assert {:ok, ^run} =
-                 transitions.initialize(instance.context, :tenantless, proposal, [
-                   first,
-                   second
-                 ])
-
-        assert {:ok, ^run} =
-                 transitions.initialize(instance.context, :tenantless, proposal, [
-                   second,
-                   first
-                 ])
-
-        assert {:ok, ^run} =
-                 transitions.initialize(instance.context, :tenantless, proposal, [
-                   first,
-                   first,
-                   second
-                 ])
-
         collapsed =
           Fixture.run(instance, "transition-collapsed-run", graph, graph_hash,
             checkpoint_seq: 1,
@@ -729,9 +533,9 @@ defmodule Docket.BackendTests.TransitionCases do
                    instance.context,
                    :tenantless,
                    %{
-                     proposal
-                     | transition_id: Fixture.id(instance, "transition-collapsed-id"),
-                       run: collapsed
+                     run: collapsed,
+                     checkpoint_type: :run_initialized,
+                     wake_at: instance.now
                    },
                    [duplicate, duplicate]
                  )
@@ -754,9 +558,9 @@ defmodule Docket.BackendTests.TransitionCases do
                    instance.context,
                    :tenantless,
                    %{
-                     proposal
-                     | transition_id: Fixture.id(instance, "transition-contradictory-id"),
-                       run: contradictory
+                     run: contradictory,
+                     checkpoint_type: :run_initialized,
+                     wake_at: instance.now
                    },
                    [
                      Fixture.event(contradictory, 1, instance.now, payload: %{"pick" => 1}),
@@ -782,211 +586,30 @@ defmodule Docket.BackendTests.TransitionCases do
                    instance.context,
                    :tenantless,
                    %{
-                     proposal
-                     | transition_id: Fixture.id(instance, "transition-mismatched-id"),
-                       run: mismatched
+                     run: mismatched,
+                     checkpoint_type: :run_initialized,
+                     wake_at: instance.now
                    },
                    [Fixture.event("some-other-run", 1, instance.now)]
                  )
-      end
-
-      @tag docket_invariant: "TRANSITION-ID-PORTABILITY"
-      test "[TRANSITION-ID-PORTABILITY] transition IDs are bounded UTF-8 on every backend",
-           %{backend_test: instance} do
-        transitions = instance.backend.transitions()
-
-        {graph, graph_hash} =
-          Fixture.publish_graph(instance, :tenantless, "transition-id-portability")
-
-        run = Fixture.run(instance, "transition-id-run", graph, graph_hash)
-
-        proposal = %{
-          transition_id: <<0xFF, 0xFE, 0x00>>,
-          run: run,
-          checkpoint_type: :run_initialized,
-          wake_at: instance.now
-        }
 
         assert {:error, :invalid_transition} =
-                 transitions.initialize(instance.context, :tenantless, proposal, [])
-
-        max_bytes = TransitionStore.max_transition_id_bytes()
-
-        oversized = %{
-          proposal
-          | transition_id: String.pad_trailing(Fixture.id(instance, "id"), max_bytes + 1, "a")
-        }
-
-        assert {:error, :invalid_transition} =
-                 transitions.initialize(instance.context, :tenantless, oversized, [])
-
-        assert {:error, :not_found} =
-                 instance.backend.runs().fetch_run(instance.context, :tenantless, run.id)
-
-        exact = %{
-          proposal
-          | transition_id: String.pad_trailing(Fixture.id(instance, "id"), max_bytes, "a")
-        }
-
-        assert {:ok, ^run} =
-                 transitions.initialize(instance.context, :tenantless, exact, [])
-      end
-
-      @tag docket_invariant: "TRANSITION-EXACT-BYTE-LIMITS"
-      test "[TRANSITION-EXACT-BYTE-LIMITS] every portable byte bound passes exactly and rejects one over",
-           %{backend_test: instance} do
-        transitions = instance.backend.transitions()
-        limits = TransitionStore.portable_limits()
-
-        {graph, graph_hash} =
-          Fixture.publish_graph(instance, :tenantless, "transition-exact-bytes")
-
-        base_proposal = fn run ->
-          %{
-            transition_id: Fixture.id(instance, "#{run.id}-id"),
-            run: run,
-            checkpoint_type: :run_initialized,
-            wake_at: instance.now
-          }
-        end
-
-        sized_run = fn suffix, event_seq, target ->
-          Fixture.pad_to_encoded_size(target, fn pad ->
-            Fixture.run(instance, suffix, graph, graph_hash,
-              checkpoint_seq: 1,
-              event_seq: event_seq,
-              input: %{"pad" => pad}
-            )
-          end)
-        end
-
-        exact_run = sized_run.("transition-exact-run-bytes", 0, limits.max_run_bytes)
-
-        assert {:ok, ^exact_run} =
                  transitions.initialize(
                    instance.context,
                    :tenantless,
-                   base_proposal.(exact_run),
-                   []
-                 )
-
-        oversized_run =
-          sized_run.("transition-over-run-bytes", 0, limits.max_run_bytes + 1)
-
-        assert {:error, :too_large} =
-                 transitions.initialize(
-                   instance.context,
-                   :tenantless,
-                   base_proposal.(oversized_run),
-                   []
+                   %{
+                     run: mismatched,
+                     checkpoint_type: :run_initialized,
+                     wake_at: instance.now
+                   },
+                   [:not_an_event]
                  )
 
         assert {:error, :not_found} =
                  instance.backend.runs().fetch_run(
                    instance.context,
                    :tenantless,
-                   oversized_run.id
-                 )
-
-        event_run =
-          Fixture.run(instance, "transition-exact-event-bytes", graph, graph_hash,
-            checkpoint_seq: 1,
-            event_seq: 1
-          )
-
-        exact_event = Fixture.sized_event(event_run, 1, instance.now, limits.max_event_bytes)
-
-        assert {:ok, ^event_run} =
-                 transitions.initialize(
-                   instance.context,
-                   :tenantless,
-                   base_proposal.(event_run),
-                   [exact_event]
-                 )
-
-        over_event_run =
-          Fixture.run(instance, "transition-over-event-bytes", graph, graph_hash,
-            checkpoint_seq: 1,
-            event_seq: 1
-          )
-
-        over_event =
-          Fixture.sized_event(over_event_run, 1, instance.now, limits.max_event_bytes + 1)
-
-        assert {:error, :too_large} =
-                 transitions.initialize(
-                   instance.context,
-                   :tenantless,
-                   base_proposal.(over_event_run),
-                   [over_event]
-                 )
-
-        assert {:error, :not_found} =
-                 instance.backend.runs().fetch_run(
-                   instance.context,
-                   :tenantless,
-                   over_event_run.id
-                 )
-
-        event_count = 54
-        event_bytes = event_count * limits.max_event_bytes
-        proposal_budget = limits.max_transition_bytes - event_bytes
-
-        sized_total_proposal = fn suffix, target ->
-          Fixture.pad_to_encoded_size(target, fn pad ->
-            run =
-              Fixture.run(instance, suffix, graph, graph_hash,
-                checkpoint_seq: 1,
-                event_seq: event_count,
-                input: %{"pad" => pad}
-              )
-
-            %{
-              transition_id: Fixture.id(instance, "#{suffix}-id"),
-              run: run,
-              checkpoint_type: :run_initialized,
-              wake_at: instance.now
-            }
-          end)
-        end
-
-        exact_total = sized_total_proposal.("transition-exact-total", proposal_budget)
-
-        exact_total_events =
-          Enum.map(
-            1..event_count,
-            &Fixture.sized_event(exact_total.run, &1, instance.now, limits.max_event_bytes)
-          )
-
-        assert {:ok, _run} =
-                 transitions.initialize(
-                   instance.context,
-                   :tenantless,
-                   exact_total,
-                   exact_total_events
-                 )
-
-        over_total = sized_total_proposal.("transition-over-total", proposal_budget + 1)
-
-        over_total_events =
-          Enum.map(
-            1..event_count,
-            &Fixture.sized_event(over_total.run, &1, instance.now, limits.max_event_bytes)
-          )
-
-        assert {:error, :too_large} =
-                 transitions.initialize(
-                   instance.context,
-                   :tenantless,
-                   over_total,
-                   over_total_events
-                 )
-
-        assert {:error, :not_found} =
-                 instance.backend.runs().fetch_run(
-                   instance.context,
-                   :tenantless,
-                   over_total.run.id
+                   mismatched.id
                  )
       end
     end

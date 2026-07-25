@@ -19,14 +19,7 @@ defmodule Docket.Backend.LegacyTransitionStore do
           proposal,
         events
       ) do
-    with :ok <-
-           Docket.Backend.TransitionStore.validate(
-             :initialize,
-             0,
-             proposal,
-             events,
-             Docket.Backend.TransitionStore.portable_limits()
-           ) do
+    with :ok <- Docket.Backend.TransitionStore.validate(:initialize, 0, proposal, events) do
       runs = backend.runs()
       event_store = backend.events()
 
@@ -59,17 +52,15 @@ defmodule Docket.Backend.LegacyTransitionStore do
              :claimed,
              Map.get(proposal, :expected_checkpoint_seq, -1),
              proposal,
-             events,
-             Docket.Backend.TransitionStore.portable_limits()
+             events
            ) do
       runs = backend.runs()
       event_store = backend.events()
-      legacy_proposal = Map.delete(proposal, :transition_id)
 
       apply(backend, :transaction, [
         context,
         fn tx ->
-          with {:ok, stored} <- apply(runs, :commit, [tx, scope, legacy_proposal]),
+          with {:ok, stored} <- apply(runs, :commit, [tx, scope, proposal]),
                :ok <- apply(event_store, :append_events, [tx, scope, run.id, events]) do
             {:ok, stored}
           end
@@ -96,8 +87,7 @@ defmodule Docket.Backend.LegacyTransitionStore do
              :unclaimed,
              expected_checkpoint_seq,
              proposal,
-             events,
-             Docket.Backend.TransitionStore.portable_limits()
+             events
            ) do
       runs = backend.runs()
       event_store = backend.events()
@@ -111,9 +101,6 @@ defmodule Docket.Backend.LegacyTransitionStore do
                 {:error, :invalid_transition}
 
               current.checkpoint_seq != expected_checkpoint_seq ->
-                {:error, :stale_checkpoint}
-
-              current.event_seq != proposal.expected_event_seq ->
                 {:error, :stale_checkpoint}
 
               true ->

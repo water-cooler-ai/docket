@@ -95,13 +95,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     def capabilities do
       %{
         contract_version: 2,
-        transitions: %{
-          version: Docket.Backend.TransitionStore.version(),
-          limits: Docket.Backend.TransitionStore.portable_limits(),
-          replay: :durable_receipts,
-          durability: :postgres_commit,
-          topology: :single_database_transaction
-        }
+        transitions: %{version: Docket.Backend.TransitionStore.version()}
       }
     end
 

@@ -1,32 +1,10 @@
 # Migrating backends from Docket 0.1.1 to 0.1.2
 
 Docket 0.1.2 replaces lifecycle use of callback transactions with the
-versioned `Docket.Backend.TransitionStore` contract. Applications using
-`Docket.Postgres` need no configuration change beyond the schema upgrade
-below. Third-party backend authors can upgrade during the 0.1.x compatibility
-window described below.
-
-## PostgreSQL schema upgrade
-
-Docket 0.1.2 requires schema version 3, which adds the durable event-sequence
-fence and the transition-receipt table. Hosts installed on 0.1.0 or 0.1.1 are
-at schema version 2 and write an ordinary migration pinning both directions:
-
-```elixir
-defmodule MyApp.Repo.Migrations.UpgradeDocketToV3 do
-  use Ecto.Migration
-
-  def up, do: Docket.Postgres.Migration.up(version: 3)
-  def down, do: Docket.Postgres.Migration.down(version: 3)
-end
-```
-
-`down(version: 3)` reverts only version 3, so a rollback returns the host to
-its pre-upgrade version-2 schema without touching claim partitions,
-schedules, or admission state. A host still on schema version 1 pins
-`down(version: 2)` instead, returning its rollback to version 1. Only fresh
-installs use `mix docket.gen.migration`, whose generated `down/0` removes the
-Docket schema entirely.
+versioned `Docket.Backend.TransitionStore` contract. There is no database
+schema change: 0.1.2 runs on the same schema version 2 as 0.1.0 and 0.1.1.
+Applications using `Docket.Postgres` need no changes. Third-party backend
+authors can upgrade during the 0.1.x compatibility window described below.
 
 ## What changed
 
@@ -43,10 +21,10 @@ private implementation details.
 
 Signals now perform scoped fetch, pure mutation evaluation, and an optimistic
 unclaimed commit. `:stale_checkpoint` causes a bounded refetch and
-re-evaluation; permanent transition-ID `:conflict` does not.
-Mutation functions may therefore run more than once and must be deterministic,
-bounded, and free of external side effects. A no-change or error decision does
-not invoke storage and publishes nothing.
+re-evaluation; other errors do not. Mutation functions may therefore run more
+than once and must be deterministic, bounded, and free of external side
+effects. A no-change or error decision does not invoke storage and publishes
+nothing.
 
 ## Declaring transition support
 
@@ -58,12 +36,7 @@ from `transitions/0`, and declares contract version 2:
 def capabilities do
   %{
     contract_version: 2,
-    transitions: %{
-      version: Docket.Backend.TransitionStore.version(),
-      limits: Docket.Backend.TransitionStore.portable_limits(),
-      replay: :durable_receipts,
-      durability: :documented_backend_policy
-    }
+    transitions: %{version: Docket.Backend.TransitionStore.version()}
   }
 end
 
@@ -79,8 +52,8 @@ Backends that omit `capabilities/0` are treated as legacy contract version 1.
 Core routes their lifecycle operations through
 `Docket.Backend.LegacyTransitionStore`, which composes the existing
 `transaction/2`, run-store, and event-store writes. That adapter preserves
-source compatibility but cannot strengthen a legacy backend's replay,
-durability, size-limit, or topology guarantees.
+source compatibility; it cannot fuse a legacy backend's writes into one
+round trip.
 
 ## Deprecated 0.1.x APIs
 
@@ -101,33 +74,17 @@ Focused graph/run/event reads and claim operations remain.
 
 ## Required semantics
 
-Validate the complete proposal and configured limits before writing. Wrong
-tenant and unknown resources both return `:not_found`. Immutable identity is
-validated before claim/checkpoint fences. Event equality compares complete
-canonical event content.
-
-Every logical transition has a stable `transition_id`: a non-empty UTF-8
-binary of at most `Docket.Backend.TransitionStore.max_transition_id_bytes/0`
-bytes. Replay with identical canonical content after an ambiguous outcome
-returns success; reuse with different proposal/event content returns
-`:conflict`. Canonical comparison collapses duplicate identical events and is
-insensitive to event list order. If events may be pruned, use a durable
-receipt independent of retained events.
+Validate the complete proposal before writing. Wrong tenant and unknown
+resources both return `:not_found`. Immutable identity is validated before
+claim/checkpoint fences. Events are idempotent by canonical content at
+`{run_id, seq}`: a pre-existing identical event is accepted and different
+content at a stored sequence returns `:event_conflict`. A failed operation
+publishes no run, schedule, support, or event changes.
 
 The portable permanent errors are `:not_found`, `:invalid_transition`,
-`:conflict`, `:event_conflict`, and `:too_large`. A lost checkpoint or event
-fence is `:stale_checkpoint`. Retryable infrastructure failures use
+`:conflict`, and `:event_conflict`. A lost claim or checkpoint fence is
+`:stale_checkpoint`. Retryable infrastructure failures use
 `{:retryable, reason}` and non-retryable infrastructure failures use
-`{:permanent, reason}`. Core does not automatically retry an
-ambiguous infrastructure result; retry the exact transition only when the
-backend can distinguish replay from a stale fence.
-
-Each backend must also document acknowledged durability and topology
-constraints. Redis Cluster implementations must co-slot every key touched by a
-transition or reject clustered mode. SQLite implementations must document busy,
-journal, synchronous, and reopen behavior. DynamoDB implementations must
-normalize transaction cancellation and throttling while respecting item and
-transaction limits.
-
-See [Transition backend feasibility](../transition-backend-feasibility.md) for
-the required substrate-specific declarations and recovery gates.
+`{:permanent, reason}`. Core never automatically retries an ambiguous
+infrastructure result; recovery flows through the claim machinery exactly as
+it did through the composed 0.1.x write path.

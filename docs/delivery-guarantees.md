@@ -37,8 +37,8 @@ stored checkpoint_seq = expected checkpoint_seq
 ```
 
 The proposed run must advance `checkpoint_seq` by exactly one. The run update,
-schedule change, retained event append, and replay receipt either all commit
-or all roll back. A stale vehicle may have executed node code, but it cannot
+schedule change, and retained event append either all commit or all roll
+back. A stale vehicle may have executed node code, but it cannot
 commit after another claimant changes the token or advances the sequence.
 
 The guarantee ends at the transition's acknowledged commit. Work performed

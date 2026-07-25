@@ -21,9 +21,6 @@ individual function boundary.
   instructions for old host-owned persistence adopters.
 - [0.1.1 to 0.1.2 transition migration](migration-0.1.1-to-0.1.2.md) —
   semantic lifecycle writes and the 0.1.x compatibility window.
-- [Transition backend feasibility](../transition-backend-feasibility.md) —
-  receipt, durability, and topology requirements for SQLite, Redis, and
-  DynamoDB implementations.
 
 Graph and compiler internals are documented in
 [graph construction](docket-graph-construction-design.md),

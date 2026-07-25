@@ -387,10 +387,10 @@ The upgrade is an ordinary hand-written transactional migration pinning both
 directions to the versions it adds:
 
 ```elixir
-defmodule MyApp.Repo.Migrations.UpgradeDocketToV3 do
+defmodule MyApp.Repo.Migrations.UpgradeDocketToV2 do
   use Ecto.Migration
 
-  def up, do: Docket.Postgres.Migration.up(version: 3)
+  def up, do: Docket.Postgres.Migration.up(version: 2)
   def down, do: Docket.Postgres.Migration.down(version: 2)
 end
 ```
@@ -398,19 +398,15 @@ end
 Stop dispatchers and all Docket run writers before the upgrade, deploy one
 homogeneous binary version, migrate, and restart. The migration locks the runs
 table against inserts while it backfills owner partitions and schedule rows.
-Schema version 3 adds the durable transition receipt table and the run-row
-event-sequence fence. The current binary requires schema version 3 and checks
-it before starting backend children. Rolling back this schema-V1 upgrade
-removes the version 3 receipt/event fence and version 2 admission schema,
-returning to schema version 1; a schema-V2 installation pins
-`down(version: 3)` instead so rollback preserves its version 2 state. Online
-migrations, readiness ledgers, fleet attestations, and audited activation are
-intentionally outside the v0.1.0 contract.
+The current binary requires schema version 2 and checks it before starting
+backend children. Rolling back this schema-V1 upgrade removes the version 2
+admission schema, returning to schema version 1. Online migrations, readiness
+ledgers, fleet attestations, and audited activation are intentionally outside
+the v0.1.0 contract.
 
-Fresh installations use `mix docket.gen.migration`, which installs V01
-through V03 in one host migration whose rollback removes the Docket schema.
-Use the same explicit prefix in both migration directions and runtime
-configuration.
+Fresh installations use `mix docket.gen.migration`, which installs V01 and
+V02 in one host migration whose rollback removes the Docket schema. Use the
+same explicit prefix in both migration directions and runtime configuration.
 
 Claim-policy correctness is covered by the checked-in windowed engine suite
 and the shared run-store contract matrix. Timing and large benchmarks are

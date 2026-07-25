@@ -36,7 +36,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                "defmodule Docket.Postgres.TestRepo.Migrations.AddDocketTables do"
 
       assert content =~ "use Ecto.Migration"
-      assert content =~ "Docket.Postgres.Migration.up(version: 3, prefix: \"public\")"
+      assert content =~ "Docket.Postgres.Migration.up(version: 2, prefix: \"public\")"
       assert content =~ "Docket.Postgres.Migration.down(version: 1, prefix: \"public\")"
 
       # The generated file must at least parse.

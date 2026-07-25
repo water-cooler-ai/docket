@@ -10,41 +10,36 @@ project follows [Semantic Versioning](https://semver.org/).
 
 - `Docket.Backend.TransitionStore`, a versioned, data-only lifecycle contract
   with named initialization, claimed, and optimistic unclaimed operations.
+  Proposals never carry callbacks, transaction handles, or
+  `Docket.Runtime.Moment` values; backend-native transactions are private
+  implementation details.
 - Explicit `Docket.Backend.capabilities/0` negotiation and `transitions/0`
   resolution. Contract-v2 declarations are validated at startup so partially
   upgraded backends fail with the missing transition callback instead of
   silently selecting a path through `function_exported?/3`.
-- A 0.1.x legacy adapter for undeclared 0.1.0/0.1.1 backends, plus portable
-  transition limits, a closed transition error vocabulary, stable logical
-  transition IDs, and durable replay receipts in both bundled backends.
-- PostgreSQL schema version 3, adding a durable event-sequence fence and
-  transition receipts that survive retained-event pruning.
-- A shared v2 semantic conformance matrix covering replay, tenancy, validation,
-  fences, concurrency, canonical events, schedule variants, exact byte/count
-  limit boundaries, zero-write rejection, and a PostgreSQL restart-durability
-  gate.
-- A documented hand-written schema upgrade per release, Oban-style: the
-  0.1.1-to-0.1.2 guide pins `Docket.Postgres.Migration.up(version: 3)` /
-  `down(version: 3)` so a rollback returns a 0.1.0/0.1.1 host to schema
-  version 2 instead of removing earlier Docket state.
-- Contract-v2 transition declarations must name their replay mechanism and
-  acknowledged durability boundary; transition IDs are bounded UTF-8 so every
-  portable substrate can index them; replay digests compare canonical event
-  content.
+- A 0.1.x legacy adapter that routes undeclared 0.1.0/0.1.1 backends through
+  the existing transaction/store composition unchanged.
+- A shared v2 semantic conformance matrix covering duplicate-run conflicts,
+  tenancy concealment, immutable-identity and fence ordering, canonical event
+  idempotency, schedule variants, concurrent same-fence winners, and
+  zero-write rejection, run against both bundled backends.
 
 ### Changed
 
 - Core lifecycle initialization, claimed moments, and signal/admin moments now
   call semantic transitions. Core no longer composes production lifecycle
   writes through public arbitrary backend transactions.
+- Every claimed moment on PostgreSQL now uses the fused one-statement commit
+  (one round trip), previously reachable only through the optional
+  `commit_transition/4` callback. The fused path now accepts pre-existing
+  canonically identical events and returns `:event_conflict` only for
+  different content at a stored sequence, matching the composed path.
 - Signals now use scoped fetch, pure evaluation, optimistic unclaimed commit,
   and a bounded refetch/re-evaluation loop only on `:stale_checkpoint`. Signal
   mutation functions may run more than once and must not perform external side
   effects.
-- PostgreSQL exposes the fused claimed-moment implementation through
-  `Docket.Postgres.TransitionStore`; the fused statement includes receipt
-  arbitration, while initialization and unclaimed paths use backend-private
-  PostgreSQL transactions.
+- There is no database schema change: 0.1.2 runs on schema version 2 exactly
+  as 0.1.0 and 0.1.1 do.
 
 ### Removed
 

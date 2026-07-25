@@ -872,7 +872,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         step: attrs.step,
         state: attrs.state,
         checkpoint_seq: attrs.checkpoint_seq,
-        event_seq: attrs.event_seq,
         latest_checkpoint_type: checkpoint_type,
         claim_attempts: 0,
         claim_abandons: 0,

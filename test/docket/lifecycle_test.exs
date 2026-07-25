@@ -439,7 +439,7 @@ defmodule Docket.LifecycleTest do
     assert {:ok, ^start_moment} =
              Docket.Lifecycle.start({backend, context}, :tenantless, start_moment)
 
-    assert {:ok, ^start_moment} =
+    assert {:error, :conflict} =
              Docket.Lifecycle.start({backend, context}, :tenantless, start_moment)
 
     assert MemoryBackend.events(context, "bad-start") == start_moment.events
@@ -483,12 +483,7 @@ defmodule Docket.LifecycleTest do
     def capabilities do
       %{
         contract_version: 2,
-        transitions: %{
-          version: Docket.Backend.TransitionStore.version(),
-          limits: Docket.Backend.TransitionStore.portable_limits(),
-          replay: :durable_receipts,
-          durability: :process_lifetime
-        }
+        transitions: %{version: Docket.Backend.TransitionStore.version()}
       }
     end
 

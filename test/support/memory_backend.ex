@@ -24,7 +24,6 @@ defmodule Docket.Test.MemoryBackend do
 
   defstruct runs: %{},
             graphs: %{},
-            receipts: %{},
             clock: nil,
             token_generator: nil
 
@@ -41,13 +40,7 @@ defmodule Docket.Test.MemoryBackend do
   def capabilities do
     %{
       contract_version: 2,
-      transitions: %{
-        version: Docket.Backend.TransitionStore.version(),
-        limits: Docket.Backend.TransitionStore.portable_limits(),
-        replay: :durable_receipts,
-        durability: :process_lifetime,
-        topology: :serialized_aggregate
-      }
+      transitions: %{version: Docket.Backend.TransitionStore.version()}
     }
   end
 
@@ -151,27 +144,18 @@ defmodule Docket.Test.MemoryBackend do
     tenant_id = owner_tenant_id!(owner_scope)
 
     with :ok <- validate_transition_request(:initialize, 0, proposal, events) do
-      digest = transition_digest(:initialize, 0, proposal, events)
-
       state_get_and_update(backend, fn state ->
         with %{run: run, checkpoint_type: checkpoint_type, wake_at: wake_at} <- proposal,
-             :miss <- receipt_result(state, owner_scope, :initialize, proposal, digest),
              :ok <- require_graph(state, owner_scope, run),
-             :ok <- require_run_absent(state, owner_scope, run.id),
+             :ok <- require_run_absent(state, run.id),
              {:ok, merged_events} <- merge_events(%{}, run.id, events) do
           record =
             run
             |> new_record(tenant_id, checkpoint_type, wake_at)
             |> Map.put(:events, merged_events)
 
-          state =
-            state
-            |> put_in([Access.key!(:runs), run.id], record)
-            |> put_receipt(owner_scope, :initialize, proposal, digest, run)
-
-          {{:ok, run}, state}
+          {{:ok, run}, put_in(state.runs[run.id], record)}
         else
-          {:replay, run} -> {{:ok, run}, state}
           {:error, reason} -> {{:error, normalize_transition_error(reason)}, state}
           _invalid -> {{:error, :invalid_transition}, state}
         end
@@ -192,13 +176,9 @@ defmodule Docket.Test.MemoryBackend do
              proposal,
              events
            ) do
-      digest = transition_digest(:claimed, expected_checkpoint_seq, proposal, events)
-
       state_get_and_update(backend, fn state ->
-        with :miss <- receipt_result(state, scope, :claimed, proposal, digest),
-             {:ok, record} <- fetch_scoped_record(state, scope, proposal.run.id),
+        with {:ok, record} <- fetch_scoped_record(state, scope, proposal.run.id),
              :ok <- validate_immutable_binding(record.run, proposal.run),
-             true <- record.run.event_seq == proposal.expected_event_seq,
              :ok <- validate_fence(record, proposal),
              {:ok, merged_events} <- merge_events(record.events, proposal.run.id, events) do
           now = current_time(state)
@@ -211,15 +191,8 @@ defmodule Docket.Test.MemoryBackend do
             |> reset_operational_health()
             |> apply_schedule(proposal.schedule, now)
 
-          state =
-            state
-            |> put_in([Access.key!(:runs), proposal.run.id], record)
-            |> put_receipt(scope, :claimed, proposal, digest, proposal.run)
-
-          {{:ok, proposal.run}, state}
+          {{:ok, proposal.run}, put_in(state.runs[proposal.run.id], record)}
         else
-          {:replay, run} -> {{:ok, run}, state}
-          false -> {{:error, :stale_checkpoint}, state}
           {:error, reason} -> {{:error, normalize_transition_error(reason)}, state}
         end
       end)
@@ -238,14 +211,10 @@ defmodule Docket.Test.MemoryBackend do
              proposal,
              events
            ) do
-      digest = transition_digest(:unclaimed, expected_checkpoint_seq, proposal, events)
-
       state_get_and_update(backend, fn state ->
-        with :miss <- receipt_result(state, scope, :unclaimed, proposal, digest),
-             {:ok, record} <- fetch_scoped_record(state, scope, proposal.run.id),
+        with {:ok, record} <- fetch_scoped_record(state, scope, proposal.run.id),
              :ok <- validate_immutable_binding(record.run, proposal.run),
              true <- record.run.checkpoint_seq == expected_checkpoint_seq,
-             true <- record.run.event_seq == proposal.expected_event_seq,
              true <-
                valid_mutation?(
                  record,
@@ -263,14 +232,8 @@ defmodule Docket.Test.MemoryBackend do
             |> reset_operational_health()
             |> apply_schedule(proposal.schedule, current_time(state))
 
-          state =
-            state
-            |> put_in([Access.key!(:runs), proposal.run.id], record)
-            |> put_receipt(scope, :unclaimed, proposal, digest, proposal.run)
-
-          {{:ok, proposal.run}, state}
+          {{:ok, proposal.run}, put_in(state.runs[proposal.run.id], record)}
         else
-          {:replay, run} -> {{:ok, run}, state}
           {:error, reason} -> {{:error, normalize_transition_error(reason)}, state}
           false -> {{:error, :stale_checkpoint}, state}
         end
@@ -1271,46 +1234,7 @@ defmodule Docket.Test.MemoryBackend do
   end
 
   defp validate_transition_request(kind, expected_checkpoint_seq, proposal, events) do
-    Docket.Backend.TransitionStore.validate(
-      kind,
-      expected_checkpoint_seq,
-      proposal,
-      events,
-      Docket.Backend.TransitionStore.portable_limits()
-    )
-  end
-
-  defp transition_digest(kind, expected_checkpoint_seq, proposal, events) do
-    Docket.Backend.TransitionStore.digest(kind, expected_checkpoint_seq, proposal, events)
-  end
-
-  defp receipt_result(state, scope, operation, proposal, expected_digest) do
-    case Map.fetch(state.receipts, proposal.transition_id) do
-      {:ok, %{scope: ^scope, operation: ^operation, digest: digest, run: run}} ->
-        if digest == expected_digest,
-          do: {:replay, run},
-          else: {:error, :conflict}
-
-      {:ok, %{scope: ^scope}} ->
-        {:error, :conflict}
-
-      {:ok, _wrong_scope} ->
-        {:error, :not_found}
-
-      :error ->
-        :miss
-    end
-  end
-
-  defp put_receipt(state, scope, operation, proposal, digest, run) do
-    receipt = %{
-      scope: scope,
-      operation: operation,
-      digest: digest,
-      run: run
-    }
-
-    put_in(state.receipts[proposal.transition_id], receipt)
+    Docket.Backend.TransitionStore.validate(kind, expected_checkpoint_seq, proposal, events)
   end
 
   defp normalize_transition_error(reason)
@@ -1325,6 +1249,7 @@ defmodule Docket.Test.MemoryBackend do
        do: :invalid_transition
 
   defp normalize_transition_error(:stale_fence), do: :stale_checkpoint
+  defp normalize_transition_error(:already_exists), do: :conflict
   defp normalize_transition_error(reason), do: reason
 
   defp require_graph(state, owner_scope, run) do
@@ -1333,16 +1258,10 @@ defmodule Docket.Test.MemoryBackend do
       else: {:error, :not_found}
   end
 
-  defp require_run_absent(state, owner_scope, run_id) do
-    case Map.fetch(state.runs, run_id) do
-      :error ->
-        :ok
-
-      {:ok, record} ->
-        if record_owner_scope(record) == owner_scope,
-          do: {:error, :conflict},
-          else: {:error, :not_found}
-    end
+  defp require_run_absent(state, run_id) do
+    if Map.has_key?(state.runs, run_id),
+      do: {:error, :already_exists},
+      else: :ok
   end
 
   defp current_time(state), do: state.clock.()
