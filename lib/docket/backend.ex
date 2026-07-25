@@ -2,11 +2,16 @@ defmodule Docket.Backend do
   @moduledoc """
   Bundle contract for a durable Docket backend.
 
-  A backend is the configuration and substitution boundary. It supplies one
-  transaction implementation and graph, run, and event capabilities that all
-  understand the transaction context produced by that implementation. Store
-  modules remain focused and independently testable, but callers must not
-  assemble capabilities from unrelated backends.
+  A backend is the configuration and substitution boundary. It supplies
+  semantic lifecycle transitions plus focused graph, run, and event
+  capabilities. Store modules remain independently testable, but callers must
+  not assemble capabilities from unrelated backends.
+
+  Since 0.1.2, lifecycle writes use `Docket.Backend.TransitionStore`. Backends
+  declare that capability explicitly through `capabilities/0`; an undeclared
+  0.1.x backend is routed through the legacy composition adapter. Public
+  callback transactions remain only for that compatibility window and are
+  removed in 0.2.
 
   The backend also owns its supervision entry point. `child_spec/2` receives
   the options nested under `{BackendModule, options}`, the small set of
@@ -35,11 +40,21 @@ defmodule Docket.Backend do
 
   @type transaction_result :: {:ok, term()} | {:error, term()}
   @type transaction_fun :: (ctx() -> transaction_result())
+  @type capabilities :: %{
+          required(:contract_version) => 1 | 2,
+          optional(:transitions) => %{
+            required(:version) => pos_integer(),
+            optional(atom()) => term()
+          }
+        }
   @type drain_summary :: %{
           required(:limit_reached) => boolean(),
           optional(atom()) => term()
         }
 
+  @doc deprecated:
+         "lifecycle transaction composition is deprecated; implement " <>
+           "Docket.Backend.TransitionStore and transitions/0"
   @doc """
   Runs `fun` in one backend transaction.
 
@@ -68,6 +83,19 @@ defmodule Docket.Backend do
   """
   @callback transaction(ctx(), transaction_fun()) :: transaction_result()
 
+  @doc """
+  Declares the backend contract and semantic transition capability.
+
+  Version 2 requires `transitions/0`, transition version 1, and a module that
+  implements every `Docket.Backend.TransitionStore` callback. Backends written
+  against 0.1.0 or 0.1.1 may omit this callback and are treated as contract
+  version 1 during the 0.1.x compatibility window.
+  """
+  @callback capabilities() :: capabilities()
+
+  @doc "Returns the backend's `Docket.Backend.TransitionStore` implementation."
+  @callback transitions() :: capability()
+
   @doc "Returns the backend's `Docket.Backend.GraphStore` implementation."
   @callback graphs() :: capability()
 
@@ -77,6 +105,7 @@ defmodule Docket.Backend do
   @doc "Returns the backend's `Docket.Backend.EventStore` implementation."
   @callback events() :: capability()
 
+  @doc deprecated: "use Docket.Backend.TransitionStore.commit_claimed/4 through transitions/0"
   @doc """
   Optionally commits one claim-fenced run transition and its assigned events
   through a backend-native fused operation.
@@ -108,5 +137,91 @@ defmodule Docket.Backend do
   @callback drain_runs(ctx(), opts :: keyword()) ::
               {:ok, drain_summary()} | {:error, term()}
 
-  @optional_callbacks commit_transition: 4
+  @optional_callbacks capabilities: 0, transitions: 0, commit_transition: 4
+
+  @doc false
+  @spec transition_store(module(), ctx()) :: {module(), ctx()}
+  def transition_store(backend, context) when is_atom(backend) do
+    case declared_capabilities(backend) do
+      :legacy ->
+        {Docket.Backend.LegacyTransitionStore, {backend, context}}
+
+      %{contract_version: 1} ->
+        {Docket.Backend.LegacyTransitionStore, {backend, context}}
+
+      %{contract_version: 2, transitions: %{version: version}} when version == 1 ->
+        unless function_exported?(backend, :transitions, 0) do
+          raise ArgumentError,
+                "backend #{inspect(backend)} declares transition contract version 2 " <>
+                  "but does not export transitions/0"
+        end
+
+        store = backend.transitions()
+        validate_transition_store!(backend, store)
+        {store, context}
+
+      capabilities ->
+        raise ArgumentError,
+              "backend #{inspect(backend)} declares an unsupported transition contract: " <>
+                inspect(capabilities)
+    end
+  end
+
+  @doc false
+  @spec validate_contract!(module()) :: :ok
+  def validate_contract!(backend) when is_atom(backend) do
+    _resolved = transition_store(backend, :validation_context)
+    :ok
+  end
+
+  @doc false
+  @spec declared_capabilities(module()) :: :legacy | capabilities()
+  def declared_capabilities(backend) when is_atom(backend) do
+    if function_exported?(backend, :capabilities, 0) do
+      case backend.capabilities() do
+        %{contract_version: 1} = capabilities ->
+          capabilities
+
+        %{
+          contract_version: 2,
+          transitions: %{version: version}
+        } = capabilities
+        when is_integer(version) and version > 0 ->
+          capabilities
+
+        capabilities ->
+          raise ArgumentError,
+                "backend #{inspect(backend)} returned invalid capabilities: " <>
+                  inspect(capabilities)
+      end
+    else
+      :legacy
+    end
+  end
+
+  defp validate_transition_store!(backend, store) when is_atom(store) do
+    Code.ensure_loaded?(store) ||
+      raise ArgumentError,
+            "backend #{inspect(backend)} transitions/0 -> #{inspect(store)} could not be loaded"
+
+    missing =
+      Docket.Backend.TransitionStore.behaviour_info(:callbacks)
+      |> Enum.reject(fn {name, arity} -> function_exported?(store, name, arity) end)
+
+    if missing != [] do
+      callbacks = Enum.map_join(missing, ", ", fn {name, arity} -> "#{name}/#{arity}" end)
+
+      raise ArgumentError,
+            "backend #{inspect(backend)} transitions/0 -> #{inspect(store)} is incomplete; " <>
+              "missing #{callbacks}"
+    end
+
+    :ok
+  end
+
+  defp validate_transition_store!(backend, store) do
+    raise ArgumentError,
+          "backend #{inspect(backend)} transitions/0 must return a module, got: " <>
+            inspect(store)
+  end
 end

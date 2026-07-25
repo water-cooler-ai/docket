@@ -3,8 +3,8 @@
 `Docket.BackendTests` is Docket's shared black-box test suite for backend
 implementations. It lives under `test/support`, not in the shipped library API.
 The production contract is defined by `Docket.Backend`,
-`Docket.Backend.GraphStore`, `Docket.Backend.RunStore`, and
-`Docket.Backend.EventStore`.
+`Docket.Backend.TransitionStore`, `Docket.Backend.GraphStore`,
+`Docket.Backend.RunStore`, and `Docket.Backend.EventStore`.
 
 ## Docket-owned backends
 
@@ -38,7 +38,8 @@ for file <- [
       "test/support/backend_tests.ex",
       "test/support/backend_tests/contract.ex",
       "test/support/backend_tests/fixture.ex",
-      "test/support/backend_tests/cases.ex"
+      "test/support/backend_tests/cases.ex",
+      "test/support/backend_tests/transition_cases.ex"
     ] do
   Code.require_file(Path.join(docket_source, file))
 end
@@ -77,6 +78,11 @@ resolves focused stores exclusively through the returned backend.
 
 Each failure includes a stable invariant ID. The shared cases currently cover:
 
+- explicit transition contract negotiation and transition-store completeness;
+- initialization, claimed, and unclaimed transition success, duplicate-run
+  conflicts, tenant concealment, immutable/fence ordering, canonical event
+  idempotency, concurrent same-fence winners, schedule variants, malformed
+  proposals, and zero-write rejection;
 - mandatory backend and focused-store callbacks;
 - commit, rollback, nested participation, rollback-only propagation,
   concurrent publication outcomes, and completed-read visibility;
@@ -92,8 +98,10 @@ Each failure includes a stable invariant ID. The shared cases currently cover:
 Passing is evidence for the portable cases above, not a claim that every
 backend is operationally equivalent. In particular, the shared suite does not
 currently establish the complete `claim_due` selection matrix, all run-list
-filters, restart durability, migrations, substrate configuration, deterministic
-lock timing, or end-to-end runtime advancement.
+filters, restart/failover durability, migrations, substrate configuration,
+deterministic lock timing, or end-to-end runtime advancement. Backend-owned
+fault suites additionally cover timeout-after-commit and the declared
+durability policy.
 
 ## Backend-specific coverage
 

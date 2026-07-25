@@ -95,6 +95,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    defmodule ForeignIdentityBackend do
+      defdelegate transaction(ctx, fun), to: Docket.Test.MemoryBackend
+      def graphs, do: Docket.Test.MemoryBackend
+      def events, do: Docket.Test.MemoryBackend
+      def capabilities, do: Docket.Test.MemoryBackend.capabilities()
+      def transitions, do: Docket.Test.MemoryBackend
+      def runs, do: __MODULE__.Runs
+
+      defmodule Runs do
+        def fetch_run(context, scope, run_id) do
+          {:ok, run} = Docket.Test.MemoryBackend.fetch_run(context, scope, run_id)
+          {:ok, %{run | started_at: DateTime.add(run.started_at, 1, :second)}}
+        end
+
+        defdelegate refresh_claim(context, scope, run_id, token, now),
+          to: Docket.Test.MemoryBackend
+      end
+    end
+
     setup do
       start_supervised!(Host)
       start_supervised!({Task.Supervisor, name: @task_sup})
@@ -226,7 +245,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {run, lease} = start_claimed!(backend_ref, Graphs.minimal_linear(), %{"value" => "x"})
       {:ok, pre_drain} = Host.fetch_run(run.id)
 
-      assert {:ok, {:discarded, :stale_fence}} =
+      assert {:ok, {:discarded, :stale_checkpoint}} =
                Vehicle.drain(
                  lease,
                  vehicle_opts({StaleCommitBackend, context}, observer_opts())
@@ -423,6 +442,27 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end
 
       assert error.type == :claim_invariant
+    end
+
+    test "a rejected claimed commit raises a claim invariant instead of discarding", %{
+      backend_ref: backend_ref,
+      context: context
+    } do
+      {run, lease} = start_claimed!(backend_ref, Graphs.minimal_linear(), %{"value" => "x"})
+
+      error =
+        assert_raise Docket.Error, fn ->
+          Vehicle.drain(lease, vehicle_opts({ForeignIdentityBackend, context}))
+        end
+
+      assert error.type == :claim_invariant
+      assert error.details.reason == :invalid_transition
+
+      assert {:ok, stored} = Host.fetch_run(run.id)
+      assert stored.checkpoint_seq == run.checkpoint_seq
+
+      assert {:ok, info} = Host.inspect_run(run.id)
+      assert info.claimed_at != nil
     end
 
     test "launch/2 runs the drain under the task supervisor", %{backend_ref: backend_ref} do
@@ -678,7 +718,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         {run, lease} = start_claimed!(backend_ref, Graphs.endless_cycle(), %{})
         {:ok, pre_drain} = Host.fetch_run(run.id)
 
-        assert {:ok, {:discarded, :stale_fence}} =
+        assert {:ok, {:discarded, :stale_checkpoint}} =
                  Vehicle.drain(
                    lease,
                    vehicle_opts({StaleCommitBackend, context}, drain_budget: [max_moments: 1])

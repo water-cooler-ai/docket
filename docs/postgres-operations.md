@@ -11,7 +11,7 @@ Add Docket plus the optional PostgreSQL dependencies to the host, configure
 ```elixir
 def deps do
   [
-    {:docket, "~> 0.1.0"},
+    {:docket, "~> 0.1.2"},
     {:ecto_sql, "~> 3.10"},
     {:postgrex, "~> 0.17"}
   ]
@@ -68,13 +68,13 @@ every run, read, and signal call.
 ## Persistence and transaction ownership
 
 `Docket.Postgres` is one fixed `Docket.Backend` bundle. It supplies compatible
-transaction, graph, run, event, and supervision capabilities. The focused
-store modules are capability and backend-test boundaries, not public
-mix-and-match configuration.
+transition, graph, run, event, and supervision capabilities. The focused store
+modules are capability and backend-test boundaries, not public mix-and-match
+configuration.
 
 `Docket.Runtime.Moment` is a pre-commit proposal containing the next run,
 assigned events, checkpoint metadata, and scheduling disposition.
-The lifecycle layer is the single transaction composer: it persists the run,
+The lifecycle layer submits one semantic transition that persists the run,
 schedule, and events atomically, then invokes best-effort observers only after
 commit. A failed event append or lost claim fence commits none of the moment.
 
@@ -325,7 +325,7 @@ Without a retry policy, a node gets one attempt and no backoff. A configured
 retry policy defaults `max_attempts` to `1` and `backoff_ms` to `0`; raise the
 attempt count and choose a positive backoff to enable durable retry parking.
 Testing modes start no dispatcher, notifier, vehicle supervisor, or pruner;
-their caller-owned drain still uses the production lifecycle transactions.
+their caller-owned drain still uses the production lifecycle transitions.
 Manual and inline drains call the same `RunStore.claim_due/3` entrypoint as the
 supervised dispatcher. One backend-instance admission phase alternates
 demand-one ready/expired preference across supervised, manual, and inline
@@ -360,7 +360,7 @@ re-execution, not a partial durable moment.
 
 ## Claim policy schema state
 
-Schema version 2 contains the shared admission substrate: the singleton
+Schema version 2 introduced the shared admission substrate: the singleton
 `docket_claim_policy` gate row, trigger-maintained `docket_claim_schedule`
 membership with exact unfinished-run counts, `docket_claim_partitions`
 ownership rows, and the scoped partial indexes that serve per-scope admission
@@ -383,26 +383,30 @@ fairness boundary; per-tenant `max_active` caps are not part of v0.1.0.
 
 ### Existing schema V1 installations
 
-The generated upgrade is an ordinary transactional migration:
+The upgrade is an ordinary hand-written transactional migration pinning both
+directions to the versions it adds:
 
-```sh
-mix docket.gen.migration -r MyApp.Repo --upgrade-from-v1
-mix ecto.migrate -r MyApp.Repo
+```elixir
+defmodule MyApp.Repo.Migrations.UpgradeDocketToV2 do
+  use Ecto.Migration
+
+  def up, do: Docket.Postgres.Migration.up(version: 2)
+  def down, do: Docket.Postgres.Migration.down(version: 2)
+end
 ```
 
 Stop dispatchers and all Docket run writers before the upgrade, deploy one
 homogeneous binary version, migrate, and restart. The migration locks the runs
 table against inserts while it backfills owner partitions and schedule rows.
 The current binary requires schema version 2 and checks it before starting
-backend children. Rolling back a generated host-schema-V1 upgrade removes the
-version 2 admission schema and returns to schema version 1. Online migrations,
-readiness ledgers, fleet
-attestations, and audited activation are intentionally outside the v0.1.0
-contract.
+backend children. Rolling back this schema-V1 upgrade removes the version 2
+admission schema, returning to schema version 1. Online migrations, readiness
+ledgers, fleet attestations, and audited activation are intentionally outside
+the v0.1.0 contract.
 
-Fresh installations generated without an upgrade flag install V01 and V02 in
-one host migration. Use the same explicit prefix in both migration
-directions and runtime configuration.
+Fresh installations use `mix docket.gen.migration`, which installs V01 and
+V02 in one host migration whose rollback removes the Docket schema. Use the
+same explicit prefix in both migration directions and runtime configuration.
 
 Claim-policy correctness is covered by the checked-in windowed engine suite
 and the shared run-store contract matrix. Timing and large benchmarks are

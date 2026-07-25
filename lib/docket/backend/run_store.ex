@@ -9,12 +9,10 @@ defmodule Docket.Backend.RunStore do
   cannot be split into independently configured stores because they mutate
   and fence the same aggregate.
 
-  Lifecycle code composes run and event writes inside one backend transaction;
-  graph versions are saved separately before
-  a run can reference them. This contract deliberately accepts neutral
-  run proposals and schedule effects, never `Docket.Checkpoint` or
-  `Docket.Runtime.Moment` values. A successful outer transaction is the point
-  at which the transition becomes durable.
+  Since 0.1.2, lifecycle writes use `Docket.Backend.TransitionStore`. The
+  legacy `insert_run/5`, `commit/3`, and `mutate_run/4` callbacks remain
+  temporarily for the 0.1.x compatibility adapter. Focused reads and claim
+  operations remain part of this contract.
   """
 
   @type ctx :: Docket.Backend.ctx()
@@ -150,6 +148,7 @@ defmodule Docket.Backend.RunStore do
   @type mutation_result ::
           {:ok, {:committed, term()} | {:unchanged, term()}} | {:error, term()}
 
+  @doc deprecated: "lifecycle insertion is deprecated; implement TransitionStore.initialize/4"
   @doc """
   Inserts one initialized, already-durable run.
 
@@ -350,6 +349,7 @@ defmodule Docket.Backend.RunStore do
               abandon_policy()
             ) :: abandon_result()
 
+  @doc deprecated: "lifecycle commits are deprecated; implement TransitionStore.commit_claimed/4"
   @doc """
   Commits one neutral runtime proposal under a mandatory token-and-sequence fence.
 
@@ -381,6 +381,8 @@ defmodule Docket.Backend.RunStore do
               {:ok, Docket.Run.t()}
               | {:error, :stale_fence | :invalid_commit | :not_found}
 
+  @doc deprecated:
+         "callback mutations are deprecated; implement TransitionStore.commit_unclaimed/5"
   @doc """
   Serializes one short read, pure decision, and optional unclaimed run update.
 

@@ -33,14 +33,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              {:ok, event_attrs} <- EventStore.prepare_events(run.id, events),
              {:ok, scope_system?, scope_key} <- scope_values(scope) do
           params =
-            statement_params(
-              attrs,
-              proposal,
-              event_attrs,
-              scope_system?,
-              scope_key,
-              prefix
-            )
+            statement_params(attrs, proposal, event_attrs, scope_system?, scope_key, prefix)
 
           execute(repo, prefix, ctx, scope, proposal, event_attrs, params)
         end
@@ -56,11 +49,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp execute(repo, prefix, ctx, scope, proposal, event_attrs, params) do
       case Ecto.Adapters.SQL.query!(repo, statement(prefix), params, log: false).rows do
-        [[1, inserted, admitted_at, _notifications]] when inserted == length(event_attrs) ->
+        [[1, inserted, admitted_at, _guards]] when inserted == length(event_attrs) ->
           maybe_emit_admission_release(admitted_at, proposal.schedule)
           {:ok, proposal.run}
 
-        [[0, 0, nil, 0]] ->
+        [[0, 0, nil, _guards]] ->
           RunStore.classify_commit_miss(ctx, scope, proposal)
 
         rows ->
@@ -75,14 +68,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end
     end
 
-    defp statement_params(
-           attrs,
-           proposal,
-           events,
-           scope_system?,
-           scope_key,
-           prefix
-         ) do
+    defp statement_params(attrs, proposal, events, scope_system?, scope_key, prefix) do
       {schedule_code, schedule_at} = schedule_values(proposal.schedule)
 
       [

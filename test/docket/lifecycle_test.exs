@@ -277,7 +277,7 @@ defmodule Docket.LifecycleTest do
     [event | events] = waiting_moment.events
     invalid_moment = %{waiting_moment | events: [%{event | run_id: "other"} | events]}
 
-    assert {:error, :event_run_mismatch} =
+    assert {:error, :invalid_transition} =
              Docket.Lifecycle.commit_moment(
                {backend, context},
                :tenantless,
@@ -428,7 +428,7 @@ defmodule Docket.LifecycleTest do
 
     assert {:ok, reference} = Host.save_graph(graph)
 
-    assert {:error, :event_run_mismatch} =
+    assert {:error, :invalid_transition} =
              Docket.Lifecycle.start({backend, context}, :tenantless, invalid_start)
 
     assert {:error, :not_found} = backend.runs().fetch_run(context, :system, "bad-start")
@@ -436,9 +436,17 @@ defmodule Docket.LifecycleTest do
     assert {:ok, %Docket.Graph{}} =
              backend.graphs().fetch_graph(context, :tenantless, graph.id, rtg.graph_hash)
 
+    assert {:ok, ^start_moment} =
+             Docket.Lifecycle.start({backend, context}, :tenantless, start_moment)
+
+    assert {:error, :conflict} =
+             Docket.Lifecycle.start({backend, context}, :tenantless, start_moment)
+
+    assert MemoryBackend.events(context, "bad-start") == start_moment.events
+
     assert {:ok, started} = Host.start_run(reference, %{"value" => "x"})
 
-    assert {:error, :event_run_mismatch} =
+    assert {:error, :invalid_transition} =
              Docket.Lifecycle.signal({backend, context}, :tenantless, started.id, fn run ->
                {:ok, moment} =
                  Docket.Runtime.RunMutation.cancel_run(run, ~U[2026-07-10 22:00:00Z])
@@ -448,6 +456,118 @@ defmodule Docket.LifecycleTest do
              end)
 
     assert {:ok, ^started} = backend.runs().fetch_run(context, :tenantless, started.id)
+  end
+
+  defmodule SignalProbeRuns do
+    def fetch_run(_context, _scope, run_id) do
+      send(self(), {:signal_probe, :fetch_run})
+      {:ok, %{Process.get(:signal_probe_run) | id: run_id}}
+    end
+  end
+
+  defmodule SignalProbeTransitions do
+    def initialize(_context, _scope, proposal, _events), do: {:ok, proposal.run}
+    def commit_claimed(_context, _scope, proposal, _events), do: {:ok, proposal.run}
+
+    def commit_unclaimed(_context, _scope, _expected_checkpoint_seq, proposal, _events) do
+      send(self(), {:signal_probe, :commit_unclaimed})
+
+      case Process.get(:signal_probe_result) do
+        :ok -> {:ok, proposal.run}
+        error -> error
+      end
+    end
+  end
+
+  defmodule SignalProbeBackend do
+    def capabilities do
+      %{
+        contract_version: 2,
+        transitions: %{version: Docket.Backend.TransitionStore.version()}
+      }
+    end
+
+    def transitions, do: Docket.LifecycleTest.SignalProbeTransitions
+    def runs, do: Docket.LifecycleTest.SignalProbeRuns
+    def events, do: Docket.LifecycleTest.SignalProbeRuns
+    def transaction(context, fun), do: fun.(context)
+  end
+
+  describe "signal transition discipline" do
+    setup do
+      now = ~U[2026-07-10 12:00:00.000000Z]
+
+      run = %Docket.Run{
+        id: "signal-probe-run",
+        graph_id: "signal-probe-graph",
+        graph_hash: "signal-probe-hash",
+        status: :running,
+        input: %{},
+        started_at: now,
+        updated_at: now,
+        checkpoint_seq: 1,
+        event_seq: 0
+      }
+
+      Process.put(:signal_probe_run, run)
+      {:ok, probe_now: now}
+    end
+
+    test "a retryable infrastructure failure is surfaced without an automatic retry",
+         %{probe_now: now} do
+      Process.put(:signal_probe_result, {:error, {:retryable, :connection_lost}})
+
+      assert {:error, {:retryable, :connection_lost}} =
+               probe_signal(advance_mutation(now))
+
+      assert_received {:signal_probe, :fetch_run}
+      assert_received {:signal_probe, :commit_unclaimed}
+      refute_received {:signal_probe, :commit_unclaimed}
+    end
+
+    test "a stale checkpoint refetches and re-evaluates a bounded number of times",
+         %{probe_now: now} do
+      Process.put(:signal_probe_result, {:error, :stale_checkpoint})
+
+      assert {:error, :stale_checkpoint} = probe_signal(advance_mutation(now))
+
+      for _attempt <- 1..4 do
+        assert_received {:signal_probe, :fetch_run}
+        assert_received {:signal_probe, :commit_unclaimed}
+      end
+
+      refute_received {:signal_probe, :fetch_run}
+      refute_received {:signal_probe, :commit_unclaimed}
+    end
+
+    test "a no-change decision publishes nothing" do
+      assert {:ok, %Docket.Run{id: "signal-probe-run"}} =
+               probe_signal(fn current -> {:unchanged, current} end)
+
+      assert_received {:signal_probe, :fetch_run}
+      refute_received {:signal_probe, :commit_unclaimed}
+    end
+
+    test "a mutation error publishes nothing" do
+      assert {:error, :nothing_to_do} =
+               probe_signal(fn _current -> {:error, :nothing_to_do} end)
+
+      assert_received {:signal_probe, :fetch_run}
+      refute_received {:signal_probe, :commit_unclaimed}
+    end
+  end
+
+  defp probe_signal(mutation) do
+    Docket.Lifecycle.signal(
+      {SignalProbeBackend, :probe_context},
+      :tenantless,
+      "signal-probe-run",
+      mutation
+    )
+  end
+
+  defp advance_mutation(now) do
+    fn current -> {:ok, Moment.propose(current, :step_committed, [], :continue, now)} end
   end
 
   defp backend_ref(host) do

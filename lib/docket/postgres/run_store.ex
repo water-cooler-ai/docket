@@ -65,6 +65,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     pruned.
     """
     @impl true
+    @deprecated "use Docket.Postgres.TransitionStore.initialize/4"
     @spec insert_run(
             ctx(),
             Docket.Backend.owner_scope(),
@@ -72,7 +73,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             Docket.Checkpoint.type(),
             DateTime.t()
           ) :: {:ok, Docket.Run.t()} | {:error, term()}
-    def insert_run(ctx, owner_scope, run, checkpoint_type, wake_at) do
+    def insert_run(ctx, owner_scope, run, checkpoint_type, wake_at),
+      do: insert_transition(ctx, owner_scope, run, checkpoint_type, wake_at)
+
+    @doc false
+    def insert_transition(ctx, owner_scope, run, checkpoint_type, wake_at) do
       _ = Storage.context!(ctx)
       tenant_id = owner_tenant_id!(owner_scope)
 
@@ -526,6 +531,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @doc "Commits an exact-next run document under the current claim fence."
     @impl true
+    @deprecated "use Docket.Postgres.TransitionStore.commit_claimed/4"
     @spec commit(ctx(), Docket.Backend.scope(), Docket.Backend.RunStore.commit_proposal()) ::
             {:ok, Docket.Run.t()} | {:error, :stale_fence | :invalid_commit | :not_found}
     def commit(ctx, scope, proposal) do
@@ -602,6 +608,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @doc "Serializes and applies one pure run mutation without requiring a claim fence."
     @impl true
+    @deprecated "use Docket.Postgres.TransitionStore.commit_unclaimed/5"
     @spec mutate_run(
             ctx(),
             Docket.Backend.scope(),
@@ -609,7 +616,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
             Docket.Backend.RunStore.mutation()
           ) ::
             Docket.Backend.RunStore.mutation_result()
-    def mutate_run(ctx, scope, run_id, mutation) when is_function(mutation, 1) do
+    def mutate_run(ctx, scope, run_id, mutation),
+      do: mutate_transition(ctx, scope, run_id, mutation)
+
+    @doc false
+    def mutate_transition(ctx, scope, run_id, mutation) when is_function(mutation, 1) do
       {repo, prefix} = Storage.context!(ctx)
       validate_scope!(scope)
 

@@ -166,5 +166,7 @@ defmodule Docket.Runtime.Supervisor do
             ":backend module #{inspect(backend)} does not implement Docket.Backend; " <>
               "missing #{Enum.join(missing, ", ")}"
     end
+
+    Docket.Backend.validate_contract!(backend)
   end
 end

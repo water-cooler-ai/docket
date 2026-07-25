@@ -12,13 +12,13 @@ defmodule Docket.Runtime.Moment do
   A moment is not a committed `Docket.Checkpoint` and carries no storage
   vocabulary. Drivers own commitment:
 
-  - A durable driver persists the proposed run and assigned events inside
-    its outer storage transaction and, only after transaction success,
-    builds the committed checkpoint with `checkpoint/1`/`context/2` and
-    delivers observers and telemetry. A lost fence or failed event append
+  - A durable driver submits the proposed run and assigned events through one
+    semantic `Docket.Backend.TransitionStore` operation and, only after
+    success, builds the committed checkpoint with `checkpoint/1`/`context/2`
+    and delivers observers and telemetry. A lost fence or failed event append
     discards the moment; no committed checkpoint value ever exists for a
-    discarded moment, and observer failure after commit cannot change
-    durable state.
+    discarded moment, and observer failure after commit cannot change durable
+    state.
   - The processless `Docket.Test` shell applies the moment directly and
     returns its checkpoint as a read-only assertion value. Nothing in the
     checkpoint path can veto the transition.

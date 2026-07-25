@@ -5,36 +5,28 @@ defmodule Docket.Lifecycle do
 
   alias Docket.Runtime.Moment
 
+  @signal_conflict_retries 3
+
   @type backend :: {module(), Docket.Backend.ctx()}
 
   @spec start(backend(), Docket.Backend.owner_scope(), Moment.t()) ::
           {:ok, Moment.t()} | {:error, term()}
   def start({backend, context}, scope, %Moment{} = moment) do
-    runs = backend.runs()
-    events = backend.events()
+    {transitions, transition_context} = Docket.Backend.transition_store(backend, context)
+
+    proposal = %{
+      run: moment.run,
+      checkpoint_type: moment.checkpoint_type,
+      wake_at: start_wake_at(moment)
+    }
 
     Docket.Telemetry.lifecycle_span(:start, fn ->
-      backend.transaction(context, fn tx ->
-        with {:ok, _run} <-
-               store_span(:run_insert, fn ->
-                 runs.insert_run(
-                   tx,
-                   scope,
-                   moment.run,
-                   moment.checkpoint_type,
-                   start_wake_at(moment)
-                 )
-               end),
-             :ok <-
-               store_span(
-                 :event_append,
-                 fn ->
-                   events.append_events(tx, scope, moment.run.id, moment.events)
-                 end
-               ) do
-          {:ok, moment}
-        end
-      end)
+      case store_span(:transition_initialize, fn ->
+             transitions.initialize(transition_context, scope, proposal, moment.events)
+           end) do
+        {:ok, _run} -> {:ok, moment}
+        {:error, reason} -> {:error, reason}
+      end
     end)
   end
 
@@ -52,8 +44,7 @@ defmodule Docket.Lifecycle do
         expected_checkpoint_seq,
         claim_token
       ) do
-    runs = backend.runs()
-    events = backend.events()
+    {transitions, transition_context} = Docket.Backend.transition_store(backend, context)
 
     proposal = %{
       run: moment.run,
@@ -64,28 +55,11 @@ defmodule Docket.Lifecycle do
     }
 
     Docket.Telemetry.lifecycle_span(:moment, fn ->
-      if function_exported?(backend, :commit_transition, 4) do
-        case store_span(
-               :transition_commit,
-               fn -> backend.commit_transition(context, scope, proposal, moment.events) end
-             ) do
-          {:ok, _run} -> {:ok, moment}
-          {:error, reason} -> {:error, reason}
-        end
-      else
-        backend.transaction(context, fn tx ->
-          with {:ok, _run} <-
-                 store_span(:run_commit, fn -> runs.commit(tx, scope, proposal) end),
-               :ok <-
-                 store_span(
-                   :event_append,
-                   fn ->
-                     events.append_events(tx, scope, moment.run.id, moment.events)
-                   end
-                 ) do
-            {:ok, moment}
-          end
-        end)
+      case store_span(:transition_commit_claimed, fn ->
+             transitions.commit_claimed(transition_context, scope, proposal, moment.events)
+           end) do
+        {:ok, _run} -> {:ok, moment}
+        {:error, reason} -> {:error, reason}
       end
     end)
   end
@@ -98,34 +72,20 @@ defmodule Docket.Lifecycle do
              {:ok, Moment.t()} | {:unchanged, Docket.Run.t()} | {:error, term()})
         ) :: {:ok, Moment.t() | Docket.Run.t()} | {:error, term()}
   def signal({backend, context}, scope, run_id, mutation) when is_function(mutation, 1) do
-    runs = backend.runs()
-    events = backend.events()
+    {transitions, transition_context} = Docket.Backend.transition_store(backend, context)
+
+    request = %{
+      runs: backend.runs(),
+      context: context,
+      transitions: transitions,
+      transition_context: transition_context,
+      scope: scope,
+      run_id: run_id,
+      mutation: mutation
+    }
 
     Docket.Telemetry.lifecycle_span(:signal, fn ->
-      backend.transaction(context, fn tx ->
-        case store_span(:run_mutation, fn ->
-               runs.mutate_run(tx, scope, run_id, fn run ->
-                 mutation_decision(mutation.(run))
-               end)
-             end) do
-          {:ok, {:committed, %Moment{} = moment}} ->
-            with :ok <-
-                   store_span(
-                     :event_append,
-                     fn ->
-                       events.append_events(tx, scope, run_id, moment.events)
-                     end
-                   ) do
-              {:ok, moment}
-            end
-
-          {:ok, {:unchanged, %Docket.Run{} = run}} ->
-            {:ok, run}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-      end)
+      retry_stale(1 + @signal_conflict_retries, fn -> signal_attempt(request) end)
     end)
   end
 
@@ -185,14 +145,52 @@ defmodule Docket.Lifecycle do
     end
   end
 
-  defp mutation_decision({:ok, %Moment{} = moment}) do
-    {:commit, moment.run, moment.checkpoint_type, schedule(moment.disposition, :unclaimed),
-     moment}
+  defp retry_stale(1, attempt), do: attempt.()
+
+  defp retry_stale(attempts_left, attempt) do
+    case attempt.() do
+      {:error, :stale_checkpoint} -> retry_stale(attempts_left - 1, attempt)
+      result -> result
+    end
   end
 
-  defp mutation_decision({:unchanged, %Docket.Run{} = run}), do: {:no_change, run}
-  defp mutation_decision({:error, reason}), do: {:error, reason}
-  defp mutation_decision(other), do: {:error, {:invalid_lifecycle_mutation, other}}
+  defp signal_attempt(request) do
+    with {:ok, current} <-
+           store_span(:run_fetch_for_transition, fn ->
+             request.runs.fetch_run(request.context, request.scope, request.run_id)
+           end) do
+      case request.mutation.(current) do
+        {:ok, %Moment{} = moment} -> commit_signal_moment(request, current, moment)
+        {:unchanged, %Docket.Run{} = run} -> {:ok, run}
+        {:error, reason} -> {:error, reason}
+        other -> {:error, {:invalid_lifecycle_mutation, other}}
+      end
+    end
+  end
+
+  defp commit_signal_moment(request, current, moment) do
+    proposal = %{
+      run: moment.run,
+      checkpoint_type: moment.checkpoint_type,
+      schedule: schedule(moment.disposition, :unclaimed)
+    }
+
+    committed =
+      store_span(:transition_commit_unclaimed, fn ->
+        request.transitions.commit_unclaimed(
+          request.transition_context,
+          request.scope,
+          current.checkpoint_seq,
+          proposal,
+          moment.events
+        )
+      end)
+
+    case committed do
+      {:ok, _run} -> {:ok, moment}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp disposition_kind(%Moment{checkpoint_type: :retry_scheduled}), do: :retry
   defp disposition_kind(%Moment{disposition: :continue}), do: :continue

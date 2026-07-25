@@ -51,8 +51,10 @@ backend that owns persistence, scheduling, recovery, and signals.
    policy; see the
    [current PostgreSQL migration and rollout guide](../postgres-operations.md#existing-schema-v1-installations).
    The generated fresh migration installs the current schema. Existing
-   schema-V1 Docket installations instead use `--upgrade-from-v1`; stop every
-   Docket writer before the upgrade. The
+   schema-V1 Docket installations instead write the hand-pinned upgrade
+   migration shown in the
+   [current PostgreSQL migration and rollout guide](../postgres-operations.md#existing-schema-v1-installations);
+   stop every Docket writer before the upgrade. The
    runtime refuses to start backend children when the recorded schema version
    does not match the current library.
 

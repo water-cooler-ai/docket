@@ -71,7 +71,7 @@ The graph and execution core needs only Docket:
 ```elixir
 def deps do
   [
-    {:docket, "~> 0.1.0"}
+    {:docket, "~> 0.1.2"}
   ]
 end
 ```
@@ -166,7 +166,7 @@ three dependencies directly:
 ```elixir
 def deps do
   [
-    {:docket, "~> 0.1.0"},
+    {:docket, "~> 0.1.2"},
     {:ecto_sql, "~> 3.10"},
     {:postgrex, "~> 0.17"}
   ]
@@ -295,6 +295,7 @@ recovery, signals, and production supervision.
 - [examples/llm-node.md](examples/llm-node.md) — a generic, configurable LLM
   node implementation.
 - [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).
+- [0.1.1 to 0.1.2 backend transition migration](docs/architecture/migration-0.1.1-to-0.1.2.md).
 - [Backend test guide](docs/backend-conformance.md) — the shared source test
   suite and backend-specific coverage boundary.
 - [Telemetry](docs/telemetry.md) — operational signals and bounded labels.
