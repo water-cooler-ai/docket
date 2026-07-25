@@ -17,8 +17,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       GraphStore,
       MomentStore,
       RunStore,
-      Storage,
-      TransitionError
+      Storage
     }
 
     @impl true
@@ -109,9 +108,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp transition(fun) do
       fun.()
       |> normalize_error()
-    rescue
-      error in [Postgrex.Error, DBConnection.ConnectionError] ->
-        {:error, TransitionError.normalize(error)}
     end
 
     defp normalize_error({:error, reason})
@@ -127,7 +123,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp normalize_error({:error, :stale_fence}), do: {:error, :stale_checkpoint}
     defp normalize_error({:error, :already_exists}), do: {:error, :conflict}
-    defp normalize_error({:error, reason}), do: {:error, TransitionError.normalize(reason)}
+    defp normalize_error({:error, _reason} = error), do: error
     defp normalize_error({:ok, %Docket.Run{}} = result), do: result
     defp normalize_error(:ok), do: :ok
 

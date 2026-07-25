@@ -546,7 +546,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                )
 
       assert_receive {:committed_telemetry, [:docket, :lifecycle, :transaction, :stop],
-                      %{duration: duration}, %{operation: :moment, result: :conflict}}
+                      %{duration: duration}, %{operation: :moment, result: :stale_fence}}
 
       assert is_integer(duration) and duration >= 0
       refute_receive {:committed_telemetry, [:docket, :checkpoint, :committed], _, _}

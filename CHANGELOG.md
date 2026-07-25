@@ -31,9 +31,13 @@ project follows [Semantic Versioning](https://semver.org/).
   writes through public arbitrary backend transactions.
 - Every claimed moment on PostgreSQL now uses the fused one-statement commit
   (one round trip), previously reachable only through the optional
-  `commit_transition/4` callback. The fused path now accepts pre-existing
-  canonically identical events and returns `:event_conflict` only for
-  different content at a stored sequence, matching the composed path.
+  `commit_transition/4` callback; legacy backends that export it keep it
+  through the compatibility adapter. Fused statement semantics are unchanged
+  from 0.1.1.
+- Lifecycle store-span telemetry `operation` labels follow the semantic
+  operations (`:transition_initialize`, `:transition_commit_claimed`,
+  `:transition_commit_unclaimed`, `:run_fetch_for_transition`); fence losses
+  keep the `:stale_fence` result label.
 - Signals now use scoped fetch, pure evaluation, optimistic unclaimed commit,
   and a bounded refetch/re-evaluation loop only on `:stale_checkpoint`. Signal
   mutation functions may run more than once and must not perform external side

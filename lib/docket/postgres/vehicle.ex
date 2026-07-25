@@ -372,7 +372,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           :ok = Lifecycle.after_commit(moment, state.after_commit_opts)
           continue(state, rtg, moment, %{budget | committed: budget.committed + 1}, fired)
 
-        {:error, reason} when reason in [:invalid_commit, :not_found] ->
+        {:error, reason} when reason in [:invalid_commit, :invalid_transition, :not_found] ->
           raise Error.new(
                   :claim_invariant,
                   "commit for claimed run #{inspect(state.lease.run_id)} was rejected",

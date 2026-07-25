@@ -54,19 +54,25 @@ defmodule Docket.Backend.LegacyTransitionStore do
              proposal,
              events
            ) do
-      runs = backend.runs()
-      event_store = backend.events()
+      if function_exported?(backend, :commit_transition, 4) do
+        backend
+        |> apply(:commit_transition, [context, scope, proposal, events])
+        |> normalize_error()
+      else
+        runs = backend.runs()
+        event_store = backend.events()
 
-      apply(backend, :transaction, [
-        context,
-        fn tx ->
-          with {:ok, stored} <- apply(runs, :commit, [tx, scope, proposal]),
-               :ok <- apply(event_store, :append_events, [tx, scope, run.id, events]) do
-            {:ok, stored}
+        apply(backend, :transaction, [
+          context,
+          fn tx ->
+            with {:ok, stored} <- apply(runs, :commit, [tx, scope, proposal]),
+                 :ok <- apply(event_store, :append_events, [tx, scope, run.id, events]) do
+              {:ok, stored}
+            end
           end
-        end
-      ])
-      |> normalize_error()
+        ])
+        |> normalize_error()
+      end
     end
   end
 

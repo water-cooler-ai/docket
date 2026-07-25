@@ -71,18 +71,4 @@ defmodule Docket.Backend.TransitionStoreTest do
     assert {:error, :conflict} =
              Docket.Test.MemoryBackend.initialize(backend, :tenantless, proposal, [])
   end
-
-  if Code.ensure_loaded?(Postgrex) do
-    test "PostgreSQL infrastructure errors normalize into the closed algebra" do
-      assert {:retryable, :serialization_failure} =
-               Docket.Postgres.TransitionError.normalize(%Postgrex.Error{
-                 postgres: %{code: :serialization_failure}
-               })
-
-      assert {:permanent, {:postgres, :check_violation}} =
-               Docket.Postgres.TransitionError.normalize(%Postgrex.Error{
-                 postgres: %{code: :check_violation}
-               })
-    end
-  end
 end
