@@ -12,7 +12,7 @@ defmodule Docket.Lifecycle do
   @spec start(backend(), Docket.Backend.owner_scope(), Moment.t()) ::
           {:ok, Moment.t()} | {:error, term()}
   def start({backend, context}, scope, %Moment{} = moment) do
-    {transitions, transition_context} = Docket.Backend.transition_store(backend, context)
+    transitions = backend.transitions()
 
     proposal = %{
       run: moment.run,
@@ -22,7 +22,7 @@ defmodule Docket.Lifecycle do
 
     Docket.Telemetry.lifecycle_span(:start, fn ->
       case store_span(:transition_initialize, fn ->
-             transitions.initialize(transition_context, scope, proposal, moment.events)
+             transitions.initialize(context, scope, proposal, moment.events)
            end) do
         {:ok, _run} -> {:ok, moment}
         {:error, reason} -> {:error, reason}
@@ -44,7 +44,7 @@ defmodule Docket.Lifecycle do
         expected_checkpoint_seq,
         claim_token
       ) do
-    {transitions, transition_context} = Docket.Backend.transition_store(backend, context)
+    transitions = backend.transitions()
 
     proposal = %{
       run: moment.run,
@@ -56,7 +56,7 @@ defmodule Docket.Lifecycle do
 
     Docket.Telemetry.lifecycle_span(:moment, fn ->
       case store_span(:transition_commit_claimed, fn ->
-             transitions.commit_claimed(transition_context, scope, proposal, moment.events)
+             transitions.commit_claimed(context, scope, proposal, moment.events)
            end) do
         {:ok, _run} -> {:ok, moment}
         {:error, reason} -> {:error, reason}
@@ -72,13 +72,10 @@ defmodule Docket.Lifecycle do
              {:ok, Moment.t()} | {:unchanged, Docket.Run.t()} | {:error, term()})
         ) :: {:ok, Moment.t() | Docket.Run.t()} | {:error, term()}
   def signal({backend, context}, scope, run_id, mutation) when is_function(mutation, 1) do
-    {transitions, transition_context} = Docket.Backend.transition_store(backend, context)
-
     request = %{
       runs: backend.runs(),
+      transitions: backend.transitions(),
       context: context,
-      transitions: transitions,
-      transition_context: transition_context,
       scope: scope,
       run_id: run_id,
       mutation: mutation
@@ -91,7 +88,7 @@ defmodule Docket.Lifecycle do
 
   @doc false
   @spec schedule(Moment.disposition(), :claimed | :unclaimed) ::
-          Docket.Backend.RunStore.schedule()
+          Docket.Backend.TransitionStore.schedule()
   def schedule(:continue, :claimed), do: :retain_claim
   def schedule(:continue, :unclaimed), do: {:release_claim, :immediate}
   def schedule({:park, :immediate, _reason}, _claim), do: {:release_claim, :immediate}
@@ -178,7 +175,7 @@ defmodule Docket.Lifecycle do
     committed =
       store_span(:transition_commit_unclaimed, fn ->
         request.transitions.commit_unclaimed(
-          request.transition_context,
+          request.context,
           request.scope,
           current.checkpoint_seq,
           proposal,

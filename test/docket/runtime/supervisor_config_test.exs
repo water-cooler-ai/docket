@@ -9,7 +9,8 @@ defmodule Docket.Runtime.SupervisorConfigTest do
   end
 
   defmodule MissingContextBackend do
-    def transaction(context, fun), do: fun.(context)
+    def capabilities, do: %{contract_version: 2, transitions: %{version: 1}}
+    def transitions, do: Docket.Test.MemoryBackend
     def graphs, do: Docket.Test.MemoryBackend
     def runs, do: Docket.Test.MemoryBackend
     def events, do: Docket.Test.MemoryBackend
@@ -21,7 +22,8 @@ defmodule Docket.Runtime.SupervisorConfigTest do
   end
 
   defmodule MissingChildSpecBackend do
-    def transaction(context, fun), do: fun.(context)
+    def capabilities, do: %{contract_version: 2, transitions: %{version: 1}}
+    def transitions, do: Docket.Test.MemoryBackend
     def graphs, do: Docket.Test.MemoryBackend
     def runs, do: Docket.Test.MemoryBackend
     def events, do: Docket.Test.MemoryBackend
@@ -35,7 +37,10 @@ defmodule Docket.Runtime.SupervisorConfigTest do
     @allowed_options [:custom, :name, :test_pid]
 
     @impl true
-    def transaction(context, fun), do: fun.(context)
+    def capabilities, do: %{contract_version: 2, transitions: %{version: 1}}
+
+    @impl true
+    def transitions, do: Docket.Test.MemoryBackend
 
     @impl true
     def graphs, do: Docket.Test.MemoryBackend
@@ -185,7 +190,7 @@ defmodule Docket.Runtime.SupervisorConfigTest do
       Docket.Runtime.Supervisor.init({@runtime, backend: __MODULE__.MissingBackend})
     end
 
-    assert_raise ArgumentError, ~r/does not implement Docket.Backend.*transaction\/2/, fn ->
+    assert_raise ArgumentError, ~r/does not implement Docket.Backend.*capabilities\/0/, fn ->
       Docket.Runtime.Supervisor.init({@runtime, backend: IncompleteBackend})
     end
 

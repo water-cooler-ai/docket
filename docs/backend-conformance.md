@@ -81,19 +81,14 @@ Each failure includes a stable invariant ID. The shared cases currently cover:
 - explicit transition contract negotiation and transition-store completeness;
 - initialization, claimed, and unclaimed transition success, duplicate-run
   conflicts, tenant concealment, immutable/fence ordering, canonical event
-  idempotency, concurrent same-fence winners, schedule variants, malformed
-  proposals, and zero-write rejection;
+  idempotency, concurrent same-fence and unclaimed CAS winners, schedule
+  variants and their durable claim/wake effects, malformed proposals, and
+  zero-write rejection;
 - mandatory backend and focused-store callbacks;
-- commit, rollback, nested participation, rollback-only propagation,
-  concurrent publication outcomes, and completed-read visibility;
-- graph/run/event compatibility and atomicity through one yielded context;
 - graph ownership and run/event tenant isolation;
 - graph content addressing, idempotence, latest/version reads, and pagination;
-- event idempotence, conflict and mismatch rejection, ordering, cursors, and
-  sparse retained histories;
-- claim fencing, exact checkpoint sequencing, refresh/release authority,
-  abandonment, poisoning, recovery, same-fence outcomes, and serialized
-  mutation safety.
+- event ordering, cursors, and sparse retained histories;
+- claim refresh/release authority, abandonment, poisoning, and recovery.
 
 Passing is evidence for the portable cases above, not a claim that every
 backend is operationally equivalent. In particular, the shared suite does not
@@ -139,7 +134,7 @@ unchanged query-error return for the same implementations except the explicit,
 backend-wide SQLSTATE `25006` normalization to the portable read-only
 transaction error.
 
-The shared matrix complements direct RunStore, transaction, supervised
+The shared matrix complements direct RunStore, transition-store, supervised
 dispatcher, manual drain, PostgreSQL claim, fencing, poison, telemetry,
 query-plan, and contention tests. Implementations build and decode plans; they
 never call RunStore admission. The matrix and its fixtures compile only from

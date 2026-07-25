@@ -72,7 +72,11 @@ defmodule Docket.Bench.Compare.Postgres.FusedCommitCheck do
     [event | _rest] = next.events
     conflicting = %{event | payload: %{"different" => true}}
 
-    expect!(:ok, EventStore.append_events(ctx, :tenantless, next.run.id, [conflicting]))
+    expect!(
+      :ok,
+      EventStore.append_transition_events(ctx, :tenantless, next.run.id, [conflicting])
+    )
+
     {:ok, before} = RunStore.inspect_run(ctx, :tenantless, initial.run.id)
 
     expect!(

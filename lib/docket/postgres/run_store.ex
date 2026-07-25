@@ -25,7 +25,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     telemetry remains a trusted instrumentation boundary and may observe bind
     parameters, like any other database telemetry subscriber.
 
-    Run insertion, moment commit, signal mutation, and poison recovery
+    Run insertion, signal mutation, and poison recovery
     announce a wake due at or before the database clock with `pg_notify` on
     the `docket_wake` channel, carrying the context prefix (empty string when
     unprefixed) as payload. The notification runs on the write's connection
@@ -50,33 +50,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @spec wake_channel() :: String.t()
     def wake_channel, do: @wake_channel
 
-    @doc """
-    Inserts one initialized running run under its explicit owner scope.
-
-    The graph version must already exist. Initialization is the only insert
-    shape: the committed run has a positive checkpoint sequence, start and
-    update timestamps, `:run_initialized` checkpoint metadata, and an explicit
-    first wake.
-
-    Before inserting the run, the same transaction ensures its canonical claim
-    partition exists. A concurrently created row wins unchanged. Failed
-    inserts and caller rollbacks remove both lifecycle writes; committed
-    partition rows remain dormant indefinitely when their last run is later
-    pruned.
-    """
-    @impl true
-    @deprecated "use Docket.Postgres.TransitionStore.initialize/4"
-    @spec insert_run(
+    @doc false
+    @spec insert_transition(
             ctx(),
             Docket.Backend.owner_scope(),
             Docket.Run.t(),
             Docket.Checkpoint.type(),
-            DateTime.t()
+            DateTime.t() | nil
           ) :: {:ok, Docket.Run.t()} | {:error, term()}
-    def insert_run(ctx, owner_scope, run, checkpoint_type, wake_at),
-      do: insert_transition(ctx, owner_scope, run, checkpoint_type, wake_at)
-
-    @doc false
     def insert_transition(ctx, owner_scope, run, checkpoint_type, wake_at) do
       _ = Storage.context!(ctx)
       tenant_id = owner_tenant_id!(owner_scope)
@@ -529,47 +510,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       result
     end
 
-    @doc "Commits an exact-next run document under the current claim fence."
-    @impl true
-    @deprecated "use Docket.Postgres.TransitionStore.commit_claimed/4"
-    @spec commit(ctx(), Docket.Backend.scope(), Docket.Backend.RunStore.commit_proposal()) ::
-            {:ok, Docket.Run.t()} | {:error, :stale_fence | :invalid_commit | :not_found}
-    def commit(ctx, scope, proposal) do
-      {repo, prefix} = Storage.context!(ctx)
-
-      with {:ok, attrs} <- prepare_commit(proposal),
-           {:ok, stored} <- fetch_scoped_row(repo, prefix, scope, proposal.run.id),
-           :ok <- validate_immutable_binding(stored, proposal.run) do
-        query =
-          Run
-          |> where([run], run.run_id == ^proposal.run.id)
-          |> scope_query(scope)
-          |> where(
-            [run],
-            run.checkpoint_seq == ^proposal.expected_checkpoint_seq and
-              run.claim_token == ^proposal.claim_token
-          )
-          |> then(fn query -> if prefix, do: put_query_prefix(query, prefix), else: query end)
-
-        updates = commit_updates(attrs, proposal.checkpoint_type, proposal.schedule, :claimed)
-
-        case repo.update_all(query, updates, log: false) do
-          {1, _} ->
-            notify_wake(repo, prefix, proposal.schedule)
-            maybe_emit_admission_release(stored.tenant_admitted_at, proposal.schedule, :claimed)
-            {:ok, proposal.run}
-
-          {0, _} ->
-            commit_miss(repo, prefix, scope, proposal.run.id)
-        end
-      else
-        {:error, :not_found} -> {:error, :not_found}
-        _ -> {:error, :invalid_commit}
-      end
-    end
-
     @doc false
-    @spec prepare_commit(Docket.Backend.RunStore.commit_proposal()) ::
+    @spec prepare_commit(Docket.Backend.TransitionStore.claimed_proposal()) ::
             {:ok, RunCodec.row_attrs()} | {:error, :invalid_commit}
     def prepare_commit(proposal) do
       with :ok <- validate_commit(proposal),
@@ -584,7 +526,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @spec classify_commit_miss(
             Docket.Backend.ctx(),
             Docket.Backend.scope(),
-            Docket.Backend.RunStore.commit_proposal()
+            Docket.Backend.TransitionStore.claimed_proposal()
           ) :: {:error, :not_found | :invalid_commit | :stale_fence}
     def classify_commit_miss(ctx, scope, %{run: %Docket.Run{} = proposed}) do
       {repo, prefix} = Storage.context!(ctx)
@@ -606,20 +548,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {:error, :invalid_commit}
     end
 
-    @doc "Serializes and applies one pure run mutation without requiring a claim fence."
-    @impl true
-    @deprecated "use Docket.Postgres.TransitionStore.commit_unclaimed/5"
-    @spec mutate_run(
+    @doc false
+    @spec mutate_transition(
             ctx(),
             Docket.Backend.scope(),
             String.t(),
-            Docket.Backend.RunStore.mutation()
-          ) ::
-            Docket.Backend.RunStore.mutation_result()
-    def mutate_run(ctx, scope, run_id, mutation),
-      do: mutate_transition(ctx, scope, run_id, mutation)
-
-    @doc false
+            (Docket.Run.t() -> term())
+          ) :: {:ok, {:committed, term()} | {:unchanged, term()}} | {:error, term()}
     def mutate_transition(ctx, scope, run_id, mutation) when is_function(mutation, 1) do
       {repo, prefix} = Storage.context!(ctx)
       validate_scope!(scope)
@@ -797,12 +732,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
            {:ok, attrs} <- RunCodec.dump(proposed_run) do
         case repo.update_all(
                scoped_row_query(row, scope, prefix),
-               commit_updates(attrs, checkpoint_type, schedule, :unclaimed),
+               commit_updates(attrs, checkpoint_type, schedule),
                log: false
              ) do
           {1, _} ->
             notify_wake(repo, prefix, schedule)
-            maybe_emit_admission_release(row.tenant_admitted_at, schedule, :unclaimed)
+            maybe_emit_admission_release(row.tenant_admitted_at, schedule)
             {:ok, {:committed, opaque}}
 
           {0, _} ->
@@ -864,7 +799,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp schedule_matches_status?(_, _), do: false
 
-    defp commit_updates(attrs, checkpoint_type, schedule, claim_origin) do
+    defp commit_updates(attrs, checkpoint_type, schedule) do
       base = [
         graph_id: attrs.graph_id,
         graph_hash: attrs.graph_hash,
@@ -884,16 +819,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       schedule_updates =
         case schedule do
-          :retain_claim ->
-            [wake_at: nil, claimed_at: dynamic([_run], fragment("CURRENT_TIMESTAMP"))]
-
-          {:release_claim, :immediate} when claim_origin == :claimed ->
-            [
-              claim_token: nil,
-              claimed_at: nil,
-              wake_at: dynamic([_run], fragment("CURRENT_TIMESTAMP"))
-            ]
-
           {:release_claim, :immediate} ->
             [
               claim_token: nil,
@@ -915,13 +840,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         end
 
       [set: base ++ schedule_updates]
-    end
-
-    defp commit_miss(repo, prefix, scope, run_id) do
-      case fetch_scoped_row(repo, prefix, scope, run_id) do
-        {:ok, _row} -> {:error, :stale_fence}
-        {:error, :not_found} -> {:error, :not_found}
-      end
     end
 
     defp fetch_locked_scoped_row(repo, prefix, scope, run_id) do
@@ -1117,18 +1035,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       )
     end
 
-    defp maybe_emit_admission_release(nil, _schedule, _origin), do: :ok
+    defp maybe_emit_admission_release(nil, _schedule), do: :ok
 
-    defp maybe_emit_admission_release(_admitted_at, schedule, origin) do
-      case {origin, schedule} do
-        {:claimed, {:release_claim, {:at, _at}}} -> emit_admission_release(:future)
-        {:claimed, {:release_claim, :external}} -> emit_admission_release(:external)
-        {:claimed, {:release_claim, :terminal}} -> emit_admission_release(:terminal)
-        {:unclaimed, {:release_claim, :immediate}} -> emit_admission_release(:signal)
-        {:unclaimed, {:release_claim, {:at, _at}}} -> emit_admission_release(:future)
-        {:unclaimed, {:release_claim, :external}} -> emit_admission_release(:external)
-        {:unclaimed, {:release_claim, :terminal}} -> emit_admission_release(:terminal)
-        _retained -> :ok
+    defp maybe_emit_admission_release(_admitted_at, schedule) do
+      case schedule do
+        {:release_claim, :immediate} -> emit_admission_release(:signal)
+        {:release_claim, {:at, _at}} -> emit_admission_release(:future)
+        {:release_claim, :external} -> emit_admission_release(:external)
+        {:release_claim, :terminal} -> emit_admission_release(:terminal)
       end
     end
 

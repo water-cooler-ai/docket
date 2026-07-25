@@ -6,7 +6,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @moduletag :postgres
 
-    alias Docket.Postgres.{AdmissionPhase, Dispatcher, Notifier, RunStore, Storage}
+    alias Docket.Postgres.{AdmissionPhase, Dispatcher, MomentStore, Notifier, RunStore, Storage}
     alias Docket.Postgres.NotifierTestRepo, as: TestRepo
     alias Docket.Postgres.Schemas.{ClaimPartition, GraphVersion, Run}
 
@@ -75,7 +75,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert {:ok, :committed} =
                  Storage.transaction(TestRepo, fn tx ->
                    {:ok, _run} =
-                     RunStore.insert_run(tx, :tenantless, run, :run_initialized, past())
+                     RunStore.insert_transition(tx, :tenantless, run, :run_initialized, past())
 
                    refute_receive {:notification, _, _, @channel, _}, 200
                    {:ok, :committed}
@@ -93,7 +93,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert {:error, :rolled_back} =
                  Storage.transaction(TestRepo, fn tx ->
                    {:ok, _run} =
-                     RunStore.insert_run(tx, :tenantless, run, :run_initialized, past())
+                     RunStore.insert_transition(tx, :tenantless, run, :run_initialized, past())
 
                    {:error, :rolled_back}
                  end)
@@ -114,7 +114,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    wake_at = DateTime.add(DateTime.utc_now(), -250, :millisecond)
 
                    {:ok, _run} =
-                     RunStore.insert_run(tx, :tenantless, run, :run_initialized, wake_at)
+                     RunStore.insert_transition(tx, :tenantless, run, :run_initialized, wake_at)
 
                    {:ok, :committed}
                  end)
@@ -128,7 +128,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         run = initialized_run("insert-future")
 
         assert {:ok, ^run} =
-                 RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, future())
+                 RunStore.insert_transition(
+                   TestRepo,
+                   :tenantless,
+                   run,
+                   :run_initialized,
+                   future()
+                 )
 
         refute_receive {:notification, _, _, @channel, _}, 300
       end
@@ -140,7 +146,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         ctx = %{repo: TestRepo, prefix: "docket_private"}
 
         assert {:ok, ^run} =
-                 RunStore.insert_run(ctx, :tenantless, run, :run_initialized, past())
+                 RunStore.insert_transition(ctx, :tenantless, run, :run_initialized, past())
 
         assert_receive {:notification, _, _, @channel, "docket_private"}
 
@@ -161,7 +167,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           {run, lease} = insert_and_claim!(run_id)
 
           assert {:ok, _run} =
-                   RunStore.commit(TestRepo, :system, commit_proposal(run, lease, schedule))
+                   MomentStore.commit(
+                     TestRepo,
+                     :system,
+                     commit_proposal(run, lease, schedule),
+                     []
+                   )
 
           assert_receive {:notification, _, _, @channel, ""}
         end
@@ -178,10 +189,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           {run, lease} = insert_and_claim!(run_id)
 
           assert {:ok, _run} =
-                   RunStore.commit(
+                   MomentStore.commit(
                      TestRepo,
                      :system,
-                     commit_proposal(run, lease, schedule, status)
+                     commit_proposal(run, lease, schedule, status),
+                     []
                    )
 
           refute_receive {:notification, _, _, @channel, _}, 300
@@ -194,10 +206,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         run = initialized_run("signal-commit")
 
         assert {:ok, ^run} =
-                 RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, future())
+                 RunStore.insert_transition(
+                   TestRepo,
+                   :tenantless,
+                   run,
+                   :run_initialized,
+                   future()
+                 )
 
         assert {:ok, {:committed, :signaled}} =
-                 RunStore.mutate_run(TestRepo, :system, run.id, immediate_mutation(:signaled))
+                 RunStore.mutate_transition(
+                   TestRepo,
+                   :system,
+                   run.id,
+                   immediate_mutation(:signaled)
+                 )
 
         assert_receive {:notification, _, _, @channel, ""}
       end
@@ -208,12 +231,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         run = initialized_run("signal-rollback")
 
         assert {:ok, ^run} =
-                 RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, future())
+                 RunStore.insert_transition(
+                   TestRepo,
+                   :tenantless,
+                   run,
+                   :run_initialized,
+                   future()
+                 )
 
         assert {:error, :event_append_failed} =
                  Storage.transaction(TestRepo, fn tx ->
                    {:ok, {:committed, :signaled}} =
-                     RunStore.mutate_run(tx, :system, run.id, immediate_mutation(:signaled))
+                     RunStore.mutate_transition(
+                       tx,
+                       :system,
+                       run.id,
+                       immediate_mutation(:signaled)
+                     )
 
                    {:error, :event_append_failed}
                  end)
@@ -227,7 +261,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         run = initialized_run("poison-retry")
 
         assert {:ok, ^run} =
-                 RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, future())
+                 RunStore.insert_transition(
+                   TestRepo,
+                   :tenantless,
+                   run,
+                   :run_initialized,
+                   future()
+                 )
 
         poison!(run.id)
 
@@ -351,7 +391,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         assert {:ok, :committed} =
                  Storage.transaction(TestRepo, fn tx ->
                    {:ok, _run} =
-                     RunStore.insert_run(tx, :tenantless, run, :run_initialized, past())
+                     RunStore.insert_transition(tx, :tenantless, run, :run_initialized, past())
 
                    {:ok, :committed}
                  end)
@@ -383,7 +423,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         run = initialized_run("poll-only")
 
         assert {:ok, ^run} =
-                 RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, past())
+                 RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, past())
 
         assert_receive {:launched, run_id, vehicle}, 3_000
         assert run_id == run.id
@@ -446,7 +486,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp insert_and_claim!(run_id) do
       run = initialized_run(run_id)
 
-      {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, future())
+      {:ok, ^run} =
+        RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, future())
 
       {:ok, %{leases: leases, poisoned: []}} =
         RunStore.claim_due(Docket.Postgres.TestAdmissionContext.resolve(TestRepo), :system, %{

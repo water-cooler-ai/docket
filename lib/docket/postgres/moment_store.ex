@@ -5,8 +5,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     The checkpoint fence, immutable run binding, scoped run update, assigned
     event insert, and optional wake notification execute as one PostgreSQL
-    statement. PostgreSQL statement atomicity replaces the portable
-    lifecycle composition's explicit transaction and sequential store calls.
+    statement. PostgreSQL statement atomicity makes the run update and event
+    insert indivisible without an explicit transaction.
 
     A zero-row update pays one diagnostic read to preserve the public
     `:not_found` / `:invalid_commit` / `:stale_fence` distinction. The
@@ -21,7 +21,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @spec commit(
             Docket.Backend.ctx(),
             Docket.Backend.scope(),
-            Docket.Backend.RunStore.commit_proposal(),
+            Docket.Backend.TransitionStore.claimed_proposal(),
             [Docket.Event.t()]
           ) :: {:ok, Docket.Run.t()} | {:error, term()}
     def commit(ctx, scope, %{run: %Docket.Run{} = run} = proposal, events) do

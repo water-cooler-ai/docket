@@ -1,0 +1,89 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: check for unpublished version
+    if: github.repository == 'water-cooler-ai/docket'
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Publish only when the mix.exs version is absent from hex.pm, so
+      # ordinary merges to main that do not bump the version are no-ops.
+      - name: Compare mix.exs version against hex.pm
+        id: check
+        run: |
+          version="$(grep -m1 '@version "' mix.exs | cut -d'"' -f2)"
+          status="$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hex.pm/api/packages/docket/releases/${version}")"
+          case "$status" in
+            404) publish=true ;;
+            200) publish=false ;;
+            *)
+              echo "Unexpected hex.pm response for ${version}: ${status}" >&2
+              exit 1
+              ;;
+          esac
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: publish v${{ needs.check.outputs.version }}
+    needs: check
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-publish-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-publish-
+
+      - run: mix deps.get
+
+      - run: mix compile --warnings-as-errors
+
+      - run: mix test
+
+      # Also builds and publishes the documentation to hexdocs.pm.
+      - name: Publish to Hex
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: mix hex.publish --yes
+
+      # Creates the tag as part of the release. Release notes are the
+      # version's own CHANGELOG section ("## <version> — <date>").
+      - name: Tag and create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ needs.check.outputs.version }}"
+          awk -v ver="$version" '
+            !found && $0 ~ ("^## " ver "( |$)") { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          gh release create "v${version}" \
+            --target "$GITHUB_SHA" \
+            --title "v${version}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"

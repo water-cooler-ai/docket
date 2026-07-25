@@ -8,7 +8,6 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
   defmodule IncompleteBundle do
     @moduledoc false
 
-    def transaction(context, fun), do: fun.(context)
     def graphs, do: Docket.Test.MemoryBackend
     def runs, do: MissingRunStore
     def events, do: Docket.Test.MemoryBackend
@@ -43,17 +42,44 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     end
   end
 
+  defmodule ContractV1Bundle do
+    @moduledoc false
+
+    def capabilities, do: %{contract_version: 1}
+  end
+
+  defmodule IncompleteStoreBundle do
+    @moduledoc false
+
+    def capabilities do
+      %{
+        contract_version: 2,
+        transitions: %{version: 1}
+      }
+    end
+
+    def transitions, do: Docket.Test.MemoryBackend
+    def graphs, do: Docket.Test.MemoryBackend
+    def runs, do: MissingRunStore
+    def events, do: Docket.Test.MemoryBackend
+    def drain_runs(_context, _opts), do: {:error, :unsupported}
+    def context(opts), do: Keyword.fetch!(opts, :name)
+
+    def child_spec(_opts, _context),
+      do: %{id: __MODULE__, start: {Task, :start_link, [fn -> :ok end]}}
+  end
+
   test "the backend owns versioned transitions and focused stores" do
     callbacks = Docket.Backend.behaviour_info(:callbacks)
     optional_callbacks = Docket.Backend.behaviour_info(:optional_callbacks)
 
-    assert {:transaction, 2} in callbacks
+    assert {:capabilities, 0} in callbacks
+    assert {:transitions, 0} in callbacks
     assert {:context, 1} in callbacks
     assert {:child_spec, 2} in callbacks
     assert {:drain_runs, 2} in callbacks
-    assert {:capabilities, 0} in optional_callbacks
-    assert {:transitions, 0} in optional_callbacks
-    assert {:commit_transition, 4} in optional_callbacks
+    refute {:capabilities, 0} in optional_callbacks
+    refute {:transitions, 0} in optional_callbacks
     refute {:storage, 0} in callbacks
     refute Code.ensure_loaded?(Docket.Storage)
     refute Code.ensure_loaded?(Docket.Storage.Graphs)
@@ -73,7 +99,6 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
 
   test "the shared memory backend implements every new read callback" do
     assert Code.ensure_loaded?(Docket.Test.MemoryBackend)
-    assert function_exported?(Docket.Test.MemoryBackend, :transaction, 2)
     assert Docket.Test.MemoryBackend.capabilities().contract_version == 2
     assert Docket.Test.MemoryBackend.transitions() == Docket.Test.MemoryBackend
     refute function_exported?(Docket.Test.MemoryBackend, :storage, 0)
@@ -90,9 +115,22 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
     end
   end
 
-  test "legacy backends resolve through the compatibility transition adapter" do
-    assert {Docket.Backend.LegacyTransitionStore, {IncompleteBundle, :context}} =
-             Docket.Backend.transition_store(IncompleteBundle, :context)
+  test "an undeclared backend fails contract validation" do
+    error =
+      assert_raise ArgumentError, fn ->
+        Docket.Backend.validate_contract!(IncompleteBundle)
+      end
+
+    assert error.message =~ "does not export capabilities/0"
+  end
+
+  test "a contract version 1 backend is rejected as removed" do
+    error =
+      assert_raise ArgumentError, fn ->
+        Docket.Backend.validate_contract!(ContractV1Bundle)
+      end
+
+    assert error.message =~ "declares contract version 1, which was removed in 0.2"
   end
 
   test "partially upgraded transition declarations fail clearly" do
@@ -116,12 +154,12 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
   end
 
   test "shared backend completeness failures name the accessor and exact callback" do
-    violations = Docket.BackendTests.Contract.violations(IncompleteBundle)
+    violations = Docket.BackendTests.Contract.violations(IncompleteStoreBundle)
 
     assert Enum.any?(violations, fn violation ->
              violation ==
-               "backend #{inspect(IncompleteBundle)} runs/0 -> #{inspect(MissingRunStore)}: " <>
-                 "missing Docket.Backend.RunStore.commit/3"
+               "backend #{inspect(IncompleteStoreBundle)} runs/0 -> #{inspect(MissingRunStore)}: " <>
+                 "missing Docket.Backend.RunStore.fetch_run/3"
            end)
   end
 end

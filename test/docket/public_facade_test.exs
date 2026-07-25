@@ -196,11 +196,13 @@ defmodule Docket.PublicFacadeTest do
     } do
       populated = run("populated", ~U[2026-07-12 00:00:00Z], event_seq: 2)
       empty = run("empty", ~U[2026-07-12 00:01:00Z])
-      insert_run!(backend, context, :tenantless, populated)
-      insert_run!(backend, context, :tenantless, empty)
 
-      events = [event("populated", 1), event("populated", 2)]
-      assert :ok = backend.append_events(context, :tenantless, populated.id, events)
+      insert_run!(backend, context, :tenantless, populated, [
+        event("populated", 1),
+        event("populated", 2)
+      ])
+
+      insert_run!(backend, context, :tenantless, empty)
 
       assert {:ok, %Docket.Event{seq: 1}} = Host.fetch_event(populated.id, 1)
       assert {:ok, %Docket.Event{seq: 2}} = Host.fetch_latest_event(populated.id)
@@ -219,9 +221,11 @@ defmodule Docket.PublicFacadeTest do
     backend = Keyword.fetch!(defaults, :backend)
     context = Keyword.fetch!(defaults, :backend_context)
 
-    insert_run!(backend, context, {:tenant, "a"}, run("a-run", ~U[2026-07-12 00:00:00Z]))
+    insert_run!(backend, context, {:tenant, "a"}, run("a-run", ~U[2026-07-12 00:00:00Z]), [
+      event("a-run", 1)
+    ])
+
     insert_run!(backend, context, {:tenant, "b"}, run("b-run", ~U[2026-07-12 00:01:00Z]))
-    assert :ok = backend.append_events(context, {:tenant, "a"}, "a-run", [event("a-run", 1)])
 
     assert {:error, %Docket.Error{type: :invalid_tenant}} = TenantHost.list_runs()
     assert {:ok, page} = TenantHost.list_runs(tenant_id: "a")
@@ -287,8 +291,6 @@ defmodule Docket.PublicFacadeTest do
         updated_at: ~U[2026-07-12 00:00:00Z]
       }
 
-      run = publish_for_run!(backend, context, :tenantless, run)
-
       events =
         for seq <- 1..2 do
           %Docket.Event{
@@ -302,20 +304,7 @@ defmodule Docket.PublicFacadeTest do
           }
         end
 
-      assert {:ok, :done} =
-               backend.transaction(context, fn tx ->
-                 with {:ok, _} <-
-                        backend.insert_run(
-                          tx,
-                          :tenantless,
-                          run,
-                          :run_initialized,
-                          ~U[2026-07-12 00:00:00Z]
-                        ),
-                      :ok <- backend.append_events(tx, :tenantless, "run", events) do
-                   {:ok, :done}
-                 end
-               end)
+      insert_run!(backend, context, :tenantless, run, events)
 
       assert {:ok, %Docket.EventPage{} = page} = Host.list_events("run", after_seq: 0, limit: 1)
       assert [%Docket.Event{seq: 1}] = page.events
@@ -329,11 +318,16 @@ defmodule Docket.PublicFacadeTest do
     end
   end
 
-  defp insert_run!(backend, context, scope, run) do
+  defp insert_run!(backend, context, scope, run, events \\ []) do
     run = publish_for_run!(backend, context, scope, run)
 
     assert {:ok, ^run} =
-             backend.insert_run(context, scope, run, :run_initialized, run.started_at)
+             backend.transitions().initialize(
+               context,
+               scope,
+               %{run: run, checkpoint_type: :run_initialized, wake_at: run.started_at},
+               events
+             )
 
     run
   end

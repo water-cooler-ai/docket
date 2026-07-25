@@ -66,7 +66,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       }
 
       assert {:ok, ^run} =
-               RunStore.insert_run(
+               RunStore.insert_transition(
                  TestRepo,
                  {:tenant, "t1"},
                  run,
@@ -79,8 +79,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "appends versioned deterministic events idempotently", %{run: run} do
       event = event(run, 2)
-      assert :ok = EventStore.append_events(TestRepo, {:tenant, "t1"}, run.id, [event])
-      assert :ok = EventStore.append_events(TestRepo, {:tenant, "t1"}, run.id, [event])
+      assert :ok = EventStore.append_transition_events(TestRepo, {:tenant, "t1"}, run.id, [event])
+      assert :ok = EventStore.append_transition_events(TestRepo, {:tenant, "t1"}, run.id, [event])
       assert TestRepo.aggregate(Event, :count) == 1
       row = TestRepo.one!(Event)
       assert Docket.DurableCodec.decode!(row.payload, :event) == event.payload
@@ -89,10 +89,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "rejects conflicting replay and preserves the winner", %{run: run} do
       event = event(run, 2)
-      assert :ok = EventStore.append_events(TestRepo, :system, run.id, [event])
+      assert :ok = EventStore.append_transition_events(TestRepo, :system, run.id, [event])
 
       assert {:error, :event_conflict} =
-               EventStore.append_events(TestRepo, :system, run.id, [
+               EventStore.append_transition_events(TestRepo, :system, run.id, [
                  event(run, 3),
                  %{event | payload: %{"other" => true}}
                ])
@@ -106,12 +106,19 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       second = %{event(run, 3) | type: :node_completed, node_id: "node"}
       third = event(run, 4)
 
-      assert :ok = EventStore.append_events(TestRepo, :system, run.id, [first])
-      assert :ok = EventStore.append_events(TestRepo, :system, run.id, [first, second, third])
+      assert :ok = EventStore.append_transition_events(TestRepo, :system, run.id, [first])
+
+      assert :ok =
+               EventStore.append_transition_events(TestRepo, :system, run.id, [
+                 first,
+                 second,
+                 third
+               ])
+
       assert TestRepo.aggregate(Event, :count) == 3
 
       assert {:error, :event_conflict} =
-               EventStore.append_events(TestRepo, :system, run.id, [
+               EventStore.append_transition_events(TestRepo, :system, run.id, [
                  second,
                  %{second | payload: %{"different" => true}}
                ])
@@ -121,25 +128,27 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "reports invalid identity fields precisely", %{run: run} do
       assert {:error, :invalid_event_sequence} =
-               EventStore.append_events(TestRepo, :system, run.id, [%{event(run, 2) | seq: 0}])
+               EventStore.append_transition_events(TestRepo, :system, run.id, [
+                 %{event(run, 2) | seq: 0}
+               ])
 
       assert {:error, :invalid_events} =
-               EventStore.append_events(TestRepo, :system, run.id, [
+               EventStore.append_transition_events(TestRepo, :system, run.id, [
                  %{event(run, 2) | timestamp: nil}
                ])
 
       assert {:error, :event_run_mismatch} =
-               EventStore.append_events(TestRepo, :system, run.id, [
+               EventStore.append_transition_events(TestRepo, :system, run.id, [
                  %{event(run, 2) | run_id: "other"}
                ])
 
       assert {:error, :invalid_events} =
-               EventStore.append_events(TestRepo, :system, run.id, [
+               EventStore.append_transition_events(TestRepo, :system, run.id, [
                  %{event(run, 2) | payload: nil}
                ])
 
       assert {:error, :invalid_events} =
-               EventStore.append_events(TestRepo, :system, run.id, [
+               EventStore.append_transition_events(TestRepo, :system, run.id, [
                  %{event(run, 2) | metadata: %{"pid" => self()}}
                ])
 
@@ -148,12 +157,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "enforces tenant ownership and validates empty appends without lookup", %{run: run} do
       assert {:error, :not_found} =
-               EventStore.append_events(TestRepo, :tenantless, run.id, [event(run, 2)])
+               EventStore.append_transition_events(TestRepo, :tenantless, run.id, [event(run, 2)])
 
       assert {:error, :not_found} =
-               EventStore.append_events(TestRepo, {:tenant, "t2"}, run.id, [event(run, 2)])
+               EventStore.append_transition_events(TestRepo, {:tenant, "t2"}, run.id, [
+                 event(run, 2)
+               ])
 
-      assert :ok = EventStore.append_events(TestRepo, {:tenant, "t2"}, "missing", [])
+      assert :ok = EventStore.append_transition_events(TestRepo, {:tenant, "t2"}, "missing", [])
     end
 
     describe "point event reads" do
@@ -326,7 +337,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         }
 
         assert {:ok, ^run} =
-                 RunStore.insert_run(
+                 RunStore.insert_transition(
                    ctx,
                    {:tenant, "private-tenant"},
                    run,
@@ -337,7 +348,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         expected = event(run, 2)
 
         assert :ok =
-                 EventStore.append_events(
+                 EventStore.append_transition_events(
                    ctx,
                    {:tenant, "private-tenant"},
                    run.id,
@@ -545,7 +556,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp append(run, seqs) do
       events = Enum.map(seqs, &event(run, &1))
-      assert :ok = EventStore.append_events(TestRepo, :system, run.id, events)
+      assert :ok = EventStore.append_transition_events(TestRepo, :system, run.id, events)
     end
 
     defp reinsert(run, opts) do
@@ -554,7 +565,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       updated = %{run | event_seq: Keyword.fetch!(opts, :event_seq)}
 
       assert {:ok, ^updated} =
-               RunStore.insert_run(
+               RunStore.insert_transition(
                  TestRepo,
                  {:tenant, "t1"},
                  updated,

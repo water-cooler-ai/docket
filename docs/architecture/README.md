@@ -17,15 +17,23 @@ individual function boundary.
   configuration, migration, recovery, and inspection.
 - [ClaimPolicy boundary](docket-claim-policy.md) — the one-statement internal
   seam, engine selection, and the admission-mode interlock.
-- [0.0.1 to 0.1.0 migration](migration-0.0.1-to-0.1.0.md) — drain-and-cut-over
-  instructions for old host-owned persistence adopters.
-- [0.1.1 to 0.1.2 transition migration](migration-0.1.1-to-0.1.2.md) —
-  semantic lifecycle writes and the 0.1.x compatibility window.
 
 Graph and compiler internals are documented in
 [graph construction](docket-graph-construction-design.md),
 [compiler design](docket-compiler-design.md), and
 [reducers](docket-reducers-design.md).
+
+## Migration guides
+
+Each guide is pinned to its release hop and stays available for readers
+upgrading from older lines.
+
+- [0.0.1 to 0.1.0](migration-0.0.1-to-0.1.0.md) — drain-and-cut-over
+  instructions for old host-owned persistence adopters.
+- [0.1.1 to 0.1.2](migration-0.1.1-to-0.1.2.md) — semantic lifecycle writes
+  and the 0.1.x compatibility window (closed in 0.2.0).
+- [0.1.2 to 0.2.0](migration-0.1.2-to-0.2.0.md) — mandatory transition
+  stores, the removed composition APIs, and the lifecycle telemetry rename.
 
 ## Future planning
 

@@ -75,34 +75,18 @@ defmodule Docket.BackendTests.Fixture do
     {graph, graph_hash}
   end
 
-  @spec insert_run(Docket.BackendTests.subject(), Docket.Backend.owner_scope(), Run.t()) ::
-          {:ok, Run.t()}
-  def insert_run(instance, owner_scope, run) do
-    instance.backend.runs().insert_run(
-      instance.context,
-      owner_scope,
-      run,
-      :run_initialized,
-      instance.now
-    )
-  end
-
   @spec initialize(Docket.BackendTests.subject(), Docket.Backend.owner_scope(), Run.t(), [
           Event.t()
         ]) ::
-          Docket.Backend.transaction_result()
+          Docket.Backend.TransitionStore.result()
   def initialize(instance, owner_scope, run, events \\ []) do
-    backend = instance.backend
-    runs = backend.runs()
-    event_store = backend.events()
+    proposal = %{
+      run: run,
+      checkpoint_type: :run_initialized,
+      wake_at: instance.now
+    }
 
-    backend.transaction(instance.context, fn tx ->
-      with {:ok, initialized} <-
-             runs.insert_run(tx, owner_scope, run, :run_initialized, instance.now),
-           :ok <- event_store.append_events(tx, owner_scope, run.id, events) do
-        {:ok, initialized}
-      end
-    end)
+    instance.backend.transitions().initialize(instance.context, owner_scope, proposal, events)
   end
 
   @spec claim(Docket.BackendTests.subject(), keyword()) ::
@@ -123,7 +107,7 @@ defmodule Docket.BackendTests.Fixture do
   end
 
   @spec proposal(Run.t(), Docket.Backend.RunStore.claim_token(), keyword()) ::
-          Docket.Backend.RunStore.commit_proposal()
+          Docket.Backend.TransitionStore.claimed_proposal()
   def proposal(run, token, opts \\ []) do
     %{
       run: run,

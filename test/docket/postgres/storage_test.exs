@@ -46,7 +46,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       graph_hash = hash(document)
 
       assert {:ok, :committed} =
-               Docket.Postgres.transaction(TestRepo, fn ctx ->
+               Storage.transaction(TestRepo, fn ctx ->
                  assert ctx == %{repo: TestRepo, prefix: nil}
 
                  assert :ok =
@@ -80,11 +80,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       root = Map.put(root, :claim_policy, claim_policy)
 
       assert {:ok, :preserved} =
-               Docket.Postgres.transaction(root, fn outer_ctx ->
+               Storage.transaction(root, fn outer_ctx ->
                  assert outer_ctx.claim_policy === claim_policy
 
                  assert {:ok, :nested} =
-                          Docket.Postgres.transaction(outer_ctx, fn inner_ctx ->
+                          Storage.transaction(outer_ctx, fn inner_ctx ->
                             assert inner_ctx.claim_policy === claim_policy
                             {:ok, :nested}
                           end)
@@ -98,7 +98,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       error_hash = hash(error_doc)
 
       assert {:error, :stop} =
-               Docket.Postgres.transaction(TestRepo, fn ctx ->
+               Storage.transaction(TestRepo, fn ctx ->
                  assert :ok =
                           GraphStore.save_graph(ctx, :tenantless, "error", error_hash, error_doc)
 
@@ -112,7 +112,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       raised_hash = hash(raised_doc)
 
       assert_raise RuntimeError, "boom", fn ->
-        Docket.Postgres.transaction(TestRepo, fn ctx ->
+        Storage.transaction(TestRepo, fn ctx ->
           assert :ok =
                    GraphStore.save_graph(ctx, :tenantless, "raised", raised_hash, raised_doc)
 
@@ -127,7 +127,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       thrown_hash = hash(thrown_doc)
 
       assert catch_throw(
-               Docket.Postgres.transaction(TestRepo, fn ctx ->
+               Storage.transaction(TestRepo, fn ctx ->
                  assert :ok =
                           GraphStore.save_graph(
                             ctx,
@@ -148,7 +148,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       invalid_hash = hash(invalid_doc)
 
       assert_raise ArgumentError, ~r/transaction callback must return/, fn ->
-        Docket.Postgres.transaction(TestRepo, fn ctx ->
+        Storage.transaction(TestRepo, fn ctx ->
           assert :ok =
                    GraphStore.save_graph(
                      ctx,
@@ -173,7 +173,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       inner_hash = hash(inner_doc)
 
       assert {:error, :rollback} =
-               Docket.Postgres.transaction(TestRepo, fn outer_ctx ->
+               Storage.transaction(TestRepo, fn outer_ctx ->
                  assert :ok =
                           GraphStore.save_graph(
                             outer_ctx,
@@ -184,7 +184,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                           )
 
                  assert {:error, :inner_stop} =
-                          Docket.Postgres.transaction(outer_ctx, fn inner_ctx ->
+                          Storage.transaction(outer_ctx, fn inner_ctx ->
                             assert inner_ctx == outer_ctx
 
                             assert :ok =
@@ -214,9 +214,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       graph_hash = hash(document)
 
       assert {:ok, {:outer, :inner}} =
-               Docket.Postgres.transaction(%{repo: TestRepo}, fn outer_ctx ->
+               Storage.transaction(%{repo: TestRepo}, fn outer_ctx ->
                  assert {:ok, :inner} =
-                          Docket.Postgres.transaction(outer_ctx, fn inner_ctx ->
+                          Storage.transaction(outer_ctx, fn inner_ctx ->
                             assert inner_ctx == %{repo: TestRepo, prefix: nil}
 
                             assert :ok =
@@ -245,7 +245,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       transaction =
         Task.async(fn ->
-          Docket.Postgres.transaction(TestRepo, fn ctx ->
+          Storage.transaction(TestRepo, fn ctx ->
             assert :ok =
                      GraphStore.save_graph(
                        ctx,

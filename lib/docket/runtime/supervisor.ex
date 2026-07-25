@@ -150,7 +150,8 @@ defmodule Docket.Runtime.Supervisor do
 
     missing =
       for {name, arity} <- [
-            transaction: 2,
+            capabilities: 0,
+            transitions: 0,
             graphs: 0,
             runs: 0,
             events: 0,

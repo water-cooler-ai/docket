@@ -9,11 +9,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @behaviour Docket.Backend.EventStore
 
-    @impl true
-    @deprecated "use Docket.Postgres.TransitionStore for lifecycle event publication"
-    def append_events(ctx, scope, run_id, events),
-      do: append_transition_events(ctx, scope, run_id, events)
-
     @doc false
     def append_transition_events(_ctx, scope, _run_id, []) do
       validate_scope!(scope)

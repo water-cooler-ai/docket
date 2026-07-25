@@ -71,7 +71,7 @@ The graph and execution core needs only Docket:
 ```elixir
 def deps do
   [
-    {:docket, "~> 0.1.2"}
+    {:docket, "~> 0.2.0"}
   ]
 end
 ```
@@ -166,7 +166,7 @@ three dependencies directly:
 ```elixir
 def deps do
   [
-    {:docket, "~> 0.1.2"},
+    {:docket, "~> 0.2.0"},
     {:ecto_sql, "~> 3.10"},
     {:postgrex, "~> 0.17"}
   ]
@@ -296,6 +296,7 @@ recovery, signals, and production supervision.
   node implementation.
 - [0.0.1 to 0.1.0 migration guide](docs/architecture/migration-0.0.1-to-0.1.0.md).
 - [0.1.1 to 0.1.2 backend transition migration](docs/architecture/migration-0.1.1-to-0.1.2.md).
+- [0.1.2 to 0.2.0 backend removal migration](docs/architecture/migration-0.1.2-to-0.2.0.md).
 - [Backend test guide](docs/backend-conformance.md) — the shared source test
   suite and backend-specific coverage boundary.
 - [Telemetry](docs/telemetry.md) — operational signals and bounded labels.

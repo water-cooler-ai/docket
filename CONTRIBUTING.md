@@ -2,11 +2,22 @@
 
 ## Release lines and PR targets
 
-- `main` is the current stable line.
-- `v0.1.0` is the active release branch for the 0.1.0 operational runtime
-  (see [docs/postgres-operations.md](docs/postgres-operations.md)).
-  **All 0.1.0 work targets `v0.1.0`, not `main`.** The release branch merges
-  back to `main` when 0.1.0 ships.
+- `main` is the current stable line. Release work branches from and targets
+  `main`.
+- `v0.1.0` was the release branch for the 0.1.0 operational runtime
+  (see [docs/postgres-operations.md](docs/postgres-operations.md)); it has
+  merged back into `main` and receives no new work.
+
+## Releasing
+
+Releases publish automatically (`.github/workflows/publish.yml`). On every
+push to `main` the workflow compares `@version` in `mix.exs` against hex.pm;
+when the version is not yet published it runs the default test suite,
+publishes the package and its documentation via `mix hex.publish`, and
+creates the `v<version>` tag and GitHub release using that version's
+CHANGELOG section as the notes. Merges that do not bump the version are
+no-ops. The workflow requires the `HEX_API_KEY` repository secret — a
+hex.pm key with the `api:write` permission.
 
 ## Optional Postgres dependencies
 

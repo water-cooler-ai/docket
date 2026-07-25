@@ -99,6 +99,78 @@ defmodule Docket.BackendTests.TransitionCases do
                  )
       end
 
+      @tag docket_invariant: "TRANSITION-INITIALIZE-REJECTIONS"
+      test "[TRANSITION-INITIALIZE-REJECTIONS] initialization accepts only a scheduled initialized running run",
+           %{backend_test: instance} do
+        transitions = instance.backend.transitions()
+
+        {graph, graph_hash} =
+          Fixture.publish_graph(instance, :tenantless, "transition-init-reject")
+
+        base = Fixture.run(instance, "transition-init-reject-run", graph, graph_hash)
+
+        proposal = fn run ->
+          %{run: run, checkpoint_type: :run_initialized, wake_at: instance.now}
+        end
+
+        for status <- [:created, :waiting, :done, :failed, :cancelled] do
+          assert {:error, :invalid_transition} =
+                   transitions.initialize(
+                     instance.context,
+                     :tenantless,
+                     proposal.(%{base | status: status}),
+                     []
+                   )
+        end
+
+        assert {:error, :invalid_transition} =
+                 transitions.initialize(
+                   instance.context,
+                   :tenantless,
+                   proposal.(%{base | checkpoint_seq: 0}),
+                   []
+                 )
+
+        assert {:error, :invalid_transition} =
+                 transitions.initialize(
+                   instance.context,
+                   :tenantless,
+                   proposal.(%{base | updated_at: nil}),
+                   []
+                 )
+
+        assert {:error, :invalid_transition} =
+                 transitions.initialize(
+                   instance.context,
+                   :tenantless,
+                   %{run: base, checkpoint_type: :step_committed, wake_at: instance.now},
+                   []
+                 )
+
+        assert {:error, :invalid_transition} =
+                 transitions.initialize(
+                   instance.context,
+                   :tenantless,
+                   %{run: base, checkpoint_type: nil, wake_at: instance.now},
+                   []
+                 )
+
+        assert {:error, :invalid_transition} =
+                 transitions.initialize(
+                   instance.context,
+                   :tenantless,
+                   %{run: base, checkpoint_type: :run_initialized, wake_at: nil},
+                   []
+                 )
+
+        assert_raise ArgumentError, fn ->
+          transitions.initialize(instance.context, {:tenant, ""}, proposal.(base), [])
+        end
+
+        assert {:error, :not_found} =
+                 instance.backend.runs().fetch_run(instance.context, :tenantless, base.id)
+      end
+
       @tag docket_invariant: "TRANSITION-CLAIMED-FENCES"
       test "[TRANSITION-CLAIMED-FENCES] claimed writes fence state and accept identical stored events",
            %{backend_test: instance} do
@@ -112,9 +184,6 @@ defmodule Docket.BackendTests.TransitionCases do
           wake_at: instance.now
         }
 
-        assert {:ok, ^initial} = transitions.initialize(instance.context, :tenantless, init, [])
-        lease = Fixture.claim(instance)
-
         advanced = %{
           initial
           | checkpoint_seq: 2,
@@ -125,6 +194,11 @@ defmodule Docket.BackendTests.TransitionCases do
 
         event = Fixture.event(advanced, 1, instance.now, payload: %{"canonical" => true})
 
+        assert {:ok, ^initial} =
+                 transitions.initialize(instance.context, :tenantless, init, [event])
+
+        lease = Fixture.claim(instance)
+
         proposal = %{
           run: advanced,
           expected_checkpoint_seq: 1,
@@ -132,14 +206,6 @@ defmodule Docket.BackendTests.TransitionCases do
           checkpoint_type: :step_committed,
           schedule: :retain_claim
         }
-
-        assert :ok =
-                 instance.backend.events().append_events(
-                   instance.context,
-                   :tenantless,
-                   initial.id,
-                   [event]
-                 )
 
         assert {:ok, ^advanced} =
                  transitions.commit_claimed(instance.context, :tenantless, proposal, [event])
@@ -160,13 +226,74 @@ defmodule Docket.BackendTests.TransitionCases do
             claim_token: "00000000-0000-0000-0000-000000000000"
         }
 
+        stale_event = Fixture.event(next, 2, instance.now, payload: %{"stale" => true})
+
+        assert {:ok, before_info} =
+                 instance.backend.runs().inspect_run(instance.context, :tenantless, initial.id)
+
         assert {:error, :stale_checkpoint} =
-                 transitions.commit_claimed(instance.context, :tenantless, stale, [])
+                 transitions.commit_claimed(instance.context, :tenantless, stale, [stale_event])
+
+        assert {:error, :not_found} =
+                 instance.backend.events().fetch_event(
+                   instance.context,
+                   :tenantless,
+                   initial.id,
+                   2
+                 )
+
+        assert {:ok, ^before_info} =
+                 instance.backend.runs().inspect_run(instance.context, :tenantless, initial.id)
 
         malformed = %{stale | run: %{next | graph_hash: "immutable-mismatch"}}
 
         assert {:error, :invalid_transition} =
                  transitions.commit_claimed(instance.context, :tenantless, malformed, [])
+
+        sequence_skip = %{
+          proposal
+          | run: %{advanced | checkpoint_seq: 4},
+            expected_checkpoint_seq: 1
+        }
+
+        assert {:error, :invalid_transition} =
+                 transitions.commit_claimed(instance.context, :tenantless, sequence_skip, [])
+
+        fresh = %{
+          advanced
+          | checkpoint_seq: 3,
+            event_seq: 2,
+            updated_at: DateTime.add(instance.now, 4, :microsecond),
+            metadata: %{"winner" => 2}
+        }
+
+        fresh_event = Fixture.event(fresh, 2, instance.now, payload: %{"fresh" => true})
+
+        fresh_proposal = %{
+          run: fresh,
+          expected_checkpoint_seq: 2,
+          claim_token: lease.claim_token,
+          checkpoint_type: :step_committed,
+          schedule: :retain_claim
+        }
+
+        assert {:ok, ^fresh} =
+                 transitions.commit_claimed(
+                   instance.context,
+                   :tenantless,
+                   fresh_proposal,
+                   [fresh_event]
+                 )
+
+        assert {:ok, ^fresh_event} =
+                 instance.backend.events().fetch_event(instance.context, :tenantless, fresh.id, 2)
+
+        assert {:ok, ^fresh_event} =
+                 instance.backend.events().fetch_latest_event(
+                   instance.context,
+                   :tenantless,
+                   fresh.id
+                 )
       end
 
       @tag docket_invariant: "TRANSITION-CONCURRENT-SAME-FENCE"
@@ -204,7 +331,9 @@ defmodule Docket.BackendTests.TransitionCases do
                 schedule: :retain_claim
               }
 
-              transitions.commit_claimed(instance.context, :tenantless, proposal, [])
+              event = Fixture.event(advanced, 1, instance.now, payload: %{"winner" => winner})
+
+              transitions.commit_claimed(instance.context, :tenantless, proposal, [event])
             end,
             max_concurrency: 2,
             ordered: false
@@ -213,6 +342,21 @@ defmodule Docket.BackendTests.TransitionCases do
 
         assert Enum.count(results, &match?({:ok, %Docket.Run{}}, &1)) == 1
         assert Enum.count(results, &(&1 == {:error, :stale_checkpoint})) == 1
+
+        assert {:ok, winner_run} = Enum.find(results, &match?({:ok, %Docket.Run{}}, &1))
+
+        assert {:ok, ^winner_run} =
+                 instance.backend.runs().fetch_run(instance.context, :tenantless, initial.id)
+
+        assert {:ok, %Docket.Event{seq: 1, payload: winner_payload}} =
+                 instance.backend.events().fetch_event(
+                   instance.context,
+                   :tenantless,
+                   initial.id,
+                   1
+                 )
+
+        assert winner_payload == winner_run.metadata
       end
 
       @tag docket_invariant: "TRANSITION-UNCLAIMED-CAS"
@@ -264,6 +408,15 @@ defmodule Docket.BackendTests.TransitionCases do
                    []
                  )
 
+        assert {:error, :claim_lost} =
+                 instance.backend.runs().refresh_claim(
+                   instance.context,
+                   :system,
+                   initial.id,
+                   lease.claim_token,
+                   DateTime.add(instance.now, 4, :microsecond)
+                 )
+
         assert {:error, :stale_checkpoint} =
                  transitions.commit_unclaimed(
                    instance.context,
@@ -288,6 +441,182 @@ defmodule Docket.BackendTests.TransitionCases do
                    %{proposal | run: stale_run},
                    []
                  )
+
+        fresh = %{
+          advanced
+          | checkpoint_seq: 3,
+            event_seq: 1,
+            updated_at: DateTime.add(instance.now, 3, :microsecond),
+            metadata: %{"signal" => 3}
+        }
+
+        fresh_event = Fixture.event(fresh, 1, instance.now, payload: %{"signal" => 3})
+
+        fresh_proposal = %{
+          run: fresh,
+          checkpoint_type: :step_committed,
+          schedule: {:release_claim, :immediate}
+        }
+
+        assert {:ok, ^fresh} =
+                 transitions.commit_unclaimed(
+                   instance.context,
+                   :tenantless,
+                   2,
+                   fresh_proposal,
+                   [fresh_event]
+                 )
+
+        assert {:ok, ^fresh_event} =
+                 instance.backend.events().fetch_event(instance.context, :tenantless, fresh.id, 1)
+
+        assert {:ok, ^fresh_event} =
+                 instance.backend.events().fetch_latest_event(
+                   instance.context,
+                   :tenantless,
+                   fresh.id
+                 )
+
+        concealed = %{
+          fresh
+          | checkpoint_seq: 4,
+            updated_at: DateTime.add(instance.now, 4, :microsecond),
+            metadata: %{"signal" => 4}
+        }
+
+        concealed_proposal = %{
+          run: concealed,
+          checkpoint_type: :step_committed,
+          schedule: {:release_claim, :immediate}
+        }
+
+        assert {:error, :not_found} =
+                 transitions.commit_unclaimed(
+                   instance.context,
+                   {:tenant, Fixture.id(instance, "unclaimed-wrong-tenant")},
+                   3,
+                   concealed_proposal,
+                   [Fixture.event(concealed, 2, instance.now, payload: %{"concealed" => true})]
+                 )
+
+        assert {:error, :not_found} =
+                 instance.backend.events().fetch_event(instance.context, :tenantless, fresh.id, 2)
+
+        rebound = %{
+          fresh
+          | checkpoint_seq: 4,
+            updated_at: DateTime.add(instance.now, 5, :microsecond),
+            graph_hash: "immutable-rebound-hash"
+        }
+
+        assert {:error, :invalid_transition} =
+                 transitions.commit_unclaimed(
+                   instance.context,
+                   :tenantless,
+                   3,
+                   %{
+                     run: rebound,
+                     checkpoint_type: :step_committed,
+                     schedule: {:release_claim, :immediate}
+                   },
+                   []
+                 )
+
+        contradictory = %{
+          fresh
+          | checkpoint_seq: 4,
+            updated_at: DateTime.add(instance.now, 6, :microsecond)
+        }
+
+        assert {:error, :event_conflict} =
+                 transitions.commit_unclaimed(
+                   instance.context,
+                   :tenantless,
+                   3,
+                   %{
+                     run: contradictory,
+                     checkpoint_type: :step_committed,
+                     schedule: {:release_claim, :immediate}
+                   },
+                   [
+                     Fixture.event(contradictory, 1, instance.now,
+                       payload: %{"different" => true}
+                     )
+                   ]
+                 )
+
+        assert {:ok, %Docket.Run{checkpoint_seq: 3}} =
+                 instance.backend.runs().fetch_run(instance.context, :tenantless, fresh.id)
+
+        assert {:ok, ^fresh_event} =
+                 instance.backend.events().fetch_latest_event(
+                   instance.context,
+                   :tenantless,
+                   fresh.id
+                 )
+      end
+
+      @tag docket_invariant: "TRANSITION-UNCLAIMED-RACE"
+      test "[TRANSITION-UNCLAIMED-RACE] concurrent same-sequence unclaimed commits produce one winner and one stale checkpoint",
+           %{backend_test: instance} do
+        transitions = instance.backend.transitions()
+
+        {graph, graph_hash} =
+          Fixture.publish_graph(instance, :tenantless, "transition-unclaimed-race")
+
+        initial = Fixture.run(instance, "transition-unclaimed-race-run", graph, graph_hash)
+
+        init = %{
+          run: initial,
+          checkpoint_type: :run_initialized,
+          wake_at: instance.now
+        }
+
+        assert {:ok, ^initial} = transitions.initialize(instance.context, :tenantless, init, [])
+
+        results =
+          1..2
+          |> Task.async_stream(
+            fn winner ->
+              advanced = %{
+                initial
+                | checkpoint_seq: 2,
+                  updated_at: DateTime.add(instance.now, winner, :microsecond),
+                  metadata: %{"winner" => winner}
+              }
+
+              proposal = %{
+                run: advanced,
+                checkpoint_type: :step_committed,
+                schedule: {:release_claim, :immediate}
+              }
+
+              event = Fixture.event(advanced, 1, instance.now, payload: %{"winner" => winner})
+
+              transitions.commit_unclaimed(instance.context, :tenantless, 1, proposal, [event])
+            end,
+            max_concurrency: 2,
+            ordered: false
+          )
+          |> Enum.map(fn {:ok, result} -> result end)
+
+        assert Enum.count(results, &match?({:ok, %Docket.Run{}}, &1)) == 1
+        assert Enum.count(results, &(&1 == {:error, :stale_checkpoint})) == 1
+
+        assert {:ok, winner_run} = Enum.find(results, &match?({:ok, %Docket.Run{}}, &1))
+
+        assert {:ok, ^winner_run} =
+                 instance.backend.runs().fetch_run(instance.context, :tenantless, initial.id)
+
+        assert {:ok, %Docket.Event{seq: 1, payload: winner_payload}} =
+                 instance.backend.events().fetch_event(
+                   instance.context,
+                   :tenantless,
+                   initial.id,
+                   1
+                 )
+
+        assert winner_payload == winner_run.metadata
       end
 
       @tag docket_invariant: "TRANSITION-CLAIMED-TENANCY-IDENTITY"
@@ -436,7 +765,47 @@ defmodule Docket.BackendTests.TransitionCases do
 
           assert stored.status == advanced.status
           assert stored.checkpoint_seq == 2
+
+          assert {:ok, info} =
+                   instance.backend.runs().inspect_run(
+                     instance.context,
+                     :tenantless,
+                     advanced.id
+                   )
+
+          refresh =
+            instance.backend.runs().refresh_claim(
+              instance.context,
+              :system,
+              initial.id,
+              lease.claim_token,
+              DateTime.add(instance.now, 60, :second)
+            )
+
+          case schedule do
+            :retain_claim ->
+              assert %DateTime{} = info.claimed_at
+              assert info.wake_at == nil
+              assert refresh == :ok
+
+            {:release_claim, :immediate} ->
+              assert info.claimed_at == nil
+              assert %DateTime{} = info.wake_at
+              assert refresh == {:error, :claim_lost}
+
+            {:release_claim, {:at, at}} ->
+              assert info.claimed_at == nil
+              assert DateTime.compare(info.wake_at, at) == :eq
+              assert refresh == {:error, :claim_lost}
+
+            {:release_claim, park} when park in [:external, :terminal] ->
+              assert info.claimed_at == nil
+              assert info.wake_at == nil
+              assert refresh == {:error, :claim_lost}
+          end
         end
+
+        commit_with.("retain", & &1, :retain_claim)
 
         commit_with.(
           "at",
@@ -455,6 +824,8 @@ defmodule Docket.BackendTests.TransitionCases do
           &%{&1 | status: :done, finished_at: DateTime.add(instance.now, 1, :microsecond)},
           {:release_claim, :terminal}
         )
+
+        commit_with.("immediate", & &1, {:release_claim, :immediate})
       end
 
       @tag docket_invariant: "TRANSITION-EVENT-CANONICAL"
@@ -475,18 +846,15 @@ defmodule Docket.BackendTests.TransitionCases do
         }
 
         assert {:ok, ^stored_conflict} =
-                 transitions.initialize(instance.context, :tenantless, stored_init, [])
+                 transitions.initialize(
+                   instance.context,
+                   :tenantless,
+                   stored_init,
+                   [Fixture.event(stored_conflict, 1, instance.now, payload: %{"stored" => 1})]
+                 )
 
         lease = Fixture.claim(instance)
         assert lease.run_id == stored_conflict.id
-
-        assert :ok =
-                 instance.backend.events().append_events(
-                   instance.context,
-                   :tenantless,
-                   stored_conflict.id,
-                   [Fixture.event(stored_conflict, 1, instance.now, payload: %{"stored" => 1})]
-                 )
 
         conflicted_advance = %{
           stored_conflict
@@ -509,7 +877,8 @@ defmodule Docket.BackendTests.TransitionCases do
                    :tenantless,
                    conflicting,
                    [
-                     Fixture.event(stored_conflict, 1, instance.now, payload: %{"proposed" => 2})
+                     Fixture.event(stored_conflict, 1, instance.now, payload: %{"proposed" => 2}),
+                     Fixture.event(stored_conflict, 2, instance.now, payload: %{"fresh" => true})
                    ]
                  )
 
@@ -518,6 +887,22 @@ defmodule Docket.BackendTests.TransitionCases do
                    instance.context,
                    :tenantless,
                    stored_conflict.id
+                 )
+
+        assert {:error, :not_found} =
+                 instance.backend.events().fetch_event(
+                   instance.context,
+                   :tenantless,
+                   stored_conflict.id,
+                   2
+                 )
+
+        assert {:ok, %Docket.Event{seq: 1, payload: %{"stored" => 1}}} =
+                 instance.backend.events().fetch_event(
+                   instance.context,
+                   :tenantless,
+                   stored_conflict.id,
+                   1
                  )
 
         collapsed =

@@ -97,7 +97,10 @@ defmodule Docket.LifecycleTest do
     @behaviour Docket.Backend
 
     @impl true
-    defdelegate transaction(context, fun), to: Docket.Test.MemoryBackend
+    defdelegate capabilities(), to: Docket.Test.MemoryBackend
+
+    @impl true
+    defdelegate transitions(), to: Docket.Test.MemoryBackend
 
     @impl true
     defdelegate graphs(), to: Docket.Test.MemoryBackend
@@ -490,7 +493,6 @@ defmodule Docket.LifecycleTest do
     def transitions, do: Docket.LifecycleTest.SignalProbeTransitions
     def runs, do: Docket.LifecycleTest.SignalProbeRuns
     def events, do: Docket.LifecycleTest.SignalProbeRuns
-    def transaction(context, fun), do: fun.(context)
   end
 
   describe "signal transition discipline" do

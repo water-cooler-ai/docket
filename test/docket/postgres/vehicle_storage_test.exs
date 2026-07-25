@@ -23,22 +23,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule Backend do
-      defdelegate transaction(ctx, fun), to: Docket.Postgres
       def graphs, do: Docket.Postgres.GraphStore
       def runs, do: Docket.Postgres.RunStore
       def events, do: Docket.Postgres.EventStore
-    end
-
-    defmodule FailingEvents do
-      def append_events(_ctx, _scope, _run_id, _events),
-        do: {:error, :injected_event_failure}
+      def capabilities, do: Docket.Postgres.capabilities()
+      def transitions, do: Docket.Postgres.transitions()
     end
 
     defmodule FailingEventsBackend do
-      defdelegate transaction(ctx, fun), to: Docket.Postgres
       def graphs, do: Docket.Postgres.GraphStore
       def runs, do: Docket.Postgres.RunStore
-      def events, do: Docket.Postgres.VehicleStorageTest.FailingEvents
+      def events, do: Docket.Postgres.EventStore
+      def capabilities, do: Docket.Postgres.capabilities()
+      def transitions, do: __MODULE__.Transitions
+
+      defmodule Transitions do
+        defdelegate initialize(ctx, owner_scope, proposal, events),
+          to: Docket.Postgres.TransitionStore
+
+        def commit_claimed(_ctx, _scope, _proposal, _events),
+          do: {:error, :injected_event_failure}
+
+        defdelegate commit_unclaimed(ctx, scope, expected_checkpoint_seq, proposal, events),
+          to: Docket.Postgres.TransitionStore
+      end
     end
 
     defmodule RelayRuns do
@@ -46,7 +54,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       defdelegate release_claim(ctx, scope, run_id, token, now), to: Docket.Postgres.RunStore
       defdelegate abandon_claim(ctx, scope, run_id, token, policy), to: Docket.Postgres.RunStore
       defdelegate claim_due(ctx, scope, policy), to: Docket.Postgres.RunStore
-      defdelegate commit(ctx, scope, proposal), to: Docket.Postgres.RunStore
 
       def refresh_claim(ctx, scope, run_id, token, now) do
         result = Docket.Postgres.RunStore.refresh_claim(ctx, scope, run_id, token, now)
@@ -61,10 +68,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule RelayBackend do
-      defdelegate transaction(ctx, fun), to: Docket.Postgres
       def graphs, do: Docket.Postgres.GraphStore
       def runs, do: Docket.Postgres.VehicleStorageTest.RelayRuns
       def events, do: Docket.Postgres.EventStore
+      def capabilities, do: Docket.Postgres.capabilities()
+      def transitions, do: Docket.Postgres.transitions()
     end
 
     setup_all do
@@ -97,7 +105,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       %{context: context, backend: {Backend, context}}
     end
 
-    test "multi-step run drains to done with one commit transaction per moment", %{
+    test "multi-step run drains to done without explicit commit transactions", %{
       context: context,
       backend: backend
     } do
@@ -115,7 +123,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert {:ok, done} = RunStore.fetch_run(context, :system, run.id)
       assert done.status == :done
-      assert commits == done.checkpoint_seq - lease.checkpoint_seq
+      assert commits == 0
       assert done.checkpoint_seq > lease.checkpoint_seq + 1
     end
 

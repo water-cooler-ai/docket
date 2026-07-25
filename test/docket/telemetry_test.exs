@@ -11,7 +11,7 @@ defmodule Docket.TelemetryTest do
     }
 
     assert Docket.Telemetry.metric_metadata(
-             [:docket, :lifecycle, :transaction, :stop],
+             [:docket, :lifecycle, :transition, :stop],
              metadata
            ) == %{operation: :moment, result: :ok}
 
@@ -31,8 +31,8 @@ defmodule Docket.TelemetryTest do
     :telemetry.attach_many(
       id,
       [
-        [:docket, :lifecycle, :transaction, :start],
-        [:docket, :lifecycle, :transaction, :stop],
+        [:docket, :lifecycle, :transition, :start],
+        [:docket, :lifecycle, :transition, :stop],
         [:docket, :store, :operation, :start],
         [:docket, :store, :operation, :stop]
       ],
@@ -64,10 +64,10 @@ defmodule Docket.TelemetryTest do
     assert length(Enum.uniq(refs)) == 1
 
     assert Enum.map(events, &elem(&1, 0)) == [
-             [:docket, :lifecycle, :transaction, :start],
+             [:docket, :lifecycle, :transition, :start],
              [:docket, :store, :operation, :start],
              [:docket, :store, :operation, :stop],
-             [:docket, :lifecycle, :transaction, :stop]
+             [:docket, :lifecycle, :transition, :stop]
            ]
   end
 

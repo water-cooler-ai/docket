@@ -4,6 +4,47 @@ All notable changes to `docket` are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## 0.2.0 — 2026-07-25
+
+### Removed
+
+- The deprecated 0.1.x public lifecycle composition surface:
+  `Docket.Backend.transaction/2`, `Docket.Backend.commit_transition/4`,
+  `Docket.Backend.RunStore.insert_run/5`, `commit/3`, `mutate_run/4`, and
+  `Docket.Backend.EventStore.append_events/4`, together with the public
+  types they carried (`Docket.Backend.transaction_fun/0`,
+  `Docket.Backend.transaction_result/0`, and the `Docket.Backend.RunStore`
+  types `commit_proposal/0`, `mutation/0`, `mutation_decision/0`,
+  `mutation_result/0`, `checkpoint_type/0`). Lifecycle writes go through
+  `Docket.Backend.TransitionStore` exclusively; backend-native transactions
+  are private implementation details.
+- The deprecated PostgreSQL delegates of that surface:
+  `Docket.Postgres.transaction/2`, `Docket.Postgres.commit_transition/4`,
+  `Docket.Postgres.RunStore.insert_run/5`, `commit/3`, `mutate_run/4`, and
+  `Docket.Postgres.EventStore.append_events/4`.
+- `Docket.Backend.LegacyTransitionStore` and the contract-version-1 /
+  undeclared-backend negotiation path. Contract negotiation accepts only
+  contract version 2 with transition version 1 and raises a specific error
+  for anything else, including backends that do not export `capabilities/0`.
+- The transaction-composition cases from the shared backend conformance
+  suite. The v2 semantic transition matrix is the lifecycle write suite;
+  retained read, cursor, claim, and isolation assertions now seed state
+  through transitions.
+
+### Changed
+
+- `Docket.Backend.capabilities/0` and `Docket.Backend.transitions/0` are
+  required callbacks. `Docket.Runtime.Supervisor` validates them with the
+  rest of the backend contract at startup.
+- The lifecycle write span is `[:docket, :lifecycle, :transition, ...]`,
+  renamed from `[:docket, :lifecycle, :transaction, ...]`; measurements and
+  metadata are unchanged.
+- The transition `schedule` type is defined on
+  `Docket.Backend.TransitionStore`; it previously lived on
+  `Docket.Backend.RunStore` for the removed commit callbacks.
+- There is no database schema change: 0.2.0 runs on schema version 2 exactly
+  as every 0.1.x release does, and no migration needs to be generated or run.
+
 ## 0.1.2 — 2026-07-24
 
 ### Added
