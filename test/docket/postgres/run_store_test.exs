@@ -7,7 +7,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @moduletag :postgres
 
     alias Docket.DurableCodec
-    alias Docket.Postgres.{ClaimPolicy, RunCodec, RunStore, Storage}
+    alias Docket.Postgres.{ClaimPolicy, MomentStore, RunCodec, RunStore, Storage}
     alias Docket.Postgres.RunStoreTestRepo, as: TestRepo
     alias Docket.Postgres.Schemas.{ClaimPartition, GraphVersion, Run}
     alias Docket.Run.ChannelState
@@ -69,7 +69,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       assert {:ok, ^run} =
-               RunStore.insert_run(
+               RunStore.insert_transition(
                  TestRepo,
                  :tenantless,
                  run,
@@ -102,7 +102,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert %ClaimPartition{scope_key: ""} = claim_partition!("")
 
       assert {:error, :already_exists} =
-               RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+               RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
     end
 
     test "owner scope is the sole trusted claim partition identity" do
@@ -125,7 +125,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           )
 
         assert {:ok, ^run} =
-                 RunStore.insert_run(
+                 RunStore.insert_transition(
                    TestRepo,
                    owner_scope,
                    run,
@@ -156,7 +156,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       run = initialized_run("dormant-partition")
 
       assert {:ok, ^run} =
-               RunStore.insert_run(
+               RunStore.insert_transition(
                  TestRepo,
                  {:tenant, "tenant"},
                  run,
@@ -178,7 +178,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         |> Enum.map(fn {run, index} ->
           {{:insert, index},
            fn ->
-             RunStore.insert_run(
+             RunStore.insert_transition(
                TestRepo,
                {:tenant, "tenant"},
                run,
@@ -202,7 +202,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       invalid = initialized_run("invalid", status: :waiting)
 
       assert {:error, :invalid_run} =
-               RunStore.insert_run(
+               RunStore.insert_transition(
                  TestRepo,
                  {:tenant, "invalid-partition"},
                  invalid,
@@ -216,7 +216,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       non_durable = initialized_run("non-durable", input: %{"owner" => self()})
 
       assert {:error, :invalid_run} =
-               RunStore.insert_run(
+               RunStore.insert_transition(
                  TestRepo,
                  {:tenant, "codec-partition"},
                  non_durable,
@@ -230,7 +230,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       missing_graph = initialized_run("missing-graph", graph_hash: "not-published")
 
       assert {:error, :not_found} =
-               RunStore.insert_run(
+               RunStore.insert_transition(
                  TestRepo,
                  {:tenant, "fk-partition"},
                  missing_graph,
@@ -244,10 +244,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       original = initialized_run("duplicate-across-partitions")
 
       assert {:ok, ^original} =
-               RunStore.insert_run(TestRepo, :tenantless, original, :run_initialized, @now)
+               RunStore.insert_transition(TestRepo, :tenantless, original, :run_initialized, @now)
 
       assert {:error, :already_exists} =
-               RunStore.insert_run(
+               RunStore.insert_transition(
                  TestRepo,
                  {:tenant, "x"},
                  original,
@@ -269,7 +269,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:error, :forced_outer_rollback} =
                Storage.transaction(TestRepo, fn tx ->
                  assert {:ok, ^run} =
-                          RunStore.insert_run(
+                          RunStore.insert_transition(
                             tx,
                             {:tenant, "tenant"},
                             run,
@@ -291,7 +291,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       existing = initialized_run("locked-existing")
 
       assert {:ok, ^existing} =
-               RunStore.insert_run(
+               RunStore.insert_transition(
                  TestRepo,
                  {:tenant, "tenant"},
                  existing,
@@ -334,7 +334,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       inserter =
         Task.async(fn ->
-          RunStore.insert_run(
+          RunStore.insert_transition(
             TestRepo,
             {:tenant, "tenant"},
             inserted,
@@ -385,7 +385,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
             receive do
               {^ref, :start_lifecycle} ->
-                RunStore.insert_run(TestRepo, {:tenant, "x"}, run, :run_initialized, @now)
+                RunStore.insert_transition(TestRepo, {:tenant, "x"}, run, :run_initialized, @now)
             after
               5_000 -> raise "lifecycle insert was not started"
             end
@@ -523,7 +523,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       for {run, checkpoint_type, wake_at} <- invalid do
         assert {:error, :invalid_run} =
-                 RunStore.insert_run(
+                 RunStore.insert_transition(
                    TestRepo,
                    :tenantless,
                    run,
@@ -535,11 +535,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       unpublished = initialized_run("unpublished", graph_hash: "missing")
 
       assert_raise ArgumentError, ~r/run owner scope must be/, fn ->
-        RunStore.insert_run(TestRepo, {:tenant, ""}, base, :run_initialized, @now)
+        RunStore.insert_transition(TestRepo, {:tenant, ""}, base, :run_initialized, @now)
       end
 
       assert {:error, :not_found} =
-               RunStore.insert_run(
+               RunStore.insert_transition(
                  TestRepo,
                  :tenantless,
                  unpublished,
@@ -550,13 +550,16 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert TestRepo.aggregate(Run, :count) == 0
 
       assert_raise ArgumentError, ~r/run owner scope must be/, fn ->
-        RunStore.insert_run(TestRepo, :system, base, :run_initialized, @now)
+        RunStore.insert_transition(TestRepo, :system, base, :run_initialized, @now)
       end
     end
 
     test "fetch and inspect raise on corrupt persisted state rather than returning not_found" do
       run = initialized_run("corrupt")
-      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+
+      assert {:ok, ^run} =
+               RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
+
       canonical_state = row!(run.id).state
 
       corrupt_states = [
@@ -584,7 +587,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "operational transitions change RunInfo but never the committed run or expose its token" do
       run = initialized_run("stable", updated_at: @committed_at)
-      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+
+      assert {:ok, ^run} =
+               RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
+
       assert {:ok, ^run} = RunStore.fetch_run(TestRepo, :system, run.id)
 
       assert {:ok, initial_info} = RunStore.inspect_run(TestRepo, :system, run.id)
@@ -670,7 +676,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       wake_at = ~U[2026-07-10 12:00:00Z]
 
       assert {:ok, ^run} =
-               RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, wake_at)
+               RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, wake_at)
 
       assert {:ok, initial} = RunStore.inspect_run(TestRepo, :system, run.id)
       assert initial.wake_at.microsecond == {0, 6}
@@ -713,7 +719,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "an expired-claim steal changes authority but not the committed run" do
       run = initialized_run("stolen", updated_at: @committed_at)
-      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+
+      assert {:ok, ^run} =
+               RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
 
       first = claim_one(@now)
       admitted_at = admit!(run.id, @now).tenant_admitted_at
@@ -777,10 +785,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       assert {:ok, ^immediate} =
-               RunStore.commit(
+               MomentStore.commit(
                  TestRepo,
                  :system,
-                 proposal(immediate, first.claim_token, 7, {:release_claim, :immediate})
+                 proposal(immediate, first.claim_token, 7, {:release_claim, :immediate}),
+                 []
                )
 
       cooperatively_released = row!("cooperative")
@@ -802,10 +811,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       }
 
       assert {:ok, ^parked} =
-               RunStore.commit(
+               MomentStore.commit(
                  TestRepo,
                  :system,
-                 proposal(parked, reclaimed.claim_token, 8, {:release_claim, {:at, parked_at}})
+                 proposal(parked, reclaimed.claim_token, 8, {:release_claim, {:at, parked_at}}),
+                 []
                )
 
       parked_row = row!("cooperative")
@@ -832,7 +842,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert admit!("signalled", @now).tenant_admitted_at == @now
 
       assert {:ok, {:committed, :signalled}} =
-               RunStore.mutate_run(TestRepo, :system, "signalled", fn current ->
+               RunStore.mutate_transition(TestRepo, :system, "signalled", fn current ->
                  proposed = %{
                    current
                    | checkpoint_seq: current.checkpoint_seq + 1,
@@ -854,7 +864,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       }
 
       assert {:error, :stale_fence} =
-               RunStore.commit(TestRepo, :system, proposal(stale, lease.claim_token, 8))
+               MomentStore.commit(TestRepo, :system, proposal(stale, lease.claim_token, 8), [])
 
       assert row!("signalled") == signalled
     end
@@ -864,29 +874,39 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       next = %{missing | checkpoint_seq: missing.checkpoint_seq + 1}
 
       assert {:error, :invalid_commit} =
-               RunStore.commit(TestRepo, :system, proposal(next, nil, missing.checkpoint_seq))
+               MomentStore.commit(
+                 TestRepo,
+                 :system,
+                 proposal(next, nil, missing.checkpoint_seq),
+                 []
+               )
 
       assert {:error, :invalid_commit} =
-               RunStore.commit(
+               MomentStore.commit(
                  TestRepo,
                  :system,
                  proposal(
                    %{next | checkpoint_seq: 10},
                    Ecto.UUID.generate(),
                    missing.checkpoint_seq
-                 )
+                 ),
+                 []
                )
 
       run = initialized_run("binding")
-      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+
+      assert {:ok, ^run} =
+               RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
+
       lease = claim_one(@now)
       changed = %{run | graph_hash: "other", checkpoint_seq: run.checkpoint_seq + 1}
 
       assert {:error, :invalid_commit} =
-               RunStore.commit(
+               MomentStore.commit(
                  TestRepo,
                  :system,
-                 proposal(changed, lease.claim_token, run.checkpoint_seq)
+                 proposal(changed, lease.claim_token, run.checkpoint_seq),
+                 []
                )
 
       changed_started_at = %{
@@ -896,21 +916,25 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       }
 
       assert {:error, :invalid_commit} =
-               RunStore.commit(
+               MomentStore.commit(
                  TestRepo,
                  :system,
-                 proposal(changed_started_at, lease.claim_token, run.checkpoint_seq)
+                 proposal(changed_started_at, lease.claim_token, run.checkpoint_seq),
+                 []
                )
     end
 
     test "commit validates schedule against proposed status" do
       run = initialized_run("schedule")
-      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+
+      assert {:ok, ^run} =
+               RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
+
       lease = claim_one(@now)
       next = %{run | checkpoint_seq: run.checkpoint_seq + 1}
 
       assert {:error, :invalid_commit} =
-               RunStore.commit(
+               MomentStore.commit(
                  TestRepo,
                  :system,
                  proposal(
@@ -918,7 +942,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    lease.claim_token,
                    run.checkpoint_seq,
                    {:release_claim, :external}
-                 )
+                 ),
+                 []
                )
     end
 
@@ -974,7 +999,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       root = Map.put(root, :claim_policy, claim_policy)
 
       assert {:ok, %{leases: [%{run_id: "alternate-transaction"}], poisoned: []}} =
-               Docket.Postgres.transaction(root, fn tx ->
+               Storage.transaction(root, fn tx ->
                  assert tx.claim_policy === claim_policy
                  RunStore.claim_due(tx, :system, policy(@now))
                end)
@@ -989,7 +1014,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       context = admission_context()
 
       assert {:error, {:claim_policy_unavailable, :unsupported_isolation}} =
-               Docket.Postgres.transaction(context, fn tx ->
+               Storage.transaction(context, fn tx ->
                  TestRepo.query!("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ WRITE")
 
                  RunStore.claim_due(tx, :system, policy(@now))
@@ -1006,7 +1031,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       context = admission_context()
 
       assert {:error, {:claim_policy_unavailable, :read_only_transaction}} =
-               Docket.Postgres.transaction(context, fn tx ->
+               Storage.transaction(context, fn tx ->
                  TestRepo.query!("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY")
                  RunStore.claim_due(tx, :system, policy(@now))
                end)
@@ -1577,10 +1602,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       loser_next = %{committed | checkpoint_seq: committed.checkpoint_seq + 1}
 
       assert {:error, :stale_fence} =
-               RunStore.commit(
+               MomentStore.commit(
                  TestRepo,
                  :system,
-                 proposal(loser_next, first.claim_token, committed.checkpoint_seq)
+                 proposal(loser_next, first.claim_token, committed.checkpoint_seq),
+                 []
                )
 
       assert row!("run") == winner
@@ -1710,7 +1736,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         initialized_run("stale-abandon", checkpoint_seq: 8, started_at: @now, updated_at: @now)
 
       proposal = proposal(run, stolen.claim_token, 7)
-      assert {:ok, ^run} = RunStore.commit(TestRepo, :system, proposal)
+      assert {:ok, ^run} = MomentStore.commit(TestRepo, :system, proposal, [])
 
       committed = row!("stale-abandon")
       assert committed.claim_attempts == 0
@@ -1872,7 +1898,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         initialized_run("abandon-progress", checkpoint_seq: 8, started_at: @now, updated_at: @now)
 
       proposal = proposal(run, lease.claim_token, 7, {:release_claim, :immediate})
-      assert {:ok, ^run} = RunStore.commit(TestRepo, :system, proposal)
+      assert {:ok, ^run} = MomentStore.commit(TestRepo, :system, proposal, [])
 
       committed = row!("abandon-progress")
       assert committed.claim_abandons == 0
@@ -2213,7 +2239,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       run = initialized_run("prefixed")
 
       assert {:ok, ^run} =
-               RunStore.insert_run(
+               RunStore.insert_transition(
                  ctx,
                  {:tenant, "prefix-tenant"},
                  run,
@@ -2269,7 +2295,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  TestRepo.query!("SET LOCAL search_path TO docket_private, public")
 
                  assert {:ok, ^run} =
-                          RunStore.insert_run(
+                          RunStore.insert_transition(
                             TestRepo,
                             {:tenant, "prefix-tenant"},
                             run,
@@ -2311,12 +2337,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       run = initialized_run("mutation", checkpoint_seq: 7)
 
       assert {:ok, ^run} =
-               RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+               RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
 
       before = row!(run.id)
 
       assert {:ok, {:unchanged, :same}} =
-               RunStore.mutate_run(TestRepo, :tenantless, run.id, fn current ->
+               RunStore.mutate_transition(TestRepo, :tenantless, run.id, fn current ->
                  assert current == run
                  {:no_change, :same}
                end)
@@ -2324,7 +2350,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert row!(run.id) == before
 
       assert_raise ArgumentError, ~r/scope must be/, fn ->
-        RunStore.mutate_run(TestRepo, {:tenant, nil}, run.id, fn _ ->
+        RunStore.mutate_transition(TestRepo, {:tenant, nil}, run.id, fn _ ->
           flunk("an invalid scope must not invoke the mutation")
         end)
       end
@@ -2334,11 +2360,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "serialized mutation rejects malformed proposals without changing the row" do
       run = initialized_run("invalid-mutation", checkpoint_seq: 7)
-      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+
+      assert {:ok, ^run} =
+               RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
+
       before = row!(run.id)
 
       assert {:error, :invalid_mutation} =
-               RunStore.mutate_run(TestRepo, :tenantless, run.id, fn current ->
+               RunStore.mutate_transition(TestRepo, :tenantless, run.id, fn current ->
                  {:commit, current, :step_committed, :retain_claim, :bad}
                end)
 
@@ -2347,12 +2376,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "serialized mutation holds the row lock while the pure decision runs" do
       run = initialized_run("locked-mutation", checkpoint_seq: 7)
-      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+
+      assert {:ok, ^run} =
+               RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
+
       parent = self()
 
       mutation =
         Task.async(fn ->
-          RunStore.mutate_run(TestRepo, :tenantless, run.id, fn current ->
+          RunStore.mutate_transition(TestRepo, :tenantless, run.id, fn current ->
             send(parent, :mutation_locked)
 
             receive do
@@ -2376,7 +2408,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     test "poison recovery is exact, idempotent, scoped, and terminal-first" do
       run = initialized_run("recover", checkpoint_seq: 7)
-      assert {:ok, ^run} = RunStore.insert_run(TestRepo, :tenantless, run, :run_initialized, @now)
+
+      assert {:ok, ^run} =
+               RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
 
       poisoned_at = DateTime.add(@now, 1, :second)
 

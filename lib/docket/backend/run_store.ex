@@ -3,23 +3,20 @@ defmodule Docket.Backend.RunStore do
   Persistence contract for the durable run aggregate.
 
   This capability owns every operation that enforces the run row's shared
-  schedule, claim, fence, and poison invariants: insertion and reads, atomic
-  due claims, claim refresh and release, pre-execution claim abandons, advance
-  commits, serialized signal mutations, and poison recovery. Those concerns
-  cannot be split into independently configured stores because they mutate
-  and fence the same aggregate.
+  schedule, claim, fence, and poison invariants without publishing a
+  transition: reads, atomic due claims, claim refresh and release,
+  pre-execution claim abandons, and poison recovery. Those concerns cannot be
+  split into independently configured stores because they mutate and fence
+  the same aggregate.
 
-  Since 0.1.2, lifecycle writes use `Docket.Backend.TransitionStore`. The
-  legacy `insert_run/5`, `commit/3`, and `mutate_run/4` callbacks remain
-  temporarily for the 0.1.x compatibility adapter. Focused reads and claim
-  operations remain part of this contract.
+  Lifecycle writes use `Docket.Backend.TransitionStore`. This contract owns
+  focused reads and claim operations only.
   """
 
   @type ctx :: Docket.Backend.ctx()
   @type scope :: Docket.Backend.scope()
   @type owner_scope :: Docket.Backend.owner_scope()
   @type claim_token :: nonempty_binary()
-  @type checkpoint_type :: atom()
 
   @typedoc "Stable newest-first run-list cursor: `{started_at, run_id}`."
   @type list_cursor :: Docket.RunPage.cursor()
@@ -38,20 +35,6 @@ defmodule Docket.Backend.RunStore do
           required(:graph_hash) => String.t() | nil,
           required(:statuses) => [Docket.Run.durable_status()] | nil
         }
-
-  @typedoc """
-  Storage effect applied with a committed run transition.
-
-  `:retain_claim` keeps the current token, refreshes its claimed time, and
-  leaves the run without a wake. A release clears the token and claimed time.
-  `:immediate` records a wake at the backend's current time, `{:at, time}`
-  records a future or current wake, and `:external` or `:terminal` records no
-  wake. The two nil-wake reasons remain distinct here so implementations can
-  validate the proposed run status.
-  """
-  @type schedule ::
-          :retain_claim
-          | {:release_claim, :immediate | :external | :terminal | {:at, DateTime.t()}}
 
   @typedoc """
   Policy for one atomic due-claim scan.
@@ -127,52 +110,6 @@ defmodule Docket.Backend.RunStore do
 
   @typedoc "Disposition applied by one pre-execution claim abandon."
   @type abandon_result :: {:ok, :rescheduled | :poisoned | :stale}
-
-  @typedoc "Neutral proposal for one claim-fenced advance commit."
-  @type commit_proposal :: %{
-          required(:run) => Docket.Run.t(),
-          required(:expected_checkpoint_seq) => non_neg_integer(),
-          required(:claim_token) => claim_token(),
-          required(:checkpoint_type) => checkpoint_type(),
-          required(:schedule) => schedule()
-        }
-
-  @typedoc "Decision returned by a pure serialized run mutation."
-  @type mutation_decision ::
-          {:commit, Docket.Run.t(), checkpoint_type(), schedule(), opaque :: term()}
-          | {:no_change, opaque :: term()}
-          | {:error, reason :: term()}
-
-  @type mutation :: (Docket.Run.t() -> mutation_decision())
-
-  @type mutation_result ::
-          {:ok, {:committed, term()} | {:unchanged, term()}} | {:error, term()}
-
-  @doc deprecated: "lifecycle insertion is deprecated; implement TransitionStore.initialize/4"
-  @doc """
-  Inserts one initialized, already-durable run.
-
-  `owner_scope` determines the stored tenant: `:tenantless` stores `nil` and
-  `{:tenant, tenant_id}` stores that identifier. The initialized run must not
-  have the transient `:created` status, must already carry its first committed
-  sequence and start time, and requires `checkpoint_type == :run_initialized`.
-  That type becomes the latest checkpoint metadata, and `wake_at` is the
-  run's first explicit schedule.
-
-  This callback owns the run aggregate and may atomically materialize
-  backend-specific supporting authority needed for that run. Supporting
-  identity must come only from `owner_scope`; serialized run or payload fields
-  cannot select it. Lifecycle orchestration appends assigned initialization
-  events in the same outer transaction, while graph publication remains a
-  separate, earlier operation.
-  """
-  @callback insert_run(
-              ctx(),
-              owner_scope(),
-              Docket.Run.t(),
-              checkpoint_type(),
-              wake_at :: DateTime.t()
-            ) :: {:ok, Docket.Run.t()} | {:error, term()}
 
   @doc """
   Reads the last committed graph-run document under an explicit scope.
@@ -348,63 +285,6 @@ defmodule Docket.Backend.RunStore do
               claim_token(),
               abandon_policy()
             ) :: abandon_result()
-
-  @doc deprecated: "lifecycle commits are deprecated; implement TransitionStore.commit_claimed/4"
-  @doc """
-  Commits one neutral runtime proposal under a mandatory token-and-sequence fence.
-
-  The stored checkpoint sequence must equal
-  `proposal.expected_checkpoint_seq`, the current claim must equal the
-  non-empty `proposal.claim_token`, and the proposed run's sequence must be
-  exactly `expected_checkpoint_seq + 1`. The checkpoint type must be a
-  supported Docket checkpoint type. A stored sequence or token mismatch
-  returns `{:error, :stale_fence}` without changing anything. A nil token,
-  wrong proposed sequence, run identity mismatch, or invalid schedule/status
-  combination returns `{:error, :invalid_commit}`.
-
-  Success replaces the run, records `checkpoint_type`, resets consecutive
-  claim attempt and abandon counts and poison facts, and applies the schedule
-  atomically.
-  `:retain_claim` refreshes the current claim for a continuing vehicle; every
-  release schedule clears it. This callback never appends events. Lifecycle
-  code appends the proposal's already-assigned events through
-  `Docket.Backend.EventStore` in the same outer transaction.
-
-  An unknown run or scope mismatch returns `{:error, :not_found}`. Proposal
-  shape and exact-next-sequence validation happen before any run lookup, so
-  `:invalid_commit` precedes `:not_found`: a malformed proposal returns
-  `:invalid_commit` even when its run id would not be visible under the
-  supplied scope, and only valid proposals return `:not_found` for an unknown
-  or out-of-scope run.
-  """
-  @callback commit(ctx(), scope(), commit_proposal()) ::
-              {:ok, Docket.Run.t()}
-              | {:error, :stale_fence | :invalid_commit | :not_found}
-
-  @doc deprecated:
-         "callback mutations are deprecated; implement TransitionStore.commit_unclaimed/5"
-  @doc """
-  Serializes one short read, pure decision, and optional unclaimed run update.
-
-  The store checks scope before invoking `mutation`, loads and exclusively
-  serializes the current committed run, and invokes the function while that
-  serialization is held. The function must perform no external I/O.
-
-  A commit decision must propose the same run id and exactly the current
-  checkpoint sequence plus one. Serialized mutation is the only unclaimed
-  graph-run write path: it revokes any current claim and applies a release
-  schedule atomically. `:retain_claim` is therefore invalid for this callback.
-  On success the store resets claim attempt and abandon counts and poison
-  facts and returns the opaque value tagged `:committed`; lifecycle code can
-  then append events in the same outer transaction.
-
-  A no-change decision returns the opaque value tagged `:unchanged` and must
-  not touch the row, claim, schedule, counters, timestamps, or event sequence.
-  An error decision is returned unchanged and also changes nothing. An unknown
-  run or scope mismatch returns `{:error, :not_found}` without invoking the
-  function; malformed proposals return `{:error, :invalid_mutation}`.
-  """
-  @callback mutate_run(ctx(), scope(), run_id :: String.t(), mutation()) :: mutation_result()
 
   @doc """
   Recovers a non-terminal poisoned run's backend-owned operational state.

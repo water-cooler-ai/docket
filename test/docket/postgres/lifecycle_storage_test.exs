@@ -25,7 +25,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       alias Docket.Postgres.Storage
       alias Docket.Postgres.Schemas.Event
 
-      def append_events(ctx, :tenantless, run_id, [event | _rest]) do
+      def append_transition_events(ctx, :tenantless, run_id, [event | _rest]) do
         {repo, prefix} = Storage.context!(ctx)
 
         event
@@ -52,24 +52,112 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
-    defmodule NoopEvents do
-      def append_events(_ctx, :tenantless, _run_id, _events), do: :ok
+    defmodule FailingTransitions do
+      @behaviour Docket.Backend.TransitionStore
+
+      alias Docket.Postgres.{GraphStore, MomentStore, RunStore, Storage}
+      alias Docket.Postgres.LifecycleStorageTest.FailingEvents
+
+      @impl true
+      def initialize(ctx, owner_scope, proposal, events) do
+        Storage.transaction(ctx, fn tx ->
+          with {:ok, _graph} <-
+                 GraphStore.fetch_graph(
+                   tx,
+                   owner_scope,
+                   proposal.run.graph_id,
+                   proposal.run.graph_hash
+                 ),
+               {:ok, stored} <-
+                 RunStore.insert_transition(
+                   tx,
+                   owner_scope,
+                   proposal.run,
+                   proposal.checkpoint_type,
+                   proposal.wake_at
+                 ),
+               :ok <-
+                 FailingEvents.append_transition_events(tx, owner_scope, proposal.run.id, events) do
+            {:ok, stored}
+          end
+        end)
+      end
+
+      @impl true
+      def commit_claimed(ctx, scope, proposal, events) do
+        Storage.transaction(ctx, fn tx ->
+          with {:ok, run} <- MomentStore.commit(tx, scope, proposal, []),
+               :ok <- FailingEvents.append_transition_events(tx, scope, proposal.run.id, events) do
+            {:ok, run}
+          end
+        end)
+      end
+
+      @impl true
+      def commit_unclaimed(ctx, scope, expected_checkpoint_seq, proposal, events) do
+        Storage.transaction(ctx, fn tx ->
+          mutation = fn current ->
+            cond do
+              not immutable_binding?(current, proposal.run) ->
+                {:error, :invalid_transition}
+
+              current.checkpoint_seq != expected_checkpoint_seq ->
+                {:error, :stale_checkpoint}
+
+              true ->
+                {:commit, proposal.run, proposal.checkpoint_type, proposal.schedule, proposal.run}
+            end
+          end
+
+          with {:ok, {:committed, stored}} <-
+                 RunStore.mutate_transition(tx, scope, proposal.run.id, mutation),
+               :ok <-
+                 FailingEvents.append_transition_events(tx, scope, proposal.run.id, events) do
+            {:ok, stored}
+          end
+        end)
+      end
+
+      defp immutable_binding?(stored, proposed) do
+        stored.id == proposed.id and stored.graph_id == proposed.graph_id and
+          stored.graph_hash == proposed.graph_hash and stored.started_at == proposed.started_at
+      end
+    end
+
+    defmodule NoopTransitions do
+      @behaviour Docket.Backend.TransitionStore
+
+      alias Docket.Postgres.TransitionStore
+
+      @impl true
+      def initialize(ctx, owner_scope, proposal, _events),
+        do: TransitionStore.initialize(ctx, owner_scope, proposal, [])
+
+      @impl true
+      defdelegate commit_claimed(ctx, scope, proposal, events), to: TransitionStore
+
+      @impl true
+      defdelegate commit_unclaimed(ctx, scope, expected_checkpoint_seq, proposal, events),
+        to: TransitionStore
     end
 
     defmodule FailingBackend do
-      defdelegate transaction(ctx, fun), to: Docket.Postgres
+      def capabilities, do: Docket.Postgres.capabilities()
+      def transitions, do: Docket.Postgres.LifecycleStorageTest.FailingTransitions
       def runs, do: Docket.Postgres.RunStore
-      def events, do: Docket.Postgres.LifecycleStorageTest.FailingEvents
+      def events, do: Docket.Postgres.EventStore
     end
 
     defmodule NoopBackend do
-      defdelegate transaction(ctx, fun), to: Docket.Postgres
+      def capabilities, do: Docket.Postgres.capabilities()
+      def transitions, do: Docket.Postgres.LifecycleStorageTest.NoopTransitions
       def runs, do: Docket.Postgres.RunStore
-      def events, do: Docket.Postgres.LifecycleStorageTest.NoopEvents
+      def events, do: Docket.Postgres.EventStore
     end
 
     defmodule RealBackend do
-      defdelegate transaction(ctx, fun), to: Docket.Postgres
+      def capabilities, do: Docket.Postgres.capabilities()
+      def transitions, do: Docket.Postgres.transitions()
       def runs, do: Docket.Postgres.RunStore
       def events, do: Docket.Postgres.EventStore
     end
@@ -194,14 +282,23 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                4
              ]
 
-      assert :ok = EventStore.append_events(TestRepo, :tenantless, next.run.id, next.events)
+      assert :ok =
+               EventStore.append_transition_events(
+                 TestRepo,
+                 :tenantless,
+                 next.run.id,
+                 next.events
+               )
+
       assert TestRepo.aggregate(Event, :count) == 4
 
       [event | _] = next.events
       conflicting = %{event | payload: %{"different" => true}}
 
       assert {:error, :event_conflict} =
-               EventStore.append_events(TestRepo, :tenantless, next.run.id, [conflicting])
+               EventStore.append_transition_events(TestRepo, :tenantless, next.run.id, [
+                 conflicting
+               ])
 
       assert {:error, :stale_checkpoint} =
                Docket.Lifecycle.commit_moment(
@@ -279,7 +376,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           DateTime.add(@now, 1, :second)
         )
 
-      assert :ok = EventStore.append_events(TestRepo, :tenantless, next.run.id, next.events)
+      assert :ok =
+               EventStore.append_transition_events(
+                 TestRepo,
+                 :tenantless,
+                 next.run.id,
+                 next.events
+               )
+
       event_count = TestRepo.aggregate(Event, :count)
 
       assert {:ok, ^next} =
@@ -322,7 +426,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       [event | _rest] = next.events
       conflicting = %{event | payload: %{"different" => true}}
-      assert :ok = EventStore.append_events(TestRepo, :tenantless, next.run.id, [conflicting])
+
+      assert :ok =
+               EventStore.append_transition_events(TestRepo, :tenantless, next.run.id, [
+                 conflicting
+               ])
 
       before = TestRepo.get_by!(Run, run_id: initial.run.id)
 

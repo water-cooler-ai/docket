@@ -11,7 +11,7 @@ Add Docket plus the optional PostgreSQL dependencies to the host, configure
 ```elixir
 def deps do
   [
-    {:docket, "~> 0.1.2"},
+    {:docket, "~> 0.2.0"},
     {:ecto_sql, "~> 3.10"},
     {:postgrex, "~> 0.17"}
   ]

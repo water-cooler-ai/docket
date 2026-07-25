@@ -2,9 +2,7 @@ defmodule Docket.Test.MemoryBackend do
   @moduledoc """
   Agent-backed implementation used by Docket's shared backend tests.
 
-  An outer transaction owns a backend-wide lock, works against an isolated
-  Agent snapshot, and publishes the snapshot only after `{:ok, value}`. Every
-  direct root mutation takes the same lock, so an overlapping transaction can
+  Every root mutation takes a backend-wide lock, so concurrent writes can
   neither overwrite nor be overwritten by another committed write.
   """
 
@@ -13,12 +11,6 @@ defmodule Docket.Test.MemoryBackend do
   @behaviour Docket.Backend.RunStore
   @behaviour Docket.Backend.EventStore
   @behaviour Docket.Backend.TransitionStore
-
-  defmodule Transaction do
-    @moduledoc false
-    @enforce_keys [:root, :agent, :rollback]
-    defstruct [:root, :agent, :rollback]
-  end
 
   @type scope :: :system | :tenantless | {:tenant, String.t()}
 
@@ -75,68 +67,6 @@ defmodule Docket.Test.MemoryBackend do
       fn -> %__MODULE__{clock: clock, token_generator: token_generator} end,
       Keyword.take(opts, [:name])
     )
-  end
-
-  @impl Docket.Backend
-  def transaction(%Transaction{rollback: rollback} = transaction, fun)
-      when is_function(fun, 1) do
-    try do
-      case validate_transaction_result(fun.(transaction)) do
-        {:ok, _value} = result ->
-          result
-
-        {:error, _reason} = error ->
-          mark_rollback_only(rollback)
-          error
-      end
-    catch
-      kind, reason ->
-        mark_rollback_only(rollback)
-        :erlang.raise(kind, reason, __STACKTRACE__)
-    end
-  end
-
-  def transaction(backend, fun) when is_function(fun, 1) do
-    with_root_lock(backend, fn ->
-      snapshot = Agent.get(backend, & &1)
-      {:ok, transaction_agent} = Agent.start_link(fn -> snapshot end)
-      {:ok, rollback_agent} = Agent.start_link(fn -> false end)
-
-      transaction = %Transaction{
-        root: backend,
-        agent: transaction_agent,
-        rollback: rollback_agent
-      }
-
-      process_key = transaction_process_key(backend)
-      previous = Process.put(process_key, true)
-
-      try do
-        case validate_transaction_result(fun.(transaction)) do
-          {:ok, _value} = result ->
-            if Agent.get(rollback_agent, & &1) do
-              {:error, :rollback}
-            else
-              committed = Agent.get(transaction_agent, & &1)
-              Agent.update(backend, fn _state -> committed end)
-              result
-            end
-
-          {:error, _reason} = error ->
-            error
-        end
-      after
-        restore_process_value(process_key, previous)
-
-        if Process.alive?(transaction_agent) do
-          Agent.stop(transaction_agent)
-        end
-
-        if Process.alive?(rollback_agent) do
-          Agent.stop(rollback_agent)
-        end
-      end
-    end)
   end
 
   @impl Docket.Backend.TransitionStore
@@ -341,28 +271,6 @@ defmodule Docket.Test.MemoryBackend do
   end
 
   @impl Docket.Backend.RunStore
-  def insert_run(backend, owner_scope, run, checkpoint_type, wake_at) do
-    tenant_id = owner_tenant_id!(owner_scope)
-
-    state_get_and_update(backend, fn state ->
-      cond do
-        not valid_initialized_run?(run, checkpoint_type, wake_at) ->
-          {{:error, :invalid_run}, state}
-
-        Map.has_key?(state.runs, run.id) ->
-          {{:error, :already_exists}, state}
-
-        not Map.has_key?(state.graphs, {owner_scope, run.graph_id, run.graph_hash}) ->
-          {{:error, :not_found}, state}
-
-        true ->
-          record = new_record(run, tenant_id, checkpoint_type, wake_at)
-          {{:ok, run}, put_in(state.runs[run.id], record)}
-      end
-    end)
-  end
-
-  @impl Docket.Backend.RunStore
   def fetch_run(backend, scope, run_id) do
     validate_scope!(scope)
 
@@ -498,44 +406,6 @@ defmodule Docket.Test.MemoryBackend do
   end
 
   @impl Docket.Backend.RunStore
-  def commit(backend, scope, proposal) do
-    validate_scope!(scope)
-
-    state_get_and_update(backend, fn state ->
-      with :ok <- validate_advance_commit(proposal),
-           :ok <- validate_next_sequence(proposal),
-           {:ok, record} <- fetch_scoped_record(state, scope, proposal.run.id),
-           :ok <- validate_immutable_binding(record.run, proposal.run),
-           :ok <- validate_fence(record, proposal) do
-        now = current_time(state)
-
-        record =
-          record
-          |> Map.put(:run, proposal.run)
-          |> Map.put(:latest_checkpoint_type, proposal.checkpoint_type)
-          |> reset_operational_health()
-          |> apply_schedule(proposal.schedule, now)
-
-        {{:ok, proposal.run}, put_in(state.runs[proposal.run.id], record)}
-      else
-        {:error, reason} -> {{:error, reason}, state}
-      end
-    end)
-  end
-
-  @impl Docket.Backend.RunStore
-  def mutate_run(backend, scope, run_id, mutation) when is_function(mutation, 1) do
-    validate_scope!(scope)
-
-    state_mutate(backend, fn state ->
-      case fetch_scoped_record(state, scope, run_id) do
-        {:ok, record} -> apply_mutation(state, run_id, record, mutation.(record.run))
-        {:error, :not_found} -> {{:error, :not_found}, state}
-      end
-    end)
-  end
-
-  @impl Docket.Backend.RunStore
   def retry_poisoned_run(backend, scope, run_id, now) do
     validate_scope!(scope)
 
@@ -563,26 +433,6 @@ defmodule Docket.Test.MemoryBackend do
 
         {:error, :not_found} ->
           {{:error, :not_found}, state}
-      end
-    end)
-  end
-
-  @impl Docket.Backend.EventStore
-  def append_events(_backend, scope, _run_id, []) do
-    validate_scope!(scope)
-    :ok
-  end
-
-  def append_events(backend, scope, run_id, events) do
-    validate_scope!(scope)
-
-    state_get_and_update(backend, fn state ->
-      with {:ok, record} <- fetch_scoped_record(state, scope, run_id),
-           {:ok, merged} <- merge_events(record.events, run_id, events) do
-        record = %{record | events: merged}
-        {:ok, put_in(state.runs[run_id], record)}
-      else
-        {:error, reason} -> {{:error, reason}, state}
       end
     end)
   end
@@ -993,41 +843,12 @@ defmodule Docket.Test.MemoryBackend do
     {DateTime.to_unix(claimed_at, :microsecond), 1, run_id}
   end
 
-  defp validate_advance_commit(%{
-         run: run,
-         expected_checkpoint_seq: expected_seq,
-         claim_token: claim_token,
-         checkpoint_type: checkpoint_type,
-         schedule: schedule
-       }) do
-    cond do
-      not is_struct(run, Docket.Run) -> {:error, :invalid_commit}
-      not is_integer(expected_seq) or expected_seq < 0 -> {:error, :invalid_commit}
-      not is_binary(claim_token) or byte_size(claim_token) == 0 -> {:error, :invalid_commit}
-      checkpoint_type not in Docket.Checkpoint.types() -> {:error, :invalid_commit}
-      not valid_schedule?(schedule) -> {:error, :invalid_commit}
-      not schedule_matches_status?(schedule, run.status) -> {:error, :invalid_commit}
-      Docket.Run.validate_failure(run) != :ok -> {:error, :invalid_commit}
-      true -> :ok
-    end
-  end
-
-  defp validate_advance_commit(_proposal), do: {:error, :invalid_commit}
-
   defp validate_fence(record, proposal) do
     if record.run.checkpoint_seq == proposal.expected_checkpoint_seq and
          record.claim_token == proposal.claim_token do
       :ok
     else
       {:error, :stale_fence}
-    end
-  end
-
-  defp validate_next_sequence(proposal) do
-    if proposal.run.checkpoint_seq == proposal.expected_checkpoint_seq + 1 do
-      :ok
-    else
-      {:error, :invalid_commit}
     end
   end
 
@@ -1076,38 +897,6 @@ defmodule Docket.Test.MemoryBackend do
     %{record | wake_at: nil, claim_token: nil, claimed_at: nil}
   end
 
-  defp apply_mutation(
-         state,
-         run_id,
-         record,
-         {:commit, proposed_run, checkpoint_type, schedule, opaque}
-       ) do
-    if valid_mutation?(record, run_id, proposed_run, checkpoint_type, schedule) do
-      record =
-        record
-        |> Map.put(:run, proposed_run)
-        |> Map.put(:latest_checkpoint_type, checkpoint_type)
-        |> reset_operational_health()
-        |> apply_schedule(schedule, current_time(state))
-
-      {{:ok, {:committed, opaque}}, put_in(state.runs[run_id], record)}
-    else
-      {{:error, :invalid_mutation}, state}
-    end
-  end
-
-  defp apply_mutation(state, _run_id, _record, {:no_change, opaque}) do
-    {{:ok, {:unchanged, opaque}}, state}
-  end
-
-  defp apply_mutation(state, _run_id, _record, {:error, reason}) do
-    {{:error, reason}, state}
-  end
-
-  defp apply_mutation(state, _run_id, _record, _invalid) do
-    {{:error, :invalid_mutation}, state}
-  end
-
   defp valid_mutation?(record, run_id, proposed_run, checkpoint_type, schedule) do
     is_struct(proposed_run, Docket.Run) and proposed_run.id == run_id and
       proposed_run.id == record.run.id and
@@ -1119,17 +908,6 @@ defmodule Docket.Test.MemoryBackend do
       valid_schedule?(schedule) and schedule_matches_status?(schedule, proposed_run.status) and
       Docket.Run.validate_failure(proposed_run) == :ok
   end
-
-  defp valid_initialized_run?(run, checkpoint_type, wake_at) do
-    is_struct(run, Docket.Run) and run.status == :running and nonempty_binary?(run.id) and
-      nonempty_binary?(run.graph_id) and nonempty_binary?(run.graph_hash) and
-      is_integer(run.checkpoint_seq) and run.checkpoint_seq >= 1 and
-      checkpoint_type == :run_initialized and
-      is_struct(run.started_at, DateTime) and is_struct(run.updated_at, DateTime) and
-      is_struct(wake_at, DateTime) and Docket.Run.validate_durable(run) == :ok
-  end
-
-  defp nonempty_binary?(value), do: is_binary(value) and byte_size(value) > 0
 
   defp reset_operational_health(record) do
     %{
@@ -1272,62 +1050,17 @@ defmodule Docket.Test.MemoryBackend do
     |> Base.url_encode64(padding: false)
   end
 
-  defp validate_transaction_result({:ok, _value} = result), do: result
-  defp validate_transaction_result({:error, _reason} = result), do: result
-
-  defp validate_transaction_result(other) do
-    raise ArgumentError,
-          "backend transaction must return {:ok, value} or {:error, reason}, got: #{inspect(other)}"
-  end
-
-  defp mark_rollback_only(agent), do: Agent.update(agent, fn _rollback_only? -> true end)
-
-  defp state_get(%Transaction{agent: agent}, fun), do: Agent.get(agent, fun)
-
-  defp state_get(backend, fun) do
-    ensure_root_context!(backend)
-    Agent.get(backend, fun)
-  end
-
-  defp state_get_and_update(%Transaction{agent: agent}, fun) do
-    with_agent_lock(agent, fn -> Agent.get_and_update(agent, fun) end)
-  end
+  defp state_get(backend, fun), do: Agent.get(backend, fun)
 
   defp state_get_and_update(backend, fun) do
     with_root_lock(backend, fn -> Agent.get_and_update(backend, fun) end)
-  end
-
-  defp state_update(%Transaction{agent: agent}, fun) do
-    with_agent_lock(agent, fn -> Agent.update(agent, fun) end)
   end
 
   defp state_update(backend, fun) do
     with_root_lock(backend, fn -> Agent.update(backend, fun) end)
   end
 
-  # Runs caller-provided mutation code in the caller, not inside the Agent.
-  # That keeps exceptions from crashing the backend process.
-  defp state_mutate(%Transaction{agent: agent}, fun) do
-    with_agent_lock(agent, fn -> mutate_agent(agent, fun) end)
-  end
-
-  defp state_mutate(backend, fun) do
-    with_root_lock(backend, fn -> mutate_agent(backend, fun) end)
-  end
-
-  defp mutate_agent(agent, fun) do
-    state = Agent.get(agent, & &1)
-    {reply, next_state} = fun.(state)
-    Agent.update(agent, fn _state -> next_state end)
-    reply
-  end
-
-  defp with_root_lock(backend, fun) do
-    ensure_root_context!(backend)
-    with_lock({__MODULE__, backend}, fun)
-  end
-
-  defp with_agent_lock(agent, fun), do: with_lock({__MODULE__, agent}, fun)
+  defp with_root_lock(backend, fun), do: with_lock({__MODULE__, backend}, fun)
 
   defp with_lock(resource, fun) do
     case :global.trans({resource, self()}, fun, [node()]) do
@@ -1335,16 +1068,4 @@ defmodule Docket.Test.MemoryBackend do
       result -> result
     end
   end
-
-  defp ensure_root_context!(backend) do
-    if Process.get(transaction_process_key(backend)) do
-      raise ArgumentError,
-            "root backend context used inside a transaction; pass the transaction context instead"
-    end
-  end
-
-  defp transaction_process_key(backend), do: {__MODULE__, :transaction, backend}
-
-  defp restore_process_value(key, nil), do: Process.delete(key)
-  defp restore_process_value(key, value), do: Process.put(key, value)
 end

@@ -38,10 +38,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule StaleCommitBackend do
-      defdelegate transaction(ctx, fun), to: Docket.Test.MemoryBackend
       def graphs, do: Docket.Test.MemoryBackend
       def events, do: Docket.Test.MemoryBackend
       def runs, do: __MODULE__.Runs
+      def capabilities, do: Docket.Test.MemoryBackend.capabilities()
+      def transitions, do: __MODULE__.Transitions
 
       defmodule Runs do
         defdelegate fetch_run(context, scope, run_id), to: Docket.Test.MemoryBackend
@@ -53,25 +54,37 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           to: Docket.Test.MemoryBackend
 
         defdelegate claim_due(context, scope, policy), to: Docket.Test.MemoryBackend
+      end
 
-        def commit(_context, _scope, _proposal), do: {:error, :stale_fence}
+      defmodule Transitions do
+        defdelegate initialize(ctx, owner_scope, proposal, events), to: Docket.Test.MemoryBackend
+
+        def commit_claimed(_ctx, _scope, _proposal, _events), do: {:error, :stale_checkpoint}
+
+        defdelegate commit_unclaimed(ctx, scope, expected_checkpoint_seq, proposal, events),
+          to: Docket.Test.MemoryBackend
       end
     end
 
     defmodule FailingEventsBackend do
-      defdelegate transaction(ctx, fun), to: Docket.Test.MemoryBackend
       def graphs, do: Docket.Test.MemoryBackend
       def runs, do: Docket.Test.MemoryBackend
-      def events, do: __MODULE__.Events
+      def events, do: Docket.Test.MemoryBackend
+      def capabilities, do: Docket.Test.MemoryBackend.capabilities()
+      def transitions, do: __MODULE__.Transitions
 
-      defmodule Events do
-        def append_events(_context, _scope, _run_id, _events),
+      defmodule Transitions do
+        defdelegate initialize(ctx, owner_scope, proposal, events), to: Docket.Test.MemoryBackend
+
+        def commit_claimed(_ctx, _scope, _proposal, _events),
           do: {:error, :injected_event_failure}
+
+        defdelegate commit_unclaimed(ctx, scope, expected_checkpoint_seq, proposal, events),
+          to: Docket.Test.MemoryBackend
       end
     end
 
     defmodule DoneRunBackend do
-      defdelegate transaction(ctx, fun), to: Docket.Test.MemoryBackend
       def graphs, do: Docket.Test.MemoryBackend
       def events, do: Docket.Test.MemoryBackend
       def runs, do: __MODULE__.Runs
@@ -85,7 +98,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule MissingRunBackend do
-      defdelegate transaction(ctx, fun), to: Docket.Test.MemoryBackend
       def graphs, do: Docket.Test.MemoryBackend
       def events, do: Docket.Test.MemoryBackend
       def runs, do: __MODULE__.Runs
@@ -96,7 +108,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     defmodule ForeignIdentityBackend do
-      defdelegate transaction(ctx, fun), to: Docket.Test.MemoryBackend
       def graphs, do: Docket.Test.MemoryBackend
       def events, do: Docket.Test.MemoryBackend
       def capabilities, do: Docket.Test.MemoryBackend.capabilities()

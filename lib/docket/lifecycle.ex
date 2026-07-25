@@ -91,7 +91,7 @@ defmodule Docket.Lifecycle do
 
   @doc false
   @spec schedule(Moment.disposition(), :claimed | :unclaimed) ::
-          Docket.Backend.RunStore.schedule()
+          Docket.Backend.TransitionStore.schedule()
   def schedule(:continue, :claimed), do: :retain_claim
   def schedule(:continue, :unclaimed), do: {:release_claim, :immediate}
   def schedule({:park, :immediate, _reason}, _claim), do: {:release_claim, :immediate}

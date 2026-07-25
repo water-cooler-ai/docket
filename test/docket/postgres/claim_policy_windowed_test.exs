@@ -6,6 +6,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     alias Docket.Postgres.ClaimPolicy
     alias Docket.Postgres.RunStore
+    alias Docket.Postgres.Storage
     alias Docket.Postgres.TestRepo
 
     @migration_version 20_260_722_000_170
@@ -88,7 +89,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       insert_ready("tenant", "transactional", @now)
 
       assert {:error, :test_rollback} =
-               Docket.Postgres.transaction(context, fn tx ->
+               Storage.transaction(context, fn tx ->
                  assert tx.claim_policy === context.claim_policy
 
                  assert {:ok, %{leases: [%{run_id: "transactional"}]}} =
@@ -100,7 +101,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert live_count("tenant") == 0
 
       assert {:ok, %{leases: [%{run_id: "transactional"}]}} =
-               Docket.Postgres.transaction(context, fn tx ->
+               Storage.transaction(context, fn tx ->
                  RunStore.claim_due(tx, :system, policy(1))
                end)
 

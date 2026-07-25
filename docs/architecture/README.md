@@ -21,6 +21,8 @@ individual function boundary.
   instructions for old host-owned persistence adopters.
 - [0.1.1 to 0.1.2 transition migration](migration-0.1.1-to-0.1.2.md) —
   semantic lifecycle writes and the 0.1.x compatibility window.
+- [0.1.2 to 0.2.0 removal migration](migration-0.1.2-to-0.2.0.md) — mandatory
+  transition stores and the removed composition APIs.
 
 Graph and compiler internals are documented in
 [graph construction](docket-graph-construction-design.md),

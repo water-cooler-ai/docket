@@ -58,15 +58,8 @@ defmodule Docket.BackendTests.Contract do
   end
 
   defp capabilities(backend) do
-    case Docket.Backend.declared_capabilities(backend) do
-      %{contract_version: 2} ->
-        @focused_capabilities ++ [transitions: Docket.Backend.TransitionStore]
-
-      _legacy ->
-        @focused_capabilities
-    end
-  rescue
-    ArgumentError -> @focused_capabilities
+    %{contract_version: 2} = Docket.Backend.declared_capabilities(backend)
+    @focused_capabilities ++ [transitions: Docket.Backend.TransitionStore]
   end
 
   defp required_callbacks(behaviour) do

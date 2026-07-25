@@ -43,7 +43,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       EventStore,
       GraphStore,
       Migration,
-      MomentStore,
       Notifier,
       Pruner,
       RunStore,
@@ -88,10 +87,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @testing_modes [:inline, :manual]
 
     @impl Docket.Backend
-    @deprecated "use Docket.Postgres.transitions() for lifecycle writes"
-    defdelegate transaction(ctx, fun), to: Storage
-
-    @impl Docket.Backend
     def capabilities do
       %{
         contract_version: 2,
@@ -110,10 +105,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     @impl Docket.Backend
     def events, do: EventStore
-
-    @impl Docket.Backend
-    @deprecated "use Docket.Postgres.transitions().commit_claimed/4"
-    defdelegate commit_transition(ctx, scope, proposal, events), to: MomentStore, as: :commit
 
     @impl Docket.Backend
     def context(opts) do

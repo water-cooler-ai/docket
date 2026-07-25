@@ -1,40 +1,14 @@
 defmodule Docket.Backend.EventStore do
   @moduledoc """
-  Persistence contract for append-only run events.
+  Persistence contract for append-only run event reads.
 
-  Event retention is a backend policy. Since 0.1.2 lifecycle orchestration
-  appends events through `Docket.Backend.TransitionStore`; this focused write
-  remains temporarily for the 0.1.x compatibility adapter.
+  Event retention is a backend policy. Lifecycle orchestration publishes
+  events through `Docket.Backend.TransitionStore`; this contract owns the
+  focused reads over what a backend retained.
   """
 
   @type ctx :: Docket.Backend.ctx()
   @type scope :: Docket.Backend.scope()
-
-  @doc deprecated: "lifecycle event composition is deprecated; append through TransitionStore"
-  @doc """
-  Appends retained events for `run_id` in sequence order.
-
-  The operation must be idempotent for an already-persisted `{run_id, seq}`
-  containing the same event. Conflicting content for that key is an error.
-  Every event must belong to `run_id`; a backend must reject a mismatched
-  event rather than storing it under the supplied run.
-
-  Event identities are assigned before this callback. The store never derives
-  a sequence from the maximum already-stored sequence, never substitutes the
-  run's checkpoint sequence, and accepts gaps left by persistence filtering. In particular,
-  `:checkpoint_committed` is an ordinary assigned event at this boundary.
-
-  For a non-empty append, `scope` is checked through the owning run and a
-  tenant mismatch is reported as `{:error, :not_found}`. An empty event list
-  validates the scope value but succeeds without a run lookup or storage
-  change.
-  """
-  @callback append_events(
-              ctx(),
-              scope(),
-              run_id :: String.t(),
-              events :: [Docket.Event.t()]
-            ) :: :ok | {:error, term()}
 
   @doc """
   Reads one retained event by its assigned positive sequence.

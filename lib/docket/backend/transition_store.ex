@@ -44,7 +44,20 @@ defmodule Docket.Backend.TransitionStore do
   @type ctx :: Docket.Backend.ctx()
   @type scope :: Docket.Backend.scope()
   @type owner_scope :: Docket.Backend.owner_scope()
-  @type schedule :: Docket.Backend.RunStore.schedule()
+
+  @typedoc """
+  Storage effect applied with a committed run transition.
+
+  `:retain_claim` keeps the current token, refreshes its claimed time, and
+  leaves the run without a wake. A release clears the token and claimed time.
+  `:immediate` records a wake at the backend's current time, `{:at, time}`
+  records a future or current wake, and `:external` or `:terminal` records no
+  wake. The two nil-wake reasons remain distinct here so implementations can
+  validate the proposed run status.
+  """
+  @type schedule ::
+          :retain_claim
+          | {:release_claim, :immediate | :external | :terminal | {:at, DateTime.t()}}
 
   @typedoc """
   Data-only initialization proposal.

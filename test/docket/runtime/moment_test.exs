@@ -452,24 +452,22 @@ defmodule Docket.Runtime.MomentTest do
 
       assert publication_rtg.graph_hash == moment.run.graph_hash
 
+      :ok =
+        MemoryBackend.save_graph(
+          backend,
+          :tenantless,
+          moment.run.graph_id,
+          moment.run.graph_hash,
+          effective
+        )
+
       {:ok, _run} =
-        MemoryBackend.transaction(backend, fn tx ->
-          with :ok <-
-                 MemoryBackend.save_graph(
-                   tx,
-                   :tenantless,
-                   moment.run.graph_id,
-                   moment.run.graph_hash,
-                   effective
-                 ),
-               {:ok, run} <-
-                 MemoryBackend.insert_run(tx, :tenantless, moment.run, :run_initialized, @now) do
-            case MemoryBackend.append_events(tx, :tenantless, run.id, moment.events) do
-              :ok -> {:ok, run}
-              {:error, reason} -> {:error, reason}
-            end
-          end
-        end)
+        MemoryBackend.initialize(
+          backend,
+          :tenantless,
+          %{run: moment.run, checkpoint_type: :run_initialized, wake_at: @now},
+          moment.events
+        )
 
       :ok
     end
@@ -481,22 +479,18 @@ defmodule Docket.Runtime.MomentTest do
     end
 
     defp commit_moment(backend, moment, expected_seq, token) do
-      MemoryBackend.transaction(backend, fn tx ->
-        proposal = %{
+      MemoryBackend.commit_claimed(
+        backend,
+        :tenantless,
+        %{
           run: moment.run,
           expected_checkpoint_seq: expected_seq,
           claim_token: token,
           checkpoint_type: moment.checkpoint_type,
           schedule: schedule_for(moment.disposition)
-        }
-
-        with {:ok, run} <- MemoryBackend.commit(tx, :tenantless, proposal) do
-          case MemoryBackend.append_events(tx, :tenantless, run.id, moment.events) do
-            :ok -> {:ok, run}
-            {:error, reason} -> {:error, reason}
-          end
-        end
-      end)
+        },
+        moment.events
+      )
     end
 
     defp published_runtime! do
@@ -552,7 +546,7 @@ defmodule Docket.Runtime.MomentTest do
 
       {:ok, moment} = Loop.propose_advance(rtg, init_moment.run, opts)
 
-      assert {:error, :stale_fence} =
+      assert {:error, :stale_checkpoint} =
                commit_moment(backend, moment, init_moment.run.checkpoint_seq, "stale-token")
 
       # The prior committed run remains the durable truth and none of the
@@ -581,22 +575,18 @@ defmodule Docket.Runtime.MomentTest do
         end)
 
       result =
-        MemoryBackend.transaction(backend, fn tx ->
-          proposal = %{
+        MemoryBackend.commit_claimed(
+          backend,
+          :tenantless,
+          %{
             run: moment.run,
             expected_checkpoint_seq: init_moment.run.checkpoint_seq,
             claim_token: token,
             checkpoint_type: moment.checkpoint_type,
             schedule: schedule_for(moment.disposition)
-          }
-
-          with {:ok, run} <- MemoryBackend.commit(tx, :tenantless, proposal) do
-            case MemoryBackend.append_events(tx, :tenantless, run.id, conflicting) do
-              :ok -> {:ok, run}
-              {:error, reason} -> {:error, reason}
-            end
-          end
-        end)
+          },
+          conflicting
+        )
 
       assert {:error, :event_conflict} = result
 
