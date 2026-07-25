@@ -14,6 +14,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @private_v2 20_260_716_000_105
     @failed_v2 20_260_716_000_106
     @host_v1_to_current 20_260_716_000_107
+    @host_v2_to_current 20_260_716_000_108
     @fresh_current 20_260_719_000_111
 
     defmodule InstallV1 do
@@ -62,6 +63,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       use Ecto.Migration
       def up, do: Docket.Postgres.Migration.up(version: 3)
       def down, do: Docket.Postgres.Migration.down(version: 2)
+    end
+
+    defmodule HostV2ToCurrent do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(version: 3)
+      def down, do: Docket.Postgres.Migration.down(version: 3)
     end
 
     setup do
@@ -420,6 +427,30 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 1
       assert v1_runs("public") == [["run-a", "tenant-a"]]
       assert owned_claim_tables("public") == []
+    end
+
+    test "host schema-V2-to-current rollback target returns to schema V2 with V2 state intact" do
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+
+      TestRepo.query!("INSERT INTO docket_claim_partitions (scope_key) VALUES ('tenant-keep')")
+
+      :ok = Ecto.Migrator.up(TestRepo, @host_v2_to_current, HostV2ToCurrent, log: false)
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 3
+
+      :ok = Ecto.Migrator.down(TestRepo, @host_v2_to_current, HostV2ToCurrent, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+      assert Enum.sort(owned_claim_tables("public")) == current_claim_tables()
+
+      assert TestRepo.query!("SELECT scope_key FROM docket_claim_partitions").rows ==
+               [["tenant-keep"]]
+
+      assert TestRepo.query!(
+               "SELECT count(*) FROM information_schema.tables " <>
+                 "WHERE table_schema = 'public' " <>
+                 "AND table_name = 'docket_transition_receipts'"
+             ).rows == [[0]]
     end
 
     test "concurrent first partition creation materializes one immutable ring position" do

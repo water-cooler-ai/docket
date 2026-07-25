@@ -29,7 +29,9 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
         contract_version: 2,
         transitions: %{
           version: 1,
-          limits: Docket.Backend.TransitionStore.portable_limits()
+          limits: Docket.Backend.TransitionStore.portable_limits(),
+          replay: :durable_receipts,
+          durability: :process_lifetime
         }
       }
     end
@@ -43,10 +45,26 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
         contract_version: 2,
         transitions: %{
           version: 1,
+          limits: Docket.Backend.TransitionStore.portable_limits(),
+          replay: :durable_receipts,
+          durability: :process_lifetime
+        }
+      }
+    end
+  end
+
+  defmodule UndeclaredReplayBundle do
+    def capabilities do
+      %{
+        contract_version: 2,
+        transitions: %{
+          version: 1,
           limits: Docket.Backend.TransitionStore.portable_limits()
         }
       }
     end
+
+    def transitions, do: Docket.Test.MemoryBackend
   end
 
   test "the backend owns versioned transitions and focused stores" do
@@ -119,6 +137,15 @@ defmodule Docket.Backend.StoreCapabilitiesTest do
       end
 
     assert error.message =~ "does not export transitions/0"
+  end
+
+  test "a transition declaration without replay and durability metadata fails clearly" do
+    error =
+      assert_raise ArgumentError, fn ->
+        Docket.Backend.validate_contract!(UndeclaredReplayBundle)
+      end
+
+    assert error.message =~ "must declare replay and durability"
   end
 
   test "shared backend completeness failures name the accessor and exact callback" do

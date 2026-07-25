@@ -3,8 +3,14 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @shortdoc "Generates a Docket PostgreSQL migration"
 
     @moduledoc """
-    Generates a fresh Docket schema migration or a host schema-V1-to-current
-    upgrade.
+    Generates the fresh-install Docket schema migration.
+
+    The generated `up/0` installs the current schema version and `down/0`
+    removes the Docket schema entirely. Hosts upgrading an existing
+    installation do not use this task: each release's upgrade guide documents
+    a hand-written migration pinning `Docket.Postgres.Migration.up/1` and
+    `down/1` to the versions that release adds, so a rollback returns the
+    host to its pre-upgrade schema.
     """
 
     use Mix.Task
@@ -16,7 +22,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @switches [
       migrations_path: :string,
       repo: [:string, :keep],
-      upgrade_from_v1: :boolean,
       prefix: :string
     ]
     @aliases [r: :repo]
@@ -34,22 +39,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           Mix.raise("--prefix must be a lowercase identifier up to 63 bytes")
         end
 
-        from_v1? = Keyword.get(opts, :upgrade_from_v1, false)
+        version = Docket.Postgres.Migration.current_version()
+        down_version = Docket.Postgres.Migration.initial_version()
 
-        current_version = Docket.Postgres.Migration.current_version()
-
-        {basename, migration_name, version, down_version} =
-          case from_v1? do
-            true ->
-              {"upgrade_docket_to_v3", UpgradeDocketToV3, current_version, 2}
-
-            false ->
-              {"add_docket_tables", AddDocketTables, current_version,
-               Docket.Postgres.Migration.initial_version()}
-          end
-
-        file = Path.join(path, "#{timestamp()}_#{basename}.exs")
-        module = Module.concat([repo, Migrations, migration_name])
+        file = Path.join(path, "#{timestamp()}_add_docket_tables.exs")
+        module = Module.concat([repo, Migrations, AddDocketTables])
 
         content = """
         defmodule #{inspect(module)} do

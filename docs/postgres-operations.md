@@ -383,11 +383,16 @@ fairness boundary; per-tenant `max_active` caps are not part of v0.1.0.
 
 ### Existing schema V1 installations
 
-The generated upgrade is an ordinary transactional migration:
+The upgrade is an ordinary hand-written transactional migration pinning both
+directions to the versions it adds:
 
-```sh
-mix docket.gen.migration -r MyApp.Repo --upgrade-from-v1
-mix ecto.migrate -r MyApp.Repo
+```elixir
+defmodule MyApp.Repo.Migrations.UpgradeDocketToV3 do
+  use Ecto.Migration
+
+  def up, do: Docket.Postgres.Migration.up(version: 3)
+  def down, do: Docket.Postgres.Migration.down(version: 2)
+end
 ```
 
 Stop dispatchers and all Docket run writers before the upgrade, deploy one
@@ -395,16 +400,17 @@ homogeneous binary version, migrate, and restart. The migration locks the runs
 table against inserts while it backfills owner partitions and schedule rows.
 Schema version 3 adds the durable transition receipt table and the run-row
 event-sequence fence. The current binary requires schema version 3 and checks
-it before starting backend children. Rolling back a generated host-schema-V1
-upgrade removes the version 3 receipt/event fence and version 2 admission
-schema, returning to schema version 1. Online migrations,
-readiness ledgers, fleet
-attestations, and audited activation are intentionally outside the v0.1.0
-contract.
+it before starting backend children. Rolling back this schema-V1 upgrade
+removes the version 3 receipt/event fence and version 2 admission schema,
+returning to schema version 1; a schema-V2 installation pins
+`down(version: 3)` instead so rollback preserves its version 2 state. Online
+migrations, readiness ledgers, fleet attestations, and audited activation are
+intentionally outside the v0.1.0 contract.
 
-Fresh installations generated without an upgrade flag install V01 through V03
-in one host migration. Use the same explicit prefix in both migration
-directions and runtime configuration.
+Fresh installations use `mix docket.gen.migration`, which installs V01
+through V03 in one host migration whose rollback removes the Docket schema.
+Use the same explicit prefix in both migration directions and runtime
+configuration.
 
 Claim-policy correctness is covered by the checked-in windowed engine suite
 and the shared run-store contract matrix. Timing and large benchmarks are

@@ -106,10 +106,18 @@ defmodule Docket.Backend.LegacyTransitionStore do
         context,
         fn tx ->
           mutation = fn current ->
-            if current.checkpoint_seq == expected_checkpoint_seq do
-              {:commit, run, proposal.checkpoint_type, proposal.schedule, run}
-            else
-              {:error, :stale_checkpoint}
+            cond do
+              not immutable_binding?(current, run) ->
+                {:error, :invalid_transition}
+
+              current.checkpoint_seq != expected_checkpoint_seq ->
+                {:error, :stale_checkpoint}
+
+              current.event_seq != proposal.expected_event_seq ->
+                {:error, :stale_checkpoint}
+
+              true ->
+                {:commit, run, proposal.checkpoint_type, proposal.schedule, run}
             end
           end
 
@@ -126,6 +134,11 @@ defmodule Docket.Backend.LegacyTransitionStore do
 
   def commit_unclaimed(_context, _scope, _expected_checkpoint_seq, _proposal, _events),
     do: {:error, :invalid_transition}
+
+  defp immutable_binding?(stored, proposed) do
+    stored.id == proposed.id and stored.graph_id == proposed.graph_id and
+      stored.graph_hash == proposed.graph_hash and stored.started_at == proposed.started_at
+  end
 
   defp normalize_error({:error, reason})
        when reason in [

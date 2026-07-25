@@ -458,6 +458,123 @@ defmodule Docket.LifecycleTest do
     assert {:ok, ^started} = backend.runs().fetch_run(context, :tenantless, started.id)
   end
 
+  defmodule SignalProbeRuns do
+    def fetch_run(_context, _scope, run_id) do
+      send(self(), {:signal_probe, :fetch_run})
+      {:ok, %{Process.get(:signal_probe_run) | id: run_id}}
+    end
+  end
+
+  defmodule SignalProbeTransitions do
+    def initialize(_context, _scope, proposal, _events), do: {:ok, proposal.run}
+    def commit_claimed(_context, _scope, proposal, _events), do: {:ok, proposal.run}
+
+    def commit_unclaimed(_context, _scope, _expected_checkpoint_seq, proposal, _events) do
+      send(self(), {:signal_probe, :commit_unclaimed})
+
+      case Process.get(:signal_probe_result) do
+        :ok -> {:ok, proposal.run}
+        error -> error
+      end
+    end
+  end
+
+  defmodule SignalProbeBackend do
+    def capabilities do
+      %{
+        contract_version: 2,
+        transitions: %{
+          version: Docket.Backend.TransitionStore.version(),
+          limits: Docket.Backend.TransitionStore.portable_limits(),
+          replay: :durable_receipts,
+          durability: :process_lifetime
+        }
+      }
+    end
+
+    def transitions, do: Docket.LifecycleTest.SignalProbeTransitions
+    def runs, do: Docket.LifecycleTest.SignalProbeRuns
+    def events, do: Docket.LifecycleTest.SignalProbeRuns
+    def transaction(context, fun), do: fun.(context)
+  end
+
+  describe "signal transition discipline" do
+    setup do
+      now = ~U[2026-07-10 12:00:00.000000Z]
+
+      run = %Docket.Run{
+        id: "signal-probe-run",
+        graph_id: "signal-probe-graph",
+        graph_hash: "signal-probe-hash",
+        status: :running,
+        input: %{},
+        started_at: now,
+        updated_at: now,
+        checkpoint_seq: 1,
+        event_seq: 0
+      }
+
+      Process.put(:signal_probe_run, run)
+      {:ok, probe_now: now}
+    end
+
+    test "a retryable infrastructure failure is surfaced without an automatic retry",
+         %{probe_now: now} do
+      Process.put(:signal_probe_result, {:error, {:retryable, :connection_lost}})
+
+      assert {:error, {:retryable, :connection_lost}} =
+               probe_signal(advance_mutation(now))
+
+      assert_received {:signal_probe, :fetch_run}
+      assert_received {:signal_probe, :commit_unclaimed}
+      refute_received {:signal_probe, :commit_unclaimed}
+    end
+
+    test "a stale checkpoint refetches and re-evaluates a bounded number of times",
+         %{probe_now: now} do
+      Process.put(:signal_probe_result, {:error, :stale_checkpoint})
+
+      assert {:error, :stale_checkpoint} = probe_signal(advance_mutation(now))
+
+      for _attempt <- 1..4 do
+        assert_received {:signal_probe, :fetch_run}
+        assert_received {:signal_probe, :commit_unclaimed}
+      end
+
+      refute_received {:signal_probe, :fetch_run}
+      refute_received {:signal_probe, :commit_unclaimed}
+    end
+
+    test "a no-change decision publishes nothing" do
+      assert {:ok, %Docket.Run{id: "signal-probe-run"}} =
+               probe_signal(fn current -> {:unchanged, current} end)
+
+      assert_received {:signal_probe, :fetch_run}
+      refute_received {:signal_probe, :commit_unclaimed}
+    end
+
+    test "a mutation error publishes nothing" do
+      assert {:error, :nothing_to_do} =
+               probe_signal(fn _current -> {:error, :nothing_to_do} end)
+
+      assert_received {:signal_probe, :fetch_run}
+      refute_received {:signal_probe, :commit_unclaimed}
+    end
+  end
+
+  defp probe_signal(mutation) do
+    Docket.Lifecycle.signal(
+      {SignalProbeBackend, :probe_context},
+      :tenantless,
+      "signal-probe-run",
+      mutation
+    )
+  end
+
+  defp advance_mutation(now) do
+    fn current -> {:ok, Moment.propose(current, :step_committed, [], :continue, now)} end
+  end
+
   defp backend_ref(host) do
     {:ok, defaults} = Docket.Runtime.Instance.defaults(host)
     {Keyword.fetch!(defaults, :backend), Keyword.fetch!(defaults, :backend_context)}

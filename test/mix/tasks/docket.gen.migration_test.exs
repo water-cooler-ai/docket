@@ -43,8 +43,8 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert {:ok, _ast} = Code.string_to_quoted(content)
     end
 
-    test "generates an explicit schema-V1-to-current upgrade with a schema-V1 rollback point" do
-      [file] =
+    test "upgrade flags are gone; upgrades are hand-written per the release guide" do
+      assert_raise OptionParser.ParseError, fn ->
         Mix.Tasks.Docket.Gen.Migration.run([
           "-r",
           "Docket.Postgres.TestRepo",
@@ -52,19 +52,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           @tmp_path,
           "--upgrade-from-v1"
         ])
-
-      assert Path.dirname(file) == @tmp_path
-      assert Path.basename(file) =~ ~r/^\d{14}_upgrade_docket_to_v3\.exs$/
-
-      content = File.read!(file)
-
-      assert content =~
-               "defmodule Docket.Postgres.TestRepo.Migrations.UpgradeDocketToV3 do"
-
-      assert content =~ "Docket.Postgres.Migration.up(version: 3, prefix: \"public\")"
-      assert content =~ "Docket.Postgres.Migration.down(version: 2, prefix: \"public\")"
-      refute content =~ "down(version: 1,"
-      assert {:ok, _ast} = Code.string_to_quoted(content)
+      end
     end
 
     test "rejects unsafe prefixes" do

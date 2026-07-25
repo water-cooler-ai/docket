@@ -134,4 +134,38 @@ defmodule Docket.BackendTests.Fixture do
       schedule: Keyword.get(opts, :schedule, :retain_claim)
     }
   end
+
+  @spec encoded_size(term()) :: non_neg_integer()
+  def encoded_size(term) do
+    term
+    |> :erlang.term_to_binary([:deterministic, minor_version: 2])
+    |> byte_size()
+  end
+
+  @doc "Builds `build.(pad)` so its deterministic encoding is exactly `target` bytes."
+  @spec pad_to_encoded_size(pos_integer(), (String.t() -> term())) :: term()
+  def pad_to_encoded_size(target, build) when is_function(build, 1) do
+    pad_to_encoded_size(target, build, target - encoded_size(build.("")), 5)
+  end
+
+  defp pad_to_encoded_size(target, build, pad_bytes, attempts_left)
+       when pad_bytes >= 0 and attempts_left > 0 do
+    candidate = build.(String.duplicate("a", pad_bytes))
+
+    case encoded_size(candidate) do
+      ^target -> candidate
+      actual -> pad_to_encoded_size(target, build, pad_bytes + target - actual, attempts_left - 1)
+    end
+  end
+
+  defp pad_to_encoded_size(target, _build, pad_bytes, _attempts_left) do
+    raise "could not pad term to exactly #{target} encoded bytes (pad #{pad_bytes})"
+  end
+
+  @spec sized_event(Run.t(), pos_integer(), DateTime.t(), pos_integer()) :: Event.t()
+  def sized_event(run, seq, now, target_bytes) do
+    pad_to_encoded_size(target_bytes, fn pad ->
+      event(run, seq, now, payload: %{"pad" => pad})
+    end)
+  end
 end

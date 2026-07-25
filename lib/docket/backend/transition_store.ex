@@ -16,10 +16,14 @@ defmodule Docket.Backend.TransitionStore do
   * `commit_unclaimed/5` applies a signal/admin proposal under an optimistic
     checkpoint-sequence fence and never requires a claim.
 
-  `transition_id` is stable for one logical transition. An implementation must
-  accept an exact replay as success and reject reuse of the ID with different
-  canonical operation, fence, proposal, or event content as `:conflict`. Canonical event replay
-  compares the complete event value, not only `{run_id, seq}`.
+  `transition_id` is stable for one logical transition. It is a non-empty
+  UTF-8 binary of at most `max_transition_id_bytes/0` bytes so every portable
+  substrate can index it. An implementation must accept a replay with
+  identical canonical content as success and reject reuse of the ID with
+  different canonical operation, fence, proposal, or event content as
+  `:conflict`. Canonical comparison collapses duplicate identical events and
+  is insensitive to event list order; it compares the complete event value,
+  not only `{run_id, seq}`.
 
   Implementations validate the complete proposal and portable size limits
   before writing. Wrong-tenant and unknown resources both return `:not_found`.
@@ -48,6 +52,8 @@ defmodule Docket.Backend.TransitionStore do
 
   @version 1
 
+  @max_transition_id_bytes 512
+
   @portable_limits %{
     max_run_bytes: 350_000,
     max_events: 100,
@@ -58,6 +64,8 @@ defmodule Docket.Backend.TransitionStore do
   @type ctx :: Docket.Backend.ctx()
   @type scope :: Docket.Backend.scope()
   @type owner_scope :: Docket.Backend.owner_scope()
+
+  @typedoc "Non-empty UTF-8 binary of at most `max_transition_id_bytes/0` bytes."
   @type transition_id :: nonempty_binary()
   @type schedule :: Docket.Backend.RunStore.schedule()
 
@@ -69,7 +77,15 @@ defmodule Docket.Backend.TransitionStore do
           required(:max_transition_bytes) => pos_integer()
         }
 
-  @typedoc "Data-only initialization proposal."
+  @typedoc """
+  Data-only initialization proposal.
+
+  * `:transition_id` — stable replay identity for this initialization.
+  * `:run` — the complete initial run value; its `checkpoint_seq` is at least
+    1 and its `event_seq` equals the number of assigned events.
+  * `:checkpoint_type` — must be `:run_initialized`.
+  * `:wake_at` — the run's first explicit schedule.
+  """
   @type init_proposal :: %{
           required(:transition_id) => transition_id(),
           required(:run) => Docket.Run.t(),
@@ -77,7 +93,24 @@ defmodule Docket.Backend.TransitionStore do
           required(:wake_at) => DateTime.t()
         }
 
-  @typedoc "Data-only claim-fenced transition proposal."
+  @typedoc """
+  Data-only claim-fenced transition proposal.
+
+  * `:transition_id` — stable replay identity for this transition.
+  * `:run` — the complete next run value; its `checkpoint_seq` must equal
+    `expected_checkpoint_seq + 1`.
+  * `:expected_checkpoint_seq` — the committed checkpoint sequence this
+    transition fences against.
+  * `:expected_event_seq` — the run's committed event sequence before this
+    transition; the proposal's events extend it contiguously.
+  * `:claim_token` — the non-empty claim token that must still hold the run.
+  * `:checkpoint_type` — the checkpoint type recorded for this transition.
+  * `:schedule` — the claim disposition. `:retain_claim` requires a `:running`
+    run; `{:release_claim, :immediate}` and `{:release_claim, {:at, at}}`
+    require `:running`; `{:release_claim, :external}` requires `:waiting`;
+    `{:release_claim, :terminal}` requires `:done`, `:failed`, or
+    `:cancelled`.
+  """
   @type claimed_proposal :: %{
           required(:transition_id) => transition_id(),
           required(:run) => Docket.Run.t(),
@@ -88,7 +121,15 @@ defmodule Docket.Backend.TransitionStore do
           required(:schedule) => schedule()
         }
 
-  @typedoc "Data-only optimistic transition proposal."
+  @typedoc """
+  Data-only optimistic transition proposal.
+
+  Carries the same fields as `t:claimed_proposal/0` except the claim token,
+  which unclaimed transitions never require, and the expected checkpoint
+  sequence, which `c:commit_unclaimed/5` receives as its own argument because
+  it is also the compare-and-swap input core re-reads on `:stale_checkpoint`.
+  `:retain_claim` is not a valid unclaimed schedule.
+  """
   @type unclaimed_proposal :: %{
           required(:transition_id) => transition_id(),
           required(:run) => Docket.Run.t(),
@@ -137,6 +178,10 @@ defmodule Docket.Backend.TransitionStore do
   @spec portable_limits() :: limits()
   def portable_limits, do: @portable_limits
 
+  @doc "Maximum `transition_id` size accepted by every version-1 backend."
+  @spec max_transition_id_bytes() :: pos_integer()
+  def max_transition_id_bytes, do: @max_transition_id_bytes
+
   @doc false
   @spec validate_limits(map(), [Docket.Event.t()], limits()) ::
           :ok | {:error, :too_large | :invalid_transition}
@@ -147,17 +192,21 @@ defmodule Docket.Backend.TransitionStore do
       )
       when is_binary(transition_id) and byte_size(transition_id) > 0 and is_list(events) and
              is_map(limits) do
-    run_bytes = encoded_size(run)
-    event_sizes = Enum.map(events, &encoded_size/1)
-    transition_bytes = encoded_size(proposal) + Enum.sum(event_sizes)
+    if byte_size(transition_id) <= @max_transition_id_bytes and String.valid?(transition_id) do
+      run_bytes = encoded_size(run)
+      event_sizes = Enum.map(events, &encoded_size/1)
+      transition_bytes = encoded_size(proposal) + Enum.sum(event_sizes)
 
-    if run_bytes <= limits.max_run_bytes and
-         length(events) <= limits.max_events and
-         Enum.all?(event_sizes, &(&1 <= limits.max_event_bytes)) and
-         transition_bytes <= limits.max_transition_bytes do
-      :ok
+      if run_bytes <= limits.max_run_bytes and
+           length(events) <= limits.max_events and
+           Enum.all?(event_sizes, &(&1 <= limits.max_event_bytes)) and
+           transition_bytes <= limits.max_transition_bytes do
+        :ok
+      else
+        {:error, :too_large}
+      end
     else
-      {:error, :too_large}
+      {:error, :invalid_transition}
     end
   end
 
@@ -207,11 +256,21 @@ defmodule Docket.Backend.TransitionStore do
     :crypto.hash(
       :sha256,
       :erlang.term_to_binary(
-        {:docket_transition, @version, kind, expected_checkpoint_seq, proposal, events},
+        {:docket_transition, @version, kind, expected_checkpoint_seq, proposal,
+         digest_events(proposal, events)},
         [:deterministic, minor_version: 2]
       )
     )
   end
+
+  defp digest_events(%{run: %Docket.Run{id: run_id}}, events) when is_list(events) do
+    case canonical_events(events, run_id) do
+      {:ok, by_sequence} -> by_sequence |> Enum.sort() |> Enum.map(&elem(&1, 1))
+      {:error, _reason} -> events
+    end
+  end
+
+  defp digest_events(_proposal, events), do: events
 
   @doc false
   @spec encode_result(Docket.Run.t()) :: binary()

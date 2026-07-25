@@ -2,8 +2,31 @@
 
 Docket 0.1.2 replaces lifecycle use of callback transactions with the
 versioned `Docket.Backend.TransitionStore` contract. Applications using
-`Docket.Postgres` need no configuration change. Third-party backend authors can
-upgrade during the 0.1.x compatibility window described below.
+`Docket.Postgres` need no configuration change beyond the schema upgrade
+below. Third-party backend authors can upgrade during the 0.1.x compatibility
+window described below.
+
+## PostgreSQL schema upgrade
+
+Docket 0.1.2 requires schema version 3, which adds the durable event-sequence
+fence and the transition-receipt table. Hosts installed on 0.1.0 or 0.1.1 are
+at schema version 2 and write an ordinary migration pinning both directions:
+
+```elixir
+defmodule MyApp.Repo.Migrations.UpgradeDocketToV3 do
+  use Ecto.Migration
+
+  def up, do: Docket.Postgres.Migration.up(version: 3)
+  def down, do: Docket.Postgres.Migration.down(version: 3)
+end
+```
+
+`down(version: 3)` reverts only version 3, so a rollback returns the host to
+its pre-upgrade version-2 schema without touching claim partitions,
+schedules, or admission state. A host still on schema version 1 pins
+`down(version: 2)` instead, returning its rollback to version 1. Only fresh
+installs use `mix docket.gen.migration`, whose generated `down/0` removes the
+Docket schema entirely.
 
 ## What changed
 
@@ -83,10 +106,13 @@ tenant and unknown resources both return `:not_found`. Immutable identity is
 validated before claim/checkpoint fences. Event equality compares complete
 canonical event content.
 
-Every logical transition has a stable `transition_id`. Exact replay after an
-ambiguous outcome returns success; reuse with different proposal/event content
-returns `:conflict`. If events may be pruned, use a durable receipt independent
-of retained events.
+Every logical transition has a stable `transition_id`: a non-empty UTF-8
+binary of at most `Docket.Backend.TransitionStore.max_transition_id_bytes/0`
+bytes. Replay with identical canonical content after an ambiguous outcome
+returns success; reuse with different proposal/event content returns
+`:conflict`. Canonical comparison collapses duplicate identical events and is
+insensitive to event list order. If events may be pruned, use a durable
+receipt independent of retained events.
 
 The portable permanent errors are `:not_found`, `:invalid_transition`,
 `:conflict`, `:event_conflict`, and `:too_large`. A lost checkpoint or event

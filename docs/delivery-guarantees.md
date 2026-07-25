@@ -12,7 +12,7 @@ a single "exactly-once" or "at-least-once" label.
 
 | Boundary | Current guarantee | Source of truth | Required consumer behavior |
 | --- | --- | --- | --- |
-| Run transition and its retained events | Atomic, single durable winner | PostgreSQL transaction containing the fenced run update and event append | None inside Docket's storage boundary |
+| Run transition and its retained events | Atomic, single durable winner | One `Docket.Backend.TransitionStore` operation compiled into the backend's native atomic primitive | None inside Docket's storage boundary |
 | Claim ownership | One current commit authority, not one executor | Current `claim_token` plus expected `checkpoint_seq` | Treat a lease as revocable authority |
 | Node attempt execution | Replayable; the same attempt may execute zero, one, or multiple times | Last committed run state | Keep node computation pure or make effects idempotent |
 | External effect initiated by a node | May happen more than once or have an ambiguous outcome | The external system | Atomically deduplicate the supplied identity with the effect |
@@ -25,8 +25,11 @@ a single "exactly-once" or "at-least-once" label.
 ## Exact boundary of the durable guarantee
 
 One runtime moment proposes a next `Docket.Run`, assigned events, checkpoint
-metadata, and a scheduling disposition. Docket commits that proposal in one
-backend transaction. The run update is accepted only when both of these match:
+metadata, and a scheduling disposition. Docket commits that proposal through
+one semantic `Docket.Backend.TransitionStore` operation; the backend maps it
+to its native atomic primitive (a PostgreSQL statement or transaction, a
+serialized in-memory aggregate). The claimed run update is accepted only when
+both of these match:
 
 ```text
 stored claim_token    = vehicle claim_token
@@ -34,15 +37,15 @@ stored checkpoint_seq = expected checkpoint_seq
 ```
 
 The proposed run must advance `checkpoint_seq` by exactly one. The run update,
-schedule change, and retained event append either all commit or all roll back.
-A stale vehicle may have executed node code, but it cannot commit after another
-claimant changes the token or advances the sequence.
+schedule change, retained event append, and replay receipt either all commit
+or all roll back. A stale vehicle may have executed node code, but it cannot
+commit after another claimant changes the token or advances the sequence.
 
-The guarantee ends at transaction commit. Work performed before that commit,
-including network calls made by node code, is outside the transaction and
-cannot be retracted when a fence is lost. Work performed after commit,
-including observers, notifications, and telemetry, cannot veto the committed
-transition and is not durably delivered by Docket.
+The guarantee ends at the transition's acknowledged commit. Work performed
+before that commit, including network calls made by node code, is outside the
+transition and cannot be retracted when a fence is lost. Work performed after
+commit, including observers, notifications, and telemetry, cannot veto the
+committed transition and is not durably delivered by Docket.
 
 ## What "at least once" means here
 

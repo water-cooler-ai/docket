@@ -20,7 +20,17 @@ project follows [Semantic Versioning](https://semver.org/).
 - PostgreSQL schema version 3, adding a durable event-sequence fence and
   transition receipts that survive retained-event pruning.
 - A shared v2 semantic conformance matrix covering replay, tenancy, validation,
-  fences, concurrency, canonical events, limits, and zero-write rejection.
+  fences, concurrency, canonical events, schedule variants, exact byte/count
+  limit boundaries, zero-write rejection, and a PostgreSQL restart-durability
+  gate.
+- A documented hand-written schema upgrade per release, Oban-style: the
+  0.1.1-to-0.1.2 guide pins `Docket.Postgres.Migration.up(version: 3)` /
+  `down(version: 3)` so a rollback returns a 0.1.0/0.1.1 host to schema
+  version 2 instead of removing earlier Docket state.
+- Contract-v2 transition declarations must name their replay mechanism and
+  acknowledged durability boundary; transition IDs are bounded UTF-8 so every
+  portable substrate can index them; replay digests compare canonical event
+  content.
 
 ### Changed
 
@@ -35,6 +45,12 @@ project follows [Semantic Versioning](https://semver.org/).
   `Docket.Postgres.TransitionStore`; the fused statement includes receipt
   arbitration, while initialization and unclaimed paths use backend-private
   PostgreSQL transactions.
+
+### Removed
+
+- `mix docket.gen.migration --upgrade-from-v1`. The generator only produces
+  the fresh install; schema upgrades are hand-written migrations documented
+  in each release's upgrade guide.
 
 ### Deprecated
 
