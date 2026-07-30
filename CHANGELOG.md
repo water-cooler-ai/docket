@@ -4,6 +4,16 @@ All notable changes to `docket` are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## 0.2.1 — 2026-07-29
+
+### Changed
+
+- Internal restructure of the runtime execution loop: dispatch results now
+  settle through a private superstep value that partitions and validates
+  each result batch exactly once before the loop picks its commit boundary,
+  and guard/activation state views are built in a single pass over the
+  graph lowering. No public API or externally observable behavior changes.
+
 ## 0.2.0 — 2026-07-25
 
 ### Removed
