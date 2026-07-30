@@ -4,15 +4,30 @@ All notable changes to `docket` are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [Semantic Versioning](https://semver.org/).
 
-## 0.2.1 — 2026-07-29
+## 0.3.0 — 2026-07-29
+
+### Added
+
+- `Docket.Run.Failure.from_error/1`, the one conversion from a
+  `Docket.Error` to a durable failure. Runs that fail during planning
+  (invalid policy, unknown node on resume) now preserve the error's node ID
+  and details on `run.failure` instead of dropping them.
+- `:run_failed` events set the event's `node_id` when the failure is
+  attributable to exactly one node.
 
 ### Changed
 
+- The `:run_failed` event payload is now a canonical projection of the
+  run's durable `Docket.Run.Failure`: `"reason"` (the failure code),
+  `"message"`, and the failure's class-specific details merged at the top
+  level. Payloads always carry `"message"`; permanent node failures gain
+  `"errors"` (per-node reasons); guard-evaluation failures carry the
+  evaluation reasons under `"reasons"` instead of `"details"`.
 - Internal restructure of the runtime execution loop: dispatch results now
   settle through a private superstep value that partitions and validates
   each result batch exactly once before the loop picks its commit boundary,
   and guard/activation state views are built in a single pass over the
-  graph lowering. No public API or externally observable behavior changes.
+  graph lowering.
 
 ## 0.2.0 — 2026-07-25
 
