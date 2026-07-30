@@ -7,6 +7,8 @@ defmodule Docket.Event do
   v0.1 event types are:
 
   - `:run_initialized`, `:run_completed`, `:run_failed`, `:run_cancelled`
+    (a `:run_failed` payload projects the run's durable failure: `"reason"`,
+    `"message"`, and the failure's class-specific details)
   - `:checkpoint_committed` (metadata-only durable checkpoint history)
   - `:node_completed`, `:node_failed` (one `:node_failed` per failed attempt)
   - `:channel_updated` (payload carries the new version or the writer node

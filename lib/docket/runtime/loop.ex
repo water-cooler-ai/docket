@@ -284,11 +284,7 @@ defmodule Docket.Runtime.Loop do
                 details: %{"limit" => limit}
               )
 
-            {:moment,
-             fail(run, config, [], failure, %{
-               "reason" => "max_supersteps_exceeded",
-               "limit" => limit
-             })}
+            {:moment, fail(run, config, [], failure)}
 
           {:execute, node_ids} ->
             case Algorithm.prepare_activations(rtg, run, node_ids, config) do
@@ -296,7 +292,7 @@ defmodule Docket.Runtime.Loop do
                 {:execute, run, activations}
 
               {:error, %Error{} = error} ->
-                {:moment, fail_planning(run, config, error)}
+                {:moment, fail(run, config, [], Failure.from_error(error))}
             end
         end
     end
@@ -320,16 +316,9 @@ defmodule Docket.Runtime.Loop do
           {:execute, run, Enum.filter(activations, &MapSet.member?(due_set, &1.task_id))}
 
         {:error, %Error{} = error} ->
-          {:moment, fail_planning(run, config, error)}
+          {:moment, fail(run, config, [], Failure.from_error(error))}
       end
     end
-  end
-
-  defp fail_planning(run, config, %Error{} = error) do
-    fail(run, config, [], Failure.new(Atom.to_string(error.type), error.message), %{
-      "reason" => Atom.to_string(error.type),
-      "message" => error.message
-    })
   end
 
   # The instant deadline checks compare against: the injected clock, floored
@@ -399,11 +388,7 @@ defmodule Docket.Runtime.Loop do
         end)
 
     failed_nodes = superstep.failures |> Enum.map(& &1.node_id) |> Enum.uniq() |> Enum.sort()
-
-    fail(run, config, entries, node_failure(superstep.failures, failed_nodes), %{
-      "reason" => "node_failed",
-      "nodes" => failed_nodes
-    })
+    fail(run, config, entries, node_failure(superstep.failures, failed_nodes))
   end
 
   # Commits the retry park: completed results move to pending writes, each
@@ -488,11 +473,7 @@ defmodule Docket.Runtime.Loop do
             details: %{"edge_id" => edge_id, "reasons" => reasons}
           )
 
-        fail(run, config, [], failure, %{
-          "reason" => "guard_evaluation_failed",
-          "edge_id" => edge_id,
-          "details" => reasons
-        })
+        fail(run, config, [], failure)
     end
   end
 
@@ -685,8 +666,10 @@ defmodule Docket.Runtime.Loop do
   end
 
   # Terminal failure absorbs the active superstep: no parked attempt, pending
-  # write, or timer survives a failed run.
-  defp fail(run, config, extra_entries, %Failure{} = failure, payload) do
+  # write, or timer survives a failed run. The durable failure is the single
+  # source of truth: the `:run_failed` event's node ID and payload are
+  # projections of it, never assembled separately.
+  defp fail(run, config, extra_entries, %Failure{} = failure) do
     now = config.clock.()
 
     run = %{
@@ -700,8 +683,17 @@ defmodule Docket.Runtime.Loop do
         timers: %{}
     }
 
-    entries = extra_entries ++ [entry(:run_failed, run.step, payload: payload)]
+    failed_entry =
+      entry(:run_failed, run.step, node_id: failure.node_id, payload: failure_payload(failure))
+
+    entries = extra_entries ++ [failed_entry]
     propose(run, :run_failed, entries, {:park, :terminal, :run_failed}, config)
+  end
+
+  defp failure_payload(%Failure{} = failure) do
+    failure.details
+    |> Map.put("reason", failure.code)
+    |> Map.put("message", failure.message)
   end
 
   # ---------------------------------------------------------------------------

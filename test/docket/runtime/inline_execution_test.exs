@@ -181,7 +181,10 @@ defmodule Docket.Runtime.InlineExecutionTest do
                run.failure
 
       run_failed = List.last(checkpoints)
-      assert Enum.any?(run_failed.events, &(&1.payload["reason"] == "max_supersteps_exceeded"))
+      assert [event] = Enum.filter(run_failed.events, &(&1.type == :run_failed))
+      assert event.payload["reason"] == "max_supersteps_exceeded"
+      assert event.payload["message"] == run.failure.message
+      assert event.payload["limit"] == 3
     end
 
     test "a host can limit a graph that is canonically unbounded" do
