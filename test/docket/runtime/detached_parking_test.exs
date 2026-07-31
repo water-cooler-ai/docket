@@ -145,61 +145,6 @@ defmodule Docket.Runtime.DetachedParkingTest do
     end
   end
 
-  describe "post-commit workers" do
-    defp worker_graph do
-      Graph.new!(id: "detach-worker")
-      |> Graph.put_field!("waits_out", schema: Docket.Schema.string())
-      |> Graph.put_node!("waits",
-        implementation: Nodes.DetachesWithWorker,
-        policies: %{"detach" => %{"deadline_ms" => 60_000}}
-      )
-      |> Graph.put_edge!("edge_start_waits", from: "$start", to: "waits")
-      |> Graph.put_edge!("edge_waits_finish", from: "waits", to: "$finish")
-      |> Graph.put_output!("waits_out", [])
-    end
-
-    test "the worker starts only after the detach park commits" do
-      graph = worker_graph()
-      rtg = compile!(graph)
-
-      {:ok, initialized, _} =
-        Docket.Test.run_inline(graph, %{}, max_steps: 0, context: %{notify: self()})
-
-      assert {:ok, moment} =
-               Docket.Runtime.Loop.propose_advance(rtg, initialized, context: %{notify: self()})
-
-      assert moment.checkpoint_type == :detach_scheduled
-      assert [%{ref: %Docket.Detached{} = ref, worker: worker}] = moment.detached_workers
-      assert ref.task_id == "#{initialized.id}:0:waits"
-      assert ref.attempt == 1
-      assert ref.idempotency_key == "#{ref.task_id}:1"
-      assert is_function(worker, 1)
-
-      # The node executed but its worker did not: proposing commits nothing
-      # and starts nothing.
-      assert_received {:detaching, _context}
-      refute_received {:worker_ran, _}
-
-      # The lifecycle starts the worker only after the commit succeeds,
-      # handing it the identity of the durably parked task.
-      supervisor = start_supervised!(Task.Supervisor)
-      assert :ok = Docket.Lifecycle.after_commit(moment, task_supervisor: supervisor)
-      assert_receive {:worker_ran, ^ref}
-    end
-
-    test "an invalid worker fails classification permanently" do
-      graph =
-        Graph.new!(id: "detach-bad-worker")
-        |> Graph.put_node!("waits", implementation: Nodes.BadDetachWorker)
-        |> Graph.put_edge!("edge_start_waits", from: "$start", to: "waits")
-        |> Graph.put_edge!("edge_waits_finish", from: "waits", to: "$finish")
-
-      assert {:ok, run, _} = Docket.Test.run_inline(graph, %{})
-      assert run.status == :failed
-      assert run.failure.details["errors"]["waits"] =~ "invalid_detach_worker"
-    end
-  end
-
   describe "late results" do
     test "a late result applies exactly once and stale or duplicate results change nothing" do
       graph = parallel_detach_graph()

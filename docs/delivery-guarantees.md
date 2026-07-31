@@ -123,21 +123,18 @@ effects.
   interrupt and park. The run commits `:waiting` with no deadline and only
   `resolve_interrupt` (or cancellation) resumes it. Right for human approval
   and external callbacks whose own system guarantees eventual resolution.
-- **Detachment** — the work is in-process but longer than an attempt:
-  return `{:detach, token, worker}` and the runtime starts the worker under
-  its task supervisor only after the detach park durably commits — the
-  worker cannot exist before the state it completes against. The attempt is
-  not consumed; the run stays `running`, parked with no claim behind a
-  mandatory deadline. The worker posts `Docket.complete_detached/4` —
-  success applies at the next barrier, a reported failure or deadline
-  expiry settles per the node's `"detach"` policy (reschedule through the
-  retry budget, or fail); exactly one completion per detached attempt
-  applies. A crashed worker is recovered by the deadline alone. An
-  externally completed detach (`{:detach, token}` with the identity handed
-  off) must retry on `%Docket.Error{type: :detach_pending}` — a completion
-  that outruns its own park commit. An attempt rescheduled after expiry may
-  repeat external effects; the stable idempotency key is the only dedupe
-  surface.
+- **Detachment** — the work outlasts an attempt and is executed elsewhere:
+  return `{:detach, token}`. The attempt is not consumed; the run stays
+  `running`, parked with no claim behind a mandatory deadline. The
+  executing system discovers the durably parked task from the database side
+  and posts `Docket.complete_detached/4` — success applies at the next
+  barrier, a reported failure or deadline expiry settles per the node's
+  `"detach"` policy (reschedule through the retry budget, or fail); exactly
+  one completion per detached attempt applies. A crashed executor is
+  recovered by the deadline alone. A completion that outruns its own park
+  commit must retry on `%Docket.Error{type: :detach_pending}`. An attempt
+  rescheduled after expiry may repeat external effects; the stable
+  idempotency key is the only dedupe surface.
 
 ## Integration rules
 

@@ -262,14 +262,16 @@ defmodule Docket do
   Applies a detached attempt's late result and schedules the next tick or
   durable wake.
 
-  `ref` is the `Docket.Detached` identity captured from the node's execution
-  context. The result commits through the serialized signal path, fenced on
-  the run still holding exactly that task detached at exactly that attempt;
-  a stale, duplicate, or superseded result is a no-op returning the current
-  run. `{:ok, update}` applies the node's state update at the next barrier;
-  `{:error, reason}` expires the detach deadline immediately so the node's
-  deadline policy settles the attempt. Tenant scope is enforced before
-  storage access.
+  `ref` is the `Docket.Detached` identity of the durably parked task the
+  completer discovered. The result commits through the serialized signal
+  path, fenced on the run still holding exactly that task detached at
+  exactly that attempt; a stale, duplicate, or superseded result is a no-op
+  returning the current run, and a completion arriving before the detach
+  park commits returns a retryable
+  `%Docket.Error{type: :detach_pending}`. `{:ok, update}` applies the
+  node's state update at the next barrier; `{:error, reason}` expires the
+  detach deadline immediately so the node's deadline policy settles the
+  attempt. Tenant scope is enforced before storage access.
   """
   def complete_detached(runtime, ref, result, opts \\ [])
 

@@ -8,13 +8,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `{:detach, token, worker}` and `{:detach, token}` node returns: a
-  first-class detached-execution protocol. A detaching attempt is not
-  consumed as a failure — the run parks durably with the task's stable
-  identity behind a mandatory deadline, the claim and vehicle release, and
-  the runtime starts `worker` under its task supervisor only after the
-  detach park commits, so a completion can never precede its own durable
-  park. The two-element form detaches for external completion.
+- `{:detach, token}` node return: a first-class detached-execution
+  protocol. A detaching attempt is not consumed as a failure — the run
+  parks durably with the task's stable identity behind a mandatory
+  deadline, and the claim and vehicle release while the work completes
+  elsewhere.
 - `Docket.complete_detached/4` (and the `use Docket` delegate): applies a
   detached attempt's late result through the serialized signal path, fenced
   on the run still holding that exact task detached at that exact attempt
@@ -25,8 +23,8 @@ project follows [Semantic Versioning](https://semver.org/).
   dropped. `{:ok, update}` applies at the next barrier; `{:error, reason}`
   expires the deadline immediately so the node's deadline policy settles
   the attempt.
-- `Docket.Detached`: the completion identity (`from_context/1`) handed to
-  runtime-started workers and external completers.
+- `Docket.Detached`: the completion identity presented by external
+  completers.
 - `"detach"` node policy (`"deadline_ms"`, `"on_deadline"` of `"reschedule"`
   or `"fail"`) and the runtime `detach_deadline_ms` default (300 000 ms).
   Every detached attempt resolves to a finite deadline; expiry with

@@ -31,6 +31,5 @@ defmodule Docket.Executor do
               {:ok, state_update :: map()}
               | {:interrupt, Docket.Interrupt.t()}
               | {:detach, term()}
-              | {:detach, term(), (Docket.Detached.t() -> any())}
               | {:error, term()}
 end

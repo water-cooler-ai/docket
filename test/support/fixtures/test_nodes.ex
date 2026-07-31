@@ -395,40 +395,6 @@ defmodule Docket.Test.Fixtures.Nodes do
     def call(_state, _config, _context), do: {:detach, self()}
   end
 
-  defmodule BadDetachWorker do
-    @moduledoc false
-    # A detach worker must be a one-arity function.
-    @behaviour Docket.Node
-
-    @impl true
-    def config_schema, do: Docket.Schema.object(%{})
-
-    @impl true
-    def call(_state, _config, _context), do: {:detach, "t", :not_a_fun}
-  end
-
-  defmodule DetachesWithWorker do
-    @moduledoc false
-    # Detaches with a runtime-started worker that reports its ref to the
-    # `:notify` pid (or the registered `:detach_worker_relay`); the runtime
-    # starts the worker only after the detach park commits.
-    @behaviour Docket.Node
-
-    @impl true
-    def config_schema, do: Docket.Schema.object(%{})
-
-    @impl true
-    def call(_state, _config, context) do
-      notify = Map.get(context.application, :notify, Process.whereis(:detach_worker_relay))
-      if notify, do: send(notify, {:detaching, context})
-
-      {:detach, "worker-token",
-       fn ref ->
-         if notify, do: send(notify, {:worker_ran, ref})
-       end}
-    end
-  end
-
   defmodule SleepsUntilReleased do
     @moduledoc false
     # Announces itself to the test coordinator and blocks until released - no

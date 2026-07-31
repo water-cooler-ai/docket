@@ -458,22 +458,7 @@ defmodule Docket.Runtime.Loop do
 
     disposition = {:park, {:at, park_info(parked.timers, now).resume_at}, reason}
 
-    propose(parked, type, entries, disposition, config,
-      pending_attempts: new_pending,
-      detached_workers: detached_workers(run, parked_tasks, superstep.detached)
-    )
-  end
-
-  # Workers ride the moment as transient process-local state; the lifecycle
-  # starts them only after this park durably commits, so a completion can
-  # never precede its own detach park.
-  defp detached_workers(run, parked_tasks, detached) do
-    for result <- detached, worker = result.value.worker, not is_nil(worker) do
-      %{
-        ref: Docket.Detached.from_task(run.id, Map.fetch!(parked_tasks, result.task_id)),
-        worker: worker
-      }
-    end
+    propose(parked, type, entries, disposition, config, pending_attempts: new_pending)
   end
 
   defp parked_attempt(run, activation, %{status: :retry} = result, now, _config) do
@@ -531,7 +516,7 @@ defmodule Docket.Runtime.Loop do
       started_at: now,
       deadline_at: deadline,
       failures: prior_failures(run, result.task_id),
-      metadata: %{"detach_token" => result.value.token}
+      metadata: %{"detach_token" => result.value}
     }
   end
 
