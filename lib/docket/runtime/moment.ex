@@ -321,7 +321,9 @@ defmodule Docket.Runtime.Moment do
 
     committed =
       events
-      |> Enum.filter(&(&1.type in [:node_completed, :node_failed, :interrupt_requested]))
+      |> Enum.filter(
+        &(&1.type in [:node_completed, :node_failed, :node_detached, :interrupt_requested])
+      )
       |> Enum.flat_map(fn event ->
         case event.payload do
           %{"attempt" => attempt} when is_integer(attempt) and attempt > 0 ->
@@ -360,6 +362,7 @@ defmodule Docket.Runtime.Moment do
 
   defp attempt_outcome(:node_completed), do: :completed
   defp attempt_outcome(:node_failed), do: :failed
+  defp attempt_outcome(:node_detached), do: :detached
   defp attempt_outcome(:interrupt_requested), do: :interrupted
 
   defp disposition_metadata(:continue), do: {"continue", nil}

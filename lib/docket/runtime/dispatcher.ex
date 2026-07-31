@@ -3,6 +3,7 @@ defmodule Docket.Runtime.Dispatcher do
 
   alias Docket.Run.TaskState
   alias Docket.Runtime.{ExecutionPolicy, TaskResult}
+  alias Docket.Wire
 
   def dispatch([], _rtg, _run, _config), do: []
 
@@ -163,7 +164,11 @@ defmodule Docket.Runtime.Dispatcher do
     result
   end
 
-  defp result(activation, {:final, status, value}),
+  @doc false
+  # Folds one classified outcome into the activation's TaskResult. Public so
+  # the loop can synthesize a deadline-expiry result for a detached task
+  # through the same retry-budget rule as a dispatched failure.
+  def result(activation, {:final, status, value}),
     do: %TaskResult{
       task_id: activation.task_id,
       node_id: activation.node_id,
@@ -172,7 +177,7 @@ defmodule Docket.Runtime.Dispatcher do
       value: value
     }
 
-  defp result(activation, {:failure, retryable?, reason}) do
+  def result(activation, {:failure, retryable?, reason}) do
     status =
       if retryable? and activation.attempt < activation.retry.max_attempts,
         do: :retry,
@@ -213,6 +218,7 @@ defmodule Docket.Runtime.Dispatcher do
       attempt: activation.attempt,
       source_versions: activation.source_versions,
       idempotency_key: task.idempotency_key,
+      task_supervisor: Keyword.get(config.executor_opts, :task_supervisor),
       application: config.context
     }
 
@@ -237,7 +243,14 @@ defmodule Docket.Runtime.Dispatcher do
     do: {:final, :interrupt, interrupt}
 
   defp classify({:interrupt, other}), do: {:failure, false, {:invalid_interrupt, other}}
-  defp classify({:await, _}), do: {:failure, false, :unsupported_await}
+
+  defp classify({:detach, token}) do
+    case Wire.dump_value(token) do
+      {:ok, durable} -> {:final, :detached, durable}
+      {:error, reason} -> {:failure, false, {:invalid_detach_token, reason}}
+    end
+  end
+
   defp classify({:command, _}), do: {:failure, false, :unsupported_command}
   defp classify({:error, reason}), do: {:failure, true, reason}
 

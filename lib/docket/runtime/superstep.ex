@@ -57,6 +57,7 @@ defmodule Docket.Runtime.Superstep do
     writes: [],
     interrupts: [],
     retries: [],
+    detached: [],
     failures: [],
     remaining_active?: false
   ]
@@ -70,6 +71,7 @@ defmodule Docket.Runtime.Superstep do
           writes: [PendingWrite.t()],
           interrupts: [PendingWrite.t()],
           retries: [TaskResult.t()],
+          detached: [TaskResult.t()],
           failures: [Failure.t()],
           remaining_active?: boolean()
         }
@@ -77,7 +79,7 @@ defmodule Docket.Runtime.Superstep do
   @doc false
   def new(rtg, run, config, activations, results) do
     results = Enum.sort_by(results, & &1.node_id)
-    {oks, interrupt_results, retries, failures} = partition(results)
+    {oks, interrupt_results, retries, detached, failures} = partition(results)
     {writes, write_failures} = validate_writes(rtg, oks)
     {interrupts, interrupt_failures} = validate_interrupts(rtg, run, interrupt_results)
 
@@ -90,6 +92,7 @@ defmodule Docket.Runtime.Superstep do
       writes: writes,
       interrupts: interrupts,
       retries: retries,
+      detached: detached,
       failures: failures ++ write_failures ++ interrupt_failures,
       remaining_active?: remaining_active?(run, results)
     }
@@ -156,23 +159,28 @@ defmodule Docket.Runtime.Superstep do
   end
 
   defp partition(results) do
-    Enum.reduce(results, {[], [], [], []}, fn result, {oks, interrupts, retries, failures} ->
+    Enum.reduce(results, {[], [], [], [], []}, fn result,
+                                                  {oks, interrupts, retries, detached, failures} ->
       case result.status do
         :ok ->
-          {[result | oks], interrupts, retries, failures}
+          {[result | oks], interrupts, retries, detached, failures}
 
         :interrupt ->
-          {oks, [result | interrupts], retries, failures}
+          {oks, [result | interrupts], retries, detached, failures}
 
         :retry ->
-          {oks, interrupts, [result | retries], failures}
+          {oks, interrupts, [result | retries], detached, failures}
+
+        :detached ->
+          {oks, interrupts, retries, [result | detached], failures}
 
         :error ->
-          {oks, interrupts, retries, [Failure.new(result, result.value) | failures]}
+          {oks, interrupts, retries, detached, [Failure.new(result, result.value) | failures]}
       end
     end)
-    |> then(fn {oks, interrupts, retries, failures} ->
-      {Enum.reverse(oks), Enum.reverse(interrupts), Enum.reverse(retries), Enum.reverse(failures)}
+    |> then(fn {oks, interrupts, retries, detached, failures} ->
+      {Enum.reverse(oks), Enum.reverse(interrupts), Enum.reverse(retries),
+       Enum.reverse(detached), Enum.reverse(failures)}
     end)
   end
 

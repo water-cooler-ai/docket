@@ -17,7 +17,7 @@ defmodule Docket.Runtime.Loop do
 
   alias Docket.{Error, Run, Schema, Wire}
   alias Docket.Run.{ChannelState, Failure, InterruptState, TaskState, TimerState}
-  alias Docket.Runtime.{Algorithm, Config, Dispatcher, Moment, Superstep}
+  alias Docket.Runtime.{Algorithm, Config, Dispatcher, ExecutionPolicy, Moment, Superstep}
 
   @doc false
   # Builds the fresh `:created` run document consumed by `init/3`. Shared by
@@ -233,8 +233,10 @@ defmodule Docket.Runtime.Loop do
     config = Config.resolve_moment(opts)
 
     case do_propose_plan(rtg, run, opts, config) do
-      {:execute, run, activations} ->
-        results = Dispatcher.dispatch(activations, rtg, run, config)
+      {:execute, run, activations, pre_results} ->
+        skip = MapSet.new(pre_results, & &1.task_id)
+        dispatchable = Enum.reject(activations, &MapSet.member?(skip, &1.task_id))
+        results = pre_results ++ Dispatcher.dispatch(dispatchable, rtg, run, config)
         {:ok, settle(Superstep.new(rtg, run, config, activations, results))}
 
       {:moment, moment} ->
@@ -266,6 +268,9 @@ defmodule Docket.Runtime.Loop do
       map_size(run.active_tasks) > 0 ->
         resume_superstep(rtg, run, opts, config)
 
+      run.pending_writes != [] ->
+        {:execute, run, [], []}
+
       true ->
         case Algorithm.plan(rtg, run, config) do
           :done ->
@@ -289,7 +294,7 @@ defmodule Docket.Runtime.Loop do
           {:execute, node_ids} ->
             case Algorithm.prepare_activations(rtg, run, node_ids, config) do
               {:ok, activations} ->
-                {:execute, run, activations}
+                {:execute, run, activations, []}
 
               {:error, %Error{} = error} ->
                 {:moment, fail(run, config, [], Failure.from_error(error))}
@@ -300,9 +305,12 @@ defmodule Docket.Runtime.Loop do
 
   # Resumes the durable active superstep: parked attempts whose retry
   # deadline has arrived are rebuilt with their committed identity; when no
-  # attempt is due yet the shell is told when to wake. Rebuilding failures
-  # (unknown node, invalid policy) fail the run the same way fresh planning
-  # does.
+  # attempt is due yet the shell is told when to wake. A due detached task is
+  # never re-dispatched — its outstanding attempt may still be executing
+  # elsewhere under the same idempotency key — so its deadline expiry is
+  # synthesized as a failure result and settled through the ordinary retry
+  # budget. Rebuilding failures (unknown node, invalid policy) fail the run
+  # the same way fresh planning does.
   defp resume_superstep(rtg, run, opts, config) do
     now = resume_now(config, opts)
     due_ids = run.active_tasks |> Map.keys() |> Enum.filter(&due?(run.timers, &1, now))
@@ -313,12 +321,31 @@ defmodule Docket.Runtime.Loop do
       case Algorithm.resume_activations(rtg, run) do
         {:ok, activations} ->
           due_set = MapSet.new(due_ids)
-          {:execute, run, Enum.filter(activations, &MapSet.member?(due_set, &1.task_id))}
+          due = Enum.filter(activations, &MapSet.member?(due_set, &1.task_id))
+          expired = Enum.filter(due, &detached?(run, &1.task_id))
+          {:execute, run, due, Enum.map(expired, &expired_result(run, &1))}
 
         {:error, %Error{} = error} ->
           {:moment, fail(run, config, [], Failure.from_error(error))}
       end
     end
+  end
+
+  defp detached?(run, task_id) do
+    match?(%TaskState{status: :detached}, Map.get(run.active_tasks, task_id))
+  end
+
+  # A worker-reported failure stored by the early-expire completion wins over
+  # the generic deadline reason; the disposition policy decides retry vs
+  # permanent through the same budget rule as dispatched failures.
+  defp expired_result(run, activation) do
+    task = Map.fetch!(run.active_tasks, activation.task_id)
+    reason = Map.get(task.metadata, "detach_error", :detach_deadline_expired)
+
+    Dispatcher.result(
+      activation,
+      {:failure, activation.detach.on_deadline == :reschedule, reason}
+    )
   end
 
   # The instant deadline checks compare against: the injected clock, floored
@@ -355,10 +382,11 @@ defmodule Docket.Runtime.Loop do
   # ---------------------------------------------------------------------------
 
   # One settlement decision per validated superstep: any permanent failure
-  # fails the run; a retrying or partially-dispatched superstep parks;
-  # otherwise the update barrier commits.
+  # fails the run; a retrying, detaching, or partially-dispatched superstep
+  # parks; otherwise the update barrier commits.
   defp settle(%Superstep{failures: [_ | _]} = superstep), do: fail_superstep(superstep)
   defp settle(%Superstep{retries: [_ | _]} = superstep), do: park(superstep)
+  defp settle(%Superstep{detached: [_ | _]} = superstep), do: park(superstep)
   defp settle(%Superstep{remaining_active?: true} = superstep), do: park(superstep)
   defp settle(%Superstep{} = superstep), do: barrier(superstep)
 
@@ -391,11 +419,12 @@ defmodule Docket.Runtime.Loop do
     fail(run, config, entries, node_failure(superstep.failures, failed_nodes))
   end
 
-  # Commits the retry park: completed results move to pending writes, each
-  # retrying task's next attempt (with its full activation identity and
-  # accumulated failures) and retry deadline become durable, and the graph
-  # step does not advance. The checkpoint is sync so a crash during backoff
-  # resumes from this state instead of resetting the attempt position.
+  # Commits the retry/detach park: completed results move to pending writes,
+  # each retrying task's next attempt (with its full activation identity and
+  # accumulated failures) and retry deadline become durable, each detached
+  # task's outstanding identity and recovery deadline become durable, and the
+  # graph step does not advance. The checkpoint is sync so a crash during the
+  # park resumes from this state instead of resetting the attempt position.
   defp park(%Superstep{run: run, config: config} = superstep) do
     now = config.clock.()
     activations_by_task = Map.new(superstep.activations, &{&1.task_id, &1})
@@ -403,11 +432,11 @@ defmodule Docket.Runtime.Loop do
     finalized_ids = Enum.map(new_pending, & &1.task_id)
 
     {parked_tasks, parked_timers} =
-      Enum.reduce(superstep.retries, {%{}, %{}}, fn result, {tasks, timers} ->
+      Enum.reduce(superstep.retries ++ superstep.detached, {%{}, %{}}, fn result,
+                                                                          {tasks, timers} ->
         activation = Map.fetch!(activations_by_task, result.task_id)
-
-        {Map.put(tasks, result.task_id, retry_task(run, activation, result)),
-         Map.put(timers, result.task_id, retry_timer(activation, now))}
+        {task, timer} = parked_attempt(run, activation, result, now, config)
+        {Map.put(tasks, result.task_id, task), Map.put(timers, result.task_id, timer)}
       end)
 
     parked = %{
@@ -418,22 +447,41 @@ defmodule Docket.Runtime.Loop do
         updated_at: now
     }
 
-    entries = attempt_failure_entries(parked.step, superstep.retries)
-    disposition = {:park, {:at, park_info(parked.timers, now).resume_at}, :retry_backoff}
+    entries =
+      attempt_failure_entries(parked.step, superstep.retries) ++
+        detach_entries(parked.step, parked_tasks, superstep.detached)
 
-    propose(parked, :retry_scheduled, entries, disposition, config, pending_attempts: new_pending)
+    {type, reason} =
+      if superstep.detached == [],
+        do: {:retry_scheduled, :retry_backoff},
+        else: {:detach_scheduled, :awaiting_detached}
+
+    disposition = {:park, {:at, park_info(parked.timers, now).resume_at}, reason}
+
+    propose(parked, type, entries, disposition, config, pending_attempts: new_pending)
+  end
+
+  defp parked_attempt(run, activation, %{status: :retry} = result, now, _config) do
+    {retry_task(run, activation, result), retry_timer(activation, now)}
+  end
+
+  defp parked_attempt(run, activation, %{status: :detached} = result, now, config) do
+    deadline_ms =
+      ExecutionPolicy.effective_detach_deadline_ms(
+        activation.detach.deadline_ms,
+        config.detach_deadline_ms
+      )
+
+    deadline = DateTime.add(now, deadline_ms, :millisecond)
+
+    {detached_task(run, activation, result, now, deadline),
+     %TimerState{kind: :detached_deadline, fires_at: deadline}}
   end
 
   # The parked next attempt keeps the committed activation identity and
   # appends this attempt's failure to the task's accumulated history.
   defp retry_task(run, activation, result) do
     next_attempt = activation.attempt + 1
-
-    prior_failures =
-      case Map.fetch(run.active_tasks, result.task_id) do
-        {:ok, %TaskState{failures: failures}} -> failures
-        :error -> []
-      end
 
     %TaskState{
       task_id: result.task_id,
@@ -445,8 +493,38 @@ defmodule Docket.Runtime.Loop do
       idempotency_key: TaskState.idempotency_key(result.task_id, next_attempt),
       snapshot: activation.snapshot,
       source_versions: activation.source_versions,
-      failures: prior_failures ++ [%{attempt: result.attempt, reason: inspect(result.value)}]
+      failures:
+        prior_failures(run, result.task_id) ++
+          [%{attempt: result.attempt, reason: inspect(result.value)}]
     }
+  end
+
+  # The detached attempt keeps its own identity outstanding: same attempt
+  # number, no failure recorded, the detach instant and mandatory recovery
+  # deadline durable, and the node's token retained for correlation.
+  defp detached_task(run, activation, result, now, deadline) do
+    %TaskState{
+      task_id: result.task_id,
+      node_id: result.node_id,
+      step: activation.step,
+      attempt: activation.attempt,
+      status: :detached,
+      input_hash: activation.input_hash,
+      idempotency_key: activation.idempotency_key,
+      snapshot: activation.snapshot,
+      source_versions: activation.source_versions,
+      started_at: now,
+      deadline_at: deadline,
+      failures: prior_failures(run, result.task_id),
+      metadata: %{"detach_token" => result.value}
+    }
+  end
+
+  defp prior_failures(run, task_id) do
+    case Map.fetch(run.active_tasks, task_id) do
+      {:ok, %TaskState{failures: failures}} -> failures
+      :error -> []
+    end
   end
 
   defp retry_timer(activation, now) do
@@ -454,6 +532,21 @@ defmodule Docket.Runtime.Loop do
       kind: :retry,
       fires_at: DateTime.add(now, activation.retry.backoff_ms, :millisecond)
     }
+  end
+
+  defp detach_entries(step, parked_tasks, detached) do
+    for result <- detached do
+      task = Map.fetch!(parked_tasks, result.task_id)
+
+      entry(:node_detached, step,
+        node_id: result.node_id,
+        task_id: result.task_id,
+        payload: %{
+          "attempt" => result.attempt,
+          "deadline_at" => DateTime.to_iso8601(task.deadline_at)
+        }
+      )
+    end
   end
 
   defp commit(%Superstep{rtg: rtg, run: run, config: config} = superstep) do
