@@ -11,6 +11,10 @@ defmodule Docket.Runtime.Superstep do
   # re-deriving lists. `absorb_pending/1` folds the run's durable pending
   # sibling writes through the same validators at the barrier, so each result
   # batch is validated once per proposal no matter which boundary it reaches.
+  #
+  # Validated writes and interrupts are held as `PendingWrite` structs — the
+  # same shape the retry park persists — so parking and absorbing durable
+  # pending writes need no translation.
 
   alias Docket.{Run, Schema}
   alias Docket.Run.PendingWrite
@@ -32,11 +36,12 @@ defmodule Docket.Runtime.Superstep do
             reason: term()
           }
 
-    def new(%TaskResult{} = result, reason) do
+    # Accepts any attempt-identified source (`TaskResult` or `PendingWrite`).
+    def new(%{node_id: node_id, task_id: task_id, attempt: attempt}, reason) do
       %__MODULE__{
-        node_id: result.node_id,
-        task_id: result.task_id,
-        attempt: result.attempt,
+        node_id: node_id,
+        task_id: task_id,
+        attempt: attempt,
         reason: reason
       }
     end
@@ -56,17 +61,14 @@ defmodule Docket.Runtime.Superstep do
     remaining_active?: false
   ]
 
-  @type write :: {TaskResult.t(), map()}
-  @type interrupt_spec :: {TaskResult.t(), Docket.Interrupt.t()}
-
   @type t :: %__MODULE__{
           rtg: Docket.Runtime.Graph.t(),
           run: Run.t(),
           config: Config.t(),
           activations: [Activation.t()],
           results: [TaskResult.t()],
-          writes: [write()],
-          interrupts: [interrupt_spec()],
+          writes: [PendingWrite.t()],
+          interrupts: [PendingWrite.t()],
           retries: [TaskResult.t()],
           failures: [Failure.t()],
           remaining_active?: boolean()
@@ -101,11 +103,13 @@ defmodule Docket.Runtime.Superstep do
   # state fails here, and it fails through the same typed failure vocabulary
   # as fresh results instead of crashing the commit.
   def absorb_pending(%__MODULE__{} = superstep) do
-    {oks, interrupt_results, [], []} = superstep.run |> rehydrate_pending() |> partition()
-    {writes, write_failures} = validate_writes(superstep.rtg, oks)
+    {updates, parked_interrupts} =
+      Enum.split_with(superstep.run.pending_writes, &(&1.kind == :update))
+
+    {writes, write_failures} = validate_writes(superstep.rtg, updates)
 
     {interrupts, interrupt_failures} =
-      validate_interrupts(superstep.rtg, superstep.run, interrupt_results)
+      validate_interrupts(superstep.rtg, superstep.run, parked_interrupts)
 
     case write_failures ++ interrupt_failures do
       [] ->
@@ -122,51 +126,26 @@ defmodule Docket.Runtime.Superstep do
   end
 
   @doc false
-  # Serializes this dispatch's finalized results into durable pending writes,
-  # sorted by node ID. Interrupt values carry their node identity so the
-  # parked write round-trips through `absorb_pending/1` unchanged.
+  # This dispatch's finalized writes and interrupts as one node-sorted list
+  # for the retry park.
   def to_pending_writes(%__MODULE__{} = superstep) do
-    Enum.sort_by(
-      Enum.map(superstep.writes, fn {result, update} ->
-        pending_write(result, :update, update)
-      end) ++
-        Enum.map(superstep.interrupts, fn {result, interrupt} ->
-          pending_write(result, :interrupt, %{interrupt | node_id: result.node_id})
-        end),
-      & &1.node_id
-    )
+    Enum.sort_by(superstep.writes ++ superstep.interrupts, & &1.node_id)
   end
 
-  defp pending_write(result, kind, value) do
+  defp pending_write(source, kind, value) do
     %PendingWrite{
-      task_id: result.task_id,
-      node_id: result.node_id,
-      attempt: result.attempt,
+      task_id: source.task_id,
+      node_id: source.node_id,
+      attempt: source.attempt,
       kind: kind,
       value: value
     }
   end
 
-  # Rehydrates pending sibling results committed by earlier retry parks back
-  # into task results. Their retried attempts' failure events were emitted by
-  # the parks that recorded them, so they contribute no failure entries at
-  # the barrier.
-  defp rehydrate_pending(run) do
-    Enum.map(run.pending_writes, fn %PendingWrite{} = pending ->
-      %TaskResult{
-        task_id: pending.task_id,
-        node_id: pending.node_id,
-        attempt: pending.attempt,
-        status: if(pending.kind == :update, do: :ok, else: :interrupt),
-        value: pending.value
-      }
-    end)
-  end
-
-  # Pending results merge ahead of fresh results; the sort is stable and
+  # Pending writes merge ahead of fresh writes; the sort is stable and
   # keyed by node ID, so merged order is deterministic.
   defp merge_by_node(pending, fresh) do
-    Enum.sort_by(pending ++ fresh, fn {result, _value} -> result.node_id end)
+    Enum.sort_by(pending ++ fresh, & &1.node_id)
   end
 
   # True when active tasks beyond this dispatch's results remain parked
@@ -197,32 +176,37 @@ defmodule Docket.Runtime.Superstep do
     end)
   end
 
+  # Both validators accept fresh `TaskResult`s and durable `PendingWrite`s:
+  # each carries the attempt identity and value the checks and emitted
+  # `PendingWrite`s need.
   defp validate_writes(rtg, oks) do
-    Enum.reduce(oks, {[], []}, fn result, {writes, failures} ->
-      case Algorithm.validate_state_update(rtg, result.node_id, result.value) do
+    Enum.reduce(oks, {[], []}, fn source, {writes, failures} ->
+      case Algorithm.validate_state_update(rtg, source.node_id, source.value) do
         {:ok, update} ->
-          {[{result, update} | writes], failures}
+          {[pending_write(source, :update, update) | writes], failures}
 
         {:error, reasons} ->
-          {writes, [Failure.new(result, {:invalid_state_update, reasons}) | failures]}
+          {writes, [Failure.new(source, {:invalid_state_update, reasons}) | failures]}
       end
     end)
     |> then(fn {writes, failures} -> {Enum.reverse(writes), Enum.reverse(failures)} end)
   end
 
-  defp validate_interrupts(rtg, run, interrupt_results) do
-    Enum.reduce(interrupt_results, {[], []}, fn result, {specs, failures} ->
-      interrupt = result.value
+  # Interrupt values are stamped with their node identity here, so parked
+  # writes round-trip through `absorb_pending/1` unchanged.
+  defp validate_interrupts(rtg, run, interrupt_sources) do
+    Enum.reduce(interrupt_sources, {[], []}, fn source, {writes, failures} ->
+      interrupt = %{source.value | node_id: source.node_id}
 
       case interrupt_errors(rtg, run, interrupt) do
         [] ->
-          {[{result, interrupt} | specs], failures}
+          {[pending_write(source, :interrupt, interrupt) | writes], failures}
 
         reasons ->
-          {specs, [Failure.new(result, {:invalid_interrupt, reasons}) | failures]}
+          {writes, [Failure.new(source, {:invalid_interrupt, reasons}) | failures]}
       end
     end)
-    |> then(fn {specs, failures} -> {Enum.reverse(specs), Enum.reverse(failures)} end)
+    |> then(fn {writes, failures} -> {Enum.reverse(writes), Enum.reverse(failures)} end)
   end
 
   defp interrupt_errors(rtg, run, interrupt) do

@@ -457,9 +457,9 @@ defmodule Docket.Runtime.Loop do
   end
 
   defp commit(%Superstep{rtg: rtg, run: run, config: config} = superstep) do
-    writes = Enum.map(superstep.writes, fn {result, update} -> {result.node_id, update} end)
+    writes = Enum.map(superstep.writes, fn write -> {write.node_id, write.value} end)
     {channels, changed_fields, writers} = Algorithm.apply_state_writes(rtg, run.channels, writes)
-    ok_node_ids = Enum.map(superstep.writes, fn {result, _update} -> result.node_id end)
+    ok_node_ids = Enum.map(superstep.writes, & &1.node_id)
 
     case Algorithm.evaluate_edge_triggers(rtg, channels, ok_node_ids, changed_fields) do
       {:ok, triggers} ->
@@ -483,7 +483,7 @@ defmodule Docket.Runtime.Loop do
     now = config.clock.()
     channels = clear_consumed_activations(rtg, channels, run.changed_channels)
 
-    {interrupts, interrupt_node_ids, interrupt_results} =
+    {interrupts, interrupt_node_ids, interrupt_writes} =
       build_interrupts(config, superstep.interrupts, now)
 
     changed_channels =
@@ -518,7 +518,7 @@ defmodule Docket.Runtime.Loop do
         triggered: triggered,
         finish: finish,
         interrupts: interrupts,
-        interrupt_results: interrupt_results
+        interrupt_writes: interrupt_writes
       )
 
     type = if map_size(interrupts) == 0, do: :step_committed, else: :interrupt_requested
@@ -535,14 +535,14 @@ defmodule Docket.Runtime.Loop do
     end
   end
 
-  defp build_interrupts(config, interrupt_specs, now) do
-    Enum.reduce(interrupt_specs, {%{}, [], %{}}, fn {result, interrupt},
-                                                    {states, node_ids, results} ->
+  defp build_interrupts(config, interrupt_writes, now) do
+    Enum.reduce(interrupt_writes, {%{}, [], %{}}, fn write, {states, node_ids, writes} ->
+      interrupt = write.value
       id = interrupt.id || config.id_generator.(:interrupt)
 
       state = %InterruptState{
         id: id,
-        node_id: result.node_id,
+        node_id: write.node_id,
         status: :open,
         resume_channel: interrupt.resume_channel,
         schema: interrupt.schema,
@@ -552,12 +552,12 @@ defmodule Docket.Runtime.Loop do
 
       {
         Map.put(states, id, state),
-        [result.node_id | node_ids],
-        Map.put(results, id, result)
+        [write.node_id | node_ids],
+        Map.put(writes, id, write)
       }
     end)
-    |> then(fn {states, node_ids, results} ->
-      {states, Enum.reverse(node_ids), results}
+    |> then(fn {states, node_ids, writes} ->
+      {states, Enum.reverse(node_ids), writes}
     end)
   end
 
@@ -585,11 +585,11 @@ defmodule Docket.Runtime.Loop do
   # and superstep failure paths, the barrier emits no attempt-failure
   # entries of its own.
   defp commit_entries(rtg, step, validated_writes, changed_fields, writers, extra) do
-    Enum.map(validated_writes, fn {result, _update} ->
+    Enum.map(validated_writes, fn write ->
       entry(:node_completed, step,
-        node_id: result.node_id,
-        task_id: result.task_id,
-        payload: %{"attempt" => result.attempt}
+        node_id: write.node_id,
+        task_id: write.task_id,
+        payload: %{"attempt" => write.attempt}
       )
     end) ++
       Enum.map(Enum.sort(changed_fields), fn field_id ->
@@ -605,13 +605,13 @@ defmodule Docket.Runtime.Loop do
         )
       end) ++
       Enum.map(Enum.sort(Keyword.fetch!(extra, :interrupts)), fn {id, state} ->
-        result = Map.fetch!(Keyword.fetch!(extra, :interrupt_results), id)
+        write = Map.fetch!(Keyword.fetch!(extra, :interrupt_writes), id)
 
         entry(:interrupt_requested, step,
           node_id: state.node_id,
-          task_id: result.task_id,
+          task_id: write.task_id,
           payload: %{
-            "attempt" => result.attempt,
+            "attempt" => write.attempt,
             "interrupt_id" => id,
             "resume_channel" => state.resume_channel
           }
