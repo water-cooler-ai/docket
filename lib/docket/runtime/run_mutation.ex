@@ -12,11 +12,12 @@ defmodule Docket.Runtime.RunMutation do
   """
 
   alias Docket.{Error, Run, Schema, Wire}
-  alias Docket.Run.{InterruptState, TimerState}
+  alias Docket.Run.{InterruptState, PendingWrite, TaskState, TimerState}
   alias Docket.Runtime.{Algorithm, Graph, Moment}
 
   @type mutation_result :: {:ok, Moment.t()} | {:error, Error.t()}
   @type cancellation_result :: mutation_result() | {:unchanged, Run.t()}
+  @type completion_result :: mutation_result() | {:unchanged, Run.t()}
 
   @durable_active [:running, :waiting]
 
@@ -92,10 +93,152 @@ defmodule Docket.Runtime.RunMutation do
              proposed,
              :interrupt_resolved,
              entries,
-             resolution_disposition(proposed, now),
+             resolution_disposition(proposed, now, :interrupt_resolved),
              now
            )}
         end
+    end
+  end
+
+  @doc """
+  Applies a detached attempt's late result and proposes the run's next wake.
+
+  The mutation is fenced on the run still holding exactly `task_id` detached
+  at exactly `attempt`: a terminal run and a task that is absent, no longer
+  `:detached`, or at a different attempt all return `{:unchanged, run}` — a
+  stale, duplicate, or superseded result changes nothing and consumes no
+  sequences. The fence re-evaluates identically under signal retry, so a
+  result applies to durable state at most once.
+
+  A `{:ok, update}` result validates against the graph like a node return
+  and parks as a pending write at the same attempt; the next advancement
+  absorbs it at the update barrier. A `{:error, reason}` result expires the
+  task's deadline immediately and records the reason; the deadline
+  disposition policy (reschedule or fail) settles it on the next
+  advancement. External effects remain at-least-once either way.
+  """
+  @spec complete_detached(
+          Graph.t(),
+          Run.t(),
+          String.t(),
+          pos_integer(),
+          {:ok, map()} | {:error, term()},
+          DateTime.t()
+        ) :: completion_result()
+  def complete_detached(rtg, %Run{} = run, task_id, attempt, result, %DateTime{} = now) do
+    cond do
+      Run.terminal?(run) ->
+        {:unchanged, run}
+
+      run.status not in @durable_active ->
+        non_durable_run(run)
+
+      not match?(
+        {:ok, %TaskState{status: :detached, attempt: ^attempt}},
+        Map.fetch(run.active_tasks, task_id)
+      ) ->
+        {:unchanged, run}
+
+      true ->
+        apply_detached_result(rtg, run, Map.fetch!(run.active_tasks, task_id), result, now)
+    end
+  end
+
+  defp apply_detached_result(rtg, run, task, {:ok, update}, now) do
+    with {:ok, update} <- durable_detached_update(update),
+         {:ok, validated} <- validate_detached_write(rtg, task, update) do
+      pending = %PendingWrite{
+        task_id: task.task_id,
+        node_id: task.node_id,
+        attempt: task.attempt,
+        kind: :update,
+        value: validated
+      }
+
+      proposed = %{
+        run
+        | active_tasks: Map.delete(run.active_tasks, task.task_id),
+          timers: Map.delete(run.timers, task.task_id),
+          pending_writes: run.pending_writes ++ [pending],
+          status: :running,
+          updated_at: now
+      }
+
+      {:ok,
+       Moment.propose(
+         proposed,
+         :detach_resolved,
+         [],
+         resolution_disposition(proposed, now, :detach_resolved),
+         now
+       )}
+    end
+  end
+
+  # A reported failure does not settle the attempt here: it expires the
+  # deadline in place and lets the next advancement dispose per the node's
+  # deadline policy, so timeout and reported failure share one machine.
+  defp apply_detached_result(_rtg, run, task, {:error, reason}, now) do
+    expired = %{
+      task
+      | deadline_at: now,
+        metadata: Map.put(task.metadata, "detach_error", failure_reason(reason))
+    }
+
+    proposed = %{
+      run
+      | active_tasks: Map.put(run.active_tasks, task.task_id, expired),
+        timers:
+          Map.put(run.timers, task.task_id, %TimerState{kind: :detached_deadline, fires_at: now}),
+        status: :running,
+        updated_at: now
+    }
+
+    {:ok,
+     Moment.propose(
+       proposed,
+       :detach_resolved,
+       [],
+       resolution_disposition(proposed, now, :detach_resolved),
+       now
+     )}
+  end
+
+  defp apply_detached_result(_rtg, _run, _task, other, _now) do
+    {:error,
+     Error.new(
+       :invalid_input,
+       "a detached result must be {:ok, update} or {:error, reason}, got #{inspect(other)}"
+     )}
+  end
+
+  defp failure_reason(reason) when is_binary(reason), do: reason
+  defp failure_reason(reason), do: inspect(reason)
+
+  defp durable_detached_update(update) do
+    case Wire.dump_value(update) do
+      {:ok, coerced} when is_map(coerced) ->
+        {:ok, coerced}
+
+      {:ok, other} ->
+        {:error,
+         Error.new(:invalid_input, "a detached update must be a map, got #{inspect(other)}")}
+
+      {:error, reason} ->
+        {:error, Error.new(:invalid_input, "detached result value is not durable: #{reason}")}
+    end
+  end
+
+  defp validate_detached_write(rtg, task, update) do
+    case Algorithm.validate_state_update(rtg, task.node_id, update) do
+      {:ok, validated} ->
+        {:ok, validated}
+
+      {:error, reasons} ->
+        {:error,
+         Error.new(:invalid_input, "detached result value is invalid",
+           details: %{reasons: reasons}
+         )}
     end
   end
 
@@ -131,9 +274,10 @@ defmodule Docket.Runtime.RunMutation do
 
   def cancel_run(%Run{} = run, %DateTime{}), do: non_durable_run(run)
 
-  # An active attempt without a timer is dispatchable now; committed retry
-  # parks always write one timer per active task.
-  defp resolution_disposition(%Run{active_tasks: tasks} = run, now) when map_size(tasks) > 0 do
+  # An active attempt without a timer is dispatchable now; committed parks
+  # always write one timer per active task.
+  defp resolution_disposition(%Run{active_tasks: tasks} = run, now, reason)
+       when map_size(tasks) > 0 do
     deadlines =
       Enum.map(tasks, fn {task_id, _task} ->
         case Map.fetch(run.timers, task_id) do
@@ -143,13 +287,13 @@ defmodule Docket.Runtime.RunMutation do
       end)
 
     if Enum.any?(deadlines, &(is_nil(&1) or DateTime.compare(&1, now) != :gt)) do
-      {:park, :immediate, :interrupt_resolved}
+      {:park, :immediate, reason}
     else
-      {:park, {:at, Enum.min(deadlines, DateTime)}, :interrupt_resolved}
+      {:park, {:at, Enum.min(deadlines, DateTime)}, reason}
     end
   end
 
-  defp resolution_disposition(%Run{}, _now), do: {:park, :immediate, :interrupt_resolved}
+  defp resolution_disposition(%Run{}, _now, reason), do: {:park, :immediate, reason}
 
   defp durable_resolution(value) do
     case Wire.dump_value(value) do

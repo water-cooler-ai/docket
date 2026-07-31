@@ -1,0 +1,4 @@
+# Release-critical files: PRs touching these require Core team approval.
+/mix.exs            @water-cooler-ai/core
+/CHANGELOG.md       @water-cooler-ai/core
+/.github/           @water-cooler-ai/core

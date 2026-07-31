@@ -7,12 +7,12 @@ defmodule Docket.Executor do
   writes. The dispatcher normalizes raises, exits, and throws, so executors
   may let node exceptions propagate.
 
-  v0.1 ships `Docket.Executor.Local`, which executes inside the dispatcher's
-  isolated, finite-deadline activation process. Custom executors receive the
-  same hard outer boundary. Queue,
-  remote, and late-completion protocols are post-v0.1; the `{:await, term()}`
-  return is reserved for them and is treated as a permanent node failure in
-  v0.1.
+  Docket ships `Docket.Executor.Local`, which executes inside the
+  dispatcher's isolated, finite-deadline activation process. Custom
+  executors receive the same hard outer boundary. A `{:detach, term()}`
+  return detaches the attempt: the run parks durably behind a mandatory
+  deadline and a late result re-enters through
+  `Docket.complete_detached/4` (see `Docket.Node` and `Docket.Detached`).
 
   The runtime dispatches all activations in a superstep concurrently. The
   executor callback remains a single-activation boundary; the update barrier
@@ -30,6 +30,6 @@ defmodule Docket.Executor do
             ) ::
               {:ok, state_update :: map()}
               | {:interrupt, Docket.Interrupt.t()}
-              | {:await, term()}
+              | {:detach, term()}
               | {:error, term()}
 end

@@ -258,6 +258,45 @@ defmodule Docket do
     end
   end
 
+  @doc """
+  Applies a detached attempt's late result and schedules the next tick or
+  durable wake.
+
+  `ref` is the `Docket.Detached` identity captured from the node's execution
+  context. The result commits through the serialized signal path, fenced on
+  the run still holding exactly that task detached at exactly that attempt;
+  a stale, duplicate, or superseded result is a no-op returning the current
+  run. `{:ok, update}` applies the node's state update at the next barrier;
+  `{:error, reason}` expires the detach deadline immediately so the node's
+  deadline policy settles the attempt. Tenant scope is enforced before
+  storage access.
+  """
+  def complete_detached(runtime, ref, result, opts \\ [])
+
+  def complete_detached(runtime, %Docket.Detached{} = ref, result, opts) do
+    with {:ok, opts} <- instance_opts(runtime, :complete_detached, opts),
+         {:ok, {backend, context} = backend_ref, scope} <- durable_access(opts),
+         {:ok, run} <- backend.runs().fetch_run(context, scope, ref.run_id),
+         {:ok, graph} <-
+           backend.graphs().fetch_graph(context, scope, run.graph_id, run.graph_hash),
+         {:ok, rtg} <- ensure_compiled_effective(graph, opts),
+         now = operation_now(opts),
+         signal_result <-
+           Lifecycle.signal(backend_ref, scope, ref.run_id, fn current ->
+             RunMutation.complete_detached(rtg, current, ref.task_id, ref.attempt, result, now)
+           end) do
+      finish_signal(signal_result, opts)
+    end
+  end
+
+  def complete_detached(_runtime, ref, _result, _opts) do
+    {:error,
+     Error.new(
+       :invalid_options,
+       "complete_detached requires a Docket.Detached identity, got #{inspect(ref)}"
+     )}
+  end
+
   @doc "Cancels a durable active run and confirms the committed terminal state."
   def cancel_run(runtime, run_id, opts \\ []) do
     with {:ok, opts} <- instance_opts(runtime, :cancel_run, opts),
@@ -471,6 +510,10 @@ defmodule Docket do
 
       def resolve_interrupt(run_id, interrupt_id, value, opts \\ []) do
         Docket.resolve_interrupt(__MODULE__, run_id, interrupt_id, value, opts)
+      end
+
+      def complete_detached(ref, result, opts \\ []) do
+        Docket.complete_detached(__MODULE__, ref, result, opts)
       end
 
       def cancel_run(run_id, opts \\ []), do: Docket.cancel_run(__MODULE__, run_id, opts)

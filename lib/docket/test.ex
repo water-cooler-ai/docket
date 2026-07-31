@@ -142,6 +142,39 @@ defmodule Docket.Test do
     end
   end
 
+  @doc """
+  Applies a detached attempt's late result inline, then continues driving
+  the run.
+
+  Requires the graph via `:graph` or `:runtime_graph` in `opts`. A stale,
+  duplicate, or superseded result changes nothing and returns the run as-is.
+  The processless shell has no other way to deliver a completion: driving a
+  detach park without this call serves the full deadline through the
+  `:sleeper` and then takes the deadline disposition, so tests exercising
+  the completion path should `step_inline/3` to the park and complete here.
+  """
+  def complete_detached_inline(%Run{} = run, task_id, attempt, result, opts \\ []) do
+    opts = normalize_opts(opts)
+
+    with {:ok, rtg} <- graph_from_opts(opts) do
+      config = Config.resolve(opts)
+
+      case RunMutation.complete_detached(rtg, run, task_id, attempt, result, config.clock.()) do
+        {:ok, moment} ->
+          {run, checkpoints} = accept_moment(moment)
+          drive(rtg, run, opts, checkpoints, 0)
+
+        {:unchanged, run} ->
+          {:ok, run, []}
+
+        {:error, error} ->
+          {:error, error, []}
+      end
+    else
+      {:error, %Error{} = error} -> {:error, error, []}
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Shell drive loop
   # ---------------------------------------------------------------------------

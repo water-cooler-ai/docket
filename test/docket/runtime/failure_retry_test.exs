@@ -41,9 +41,9 @@ defmodule Docket.Runtime.FailureRetryTest do
       end
     end
 
-    test "reserved return shapes fail permanently without retry" do
+    test "invalid return shapes fail permanently without retry" do
       for {implementation, marker} <- [
-            {Nodes.Awaits, ":unsupported_await"},
+            {Nodes.DetachesBadToken, ":invalid_detach_token"},
             {Nodes.BadReturn, ":invalid_node_return"}
           ] do
         graph =

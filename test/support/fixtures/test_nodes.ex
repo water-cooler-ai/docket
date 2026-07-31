@@ -360,16 +360,39 @@ defmodule Docket.Test.Fixtures.Nodes do
     def call(_state, _config, _context), do: throw(:ball)
   end
 
-  defmodule Awaits do
+  defmodule Detaches do
     @moduledoc false
-    # {:await, _} is a reserved post-v0.1 return shape.
+    # Detaches with the token configured under "token"; when a coordinator is
+    # present in the application context, announces its identity first so
+    # tests can complete the attempt later.
+    @behaviour Docket.Node
+
+    @impl true
+    def config_schema do
+      Docket.Schema.object(%{"token" => Docket.Schema.string()})
+    end
+
+    @impl true
+    def call(_state, config, context) do
+      case Map.fetch(context.application, :coordinator) do
+        {:ok, coordinator} -> send(coordinator, {:detaching, context})
+        :error -> :ok
+      end
+
+      {:detach, Map.get(config, "token", "detach-token")}
+    end
+  end
+
+  defmodule DetachesBadToken do
+    @moduledoc false
+    # A non-durable detach token (a pid) must fail classification.
     @behaviour Docket.Node
 
     @impl true
     def config_schema, do: Docket.Schema.object(%{})
 
     @impl true
-    def call(_state, _config, _context), do: {:await, :external}
+    def call(_state, _config, _context), do: {:detach, self()}
   end
 
   defmodule SleepsUntilReleased do

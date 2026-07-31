@@ -179,8 +179,8 @@ defmodule Docket.Runtime.Superstep do
       end
     end)
     |> then(fn {oks, interrupts, retries, detached, failures} ->
-      {Enum.reverse(oks), Enum.reverse(interrupts), Enum.reverse(retries),
-       Enum.reverse(detached), Enum.reverse(failures)}
+      {Enum.reverse(oks), Enum.reverse(interrupts), Enum.reverse(retries), Enum.reverse(detached),
+       Enum.reverse(failures)}
     end)
   end
 

@@ -30,8 +30,20 @@ defmodule Docket.Node do
   field and branch on that field with an edge guard — do not return
   `{:error, ...}`.
 
-  `{:await, term()}` is reserved for post-v0.1 late-completion protocols; in v0.1
-  the dispatcher treats it as a permanent node failure.
+  ## Detachment
+
+  Returning `{:detach, token}` hands the attempt's work back to the runtime:
+  the attempt is not consumed and no failure is recorded, the run parks
+  durably with the task's identity and a mandatory deadline, and the claim
+  releases. The node must return promptly — the attempt timeout bounds the
+  return, not the detached work — and must start the work outside its own
+  process (see `Docket.Detached.start/2`; the activation process is killed
+  at its timeout). The work completes through `Docket.complete_detached/4`,
+  or the deadline recovers the run per the node's `"detach"` policy. The
+  token must be a durable value; it is retained on the parked task for
+  correlation. External effects remain at-least-once: an attempt
+  re-executed after deadline expiry may repeat them, deduplicated only by
+  the stable idempotency key.
   """
 
   @callback config_schema() :: Docket.Schema.t()
@@ -39,13 +51,10 @@ defmodule Docket.Node do
   @doc """
   Executes the node against its state snapshot, resolved config, and runtime
   context.
-
-  `{:await, term()}` is reserved for post-v0.1 late-completion protocols; in
-  v0.1 the dispatcher treats it as a permanent node failure.
   """
   @callback call(state :: map(), config :: map(), context :: map()) ::
               {:ok, state_update :: map()}
               | {:interrupt, Docket.Interrupt.t()}
-              | {:await, term()}
+              | {:detach, term()}
               | {:error, term()}
 end
