@@ -2,6 +2,7 @@ defmodule Docket.DetachedTest do
   use ExUnit.Case, async: true
 
   alias Docket.Detached
+  alias Docket.Run.TaskState
 
   @context %{
     run_id: "run_abc",
@@ -28,21 +29,18 @@ defmodule Docket.DetachedTest do
     end
   end
 
-  describe "start/2" do
-    test "starts detached work under the runtime task supervisor" do
-      supervisor = start_supervised!({Task.Supervisor, name: nil})
-      context = Map.put(@context, :task_supervisor, supervisor)
-      parent = self()
+  describe "from_task/2" do
+    test "carries the durably parked task's identity verbatim" do
+      task = %TaskState{
+        task_id: "run_abc:3:fetch",
+        node_id: "fetch",
+        step: 3,
+        attempt: 2,
+        status: :detached,
+        idempotency_key: "run_abc:3:fetch:2"
+      }
 
-      assert {:ok, pid} = Detached.start(context, fn -> send(parent, {:worked, self()}) end)
-      assert_receive {:worked, ^pid}
-    end
-
-    test "returns an error when no runtime task supervisor exists" do
-      assert {:error, :no_task_supervisor} = Detached.start(@context, fn -> :ok end)
-
-      assert {:error, :no_task_supervisor} =
-               Detached.start(Map.put(@context, :task_supervisor, nil), fn -> :ok end)
+      assert Detached.from_task("run_abc", task) == Detached.from_context(@context)
     end
   end
 end

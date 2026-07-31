@@ -244,12 +244,17 @@ defmodule Docket.Runtime.Dispatcher do
 
   defp classify({:interrupt, other}), do: {:failure, false, {:invalid_interrupt, other}}
 
-  defp classify({:detach, token}) do
+  defp classify({:detach, token}), do: classify({:detach, token, nil})
+
+  defp classify({:detach, token, worker}) when is_nil(worker) or is_function(worker, 1) do
     case Wire.dump_value(token) do
-      {:ok, durable} -> {:final, :detached, durable}
+      {:ok, durable} -> {:final, :detached, %{token: durable, worker: worker}}
       {:error, reason} -> {:failure, false, {:invalid_detach_token, reason}}
     end
   end
+
+  defp classify({:detach, _token, worker}),
+    do: {:failure, false, {:invalid_detach_worker, worker}}
 
   defp classify({:command, _}), do: {:failure, false, :unsupported_command}
   defp classify({:error, reason}), do: {:failure, true, reason}

@@ -8,19 +8,25 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `{:detach, token}` node return: a first-class detached-execution protocol.
-  A detaching attempt is not consumed as a failure — the run parks durably
-  with the task's stable identity behind a mandatory deadline, the claim and
-  vehicle release, and the in-process work continues under the runtime's
-  task supervisor.
+- `{:detach, token, worker}` and `{:detach, token}` node returns: a
+  first-class detached-execution protocol. A detaching attempt is not
+  consumed as a failure — the run parks durably with the task's stable
+  identity behind a mandatory deadline, the claim and vehicle release, and
+  the runtime starts `worker` under its task supervisor only after the
+  detach park commits, so a completion can never precede its own durable
+  park. The two-element form detaches for external completion.
 - `Docket.complete_detached/4` (and the `use Docket` delegate): applies a
   detached attempt's late result through the serialized signal path, fenced
-  on the run still holding that exact task detached at that exact attempt.
-  Stale, duplicate, and superseded results are no-ops. `{:ok, update}`
-  applies at the next barrier; `{:error, reason}` expires the deadline
-  immediately so the node's deadline policy settles the attempt.
-- `Docket.Detached`: completion identity (`from_context/1`) and the
-  supervised home for detached work (`start/2`).
+  on the run still holding that exact task detached at that exact attempt
+  with no result yet recorded. Exactly one completion per detached attempt
+  applies; stale, duplicate, and superseded results are no-ops, and a
+  completion arriving before its detach park commits returns a retryable
+  `%Docket.Error{type: :detach_pending}` instead of being silently
+  dropped. `{:ok, update}` applies at the next barrier; `{:error, reason}`
+  expires the deadline immediately so the node's deadline policy settles
+  the attempt.
+- `Docket.Detached`: the completion identity (`from_context/1`) handed to
+  runtime-started workers and external completers.
 - `"detach"` node policy (`"deadline_ms"`, `"on_deadline"` of `"reschedule"`
   or `"fail"`) and the runtime `detach_deadline_ms` default (300 000 ms).
   Every detached attempt resolves to a finite deadline; expiry with

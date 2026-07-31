@@ -105,10 +105,10 @@ attempt parks as durable task state (stable task and attempt identity, no
 in-flight process state) behind a mandatory deadline; the vehicle and claim
 release at the park. The late result re-enters as a serialized mutation
 through the signal path, fenced on that exact detached task and attempt, so
-stale, duplicate, and superseded results cannot advance the run. Local work
-runs supervised under the runtime's task supervisor via
-`Docket.Detached.start/2`, and replay plus external-effect idempotency rules
-are unchanged for late or rejected results. See `Docket.Node`,
+stale, duplicate, and superseded results cannot advance the run. Local
+workers run supervised under the runtime's task supervisor, started only
+after the detach park commits, and replay plus external-effect idempotency
+rules are unchanged for late or rejected results. See `Docket.Node`,
 `Docket.Detached`, and the waiting-strategy guide in
 [delivery-guarantees](delivery-guarantees.md).
 

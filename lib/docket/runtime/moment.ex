@@ -57,12 +57,23 @@ defmodule Docket.Runtime.Moment do
     :disposition,
     :proposed_at,
     pending_attempts: [],
+    detached_workers: [],
     checkpoint_metadata: %{}
   ]
 
   @type park_kind :: :immediate | :external | {:at, DateTime.t()} | :terminal
 
   @type disposition :: :continue | {:park, park_kind(), term()}
+
+  @typedoc """
+  A detached worker to start only after this moment durably commits.
+
+  Transient process-local state: the function is never persisted, never part
+  of checkpoint metadata, and is dropped with the moment when a commit loses
+  its fence — a worker exists only for a detach park that is already
+  durable.
+  """
+  @type detached_worker :: %{ref: Docket.Detached.t(), worker: (Docket.Detached.t() -> any())}
 
   @type event_entry :: %{
           type: Event.type(),
@@ -131,6 +142,7 @@ defmodule Docket.Runtime.Moment do
       checkpoint_type: type,
       checkpoint_metadata: metadata,
       pending_attempts: pending_attempts,
+      detached_workers: Keyword.get(opts, :detached_workers, []),
       disposition: disposition,
       proposed_at: now
     }

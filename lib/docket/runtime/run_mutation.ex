@@ -104,11 +104,18 @@ defmodule Docket.Runtime.RunMutation do
   Applies a detached attempt's late result and proposes the run's next wake.
 
   The mutation is fenced on the run still holding exactly `task_id` detached
-  at exactly `attempt`: a terminal run and a task that is absent, no longer
-  `:detached`, or at a different attempt all return `{:unchanged, run}` — a
-  stale, duplicate, or superseded result changes nothing and consumes no
-  sequences. The fence re-evaluates identically under signal retry, so a
-  result applies to durable state at most once.
+  at exactly `attempt` with no result yet recorded: a terminal run, a task
+  that is absent, no longer `:detached`, at a different attempt, or already
+  carrying a reported failure all return `{:unchanged, run}` — a stale,
+  duplicate, or superseded result changes nothing and consumes no
+  sequences. The fence re-evaluates identically under signal retry, so
+  exactly one completion per detached attempt applies to durable state.
+
+  One premature case is distinguished from staleness: a completion for a
+  task in the run's **current** step that is neither parked nor pending has
+  arrived before its detach park committed and returns
+  `{:error, %Docket.Error{type: :detach_pending}}` so the caller can retry
+  instead of silently losing the result.
 
   A `{:ok, update}` result validates against the graph like a node return
   and parks as a pending write at the same attempt; the next advancement
@@ -133,14 +140,37 @@ defmodule Docket.Runtime.RunMutation do
       run.status not in @durable_active ->
         non_durable_run(run)
 
-      not match?(
-        {:ok, %TaskState{status: :detached, attempt: ^attempt}},
-        Map.fetch(run.active_tasks, task_id)
-      ) ->
-        {:unchanged, run}
-
       true ->
-        apply_detached_result(rtg, run, Map.fetch!(run.active_tasks, task_id), result, now)
+        case Map.fetch(run.active_tasks, task_id) do
+          {:ok, %TaskState{status: :detached, attempt: ^attempt} = task} ->
+            if Map.has_key?(task.metadata, "detach_error"),
+              do: {:unchanged, run},
+              else: apply_detached_result(rtg, run, task, result, now)
+
+          _other ->
+            premature_or_stale(run, task_id)
+        end
+    end
+  end
+
+  # A completion misses the fence either because it is stale (the attempt
+  # was absorbed, superseded, or rescheduled) or because it arrived before
+  # its detach park committed. Only the current step with no parked task and
+  # no pending write can be the premature case; it is retryable, never a
+  # silent no-op, so a fast worker's result cannot be lost to the window
+  # between dispatch and the park commit.
+  defp premature_or_stale(run, task_id) do
+    current_step? = String.starts_with?(task_id, "#{run.id}:#{run.step}:")
+    pending? = Enum.any?(run.pending_writes, &(&1.task_id == task_id))
+
+    if current_step? and not pending? and not Map.has_key?(run.active_tasks, task_id) do
+      {:error,
+       Error.new(
+         :detach_pending,
+         "task #{inspect(task_id)} is not detached yet; retry after the detach park commits"
+       )}
+    else
+      {:unchanged, run}
     end
   end
 

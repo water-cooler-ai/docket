@@ -32,15 +32,25 @@ defmodule Docket.Node do
 
   ## Detachment
 
-  Returning `{:detach, token}` hands the attempt's work back to the runtime:
-  the attempt is not consumed and no failure is recorded, the run parks
-  durably with the task's identity and a mandatory deadline, and the claim
-  releases. The node must return promptly — the attempt timeout bounds the
-  return, not the detached work — and must start the work outside its own
-  process (see `Docket.Detached.start/2`; the activation process is killed
-  at its timeout). The work completes through `Docket.complete_detached/4`,
-  or the deadline recovers the run per the node's `"detach"` policy. The
-  token must be a durable value; it is retained on the parked task for
+  Returning `{:detach, token, worker}` hands the attempt's work back to the
+  runtime: the attempt is not consumed and no failure is recorded, the run
+  parks durably with the task's identity and a mandatory deadline, and the
+  claim releases. The runtime starts `worker` (a one-arity function
+  receiving the `Docket.Detached` identity) under its task supervisor
+  **only after the detach park commits**, so the worker's completion can
+  never race a park that is not yet durable — never start the work inside
+  the node body; the activation process is killed at its attempt timeout
+  and a park that loses its commit fence must not leave a worker behind.
+
+  Returning `{:detach, token}` detaches without a runtime-started worker:
+  an external system completes the attempt instead, using an identity the
+  node built with `Docket.Detached.from_context/1`. An external completion
+  arriving before the park commits receives a retryable
+  `%Docket.Error{type: :detach_pending}`.
+
+  Either way the work completes through `Docket.complete_detached/4`, or
+  the deadline recovers the run per the node's `"detach"` policy. The token
+  must be a durable value; it is retained on the parked task for
   correlation. External effects remain at-least-once: an attempt
   re-executed after deadline expiry may repeat them, deduplicated only by
   the stable idempotency key.
@@ -56,5 +66,6 @@ defmodule Docket.Node do
               {:ok, state_update :: map()}
               | {:interrupt, Docket.Interrupt.t()}
               | {:detach, term()}
+              | {:detach, term(), (Docket.Detached.t() -> any())}
               | {:error, term()}
 end

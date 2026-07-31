@@ -382,6 +382,44 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       assert output == %{"waits_out" => "late done"}
     end
 
+    test "a runtime-started worker exists only after its detach park is durable" do
+      Process.register(self(), :detach_worker_relay)
+
+      on_exit(fn ->
+        if Process.whereis(:detach_worker_relay), do: Process.unregister(:detach_worker_relay)
+      end)
+
+      start_supervised!(InlineHost)
+
+      graph =
+        Docket.Graph.new!(id: "backend-detach-worker")
+        |> Docket.Graph.put_field!("waits_out", schema: Docket.Schema.string())
+        |> Docket.Graph.put_node!("waits",
+          implementation: Docket.Test.Fixtures.Nodes.DetachesWithWorker,
+          policies: %{"detach" => %{"deadline_ms" => 60_000}}
+        )
+        |> Docket.Graph.put_edge!("edge_start_waits", from: "$start", to: "waits")
+        |> Docket.Graph.put_edge!("edge_waits_finish", from: "waits", to: "$finish")
+        |> Docket.Graph.put_output!("waits_out", [])
+
+      assert {:ok, reference} = InlineHost.save_graph(graph)
+      assert {:ok, %Docket.Run{status: :running} = parked} = InlineHost.start_run(reference, %{})
+
+      # The worker was started by the runtime after the park commit: by the
+      # time it reports, the detached task is already durable.
+      assert_receive {:worker_ran, %Docket.Detached{} = ref}, 2_000
+      assert ref.run_id == parked.id
+      assert {:ok, %Docket.Run{} = durable} = InlineHost.fetch_run(parked.id)
+
+      assert %Docket.Run.TaskState{status: :detached, attempt: 1} =
+               durable.active_tasks[ref.task_id]
+
+      assert {:ok, %Docket.Run{status: :done} = done} =
+               InlineHost.complete_detached(ref, {:ok, %{"waits_out" => "worker done"}})
+
+      assert done.output == %{"waits_out" => "worker done"}
+    end
+
     test "SQL Sandbox owner completes inline named interrupt flow in the caller" do
       owner = Ecto.Adapters.SQL.Sandbox.start_owner!(SandboxRepo, shared: true)
       on_exit(fn -> if Process.alive?(owner), do: Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)

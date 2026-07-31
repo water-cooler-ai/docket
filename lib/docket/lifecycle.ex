@@ -119,6 +119,11 @@ defmodule Docket.Lifecycle do
 
     Docket.Telemetry.emit_events(moment.run, moment.events)
 
+    Enum.each(
+      moment.detached_workers,
+      &start_detached_worker(Keyword.get(opts, :task_supervisor), &1)
+    )
+
     opts
     |> Keyword.get(:checkpoint_observers, [])
     |> List.wrap()
@@ -131,6 +136,17 @@ defmodule Docket.Lifecycle do
       )
     )
 
+    :ok
+  end
+
+  # A detached worker starts only here — after its detach park durably
+  # committed — so a completion can never race a park that does not exist,
+  # and a fence-lost moment never starts one. A crashed or unstarted worker
+  # resolves through the task's detach deadline.
+  defp start_detached_worker(nil, _spec), do: :ok
+
+  defp start_detached_worker(supervisor, %{ref: ref, worker: worker}) do
+    _ = Task.Supervisor.start_child(supervisor, fn -> worker.(ref) end)
     :ok
   end
 

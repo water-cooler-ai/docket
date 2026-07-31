@@ -1,20 +1,24 @@
 defmodule Docket.Detached do
   @moduledoc """
-  Identity and supervision helpers for detached node work.
+  Completion identity for detached node work.
 
-  A node that returns `{:detach, token}` hands its in-flight work back to
-  the runtime: the run parks durably with the task's identity and a
-  mandatory deadline, and the claim releases while the work finishes outside
-  the runtime. Work must not live in the activation process — the dispatcher
-  kills that process at its attempt timeout — so `start/2` starts it under
-  the runtime's task supervisor, and `from_context/1` captures the
-  completion identity from the node's execution context before the node
-  returns.
+  A node that returns `{:detach, token, worker}` hands its long-running work
+  back to the runtime: the run parks durably with the task's identity and a
+  mandatory deadline, the claim releases, and the runtime starts `worker`
+  under its task supervisor **only after that park commits** — the worker
+  receives this identity and completes through `Docket.complete_detached/4`
+  (or the `use Docket` delegate). Because the worker cannot exist before the
+  detach is durable, a completion can never race a park that was not yet
+  persisted, and a park whose commit loses its fence never starts a worker.
 
-  The worker completes through `Docket.complete_detached/4` (or the
-  `use Docket` delegate) with the captured identity. A worker that crashes
-  or never completes is recovered by the detach deadline; nothing tracks the
-  worker process itself.
+  A node that hands work to an external system instead returns
+  `{:detach, token}` and gives that system the identity (build it with
+  `from_context/1` inside the node). An external completion that arrives
+  before the detach park commits receives
+  `{:error, %Docket.Error{type: :detach_pending}}` and must retry.
+
+  A worker that crashes or never completes is recovered by the detach
+  deadline; nothing tracks the worker process itself.
   """
 
   alias Docket.Run.TaskState
@@ -54,21 +58,18 @@ defmodule Docket.Detached do
     }
   end
 
-  @doc """
-  Starts detached work under the runtime's task supervisor.
-
-  The supervisor comes from the node's execution context; work started here
-  survives the activation process, the vehicle, and the claim, and is
-  terminated with the runtime's supervision tree. Returns
-  `{:error, :no_task_supervisor}` in shells that run without a runtime tree,
-  such as the processless `Docket.Test`.
-  """
-  @spec start(map(), (-> any())) :: {:ok, pid()} | {:error, term()}
-  def start(%{task_supervisor: supervisor}, fun)
-      when not is_nil(supervisor) and is_function(fun, 0) do
-    Task.Supervisor.start_child(supervisor, fun)
+  @doc false
+  # Builds the identity handed to a post-commit worker from the durably
+  # parked task itself.
+  @spec from_task(String.t(), TaskState.t()) :: t()
+  def from_task(run_id, %TaskState{} = task) do
+    %__MODULE__{
+      run_id: run_id,
+      node_id: task.node_id,
+      step: task.step,
+      attempt: task.attempt,
+      task_id: task.task_id,
+      idempotency_key: task.idempotency_key
+    }
   end
-
-  def start(context, fun) when is_map(context) and is_function(fun, 0),
-    do: {:error, :no_task_supervisor}
 end

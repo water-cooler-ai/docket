@@ -220,6 +220,48 @@ defmodule Docket.Runtime.RunMutationTest do
       assert :ok = Docket.Run.validate_durable(moment.run)
     end
 
+    test "the first error completion closes the fence for every later completion" do
+      {rtg, run, task_id} = detached_run()
+
+      assert {:ok, %Moment{run: reported}} =
+               RunMutation.complete_detached(rtg, run, task_id, 1, {:error, :boom}, @now)
+
+      # Until the expiry settles, the task is still :detached — but the
+      # recorded failure durably closes the fence: no duplicate error, no
+      # replacing success.
+      assert reported.active_tasks[task_id].status == :detached
+
+      assert {:unchanged, ^reported} =
+               RunMutation.complete_detached(rtg, reported, task_id, 1, {:error, :again}, @now)
+
+      assert {:unchanged, ^reported} =
+               RunMutation.complete_detached(
+                 rtg,
+                 reported,
+                 task_id,
+                 1,
+                 {:ok, %{"out" => "x"}},
+                 @now
+               )
+    end
+
+    test "a premature completion is a retryable error, not a silent no-op" do
+      graph = detach_graph()
+      {:ok, initialized, _} = Docket.Test.run_inline(graph, %{}, max_steps: 0)
+      rtg = compile!(graph)
+      task_id = "#{initialized.id}:0:waits"
+
+      assert {:error, %Docket.Error{type: :detach_pending}} =
+               RunMutation.complete_detached(
+                 rtg,
+                 initialized,
+                 task_id,
+                 1,
+                 {:ok, %{"out" => "early"}},
+                 @now
+               )
+    end
+
     test "stale, superseded, and terminal completions are no-ops" do
       {rtg, run, task_id} = detached_run()
 
