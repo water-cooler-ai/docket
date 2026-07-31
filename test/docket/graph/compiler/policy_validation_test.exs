@@ -15,7 +15,8 @@ defmodule Docket.Graph.Compiler.PolicyValidationTest do
       graph =
         with_policies(%{
           "timeout_ms" => 5_000,
-          "retry" => %{"max_attempts" => 3, "backoff_ms" => 10}
+          "retry" => %{"max_attempts" => 3, "backoff_ms" => 10},
+          "detach" => %{"deadline_ms" => 60_000, "on_deadline" => "fail"}
         })
 
       assert {:ok, _rtg} = Compiler.compile(graph)
@@ -24,6 +25,7 @@ defmodule Docket.Graph.Compiler.PolicyValidationTest do
     test "absent and partial policies compile" do
       assert {:ok, _rtg} = Compiler.compile(with_policies(%{}))
       assert {:ok, _rtg} = Compiler.compile(with_policies(%{"retry" => %{}}))
+      assert {:ok, _rtg} = Compiler.compile(with_policies(%{"detach" => %{}}))
     end
 
     test "unknown open policy keys are ignored" do
@@ -71,6 +73,26 @@ defmodule Docket.Graph.Compiler.PolicyValidationTest do
         |> assert_diagnostic(:invalid_policy, path: [:nodes, "flaky", :policies, "retry"])
 
       assert diagnostic.message =~ "jitter"
+    end
+
+    test "detach must be a map with valid fields" do
+      with_policies(%{"detach" => 500})
+      |> verify_error!()
+      |> assert_diagnostic(:invalid_policy,
+        path: [:nodes, "flaky", :policies, "detach"],
+        public_id: "flaky"
+      )
+
+      for detach <- [
+            %{"deadline_ms" => 0},
+            %{"deadline_ms" => "soon"},
+            %{"on_deadline" => "explode"},
+            %{"deadline_ms" => 1_000, "grace" => true}
+          ] do
+        with_policies(%{"detach" => detach})
+        |> verify_error!()
+        |> assert_diagnostic(:invalid_policy, path: [:nodes, "flaky", :policies, "detach"])
+      end
     end
 
     test "the reserved on_error key is rejected" do

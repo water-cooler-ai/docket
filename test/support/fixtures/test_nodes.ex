@@ -374,8 +374,8 @@ defmodule Docket.Test.Fixtures.Nodes do
 
     @impl true
     def call(_state, config, context) do
-      case Map.fetch(context.application, :coordinator) do
-        {:ok, coordinator} -> send(coordinator, {:detaching, context})
+      case Map.fetch(context.application, :notify) do
+        {:ok, pid} -> send(pid, {:detaching, context})
         :error -> :ok
       end
 

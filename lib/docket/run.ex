@@ -354,7 +354,7 @@ defmodule Docket.Run do
   # attempt has no lifetimes and a retry timer; a detached attempt carries
   # its detach instant and a deadline exactly equal to its deadline timer.
   defp valid_task_status?(run, task_id, %TaskState{status: :retry_scheduled} = task) do
-    is_nil(task.started_at) and is_nil(task.deadline_at) and
+    is_nil(task.started_at) and is_nil(task.deadline_at) and task.failures != [] and
       match?({:ok, %TimerState{kind: :retry}}, Map.fetch(run.timers, task_id))
   end
 
@@ -377,7 +377,9 @@ defmodule Docket.Run do
 
   defp valid_source_versions?(_versions), do: false
 
-  defp valid_failures?(failures) when is_list(failures) and failures != [] do
+  defp valid_failures?([]), do: true
+
+  defp valid_failures?(failures) when is_list(failures) do
     if not proper_list?(failures) do
       false
     else

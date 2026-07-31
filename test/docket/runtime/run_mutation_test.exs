@@ -152,6 +152,105 @@ defmodule Docket.Runtime.RunMutationTest do
     end
   end
 
+  describe "complete_detached/6" do
+    defp detach_graph do
+      Graph.new!(id: "mutation-detach")
+      |> Graph.put_field!("out", schema: Docket.Schema.string())
+      |> Graph.put_node!("waits",
+        implementation: Nodes.Detaches,
+        config: %{token: "t"},
+        policies: %{"detach" => %{"deadline_ms" => 60_000}}
+      )
+      |> Graph.put_edge!("edge_start_waits", from: "$start", to: "waits")
+      |> Graph.put_edge!("edge_waits_finish", from: "waits", to: "$finish")
+      |> Graph.put_output!("out", [])
+    end
+
+    defp detached_run do
+      graph = detach_graph()
+      sleeper = fn _ms -> :ok end
+      {:ok, initialized, _} = Docket.Test.run_inline(graph, %{}, max_steps: 0, sleeper: sleeper)
+
+      {:ok, parked, _} =
+        Docket.Test.step_inline(initialized, graph: graph, sleeper: sleeper)
+
+      {compile!(graph), parked, "#{initialized.id}:0:waits"}
+    end
+
+    test "deterministically applies a success result as one pending write" do
+      {rtg, run, task_id} = detached_run()
+      result = {:ok, %{"out" => "late"}}
+
+      assert {:ok, %Moment{} = first} =
+               RunMutation.complete_detached(rtg, run, task_id, 1, result, @now)
+
+      assert RunMutation.complete_detached(rtg, run, task_id, 1, result, @now) == {:ok, first}
+
+      assert first.checkpoint_type == :detach_resolved
+      assert first.disposition == {:park, :immediate, :detach_resolved}
+      assert first.run.status == :running
+      assert first.run.active_tasks == %{}
+      assert first.run.timers == %{}
+
+      assert [%Docket.Run.PendingWrite{task_id: ^task_id, attempt: 1, kind: :update}] =
+               first.run.pending_writes
+
+      # No runtime event: the applied attempt's :node_completed is emitted by
+      # the barrier that absorbs the write.
+      assert Enum.map(first.events, & &1.type) == [:checkpoint_committed]
+      assert first.run.checkpoint_seq == run.checkpoint_seq + 1
+      assert :ok = Docket.Run.validate_durable(first.run)
+    end
+
+    test "a failure result expires the deadline in place" do
+      {rtg, run, task_id} = detached_run()
+
+      assert {:ok, %Moment{} = moment} =
+               RunMutation.complete_detached(rtg, run, task_id, 1, {:error, :boom}, @now)
+
+      assert moment.checkpoint_type == :detach_resolved
+      assert moment.disposition == {:park, :immediate, :detach_resolved}
+
+      task = moment.run.active_tasks[task_id]
+      assert task.status == :detached
+      assert task.attempt == 1
+      assert task.deadline_at == @now
+      assert task.metadata["detach_error"] == ":boom"
+      assert moment.run.timers[task_id].fires_at == @now
+      assert :ok = Docket.Run.validate_durable(moment.run)
+    end
+
+    test "stale, superseded, and terminal completions are no-ops" do
+      {rtg, run, task_id} = detached_run()
+
+      # Wrong attempt and unknown task change nothing.
+      assert {:unchanged, ^run} =
+               RunMutation.complete_detached(rtg, run, task_id, 2, {:ok, %{"out" => "x"}}, @now)
+
+      assert {:unchanged, ^run} =
+               RunMutation.complete_detached(rtg, run, "ghost", 1, {:ok, %{"out" => "x"}}, @now)
+
+      # A cancelled run is a silent no-op, not an error.
+      assert {:ok, %Moment{run: cancelled}} = RunMutation.cancel_run(run, @now)
+
+      assert {:unchanged, ^cancelled} =
+               RunMutation.complete_detached(rtg, cancelled, task_id, 1, {:ok, %{"out" => "x"}}, @now)
+    end
+
+    test "invalid result values are API errors" do
+      {rtg, run, task_id} = detached_run()
+
+      assert {:error, %Docket.Error{type: :invalid_input}} =
+               RunMutation.complete_detached(rtg, run, task_id, 1, {:ok, %{"ghost" => "x"}}, @now)
+
+      assert {:error, %Docket.Error{type: :invalid_input}} =
+               RunMutation.complete_detached(rtg, run, task_id, 1, {:ok, "not a map"}, @now)
+
+      assert {:error, %Docket.Error{type: :invalid_input}} =
+               RunMutation.complete_detached(rtg, run, task_id, 1, :done, @now)
+    end
+  end
+
   describe "cancel_run/2" do
     test "deterministically cancels running and waiting runs with a terminal moment" do
       {_rtg, waiting} = waiting_run()

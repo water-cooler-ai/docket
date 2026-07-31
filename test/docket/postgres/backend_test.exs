@@ -329,6 +329,59 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                InlineHost.resolve_interrupt(waiting.id, interrupt_id, "again")
     end
 
+    test "inline testing parks a detached attempt durably and completes it through the facade" do
+      start_supervised!(InlineHost)
+
+      graph =
+        Docket.Graph.new!(id: "backend-detach")
+        |> Docket.Graph.put_field!("waits_out", schema: Docket.Schema.string())
+        |> Docket.Graph.put_node!("waits",
+          implementation: Docket.Test.Fixtures.Nodes.Detaches,
+          config: %{token: "backend-job"},
+          policies: %{"detach" => %{"deadline_ms" => 60_000}}
+        )
+        |> Docket.Graph.put_edge!("edge_start_waits", from: "$start", to: "waits")
+        |> Docket.Graph.put_edge!("edge_waits_finish", from: "waits", to: "$finish")
+        |> Docket.Graph.put_output!("waits_out", [])
+
+      assert {:ok, reference} = InlineHost.save_graph(graph)
+      assert {:ok, %Docket.Run{status: :running} = parked} = InlineHost.start_run(reference, %{})
+
+      # The detach park commits the deadline as the durable wake with no
+      # claim: the run is not claimable before the deadline.
+      [task_id] = Map.keys(parked.active_tasks)
+
+      assert %Docket.Run.TaskState{status: :detached, attempt: 1, deadline_at: deadline_at} =
+               parked.active_tasks[task_id]
+
+      assert {:ok, %Docket.RunInfo{} = info} = InlineHost.inspect_run(parked.id)
+      assert info.wake_at == deadline_at
+      assert {:ok, %{drained: 0}} = InlineHost.drain_runs()
+
+      ref = %Docket.Detached{
+        run_id: parked.id,
+        node_id: "waits",
+        step: 0,
+        attempt: 1,
+        task_id: task_id,
+        idempotency_key: "#{task_id}:1"
+      }
+
+      assert {:ok, %Docket.Run{status: :done} = done} =
+               InlineHost.complete_detached(ref, {:ok, %{"waits_out" => "late done"}})
+
+      assert done.output == %{"waits_out" => "late done"}
+
+      # A duplicate completion is a no-op success against the settled run.
+      assert {:ok, %Docket.Run{status: :done}} =
+               InlineHost.complete_detached(ref, {:ok, %{"waits_out" => "duplicate"}})
+
+      assert {:ok, %Docket.RunInfo{run: %Docket.Run{status: :done, output: output}}} =
+               InlineHost.inspect_run(parked.id)
+
+      assert output == %{"waits_out" => "late done"}
+    end
+
     test "SQL Sandbox owner completes inline named interrupt flow in the caller" do
       owner = Ecto.Adapters.SQL.Sandbox.start_owner!(SandboxRepo, shared: true)
       on_exit(fn -> if Process.alive?(owner), do: Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
