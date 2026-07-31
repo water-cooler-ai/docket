@@ -16,6 +16,7 @@ a single "exactly-once" or "at-least-once" label.
 | Claim ownership | One current commit authority, not one executor | Current `claim_token` plus expected `checkpoint_seq` | Treat a lease as revocable authority |
 | Node attempt execution | Replayable; the same attempt may execute zero, one, or multiple times | Last committed run state | Keep node computation pure or make effects idempotent |
 | External effect initiated by a node | May happen more than once or have an ambiguous outcome | The external system | Atomically deduplicate the supplied identity with the effect |
+| Detached late result | Applies to durable state at most once, fenced on the exact detached task and attempt; the detached work itself is at-least-once | The serialized signal commit against the run document | Treat rejected or duplicate completions as no-ops; deduplicate the work's external effects by the attempt's idempotency key |
 | Retained event persistence | Atomic with its run transition and idempotent by `{run_id, seq}` | `docket_events` during its configured retention period | Do not confuse persistence with delivery |
 | Retained event export or consumption | No built-in delivery guarantee | Application exporter and consumer state | Use durable cursors, retry, and deduplicate by `{run_id, seq}` |
 | `checkpoint_observers` and poison callbacks | Best effort; may be lost or duplicated | Durable run and event rows, not the callback | Use only for hints and observability |
@@ -107,6 +108,30 @@ Database replication, failover durability, and read routing must preserve the
 committed PostgreSQL history on which Docket relies. Promotion of a replica
 that has not received acknowledged commits can invalidate guarantees above
 the single database history visible to Docket.
+
+## Choosing a waiting strategy
+
+Work that outlasts a node attempt has three shapes. All of them are
+at-least-once at the external boundary; none can promise exactly-once
+effects.
+
+- **Strict alignment** — do the work inside the attempt, bounded by
+  `timeout_ms` and the host `max_attempt_elapsed_ms`. Right for work that
+  reliably fits the attempt deadline. A killed attempt is retried per the
+  node's retry policy and cannot retract effects already started.
+- **External wait** — the work is durably owned by another system: request an
+  interrupt and park. The run commits `:waiting` with no deadline and only
+  `resolve_interrupt` (or cancellation) resumes it. Right for human approval
+  and external callbacks whose own system guarantees eventual resolution.
+- **Detachment** — the work is in-process but longer than an attempt: start
+  it under `Docket.Detached.start/2` and return `{:detach, token}`. The
+  attempt is not consumed; the run stays `running`, parked with no claim
+  behind a mandatory deadline. The worker posts `Docket.complete_detached/4`
+  — success applies at the next barrier, a reported failure or deadline
+  expiry settles per the node's `"detach"` policy (reschedule through the
+  retry budget, or fail). A crashed worker is recovered by the deadline
+  alone. An attempt rescheduled after expiry may repeat external effects;
+  the stable idempotency key is the only dedupe surface.
 
 ## Integration rules
 

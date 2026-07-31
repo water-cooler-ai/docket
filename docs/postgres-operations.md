@@ -295,6 +295,7 @@ the prior success. There is no public `resume_run` or graph-semantic
 | `backend.dispatcher.max_claim_attempts` | `5` | Launches allowed before the next recovery need poisons. |
 | `backend.dispatcher.drain_timeout_ms` | `30_000` | Shutdown wait for tracked vehicles. |
 | `max_attempt_elapsed_ms` | `2_000` | Instance-owned finite host maximum inherited by nodes without `timeout_ms`; larger explicit graph timeouts are rejected before execution. |
+| `detach_deadline_ms` | `300_000` | Instance-owned default detach deadline inherited by nodes whose `"detach"` policy declares no `"deadline_ms"`. Every detached attempt resolves to a finite deadline; there is no host ceiling because a detached run holds no process and no claim. |
 | `backend.vehicle.drain_budget` | 100 moments / 3 seconds | Cooperative moment-boundary yield; `max_elapsed_ms` must be finite, at least the attempt maximum, and below orphan TTL. |
 | `backend.vehicle.abandon_backoff_ms` | `30_000` | Base delay before retrying a pre-execution incompatibility; host-limit handbacks double it per consecutive abandon. |
 | `backend.vehicle.abandon_backoff_cap_ms` | `3_600_000` | Ceiling on the exponential host-incompatibility backoff. |
@@ -319,8 +320,13 @@ Attempt timeout bounds executor callback residency, not exact claim-hold time.
 The drain budget is cooperative, orphan TTL recovers crashed hosts, dispatcher
 shutdown timeout bounds graceful waiting, and client watchdogs are external.
 Killing an attempt cannot retract external effects or unlinked children;
-expected long work must use a durable external wait/interrupt until native
-detached await support is available.
+expected long work uses a durable external wait/interrupt or detaches with
+`{:detach, token}`.
+A detached run stays `running` with no claim and its wake set to the detach
+deadline: the ordinary ready scan is the deadline sweeper, `await_run` keeps
+polling through a detach, and `list_runs(status: :waiting)` does not surface
+detached runs — `inspect_run` shows the deadline as `wake_at` and the task as
+`:detached`.
 Without a retry policy, a node gets one attempt and no backoff. A configured
 retry policy defaults `max_attempts` to `1` and `backoff_ms` to `0`; raise the
 attempt count and choose a positive backoff to enable durable retry parking.

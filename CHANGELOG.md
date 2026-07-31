@@ -4,6 +4,45 @@ All notable changes to `docket` are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `{:detach, token}` node return: a first-class detached-execution protocol.
+  A detaching attempt is not consumed as a failure — the run parks durably
+  with the task's stable identity behind a mandatory deadline, the claim and
+  vehicle release, and the in-process work continues under the runtime's
+  task supervisor.
+- `Docket.complete_detached/4` (and the `use Docket` delegate): applies a
+  detached attempt's late result through the serialized signal path, fenced
+  on the run still holding that exact task detached at that exact attempt.
+  Stale, duplicate, and superseded results are no-ops. `{:ok, update}`
+  applies at the next barrier; `{:error, reason}` expires the deadline
+  immediately so the node's deadline policy settles the attempt.
+- `Docket.Detached`: completion identity (`from_context/1`) and the
+  supervised home for detached work (`start/2`).
+- `"detach"` node policy (`"deadline_ms"`, `"on_deadline"` of `"reschedule"`
+  or `"fail"`) and the runtime `detach_deadline_ms` default (300 000 ms).
+  Every detached attempt resolves to a finite deadline; expiry with
+  `"reschedule"` consumes the attempt through the normal retry budget.
+- `:detach_scheduled` and `:detach_resolved` checkpoint types, the
+  `:node_detached` event (`[:docket, :node, :detached]` telemetry), the
+  `:detached` task status, and the `:detached_deadline` timer kind.
+- `Docket.Test.complete_detached_inline/5` for the processless shell.
+
+### Changed
+
+- The reserved `{:await, term()}` node return is removed and replaced by
+  `{:detach, term()}`. `{:await, _}` is now an ordinary invalid node return
+  (permanent failure) instead of the dedicated `:unsupported_await`
+  rejection.
+- A run may durably hold pending writes with no active tasks: a detached
+  completion parks its result until the next advancement absorbs it at the
+  barrier.
+- No database schema change: this release runs on the same schema version 2
+  as every 0.2.x and 0.3.x release. A detached run parks `running` with its
+  wake set to the detach deadline, so the existing ready scan recovers it.
+
 ## 0.3.0 — 2026-07-29
 
 ### Added

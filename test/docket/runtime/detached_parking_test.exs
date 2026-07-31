@@ -80,7 +80,9 @@ defmodule Docket.Runtime.DetachedParkingTest do
       assert idempotency_key == "#{task_id}:1"
       assert is_binary(input_hash)
       assert deadline_at == ~U[2026-07-30 12:00:00.050000Z]
-      assert %TimerState{kind: :detached_deadline, fires_at: ^deadline_at} = parked.timers[task_id]
+
+      assert %TimerState{kind: :detached_deadline, fires_at: ^deadline_at} =
+               parked.timers[task_id]
 
       # The completed sibling parks as a pending write, invisible until the
       # barrier.
@@ -90,7 +92,11 @@ defmodule Docket.Runtime.DetachedParkingTest do
       assert [detach_event] = Enum.filter(park.events, &(&1.type == :node_detached))
       assert detach_event.node_id == "waits"
       assert detach_event.task_id == task_id
-      assert detach_event.payload == %{"attempt" => 1, "deadline_at" => "2026-07-30T12:00:00.050000Z"}
+
+      assert detach_event.payload == %{
+               "attempt" => 1,
+               "deadline_at" => "2026-07-30T12:00:00.050000Z"
+             }
 
       assert park.metadata["park_reason"] == "awaiting_detached"
       assert park.metadata["wake_disposition"] == "at"
@@ -128,12 +134,14 @@ defmodule Docket.Runtime.DetachedParkingTest do
       no_deadline =
         update_in(parked.active_tasks[task_id], &%{&1 | deadline_at: nil})
 
-      assert {:error, %Docket.Error{type: :invalid_run}} = Docket.Run.validate_durable(no_deadline)
+      assert {:error, %Docket.Error{type: :invalid_run}} =
+               Docket.Run.validate_durable(no_deadline)
 
       retry_timer =
         put_in(parked.timers[task_id], %TimerState{kind: :retry, fires_at: DateTime.utc_now()})
 
-      assert {:error, %Docket.Error{type: :invalid_run}} = Docket.Run.validate_durable(retry_timer)
+      assert {:error, %Docket.Error{type: :invalid_run}} =
+               Docket.Run.validate_durable(retry_timer)
     end
   end
 
@@ -273,7 +281,13 @@ defmodule Docket.Runtime.DetachedParkingTest do
       assert run.failure.details["errors"]["waits"] =~ "detach_deadline_expired"
 
       assert checkpoint_types(checkpoints) ==
-               [:run_initialized, :detach_scheduled, :retry_scheduled, :detach_scheduled, :run_failed]
+               [
+                 :run_initialized,
+                 :detach_scheduled,
+                 :retry_scheduled,
+                 :detach_scheduled,
+                 :run_failed
+               ]
 
       # Detach wait, zero-backoff retry park, second detach wait.
       assert_received {:slept, 25}

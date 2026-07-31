@@ -234,7 +234,14 @@ defmodule Docket.Runtime.RunMutationTest do
       assert {:ok, %Moment{run: cancelled}} = RunMutation.cancel_run(run, @now)
 
       assert {:unchanged, ^cancelled} =
-               RunMutation.complete_detached(rtg, cancelled, task_id, 1, {:ok, %{"out" => "x"}}, @now)
+               RunMutation.complete_detached(
+                 rtg,
+                 cancelled,
+                 task_id,
+                 1,
+                 {:ok, %{"out" => "x"}},
+                 @now
+               )
     end
 
     test "invalid result values are API errors" do

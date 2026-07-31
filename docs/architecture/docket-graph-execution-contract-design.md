@@ -62,17 +62,13 @@ Public node modules implement `Docket.Node.call/3`:
 call(state, config, context)
   :: {:ok, map()}
    | {:interrupt, Docket.Interrupt.t()}
-   | {:await, term()}
+   | {:detach, term()}
    | {:error, term()}
 ```
 
 The configured `Docket.Executor` receives an internal activation and runtime
-node definition. It normalizes callback success, interrupts, errors,
-exceptions, exits, throws, and timeouts into runtime task results.
-
-`:await` is reserved and is treated as a permanent node failure by the current
-local execution contract. Queue, remote-completion, and replay-only executor
-protocols are not part of v0.1.0.
+node definition. It normalizes callback success, interrupts, detachments,
+errors, exceptions, exits, throws, and timeouts into runtime task results.
 
 Node writes are keyed by public graph field ID. Runtime validation rejects
 unknown fields and invalid write values before reducers run. The executor does

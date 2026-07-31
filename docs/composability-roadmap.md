@@ -98,26 +98,19 @@ A runtime subgraph node referencing an independently versioned child graph is
 deferred. It would require nested run, checkpoint, interrupt, and recovery
 semantics rather than only a graph-document transformation.
 
-### Detached node completion
+### Detached node completion (shipped)
 
-Vehicles do not refresh claims. In-process node attempts run under the
-runtime-owned hard deadline, and token/sequence fencing rejects a stale commit
-after claim recovery. Work durably owned by an external system should park the
-run and return through an interrupt or another serialized signal.
-
-`{:await, term()}` is reserved by the executor contract and currently becomes a
-permanent node failure. Supporting detached completion would require:
-
-- a durable task state that records stable task and attempt identity without
-  trying to checkpoint an in-flight process;
-- a serialized result mutation fenced on that exact detached task and attempt;
-- a mandatory durable deadline and recovery path;
-- a supervised home for local completions after the vehicle exits; and
-- unchanged replay and external-effect idempotency rules for late or rejected
-  results.
-
-The completion protocol must release the vehicle and claim while ensuring that
-stale, duplicate, and superseded results cannot advance the run.
+`{:detach, token}` is the specified late-completion protocol. A detached
+attempt parks as durable task state (stable task and attempt identity, no
+in-flight process state) behind a mandatory deadline; the vehicle and claim
+release at the park. The late result re-enters as a serialized mutation
+through the signal path, fenced on that exact detached task and attempt, so
+stale, duplicate, and superseded results cannot advance the run. Local work
+runs supervised under the runtime's task supervisor via
+`Docket.Detached.start/2`, and replay plus external-effect idempotency rules
+are unchanged for late or rejected results. See `Docket.Node`,
+`Docket.Detached`, and the waiting-strategy guide in
+[delivery-guarantees](delivery-guarantees.md).
 
 ### Additional extension points
 

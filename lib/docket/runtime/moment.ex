@@ -30,7 +30,7 @@ defmodule Docket.Runtime.Moment do
   | `:continue` | the run is advanceable now; propose the next moment |
   | `{:park, :immediate, reason}` | commit, then wake immediately |
   | `{:park, :external, reason}` | nothing dispatchable until an external signal (open interrupts) |
-  | `{:park, {:at, timestamp}, reason}` | nothing dispatchable before `timestamp` (earliest retry deadline) |
+  | `{:park, {:at, timestamp}, reason}` | nothing dispatchable before `timestamp` (earliest retry or detach deadline) |
   | `{:park, :terminal, reason}` | the run is terminal; it never wakes again |
 
   `{:park, :immediate, reason}` is reserved for driver yield boundaries and
