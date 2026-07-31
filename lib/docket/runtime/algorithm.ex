@@ -182,7 +182,8 @@ defmodule Docket.Runtime.Algorithm do
       source_versions: identity.source_versions,
       config: node.config,
       timeout_ms: policies.timeout_ms,
-      retry: policies.retry
+      retry: policies.retry,
+      detach: policies.detach
     }
   end
 

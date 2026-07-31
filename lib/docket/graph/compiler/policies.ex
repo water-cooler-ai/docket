@@ -29,17 +29,22 @@ defmodule Docket.Graph.Compiler.Policies do
   @spec max_supersteps_key() :: String.t()
   def max_supersteps_key, do: @max_supersteps_key
 
-  @typedoc "Resolved v0.1 node execution policies with defaults applied."
+  @typedoc "Resolved node execution policies with defaults applied."
   @type node_policies :: %{
           timeout_ms: pos_integer() | nil,
-          retry: %{max_attempts: pos_integer(), backoff_ms: non_neg_integer()}
+          retry: %{max_attempts: pos_integer(), backoff_ms: non_neg_integer()},
+          detach: %{deadline_ms: pos_integer() | nil, on_deadline: :reschedule | :fail}
         }
 
   @doc """
-  Resolves the v0.1 node policy surface: `"timeout_ms"` and
-  `"retry" => %{"max_attempts", "backoff_ms"}`. `"on_error"` is reserved for
-  post-v0.1 routing and rejected so graphs cannot silently depend on it;
+  Resolves the node policy surface: `"timeout_ms"`,
+  `"retry" => %{"max_attempts", "backoff_ms"}`, and
+  `"detach" => %{"deadline_ms", "on_deadline"}`. `"on_error"` is reserved
+  for post-v0.1 routing and rejected so graphs cannot silently depend on it;
   other unknown keys are ignored as open content.
+
+  A nil detach `deadline_ms` inherits the runtime's configured default, so a
+  detached attempt always resolves to a finite deadline.
 
   Returns every problem, keyed by the offending policy key, so compiler
   validation can attach one diagnostic per key while the runtime joins them
@@ -51,9 +56,10 @@ defmodule Docket.Graph.Compiler.Policies do
   def node_policies(policies) when is_map(policies) and not is_struct(policies) do
     {timeout_result, timeout_errors} = check_timeout(policies)
     {retry_result, retry_errors} = check_retry(policies)
+    {detach_result, detach_errors} = check_detach(policies)
 
-    case reserved_errors(policies) ++ timeout_errors ++ retry_errors do
-      [] -> {:ok, %{timeout_ms: timeout_result, retry: retry_result}}
+    case reserved_errors(policies) ++ timeout_errors ++ retry_errors ++ detach_errors do
+      [] -> {:ok, %{timeout_ms: timeout_result, retry: retry_result, detach: detach_result}}
       errors -> {:error, errors}
     end
   end
@@ -147,6 +153,83 @@ defmodule Docket.Graph.Compiler.Policies do
 
       extra ->
         {nil, [{"retry", "node retry policy has unknown keys #{inspect(Enum.sort(extra))}"}]}
+    end
+  end
+
+  @detach_defaults %{deadline_ms: nil, on_deadline: :reschedule}
+
+  defp check_detach(policies) do
+    case Map.get(policies, "detach") do
+      nil ->
+        {@detach_defaults, []}
+
+      %{} = detach ->
+        results = [
+          detach_deadline(detach),
+          detach_on_deadline(detach),
+          detach_known_keys(detach)
+        ]
+
+        case Enum.flat_map(results, fn {_value, errors} -> errors end) do
+          [] ->
+            [{deadline_ms, []}, {on_deadline, []}, _keys] = results
+            {%{deadline_ms: deadline_ms, on_deadline: on_deadline}, []}
+
+          errors ->
+            {@detach_defaults, errors}
+        end
+
+      other ->
+        {@detach_defaults,
+         [{"detach", "node policy \"detach\" must be a map, got #{inspect(other)}"}]}
+    end
+  end
+
+  defp detach_deadline(detach) do
+    case Map.get(detach, "deadline_ms") do
+      nil ->
+        {@detach_defaults.deadline_ms, []}
+
+      value when is_integer(value) and value > 0 ->
+        {value, []}
+
+      other ->
+        {@detach_defaults.deadline_ms,
+         [
+           {"detach",
+            "node detach policy \"deadline_ms\" must be a positive integer, got #{inspect(other)}"}
+         ]}
+    end
+  end
+
+  defp detach_on_deadline(detach) do
+    case Map.get(detach, "on_deadline") do
+      nil ->
+        {@detach_defaults.on_deadline, []}
+
+      "reschedule" ->
+        {:reschedule, []}
+
+      "fail" ->
+        {:fail, []}
+
+      other ->
+        {@detach_defaults.on_deadline,
+         [
+           {"detach",
+            "node detach policy \"on_deadline\" must be \"reschedule\" or \"fail\", " <>
+              "got #{inspect(other)}"}
+         ]}
+    end
+  end
+
+  defp detach_known_keys(detach) do
+    case Map.keys(detach) -- ["deadline_ms", "on_deadline"] do
+      [] ->
+        {nil, []}
+
+      extra ->
+        {nil, [{"detach", "node detach policy has unknown keys #{inspect(Enum.sort(extra))}"}]}
     end
   end
 end

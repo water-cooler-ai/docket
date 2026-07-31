@@ -21,10 +21,12 @@ defmodule Docket.Runtime.Activation do
     :source_versions,
     :config,
     :timeout_ms,
-    :retry
+    :retry,
+    :detach
   ]
 
   @type retry :: %{max_attempts: pos_integer(), backoff_ms: non_neg_integer()}
+  @type detach :: %{deadline_ms: pos_integer() | nil, on_deadline: :reschedule | :fail}
 
   @type t :: %__MODULE__{
           task_id: String.t(),
@@ -38,6 +40,7 @@ defmodule Docket.Runtime.Activation do
           source_versions: %{optional(String.t()) => non_neg_integer()},
           config: map(),
           timeout_ms: pos_integer() | nil,
-          retry: retry()
+          retry: retry(),
+          detach: detach()
         }
 end

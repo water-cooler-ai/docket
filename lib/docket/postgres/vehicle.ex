@@ -39,6 +39,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       :executor,
       :executor_opts,
       :max_attempt_elapsed_ms,
+      :detach_deadline_ms,
       :max_supersteps,
       :context,
       :id_generator,

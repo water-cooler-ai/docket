@@ -17,6 +17,8 @@ defmodule Docket.Checkpoint do
           :run_initialized
           | :step_committed
           | :retry_scheduled
+          | :detach_scheduled
+          | :detach_resolved
           | :interrupt_requested
           | :interrupt_resolved
           | :run_completed
@@ -36,6 +38,8 @@ defmodule Docket.Checkpoint do
     :run_initialized,
     :step_committed,
     :retry_scheduled,
+    :detach_scheduled,
+    :detach_resolved,
     :interrupt_requested,
     :interrupt_resolved,
     :run_completed,

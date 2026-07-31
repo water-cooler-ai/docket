@@ -39,4 +39,11 @@ defmodule Docket.Runtime.ExecutionPolicy do
   @spec effective_timeout(pos_integer() | nil, pos_integer()) :: pos_integer()
   def effective_timeout(nil, maximum), do: maximum
   def effective_timeout(timeout, maximum), do: min(timeout, maximum)
+
+  # A node without an explicit detach deadline inherits the runtime default.
+  # Unlike the attempt timeout there is no host ceiling: a detached run holds
+  # no process and no claim.
+  @spec effective_detach_deadline_ms(pos_integer() | nil, pos_integer()) :: pos_integer()
+  def effective_detach_deadline_ms(nil, default), do: default
+  def effective_detach_deadline_ms(deadline_ms, _default), do: deadline_ms
 end

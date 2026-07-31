@@ -9,6 +9,14 @@ defmodule Docket.Run.TaskState do
   source versions the superstep planned against, and every prior failed
   attempt. Re-executing from this state preserves the task and idempotency
   identity of the superstep that parked it.
+
+  Two durable statuses exist. `:retry_scheduled` is a parked next attempt
+  with `started_at` and `deadline_at` nil. `:detached` is an outstanding
+  attempt whose work continues outside the runtime: `started_at` records the
+  detach commit, `deadline_at` the mandatory recovery deadline (equal to its
+  `:detached_deadline` timer), the attempt number is the detached attempt
+  itself, and `metadata["detach_token"]` carries the node's correlation
+  token.
   """
 
   defstruct [

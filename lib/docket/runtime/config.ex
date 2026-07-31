@@ -10,6 +10,7 @@ defmodule Docket.Runtime.Config do
     :sleeper,
     :id_generator,
     :max_attempt_elapsed_ms,
+    :detach_deadline_ms,
     :max_supersteps,
     :context,
     :checkpoint_observers
@@ -29,6 +30,7 @@ defmodule Docket.Runtime.Config do
           id_generator: (atom() -> String.t()),
           sleeper: (non_neg_integer() -> :ok),
           max_attempt_elapsed_ms: pos_integer(),
+          detach_deadline_ms: pos_integer(),
           max_supersteps: pos_integer() | nil,
           context: map()
         }
@@ -95,6 +97,7 @@ defmodule Docket.Runtime.Config do
     end
 
     validate_positive!(opts, :max_attempt_elapsed_ms)
+    validate_positive!(opts, :detach_deadline_ms)
     validate_positive!(opts, :max_supersteps)
     validate_observers!(Keyword.get(opts, :checkpoint_observers, []))
     :ok
@@ -107,6 +110,12 @@ defmodule Docket.Runtime.Config do
       raise ArgumentError, ":max_attempt_elapsed_ms must be a positive finite integer"
     end
 
+    detach_deadline_ms = Keyword.get(opts, :detach_deadline_ms, 300_000)
+
+    unless is_integer(detach_deadline_ms) and detach_deadline_ms > 0 do
+      raise ArgumentError, ":detach_deadline_ms must be a positive finite integer"
+    end
+
     %{
       executor: Keyword.get(opts, :executor, Docket.Executor.Local),
       executor_opts: Keyword.get(opts, :executor_opts, []),
@@ -114,6 +123,7 @@ defmodule Docket.Runtime.Config do
       id_generator: Keyword.get(opts, :id_generator, &default_id/1),
       sleeper: Keyword.get(opts, :sleeper, &sleep/1),
       max_attempt_elapsed_ms: max_attempt_elapsed_ms,
+      detach_deadline_ms: detach_deadline_ms,
       max_supersteps: Keyword.get(opts, :max_supersteps),
       context: Keyword.get(opts, :context, %{})
     }

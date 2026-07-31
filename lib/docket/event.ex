@@ -11,6 +11,8 @@ defmodule Docket.Event do
     `"message"`, and the failure's class-specific details)
   - `:checkpoint_committed` (metadata-only durable checkpoint history)
   - `:node_completed`, `:node_failed` (one `:node_failed` per failed attempt)
+  - `:node_detached` (an attempt handed its work back to the runtime; the
+    payload carries the attempt number and recovery deadline)
   - `:channel_updated` (payload carries the new version or the writer node
     IDs depending on the write's origin, never the value)
   - `:edge_triggered`
@@ -38,6 +40,7 @@ defmodule Docket.Event do
           | :checkpoint_committed
           | :node_completed
           | :node_failed
+          | :node_detached
           | :channel_updated
           | :edge_triggered
           | :interrupt_requested
@@ -64,6 +67,7 @@ defmodule Docket.Event do
     :checkpoint_committed,
     :node_completed,
     :node_failed,
+    :node_detached,
     :channel_updated,
     :edge_triggered,
     :interrupt_requested,

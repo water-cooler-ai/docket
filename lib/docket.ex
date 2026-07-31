@@ -49,6 +49,7 @@ defmodule Docket do
     :sleeper,
     :id_generator,
     :max_attempt_elapsed_ms,
+    :detach_deadline_ms,
     :max_supersteps,
     :context,
     :checkpoint_observers,

@@ -42,13 +42,17 @@ defmodule Docket.Run do
 
   ## Active superstep
 
-  Between a retryable node failure and the superstep's update barrier, the
-  run durably encodes the superstep in flight: `active_tasks` holds the
-  parked next attempt of each still-executing task (stable identity,
-  snapshot, accumulated failures), `pending_writes` holds completed sibling
-  results that stay invisible to channels until the barrier, and `timers`
-  holds each parked task's retry deadline. These fields are non-empty only
-  on a `:running` run and are cleared by the barrier or a terminal commit.
+  Between a retryable node failure or a detached attempt and the superstep's
+  update barrier, the run durably encodes the superstep in flight:
+  `active_tasks` holds the parked next attempt of each retrying task and the
+  outstanding identity of each detached task (stable identity, snapshot,
+  accumulated failures), `pending_writes` holds completed sibling results
+  that stay invisible to channels until the barrier, and `timers` holds each
+  parked task's retry deadline or detach deadline. These fields are
+  non-empty only on a `:running` run and are cleared by the barrier or a
+  terminal commit. Between a detached completion and its barrier,
+  `pending_writes` may briefly be non-empty with no active tasks; the next
+  advancement commits the barrier.
 
   ## Failure
 
@@ -271,10 +275,7 @@ defmodule Docket.Run do
         invalid_durable("active superstep state is only valid on a running run")
 
       active_ids != timer_ids ->
-        invalid_durable("active task IDs must match retry timer IDs")
-
-      run.pending_writes != [] and map_size(run.active_tasks) == 0 ->
-        invalid_durable("pending writes require active tasks")
+        invalid_durable("active task IDs must match timer IDs")
 
       length(node_ids) != MapSet.size(MapSet.new(node_ids)) ->
         invalid_durable("a node may appear only once in an active superstep")
@@ -340,14 +341,35 @@ defmodule Docket.Run do
     exact_struct?(task, TaskState) and valid_id?(task_id) and valid_id?(task.node_id) and
       task.task_id == task_id and
       task_id == TaskState.task_id(run.id, run.step, task.node_id) and task.step == run.step and
-      task.status == :retry_scheduled and pos_integer?(task.attempt) and
+      pos_integer?(task.attempt) and
       task.idempotency_key == TaskState.idempotency_key(task_id, task.attempt) and
       valid_id?(task.input_hash) and portable_map?(task.snapshot) and
       valid_source_versions?(task.source_versions) and valid_failures?(failures) and
       task.attempt == length(failures) + 1 and
-      task.input_hash == TaskState.snapshot_hash(task.snapshot) and is_nil(task.started_at) and
-      is_nil(task.deadline_at) and portable_map?(task.metadata)
+      task.input_hash == TaskState.snapshot_hash(task.snapshot) and
+      portable_map?(task.metadata) and valid_task_status?(run, task_id, task)
   end
+
+  # Each durable task status pins its own schedule shape: a retry-scheduled
+  # attempt has no lifetimes and a retry timer; a detached attempt carries
+  # its detach instant and a deadline exactly equal to its deadline timer.
+  defp valid_task_status?(run, task_id, %TaskState{status: :retry_scheduled} = task) do
+    is_nil(task.started_at) and is_nil(task.deadline_at) and
+      match?({:ok, %TimerState{kind: :retry}}, Map.fetch(run.timers, task_id))
+  end
+
+  defp valid_task_status?(run, task_id, %TaskState{status: :detached} = task) do
+    valid_datetime?(task.started_at) and valid_datetime?(task.deadline_at) and
+      case Map.fetch(run.timers, task_id) do
+        {:ok, %TimerState{kind: :detached_deadline, fires_at: fires_at}} ->
+          fires_at == task.deadline_at
+
+        _other ->
+          false
+      end
+  end
+
+  defp valid_task_status?(_run, _task_id, _task), do: false
 
   defp valid_source_versions?(versions) when is_map(versions) and not is_struct(versions) do
     Enum.all?(versions, fn {id, version} -> valid_id?(id) and non_neg_integer?(version) end)
@@ -432,7 +454,8 @@ defmodule Docket.Run do
 
   defp valid_timers?(timers) when is_map(timers) and not is_struct(timers) do
     Enum.all?(timers, fn
-      {id, %TimerState{kind: :retry, fires_at: fires_at} = timer} ->
+      {id, %TimerState{kind: kind, fires_at: fires_at} = timer}
+      when kind in [:retry, :detached_deadline] ->
         exact_struct?(timer, TimerState) and valid_id?(id) and valid_datetime?(fires_at)
 
       _other ->

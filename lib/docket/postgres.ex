@@ -57,7 +57,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       max_claim_attempts: 5,
       drain_timeout_ms: 30_000
     ]
-    @default_execution [max_attempt_elapsed_ms: 2_000]
+    @default_execution [max_attempt_elapsed_ms: 2_000, detach_deadline_ms: 300_000]
     @default_vehicle [drain_budget: [max_moments: 100, max_elapsed_ms: 3_000]]
 
     @dispatcher_keys [

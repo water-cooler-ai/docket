@@ -19,6 +19,7 @@ defmodule Docket.Telemetry do
   | `[:docket, :checkpoint, :committed]`| `:checkpoint_committed`|
   | `[:docket, :node, :completed]`      | `:node_completed`      |
   | `[:docket, :node, :failed]`         | `:node_failed`         |
+  | `[:docket, :node, :detached]`       | `:node_detached`       |
   | `[:docket, :channel, :updated]`     | `:channel_updated`     |
   | `[:docket, :edge, :triggered]`      | `:edge_triggered`      |
   | `[:docket, :interrupt, :requested]` | `:interrupt_requested` |
@@ -39,6 +40,7 @@ defmodule Docket.Telemetry do
     checkpoint_committed: [:docket, :checkpoint, :committed],
     node_completed: [:docket, :node, :completed],
     node_failed: [:docket, :node, :failed],
+    node_detached: [:docket, :node, :detached],
     channel_updated: [:docket, :channel, :updated],
     edge_triggered: [:docket, :edge, :triggered],
     interrupt_requested: [:docket, :interrupt, :requested],
