@@ -10,11 +10,14 @@ defmodule Docket.Runtime.Loop do
   # checkpoint and emits no telemetry. `propose_init/3` and
   # `propose_advance/3` expose the raw moments to durable and processless
   # drivers alike.
-  # Deterministic execution logic lives in `Docket.Runtime.Algorithm`.
+  # Deterministic execution logic lives in `Docket.Runtime.Algorithm`;
+  # dispatch results settle through `Docket.Runtime.Superstep`, which
+  # partitions and validates each result batch exactly once before the loop
+  # picks the commit boundary.
 
   alias Docket.{Error, Run, Schema, Wire}
-  alias Docket.Run.{ChannelState, Failure, InterruptState, PendingWrite, TaskState, TimerState}
-  alias Docket.Runtime.{Algorithm, Config, Dispatcher, Moment, TaskResult}
+  alias Docket.Run.{ChannelState, Failure, InterruptState, TaskState, TimerState}
+  alias Docket.Runtime.{Algorithm, Config, Dispatcher, Moment, Superstep}
 
   @doc false
   # Builds the fresh `:created` run document consumed by `init/3`. Shared by
@@ -232,11 +235,7 @@ defmodule Docket.Runtime.Loop do
     case do_propose_plan(rtg, run, opts, config) do
       {:execute, run, activations} ->
         results = Dispatcher.dispatch(activations, rtg, run, config)
-
-        case do_propose_results(rtg, run, config, activations, results) do
-          {:moment, moment} -> {:ok, moment}
-          {:moment, moment, _park} -> {:ok, moment}
-        end
+        {:ok, settle(Superstep.new(rtg, run, config, activations, results))}
 
       {:moment, moment} ->
         {:ok, moment}
@@ -270,7 +269,7 @@ defmodule Docket.Runtime.Loop do
       true ->
         case Algorithm.plan(rtg, run, config) do
           :done ->
-            complete(rtg, run, config)
+            {:moment, complete(rtg, run, config)}
 
           {:wait, interrupt_ids} ->
             {:wait, run, interrupt_ids}
@@ -278,15 +277,14 @@ defmodule Docket.Runtime.Loop do
           {:failed, :max_supersteps_exceeded} ->
             limit = Algorithm.max_supersteps(rtg, config)
 
-            fail(run, config, [],
-              failure:
-                Failure.new(
-                  "max_supersteps_exceeded",
-                  "run exceeded the superstep limit of #{limit}",
-                  details: %{"limit" => limit}
-                ),
-              payload: %{"reason" => "max_supersteps_exceeded", "limit" => limit}
-            )
+            failure =
+              Failure.new(
+                "max_supersteps_exceeded",
+                "run exceeded the superstep limit of #{limit}",
+                details: %{"limit" => limit}
+              )
+
+            {:moment, fail(run, config, [], failure)}
 
           {:execute, node_ids} ->
             case Algorithm.prepare_activations(rtg, run, node_ids, config) do
@@ -294,10 +292,7 @@ defmodule Docket.Runtime.Loop do
                 {:execute, run, activations}
 
               {:error, %Error{} = error} ->
-                fail(run, config, [],
-                  failure: Failure.new(Atom.to_string(error.type), error.message),
-                  payload: %{"reason" => Atom.to_string(error.type), "message" => error.message}
-                )
+                {:moment, fail(run, config, [], Failure.from_error(error))}
             end
         end
     end
@@ -321,10 +316,7 @@ defmodule Docket.Runtime.Loop do
           {:execute, run, Enum.filter(activations, &MapSet.member?(due_set, &1.task_id))}
 
         {:error, %Error{} = error} ->
-          fail(run, config, [],
-            failure: Failure.new(Atom.to_string(error.type), error.message),
-            payload: %{"reason" => Atom.to_string(error.type), "message" => error.message}
-          )
+          {:moment, fail(run, config, [], Failure.from_error(error))}
       end
     end
   end
@@ -358,92 +350,32 @@ defmodule Docket.Runtime.Loop do
     %{resume_at: resume_at, wait_ms: max(DateTime.diff(resume_at, now, :millisecond), 0)}
   end
 
-  defp complete(rtg, run, config) do
-    now = config.clock.()
-    output = Algorithm.project_output(rtg, run.channels)
-    run = %{run | status: :done, output: output, finished_at: now, updated_at: now}
+  # ---------------------------------------------------------------------------
+  # Superstep settlement
+  # ---------------------------------------------------------------------------
 
-    entries = [
-      entry(:run_completed, run.step, payload: %{"outputs" => Enum.sort(Map.keys(output))})
-    ]
-
-    {:moment, propose(run, :run_completed, entries, {:park, :terminal, :run_completed}, config)}
-  end
-
-  # Terminal failure absorbs the active superstep: no parked attempt, pending
-  # write, or timer survives a failed run.
-  defp fail(run, config, extra_entries, opts) do
-    now = config.clock.()
-    failure = Keyword.fetch!(opts, :failure)
-
-    run = %{
-      run
-      | status: :failed,
-        failure: failure,
-        finished_at: now,
-        updated_at: now,
-        active_tasks: %{},
-        pending_writes: [],
-        timers: %{}
-    }
-
-    entries =
-      extra_entries ++ [entry(:run_failed, run.step, payload: Keyword.fetch!(opts, :payload))]
-
-    {:moment, propose(run, :run_failed, entries, {:park, :terminal, :run_failed}, config)}
-  end
-
-  defp do_propose_results(rtg, run, config, activations, results) do
-    results = Enum.sort_by(results, & &1.node_id)
-
-    {oks, interrupt_results, retries, errors} = partition_results(results)
-    {validated_writes, write_errors} = validate_writes(rtg, oks)
-    {interrupt_specs, interrupt_errors} = validate_interrupts(rtg, run, interrupt_results)
-    permanent = errors ++ write_errors ++ interrupt_errors
-
-    cond do
-      permanent != [] ->
-        fail_superstep(run, config, results, permanent)
-
-      retries != [] or remaining_active?(run, results) ->
-        park(run, config, activations, retries, validated_writes, interrupt_specs)
-
-      true ->
-        barrier(rtg, run, config, results, validated_writes, interrupt_specs)
-    end
-  end
+  # One settlement decision per validated superstep: any permanent failure
+  # fails the run; a retrying or partially-dispatched superstep parks;
+  # otherwise the update barrier commits.
+  defp settle(%Superstep{failures: [_ | _]} = superstep), do: fail_superstep(superstep)
+  defp settle(%Superstep{retries: [_ | _]} = superstep), do: park(superstep)
+  defp settle(%Superstep{remaining_active?: true} = superstep), do: park(superstep)
+  defp settle(%Superstep{} = superstep), do: barrier(superstep)
 
   # The update barrier: pending sibling results parked by earlier retry
-  # commits pass through the same validators as this dispatch's results.
-  # Validation is deterministic, so runtime-produced pending state validates
-  # identically to when it was parked; only corrupted durable state can
-  # fail here, and it fails the run through the typed permanent path
-  # instead of crashing the commit.
-  defp barrier(rtg, run, config, results, validated_writes, interrupt_specs) do
-    pending_results = rehydrate_pending(run)
-    {pending_oks, pending_interrupts, [], []} = partition_results(pending_results)
-    {pending_writes, pending_write_errors} = validate_writes(rtg, pending_oks)
-    {pending_specs, pending_interrupt_errors} = validate_interrupts(rtg, run, pending_interrupts)
-
-    case pending_write_errors ++ pending_interrupt_errors do
-      [] ->
-        validated_writes =
-          Enum.sort_by(pending_writes ++ validated_writes, fn {result, _} -> result.node_id end)
-
-        interrupt_specs =
-          Enum.sort_by(pending_specs ++ interrupt_specs, fn {result, _} -> result.node_id end)
-
-        commit(rtg, run, config, results, validated_writes, interrupt_specs)
-
-      permanent ->
-        fail_superstep(run, config, results, permanent)
+  # commits pass through the same validators as this dispatch's results
+  # before the barrier commits (see `Superstep.absorb_pending/1`).
+  defp barrier(%Superstep{} = superstep) do
+    case Superstep.absorb_pending(superstep) do
+      {:ok, superstep} -> commit(superstep)
+      {:error, superstep} -> fail_superstep(superstep)
     end
   end
 
-  defp fail_superstep(run, config, results, permanent) do
+  defp fail_superstep(%Superstep{run: run, config: config} = superstep) do
     entries =
-      attempt_failure_entries(run.step, results) ++
-        Enum.map(permanent, fn failure ->
+      attempt_failure_entries(run.step, superstep.results) ++
+        Enum.map(superstep.failures, fn %Superstep.Failure{} = failure ->
           entry(:node_failed, run.step,
             node_id: failure.node_id,
             task_id: failure.task_id,
@@ -455,19 +387,8 @@ defmodule Docket.Runtime.Loop do
           )
         end)
 
-    failed_nodes = permanent |> Enum.map(& &1.node_id) |> Enum.uniq() |> Enum.sort()
-
-    fail(run, config, entries,
-      failure: node_failure(permanent, failed_nodes),
-      payload: %{"reason" => "node_failed", "nodes" => failed_nodes}
-    )
-  end
-
-  # True when active tasks beyond this dispatch's results remain parked
-  # (their retry deadlines were not due), so the barrier cannot commit yet.
-  defp remaining_active?(run, results) do
-    dispatched = MapSet.new(results, & &1.task_id)
-    run.active_tasks |> Map.keys() |> Enum.any?(&(not MapSet.member?(dispatched, &1)))
+    failed_nodes = superstep.failures |> Enum.map(& &1.node_id) |> Enum.uniq() |> Enum.sort()
+    fail(run, config, entries, node_failure(superstep.failures, failed_nodes))
   end
 
   # Commits the retry park: completed results move to pending writes, each
@@ -475,53 +396,18 @@ defmodule Docket.Runtime.Loop do
   # accumulated failures) and retry deadline become durable, and the graph
   # step does not advance. The checkpoint is sync so a crash during backoff
   # resumes from this state instead of resetting the attempt position.
-  defp park(run, config, activations, retries, validated_writes, interrupt_specs) do
+  defp park(%Superstep{run: run, config: config} = superstep) do
     now = config.clock.()
-    activations_by_task = Map.new(activations, &{&1.task_id, &1})
-
-    new_pending =
-      Enum.sort_by(
-        Enum.map(validated_writes, fn {result, update} ->
-          pending_write(result, :update, update)
-        end) ++
-          Enum.map(interrupt_specs, fn {result, interrupt} ->
-            pending_write(result, :interrupt, %{interrupt | node_id: result.node_id})
-          end),
-        & &1.node_id
-      )
-
+    activations_by_task = Map.new(superstep.activations, &{&1.task_id, &1})
+    new_pending = Superstep.to_pending_writes(superstep)
     finalized_ids = Enum.map(new_pending, & &1.task_id)
 
     {parked_tasks, parked_timers} =
-      Enum.reduce(retries, {%{}, %{}}, fn result, {tasks, timers} ->
+      Enum.reduce(superstep.retries, {%{}, %{}}, fn result, {tasks, timers} ->
         activation = Map.fetch!(activations_by_task, result.task_id)
-        next_attempt = activation.attempt + 1
 
-        prior_failures =
-          case Map.fetch(run.active_tasks, result.task_id) do
-            {:ok, %TaskState{failures: failures}} -> failures
-            :error -> []
-          end
-
-        task = %TaskState{
-          task_id: result.task_id,
-          node_id: result.node_id,
-          step: activation.step,
-          attempt: next_attempt,
-          status: :retry_scheduled,
-          input_hash: activation.input_hash,
-          idempotency_key: TaskState.idempotency_key(result.task_id, next_attempt),
-          snapshot: activation.snapshot,
-          source_versions: activation.source_versions,
-          failures: prior_failures ++ [%{attempt: result.attempt, reason: inspect(result.value)}]
-        }
-
-        timer = %TimerState{
-          kind: :retry,
-          fires_at: DateTime.add(now, activation.retry.backoff_ms, :millisecond)
-        }
-
-        {Map.put(tasks, result.task_id, task), Map.put(timers, result.task_id, timer)}
+        {Map.put(tasks, result.task_id, retry_task(run, activation, result)),
+         Map.put(timers, result.task_id, retry_timer(activation, now))}
       end)
 
     parked = %{
@@ -532,215 +418,111 @@ defmodule Docket.Runtime.Loop do
         updated_at: now
     }
 
-    park = park_info(parked.timers, now)
-    entries = attempt_failure_entries(parked.step, retries)
-    disposition = {:park, {:at, park.resume_at}, :retry_backoff}
+    entries = attempt_failure_entries(parked.step, superstep.retries)
+    disposition = {:park, {:at, park_info(parked.timers, now).resume_at}, :retry_backoff}
 
-    {:moment,
-     propose(parked, :retry_scheduled, entries, disposition, config,
-       pending_attempts: new_pending
-     ), park}
+    propose(parked, :retry_scheduled, entries, disposition, config, pending_attempts: new_pending)
   end
 
-  defp pending_write(result, kind, value) do
-    %PendingWrite{
+  # The parked next attempt keeps the committed activation identity and
+  # appends this attempt's failure to the task's accumulated history.
+  defp retry_task(run, activation, result) do
+    next_attempt = activation.attempt + 1
+
+    prior_failures =
+      case Map.fetch(run.active_tasks, result.task_id) do
+        {:ok, %TaskState{failures: failures}} -> failures
+        :error -> []
+      end
+
+    %TaskState{
       task_id: result.task_id,
       node_id: result.node_id,
-      attempt: result.attempt,
-      kind: kind,
-      value: value
+      step: activation.step,
+      attempt: next_attempt,
+      status: :retry_scheduled,
+      input_hash: activation.input_hash,
+      idempotency_key: TaskState.idempotency_key(result.task_id, next_attempt),
+      snapshot: activation.snapshot,
+      source_versions: activation.source_versions,
+      failures: prior_failures ++ [%{attempt: result.attempt, reason: inspect(result.value)}]
     }
   end
 
-  # Rehydrates pending sibling results committed by earlier retry parks back
-  # into task results. Their retried attempts' failure events were emitted by
-  # the parks that recorded them, so they contribute no failure entries at
-  # the barrier.
-  defp rehydrate_pending(run) do
-    Enum.map(run.pending_writes, fn %PendingWrite{} = pending ->
-      %TaskResult{
-        task_id: pending.task_id,
-        node_id: pending.node_id,
-        attempt: pending.attempt,
-        status: if(pending.kind == :update, do: :ok, else: :interrupt),
-        value: pending.value
-      }
-    end)
-  end
-
-  defp failure(result, reason) do
-    %{
-      node_id: result.node_id,
-      task_id: result.task_id,
-      attempt: result.attempt,
-      reason: reason
+  defp retry_timer(activation, now) do
+    %TimerState{
+      kind: :retry,
+      fires_at: DateTime.add(now, activation.retry.backoff_ms, :millisecond)
     }
   end
 
-  # The durable cause for a permanent node failure. Per-node reasons remain in
-  # the run's details independently of retained event history.
-  defp node_failure(permanent, failed_nodes) do
-    errors = Map.new(permanent, fn failure -> {failure.node_id, inspect(failure.reason)} end)
-
-    node_id =
-      case failed_nodes do
-        [node_id] -> node_id
-        _multiple -> nil
-      end
-
-    Failure.new("node_failed", "node(s) #{Enum.join(failed_nodes, ", ")} failed permanently",
-      node_id: node_id,
-      details: %{"nodes" => failed_nodes, "errors" => errors}
-    )
-  end
-
-  defp partition_results(results) do
-    Enum.reduce(results, {[], [], [], []}, fn result, {oks, interrupts, retries, errors} ->
-      case result.status do
-        :ok ->
-          {[result | oks], interrupts, retries, errors}
-
-        :interrupt ->
-          {oks, [result | interrupts], retries, errors}
-
-        :retry ->
-          {oks, interrupts, [result | retries], errors}
-
-        :error ->
-          {oks, interrupts, retries, [failure(result, result.value) | errors]}
-      end
-    end)
-    |> then(fn {oks, interrupts, retries, errors} ->
-      {Enum.reverse(oks), Enum.reverse(interrupts), Enum.reverse(retries), Enum.reverse(errors)}
-    end)
-  end
-
-  defp validate_writes(rtg, oks) do
-    Enum.reduce(oks, {[], []}, fn result, {writes, errors} ->
-      case Algorithm.validate_state_update(rtg, result.node_id, result.value) do
-        {:ok, update} ->
-          {[{result, update} | writes], errors}
-
-        {:error, reasons} ->
-          {writes, [failure(result, {:invalid_state_update, reasons}) | errors]}
-      end
-    end)
-    |> then(fn {writes, errors} -> {Enum.reverse(writes), Enum.reverse(errors)} end)
-  end
-
-  defp validate_interrupts(rtg, run, interrupt_results) do
-    Enum.reduce(interrupt_results, {[], []}, fn result, {specs, errors} ->
-      interrupt = result.value
-
-      case interrupt_errors(rtg, run, interrupt) do
-        [] ->
-          {[{result, interrupt} | specs], errors}
-
-        reasons ->
-          {specs, [failure(result, {:invalid_interrupt, reasons}) | errors]}
-      end
-    end)
-    |> then(fn {specs, errors} -> {Enum.reverse(specs), Enum.reverse(errors)} end)
-  end
-
-  defp interrupt_errors(rtg, run, interrupt) do
-    check_resume_channel(rtg, interrupt) ++
-      check_schema(interrupt) ++
-      check_id_unused(run, interrupt)
-  end
-
-  defp check_resume_channel(rtg, interrupt) do
-    if Map.has_key?(rtg.lowering.public_to_runtime.fields, interrupt.resume_channel || "") do
-      []
-    else
-      [
-        "interrupt resume_channel #{inspect(interrupt.resume_channel)} is not a declared state field"
-      ]
-    end
-  end
-
-  defp check_schema(interrupt) do
-    case interrupt.schema do
-      nil -> []
-      %Schema{} -> []
-      other -> ["interrupt schema must be a Docket.Schema or nil, got #{inspect(other)}"]
-    end
-  end
-
-  defp check_id_unused(run, interrupt) do
-    if interrupt.id != nil and Map.has_key?(run.interrupts, interrupt.id) do
-      ["interrupt id #{inspect(interrupt.id)} already exists on this run"]
-    else
-      []
-    end
-  end
-
-  defp commit(rtg, run, config, results, validated_writes, interrupt_specs) do
-    writes = Enum.map(validated_writes, fn {result, update} -> {result.node_id, update} end)
+  defp commit(%Superstep{rtg: rtg, run: run, config: config} = superstep) do
+    writes = Enum.map(superstep.writes, fn write -> {write.node_id, write.value} end)
     {channels, changed_fields, writers} = Algorithm.apply_state_writes(rtg, run.channels, writes)
-    ok_node_ids = Enum.map(validated_writes, fn {result, _update} -> result.node_id end)
+    ok_node_ids = Enum.map(superstep.writes, & &1.node_id)
 
     case Algorithm.evaluate_edge_triggers(rtg, channels, ok_node_ids, changed_fields) do
+      {:ok, triggers} ->
+        commit_step(superstep, triggers, ok_node_ids, changed_fields, writers)
+
       {:error, {edge_id, reasons}} ->
-        fail(run, config, [],
-          failure:
-            Failure.new(
-              "guard_evaluation_failed",
-              "edge #{edge_id} guard evaluation failed",
-              details: %{"edge_id" => edge_id, "reasons" => reasons}
-            ),
-          payload: %{
-            "reason" => "guard_evaluation_failed",
-            "edge_id" => edge_id,
-            "details" => reasons
-          }
-        )
-
-      {:ok, %{channels: channels, triggered: triggered, finish: finish}} ->
-        now = config.clock.()
-        channels = clear_consumed_activations(rtg, channels, run.changed_channels)
-
-        {interrupts, interrupt_node_ids, interrupt_results} =
-          build_interrupts(config, interrupt_specs, now)
-
-        changed_channels =
-          MapSet.new(
-            Enum.map(changed_fields, &("state:" <> &1)) ++
-              Enum.map(triggered, &Map.fetch!(rtg.edges, &1).channel_id)
+        failure =
+          Failure.new(
+            "guard_evaluation_failed",
+            "edge #{edge_id} guard evaluation failed",
+            details: %{"edge_id" => edge_id, "reasons" => reasons}
           )
 
-        pending_nodes =
-          run.pending_nodes
-          |> MapSet.difference(MapSet.new(ok_node_ids))
-          |> MapSet.union(MapSet.new(interrupt_node_ids))
-
-        committed = %{
-          run
-          | channels: channels,
-            changed_channels: changed_channels,
-            pending_nodes: pending_nodes,
-            interrupts: Map.merge(run.interrupts, interrupts),
-            active_tasks: %{},
-            pending_writes: [],
-            timers: %{},
-            step: run.step + 1,
-            status: :running,
-            updated_at: now
-        }
-
-        committed = %{committed | status: eager_status(rtg, committed, config)}
-
-        entries =
-          commit_entries(rtg, run.step, results, validated_writes, changed_fields, writers,
-            triggered: triggered,
-            finish: finish,
-            interrupts: interrupts,
-            interrupt_results: interrupt_results
-          )
-
-        type = if map_size(interrupts) == 0, do: :step_committed, else: :interrupt_requested
-        {:moment, propose(committed, type, entries, run_disposition(committed), config)}
+        fail(run, config, [], failure)
     end
+  end
+
+  defp commit_step(%Superstep{} = superstep, triggers, ok_node_ids, changed_fields, writers) do
+    %Superstep{rtg: rtg, run: run, config: config} = superstep
+    %{channels: channels, triggered: triggered, finish: finish} = triggers
+    now = config.clock.()
+    channels = clear_consumed_activations(rtg, channels, run.changed_channels)
+
+    {interrupts, interrupt_node_ids, interrupt_writes} =
+      build_interrupts(config, superstep.interrupts, now)
+
+    changed_channels =
+      MapSet.new(
+        Enum.map(changed_fields, &("state:" <> &1)) ++
+          Enum.map(triggered, &Map.fetch!(rtg.edges, &1).channel_id)
+      )
+
+    pending_nodes =
+      run.pending_nodes
+      |> MapSet.difference(MapSet.new(ok_node_ids))
+      |> MapSet.union(MapSet.new(interrupt_node_ids))
+
+    committed = %{
+      run
+      | channels: channels,
+        changed_channels: changed_channels,
+        pending_nodes: pending_nodes,
+        interrupts: Map.merge(run.interrupts, interrupts),
+        active_tasks: %{},
+        pending_writes: [],
+        timers: %{},
+        step: run.step + 1,
+        status: :running,
+        updated_at: now
+    }
+
+    committed = %{committed | status: eager_status(rtg, committed, config)}
+
+    entries =
+      commit_entries(rtg, run.step, superstep.writes, changed_fields, writers,
+        triggered: triggered,
+        finish: finish,
+        interrupts: interrupts,
+        interrupt_writes: interrupt_writes
+      )
+
+    type = if map_size(interrupts) == 0, do: :step_committed, else: :interrupt_requested
+    propose(committed, type, entries, run_disposition(committed), config)
   end
 
   # The run must never durably claim :running when nothing can proceed: when
@@ -753,14 +535,14 @@ defmodule Docket.Runtime.Loop do
     end
   end
 
-  defp build_interrupts(config, interrupt_specs, now) do
-    Enum.reduce(interrupt_specs, {%{}, [], %{}}, fn {result, interrupt},
-                                                    {states, node_ids, results} ->
+  defp build_interrupts(config, interrupt_writes, now) do
+    Enum.reduce(interrupt_writes, {%{}, [], %{}}, fn write, {states, node_ids, writes} ->
+      interrupt = write.value
       id = interrupt.id || config.id_generator.(:interrupt)
 
       state = %InterruptState{
         id: id,
-        node_id: result.node_id,
+        node_id: write.node_id,
         status: :open,
         resume_channel: interrupt.resume_channel,
         schema: interrupt.schema,
@@ -770,12 +552,12 @@ defmodule Docket.Runtime.Loop do
 
       {
         Map.put(states, id, state),
-        [result.node_id | node_ids],
-        Map.put(results, id, result)
+        [write.node_id | node_ids],
+        Map.put(writes, id, write)
       }
     end)
-    |> then(fn {states, node_ids, results} ->
-      {states, Enum.reverse(node_ids), results}
+    |> then(fn {states, node_ids, writes} ->
+      {states, Enum.reverse(node_ids), writes}
     end)
   end
 
@@ -799,15 +581,17 @@ defmodule Docket.Runtime.Loop do
     end)
   end
 
-  defp commit_entries(rtg, step, results, validated_writes, changed_fields, writers, extra) do
-    attempt_failure_entries(step, results) ++
-      Enum.map(validated_writes, fn {result, _update} ->
-        entry(:node_completed, step,
-          node_id: result.node_id,
-          task_id: result.task_id,
-          payload: %{"attempt" => result.attempt}
-        )
-      end) ++
+  # A committing superstep has no retry results, so unlike the retry park
+  # and superstep failure paths, the barrier emits no attempt-failure
+  # entries of its own.
+  defp commit_entries(rtg, step, validated_writes, changed_fields, writers, extra) do
+    Enum.map(validated_writes, fn write ->
+      entry(:node_completed, step,
+        node_id: write.node_id,
+        task_id: write.task_id,
+        payload: %{"attempt" => write.attempt}
+      )
+    end) ++
       Enum.map(Enum.sort(changed_fields), fn field_id ->
         entry(:channel_updated, step,
           channel_id: "state:" <> field_id,
@@ -821,13 +605,13 @@ defmodule Docket.Runtime.Loop do
         )
       end) ++
       Enum.map(Enum.sort(Keyword.fetch!(extra, :interrupts)), fn {id, state} ->
-        result = Map.fetch!(Keyword.fetch!(extra, :interrupt_results), id)
+        write = Map.fetch!(Keyword.fetch!(extra, :interrupt_writes), id)
 
         entry(:interrupt_requested, step,
           node_id: state.node_id,
-          task_id: result.task_id,
+          task_id: write.task_id,
           payload: %{
-            "attempt" => result.attempt,
+            "attempt" => write.attempt,
             "interrupt_id" => id,
             "resume_channel" => state.resume_channel
           }
@@ -850,6 +634,66 @@ defmodule Docket.Runtime.Loop do
         }
       )
     end
+  end
+
+  # The durable cause for a permanent node failure. Per-node reasons remain in
+  # the run's details independently of retained event history.
+  defp node_failure(failures, failed_nodes) do
+    errors = Map.new(failures, fn failure -> {failure.node_id, inspect(failure.reason)} end)
+
+    node_id =
+      case failed_nodes do
+        [node_id] -> node_id
+        _multiple -> nil
+      end
+
+    Failure.new("node_failed", "node(s) #{Enum.join(failed_nodes, ", ")} failed permanently",
+      node_id: node_id,
+      details: %{"nodes" => failed_nodes, "errors" => errors}
+    )
+  end
+
+  defp complete(rtg, run, config) do
+    now = config.clock.()
+    output = Algorithm.project_output(rtg, run.channels)
+    run = %{run | status: :done, output: output, finished_at: now, updated_at: now}
+
+    entries = [
+      entry(:run_completed, run.step, payload: %{"outputs" => Enum.sort(Map.keys(output))})
+    ]
+
+    propose(run, :run_completed, entries, {:park, :terminal, :run_completed}, config)
+  end
+
+  # Terminal failure absorbs the active superstep: no parked attempt, pending
+  # write, or timer survives a failed run. The durable failure is the single
+  # source of truth: the `:run_failed` event's node ID and payload are
+  # projections of it, never assembled separately.
+  defp fail(run, config, extra_entries, %Failure{} = failure) do
+    now = config.clock.()
+
+    run = %{
+      run
+      | status: :failed,
+        failure: failure,
+        finished_at: now,
+        updated_at: now,
+        active_tasks: %{},
+        pending_writes: [],
+        timers: %{}
+    }
+
+    failed_entry =
+      entry(:run_failed, run.step, node_id: failure.node_id, payload: failure_payload(failure))
+
+    entries = extra_entries ++ [failed_entry]
+    propose(run, :run_failed, entries, {:park, :terminal, :run_failed}, config)
+  end
+
+  defp failure_payload(%Failure{} = failure) do
+    failure.details
+    |> Map.put("reason", failure.code)
+    |> Map.put("message", failure.message)
   end
 
   # ---------------------------------------------------------------------------

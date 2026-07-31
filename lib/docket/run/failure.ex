@@ -61,5 +61,27 @@ defmodule Docket.Run.Failure do
     %__MODULE__{code: code, message: message, node_id: node_id, details: details}
   end
 
+  @doc """
+  Builds a failure from a `Docket.Error`.
+
+  The error's type becomes the failure code, and the node ID carries over
+  when the error is node-scoped. Details are coerced to their durable form
+  exactly as checkpointed run data is. Raises `ArgumentError` when the
+  error's details contain a non-durable value.
+  """
+  @spec from_error(Docket.Error.t()) :: t()
+  def from_error(%Docket.Error{} = error) do
+    details =
+      case Docket.Wire.dump_value(error.details || %{}) do
+        {:ok, durable} ->
+          durable
+
+        {:error, reason} ->
+          raise ArgumentError, "failure details must be durable: #{reason}"
+      end
+
+    new(Atom.to_string(error.type), error.message, node_id: error.node_id, details: details)
+  end
+
   defp nonempty_string?(value), do: is_binary(value) and byte_size(value) > 0
 end

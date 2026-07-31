@@ -11,7 +11,7 @@ defmodule Docket.Runtime.Algorithm do
   alias Docket.Graph.Compiler.Policies
   alias Docket.Guard
   alias Docket.Run.{ChannelState, TaskState}
-  alias Docket.Runtime.Activation
+  alias Docket.Runtime.{Activation, StateView}
   alias Docket.{Reducer, Schema, Wire}
 
   @start_id "$start"
@@ -34,15 +34,16 @@ defmodule Docket.Runtime.Algorithm do
     limit is reached
   """
   def plan(rtg, run, config) do
-    interrupted = interrupted_node_ids(run)
+    open = open_interrupts(run)
+    interrupted = MapSet.new(open, fn {_id, interrupt} -> interrupt.node_id end)
     candidates = candidate_node_ids(rtg, run, interrupted)
 
     cond do
-      candidates == [] and map_size(open_interrupts(run)) == 0 ->
+      candidates == [] and map_size(open) == 0 ->
         :done
 
       candidates == [] ->
-        {:wait, run |> open_interrupts() |> Map.keys() |> Enum.sort()}
+        {:wait, open |> Map.keys() |> Enum.sort()}
 
       exceeds_max_supersteps?(rtg, run, config) ->
         {:failed, :max_supersteps_exceeded}
@@ -63,13 +64,6 @@ defmodule Docket.Runtime.Algorithm do
     end)
     |> Enum.map(fn {_runtime_id, node} -> node.public_id end)
     |> Enum.sort()
-  end
-
-  defp interrupted_node_ids(run) do
-    run
-    |> open_interrupts()
-    |> Enum.map(fn {_id, interrupt} -> interrupt.node_id end)
-    |> MapSet.new()
   end
 
   @doc false
@@ -100,9 +94,8 @@ defmodule Docket.Runtime.Algorithm do
   declares an invalid v0.1 policy.
   """
   def prepare_activations(rtg, run, node_ids, _config) do
-    snapshot = state_snapshot(rtg, run)
-    versions = state_versions(rtg, run)
-    input_hash = TaskState.snapshot_hash(snapshot)
+    view = StateView.new(rtg, run.channels)
+    input_hash = TaskState.snapshot_hash(view.values)
 
     node_ids
     |> Enum.sort()
@@ -117,8 +110,8 @@ defmodule Docket.Runtime.Algorithm do
               step: run.step,
               attempt: 1,
               input_hash: input_hash,
-              snapshot: snapshot,
-              source_versions: versions
+              snapshot: view.values,
+              source_versions: view.versions
             })
 
           {:cont, {:ok, [activation | acc]}}
@@ -217,47 +210,6 @@ defmodule Docket.Runtime.Algorithm do
       {:error, errors} ->
         message = Enum.map_join(errors, "; ", fn {_key, message} -> message end)
         {:error, Docket.Error.new(:invalid_policy, message, node_id: node_id, phase: :plan)}
-    end
-  end
-
-  @doc """
-  Builds the committed state snapshot: one flat map keyed by public input and
-  field ID.
-
-  Never-written channels are absent unless the graph declares a non-nil
-  default, so nodes and guards see missing state as missing rather than nil.
-  """
-  def state_snapshot(rtg, run) do
-    for {channel_id, {kind, public_id}} <- rtg.lowering.runtime_to_public,
-        kind in [:input, :field],
-        {:ok, value} <- [snapshot_value(rtg, run, channel_id)],
-        into: %{} do
-      {public_id, value}
-    end
-  end
-
-  defp snapshot_value(rtg, run, channel_id) do
-    case Map.fetch(run.channels, channel_id) do
-      {:ok, %ChannelState{value: value}} ->
-        {:ok, value}
-
-      :error ->
-        case Map.fetch!(rtg.channels, channel_id).default do
-          nil -> :missing
-          default -> {:ok, default}
-        end
-    end
-  end
-
-  @doc false
-  def state_versions(rtg, run) do
-    for {channel_id, {kind, public_id}} <- rtg.lowering.runtime_to_public,
-        kind in [:input, :field],
-        into: %{} do
-      case Map.fetch(run.channels, channel_id) do
-        {:ok, %ChannelState{version: version}} -> {public_id, version}
-        :error -> {public_id, 0}
-      end
     end
   end
 
@@ -404,7 +356,7 @@ defmodule Docket.Runtime.Algorithm do
   or `{:error, {edge_id, reasons}}` on guard evaluation failure.
   """
   def evaluate_edge_triggers(rtg, channels, ok_node_ids, changed_fields) do
-    guard_context = guard_context(rtg, channels, changed_fields)
+    view = StateView.new(rtg, channels, changed_fields)
     ok_set = MapSet.new(ok_node_ids)
 
     edges =
@@ -422,7 +374,7 @@ defmodule Docket.Runtime.Algorithm do
     candidates
     |> Enum.reduce_while({:ok, {channels, [], []}}, fn edge,
                                                        {:ok, {channels, triggered, finish}} ->
-      case edge_triggers?(edge, guard_context) do
+      case edge_triggers?(edge, view) do
         {:ok, false} ->
           {:cont, {:ok, {channels, triggered, finish}}}
 
@@ -489,7 +441,7 @@ defmodule Docket.Runtime.Algorithm do
   the initial committed state (the input channels just written).
   """
   def evaluate_start_edges(rtg, channels, changed_input_ids) do
-    guard_context = guard_context(rtg, channels, MapSet.new(changed_input_ids))
+    view = StateView.new(rtg, channels, changed_input_ids)
 
     start_edges =
       rtg.edges
@@ -498,7 +450,7 @@ defmodule Docket.Runtime.Algorithm do
       |> Enum.sort_by(& &1.id)
 
     Enum.reduce_while(start_edges, {:ok, {channels, []}}, fn edge, {:ok, {channels, triggered}} ->
-      case edge_triggers?(edge, guard_context) do
+      case edge_triggers?(edge, view) do
         {:ok, true} ->
           {:cont, {:ok, {bump_channel(channels, edge.channel_id, true), [edge.id | triggered]}}}
 
@@ -522,19 +474,8 @@ defmodule Docket.Runtime.Algorithm do
   # Guards
   # ---------------------------------------------------------------------------
 
-  @doc false
-  def guard_context(rtg, channels, changed_fields) do
-    run_view = %Docket.Run{channels: channels}
-
-    %{
-      values: state_snapshot(rtg, run_view),
-      versions: state_versions(rtg, run_view),
-      changed: changed_fields
-    }
-  end
-
   @doc """
-  Evaluates a guard expression against committed state.
+  Evaluates a guard expression against a committed `Docket.Runtime.StateView`.
 
   Guards are lax: never-written channels and missing path segments make
   `exists/1`, `equals/2`, and `changed/1` false rather than raising.

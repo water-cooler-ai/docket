@@ -71,7 +71,7 @@ The graph and execution core needs only Docket:
 ```elixir
 def deps do
   [
-    {:docket, "~> 0.2.0"}
+    {:docket, "~> 0.3.0"}
   ]
 end
 ```
@@ -166,7 +166,7 @@ three dependencies directly:
 ```elixir
 def deps do
   [
-    {:docket, "~> 0.2.0"},
+    {:docket, "~> 0.3.0"},
     {:ecto_sql, "~> 3.10"},
     {:postgrex, "~> 0.17"}
   ]

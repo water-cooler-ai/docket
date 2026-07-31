@@ -83,6 +83,13 @@ defmodule Docket.Runtime.FailureRetryTest do
 
       run_failed = List.last(checkpoints)
       assert Enum.any?(run_failed.events, &(&1.payload["reason"] =~ "unknown field"))
+
+      assert [failed_event] = Enum.filter(run_failed.events, &(&1.type == :run_failed))
+      assert failed_event.node_id == "writer"
+      assert failed_event.payload["reason"] == "node_failed"
+      assert failed_event.payload["message"] == run.failure.message
+      assert failed_event.payload["nodes"] == ["writer"]
+      assert failed_event.payload["errors"]["writer"] =~ "unknown field"
     end
 
     test "schema-invalid writes fail the superstep" do
@@ -261,10 +268,13 @@ defmodule Docket.Runtime.FailureRetryTest do
       assert {:ok, run, checkpoints} = Docket.Test.run_inline(rtg, %{})
 
       assert run.status == :failed
-      assert %Docket.Run.Failure{code: "invalid_policy"} = run.failure
+      assert %Docket.Run.Failure{code: "invalid_policy", node_id: "flaky"} = run.failure
 
       run_failed = List.last(checkpoints)
-      assert Enum.any?(run_failed.events, &(&1.payload["reason"] == "invalid_policy"))
+      assert [event] = Enum.filter(run_failed.events, &(&1.type == :run_failed))
+      assert event.node_id == "flaky"
+      assert event.payload["reason"] == "invalid_policy"
+      assert event.payload["message"] == run.failure.message
     end
 
     test "the reserved on_error policy is rejected at plan time" do
