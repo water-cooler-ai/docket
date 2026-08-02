@@ -200,6 +200,145 @@ defmodule Docket.RunTest do
     end
   end
 
+  describe "validate_durable/1 detached task shapes" do
+    @scheduled ~U[2026-07-03 10:00:02.000000Z]
+    @deadline ~U[2026-07-03 10:00:32.000000Z]
+
+    defp pending_task(overrides) do
+      snapshot = %{}
+      task_id = TaskState.task_id("run_1", 0, "n")
+
+      struct!(
+        %TaskState{
+          task_id: task_id,
+          node_id: "n",
+          step: 0,
+          attempt: 1,
+          status: :detached_pending,
+          input_hash: TaskState.snapshot_hash(snapshot),
+          idempotency_key: TaskState.idempotency_key(task_id, 1),
+          snapshot: snapshot,
+          source_versions: %{},
+          scheduled_at: @scheduled,
+          failures: []
+        },
+        overrides
+      )
+    end
+
+    defp running_with(task, timers) do
+      %{
+        durable_run()
+        | status: :running,
+          active_tasks: %{task.task_id => task},
+          timers: timers
+      }
+    end
+
+    test "an unbounded pending task is legal with no timer and no deadline" do
+      task = pending_task([])
+      assert :ok = Run.validate_durable(running_with(task, %{}))
+    end
+
+    test "a bounded pending task requires its schedule-to-start timer to match" do
+      task = pending_task(deadline_at: @deadline)
+      timer = %TimerState{kind: :schedule_to_start, fires_at: @deadline}
+
+      assert :ok = Run.validate_durable(running_with(task, %{task.task_id => timer}))
+
+      # Deadline without a timer, timer without a deadline, and a mismatched
+      # or wrong-kind timer are all unrepresentable.
+      assert {:error, %Docket.Error{}} = Run.validate_durable(running_with(task, %{}))
+
+      assert {:error, %Docket.Error{}} =
+               Run.validate_durable(running_with(pending_task([]), %{task.task_id => timer}))
+
+      late = %TimerState{kind: :schedule_to_start, fires_at: DateTime.add(@deadline, 1)}
+
+      assert {:error, %Docket.Error{}} =
+               Run.validate_durable(running_with(task, %{task.task_id => late}))
+
+      retry = %TimerState{kind: :retry, fires_at: @deadline}
+
+      assert {:error, %Docket.Error{}} =
+               Run.validate_durable(running_with(task, %{task.task_id => retry}))
+    end
+
+    test "a pending task never carries a claim instant or token material" do
+      claimed_at = pending_task(started_at: @scheduled)
+      assert {:error, %Docket.Error{}} = Run.validate_durable(running_with(claimed_at, %{}))
+    end
+
+    test "a claimed task without a start-to-close deadline is unrepresentable" do
+      claimed =
+        pending_task(status: :detached_claimed, started_at: @scheduled, deadline_at: @deadline)
+
+      assert :ok = Run.validate_durable(running_with(claimed, %{}))
+
+      assert {:error, %Docket.Error{}} =
+               Run.validate_durable(running_with(%{claimed | deadline_at: nil}, %{}))
+
+      assert {:error, %Docket.Error{}} =
+               Run.validate_durable(running_with(%{claimed | started_at: nil}, %{}))
+
+      # A claimed task carries no timer in this schema; a stray one has no
+      # owning semantics.
+      stray = %TimerState{kind: :schedule_to_start, fires_at: @deadline}
+
+      assert {:error, %Docket.Error{}} =
+               Run.validate_durable(running_with(claimed, %{claimed.task_id => stray}))
+    end
+
+    test "a fresh pending attempt has no failures; the attempt count still binds" do
+      # Attempt 2 with an empty history breaks attempt == failures + 1.
+      task_id = TaskState.task_id("run_1", 0, "n")
+
+      stale =
+        pending_task(attempt: 2, idempotency_key: TaskState.idempotency_key(task_id, 2))
+
+      assert {:error, %Docket.Error{}} = Run.validate_durable(running_with(stale, %{}))
+
+      # A retry-scheduled attempt still requires a non-empty history.
+      retry_task =
+        pending_task(status: :retry_scheduled, scheduled_at: nil, failures: [])
+
+      timer = %TimerState{kind: :retry, fires_at: @deadline}
+
+      assert {:error, %Docket.Error{}} =
+               Run.validate_durable(running_with(retry_task, %{retry_task.task_id => timer}))
+    end
+
+    test "a retry-scheduled attempt rejects detached lifetimes" do
+      task_id = TaskState.task_id("run_1", 0, "n")
+
+      retry_task =
+        pending_task(
+          status: :retry_scheduled,
+          attempt: 2,
+          idempotency_key: TaskState.idempotency_key(task_id, 2),
+          failures: [%{attempt: 1, reason: "boom"}]
+        )
+
+      timer = %TimerState{kind: :retry, fires_at: @deadline}
+      timers = %{retry_task.task_id => timer}
+
+      assert {:error, %Docket.Error{}} =
+               Run.validate_durable(running_with(retry_task, timers))
+
+      assert :ok =
+               Run.validate_durable(running_with(%{retry_task | scheduled_at: nil}, timers))
+    end
+
+    test "unknown task statuses and stray timers stay invalid" do
+      unknown = pending_task(status: :detached)
+      assert {:error, %Docket.Error{}} = Run.validate_durable(running_with(unknown, %{}))
+
+      task = pending_task([])
+      stray = %{"other_task" => %TimerState{kind: :retry, fires_at: @deadline}}
+      assert {:error, %Docket.Error{}} = Run.validate_durable(running_with(task, stray))
+    end
+  end
+
   describe "Failure.new/3" do
     test "builds a failure and validates its fields" do
       assert Failure.new("node_failed", "boom", node_id: "n1", details: %{"k" => "v"}) ==

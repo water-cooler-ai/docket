@@ -12,6 +12,7 @@ defmodule Docket.Runtime.Algorithm do
   alias Docket.Guard
   alias Docket.Run.{ChannelState, TaskState}
   alias Docket.Runtime.{Activation, StateView}
+  alias Docket.Runtime.Graph.Node
   alias Docket.{Reducer, Schema, Wire}
 
   @start_id "$start"
@@ -182,7 +183,8 @@ defmodule Docket.Runtime.Algorithm do
       source_versions: identity.source_versions,
       config: node.config,
       timeout_ms: policies.timeout_ms,
-      retry: policies.retry
+      retry: policies.retry,
+      detach: policies.detach
     }
   end
 
@@ -203,14 +205,28 @@ defmodule Docket.Runtime.Algorithm do
   end
 
   defp resolved_policies(node, node_id) do
-    case Policies.node_policies(node.policies) do
-      {:ok, policies} ->
-        {:ok, policies}
-
-      {:error, errors} ->
-        message = Enum.map_join(errors, "; ", fn {_key, message} -> message end)
-        {:error, Docket.Error.new(:invalid_policy, message, node_id: node_id, phase: :plan)}
+    with {:ok, policies} <- policy_result(Policies.node_policies(node.policies), node_id),
+         {:ok, detach} <- resolved_detach(node, node_id) do
+      {:ok, Map.put(policies, :detach, detach)}
     end
+  end
+
+  # Detach policies resolve only for detached nodes; a module node's
+  # activation carries no detach shape (compile validation rejects the block
+  # on module nodes).
+  defp resolved_detach(node, node_id) do
+    if Node.detached?(node) do
+      policy_result(Policies.detach_node_policies(node.policies), node_id)
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp policy_result({:ok, resolved}, _node_id), do: {:ok, resolved}
+
+  defp policy_result({:error, errors}, node_id) do
+    message = Enum.map_join(errors, "; ", fn {_key, message} -> message end)
+    {:error, Docket.Error.new(:invalid_policy, message, node_id: node_id, phase: :plan)}
   end
 
   # ---------------------------------------------------------------------------

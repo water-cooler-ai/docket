@@ -941,10 +941,233 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                    next,
                    lease.claim_token,
                    run.checkpoint_seq,
-                   {:release_claim, :external}
+                   {:release_claim, :terminal}
                  ),
                  []
                )
+    end
+
+    describe "detached claim index" do
+      test "the fused claimed commit writes the pending row atomically with the park" do
+        run = initialized_run("detached-park")
+
+        assert {:ok, ^run} =
+                 RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
+
+        lease = claim_one(@now)
+        task = pending_detached(run, "summarize")
+
+        parked = %{
+          run
+          | checkpoint_seq: run.checkpoint_seq + 1,
+            active_tasks: %{task.task_id => task}
+        }
+
+        assert {:ok, _} =
+                 MomentStore.commit(
+                   TestRepo,
+                   :system,
+                   %{
+                     proposal(
+                       parked,
+                       lease.claim_token,
+                       run.checkpoint_seq,
+                       {:release_claim, :external}
+                     )
+                     | checkpoint_type: :detach_scheduled
+                   },
+                   []
+                 )
+
+        assert [row] = index_rows(run.id)
+        assert row.task_id == task.task_id
+        assert row.node_id == "summarize"
+        assert row.attempt == 1
+        assert row.state == "pending"
+        assert row.tenant_id == nil
+        assert row.scope_key == ""
+        assert row.scheduled_at == @now
+        assert row.claimed_at == nil
+        assert row.deadline_at == nil
+
+        # The same commit released the claim with no wake: the run waits on
+        # an external event, newly legal for a running run.
+        stored = TestRepo.one!(from(r in Run, where: r.run_id == ^run.id))
+        assert stored.status == :running
+        assert stored.wake_at == nil
+        assert stored.claim_token == nil
+      end
+
+      test "a stale fence syncs nothing" do
+        run = initialized_run("detached-stale")
+
+        assert {:ok, ^run} =
+                 RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
+
+        lease = claim_one(@now)
+        task = pending_detached(run, "summarize")
+
+        parked = %{
+          run
+          | checkpoint_seq: run.checkpoint_seq + 2,
+            active_tasks: %{task.task_id => task}
+        }
+
+        assert {:error, _} =
+                 MomentStore.commit(
+                   TestRepo,
+                   :system,
+                   proposal(
+                     parked,
+                     lease.claim_token,
+                     run.checkpoint_seq + 1,
+                     {:release_claim, :external}
+                   ),
+                   []
+                 )
+
+        assert index_rows(run.id) == []
+      end
+
+      test "cancel removes the rows in the same terminal signal commit" do
+        run = park_detached_run!("detached-cancel")
+        assert [_row] = index_rows(run.id)
+
+        cancel_at = DateTime.add(@now, 5, :second)
+
+        assert {:ok, {:committed, _}} =
+                 RunStore.mutate_transition(TestRepo, :system, run.id, fn current ->
+                   {:ok, moment} = Docket.Runtime.RunMutation.cancel_run(current, cancel_at)
+                   {:commit, moment.run, :run_cancelled, {:release_claim, :terminal}, moment.run}
+                 end)
+
+        assert index_rows(run.id) == []
+        stored = TestRepo.one!(from(r in Run, where: r.run_id == ^run.id))
+        assert stored.status == :cancelled
+      end
+
+      test "an emptied detached set clears the rows through the fused commit" do
+        run = park_detached_run!("detached-empty", {:release_claim, {:at, @now}})
+        assert [_row] = index_rows(run.id)
+
+        lease = claim_one(@now)
+        cleared = %{run | checkpoint_seq: run.checkpoint_seq + 1, active_tasks: %{}}
+
+        assert {:ok, _} =
+                 MomentStore.commit(
+                   TestRepo,
+                   :system,
+                   proposal(
+                     cleared,
+                     lease.claim_token,
+                     run.checkpoint_seq,
+                     {:release_claim, :immediate}
+                   ),
+                   []
+                 )
+
+        assert index_rows(run.id) == []
+      end
+
+      test "a crash-window straggler rides the run FK cascade" do
+        run = park_detached_run!("detached-straggler")
+
+        assert {:ok, {:committed, _}} =
+                 RunStore.mutate_transition(TestRepo, :system, run.id, fn current ->
+                   {:ok, moment} =
+                     Docket.Runtime.RunMutation.cancel_run(
+                       current,
+                       DateTime.add(@now, 5, :second)
+                     )
+
+                   {:commit, moment.run, :run_cancelled, {:release_claim, :terminal}, moment.run}
+                 end)
+
+        assert index_rows(run.id) == []
+
+        # Manufacture the straggler the sync can no longer see, then delete
+        # the terminal run the way the pruner does.
+        TestRepo.insert_all(Docket.Postgres.Schemas.DetachedTask, [
+          %{
+            run_id: run.id,
+            tenant_id: nil,
+            task_id: "#{run.id}:0:straggler",
+            node_id: "straggler",
+            attempt: 1,
+            state: "pending",
+            scheduled_at: @now
+          }
+        ])
+
+        assert [_row] = index_rows(run.id)
+
+        TestRepo.query!("DELETE FROM docket_runs WHERE run_id = $1", [run.id], log: false)
+        assert index_rows(run.id) == []
+      end
+
+      test "abandon_claim with a nil retry_at records no wake and never poisons" do
+        insert_run!("abandon-external")
+        lease = claim_one(@now)
+
+        assert {:ok, :rescheduled} =
+                 RunStore.abandon_claim(
+                   TestRepo,
+                   :system,
+                   "abandon-external",
+                   lease.claim_token,
+                   %{
+                     expected_checkpoint_seq: lease.checkpoint_seq,
+                     now: @now,
+                     retry_at: nil,
+                     max_claim_abandons: 5,
+                     non_poisoning: true
+                   }
+                 )
+
+        stored = TestRepo.one!(from(r in Run, where: r.run_id == "abandon-external"))
+        assert stored.wake_at == nil
+        assert stored.claim_token == nil
+        assert stored.poisoned_at == nil
+      end
+
+      test "rows carry the run's tenancy" do
+        run = initialized_run("detached-tenant")
+
+        assert {:ok, ^run} =
+                 RunStore.insert_transition(
+                   TestRepo,
+                   {:tenant, "t1"},
+                   run,
+                   :run_initialized,
+                   @now
+                 )
+
+        lease = claim_one(@now)
+        task = pending_detached(run, "summarize")
+
+        parked = %{
+          run
+          | checkpoint_seq: run.checkpoint_seq + 1,
+            active_tasks: %{task.task_id => task}
+        }
+
+        assert {:ok, _} =
+                 MomentStore.commit(
+                   TestRepo,
+                   :system,
+                   proposal(
+                     parked,
+                     lease.claim_token,
+                     run.checkpoint_seq,
+                     {:release_claim, :external}
+                   ),
+                   []
+                 )
+
+        assert [row] = index_rows(run.id)
+        assert row.tenant_id == "t1"
+        assert row.scope_key == "t1"
+      end
     end
 
     test "returns an empty typed batch when no work is eligible" do
@@ -2497,6 +2720,62 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         checkpoint_type: :step_committed,
         schedule: schedule
       }
+    end
+
+    defp pending_detached(run, node_id) do
+      snapshot = %{}
+      task_id = Docket.Run.TaskState.task_id(run.id, run.step, node_id)
+
+      %Docket.Run.TaskState{
+        task_id: task_id,
+        node_id: node_id,
+        step: run.step,
+        attempt: 1,
+        status: :detached_pending,
+        input_hash: Docket.Run.TaskState.snapshot_hash(snapshot),
+        idempotency_key: Docket.Run.TaskState.idempotency_key(task_id, 1),
+        snapshot: snapshot,
+        source_versions: %{},
+        scheduled_at: @now,
+        failures: []
+      }
+    end
+
+    defp index_rows(run_id) do
+      TestRepo.all(
+        from(task in Docket.Postgres.Schemas.DetachedTask,
+          where: task.run_id == ^run_id,
+          order_by: task.task_id
+        )
+      )
+    end
+
+    # Inserts, claims, and parks one run with a single pending detached task
+    # through the fused commit, returning the parked run document.
+    defp park_detached_run!(run_id, schedule \\ {:release_claim, :external}) do
+      run = initialized_run(run_id)
+
+      {:ok, ^run} =
+        RunStore.insert_transition(TestRepo, :tenantless, run, :run_initialized, @now)
+
+      lease = claim_one(@now)
+      task = pending_detached(run, "summarize")
+
+      parked = %{
+        run
+        | checkpoint_seq: run.checkpoint_seq + 1,
+          active_tasks: %{task.task_id => task}
+      }
+
+      {:ok, _} =
+        MomentStore.commit(
+          TestRepo,
+          :system,
+          proposal(parked, lease.claim_token, run.checkpoint_seq, schedule),
+          []
+        )
+
+      parked
     end
 
     defp current_claim?(run_id, token) do

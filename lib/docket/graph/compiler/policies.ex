@@ -185,6 +185,46 @@ defmodule Docket.Graph.Compiler.Policies do
 
   def detach_policies(_other), do: :ok
 
+  @typedoc "Resolved detach policies for one planned detached-node activation."
+  @type detach_policies :: %{
+          schedule_to_start_ms: pos_integer() | nil,
+          start_to_close_ms: pos_integer() | nil,
+          on_deadline: :reschedule | :fail
+        }
+
+  @doc """
+  Resolves a detached node's `"detach"` policy block into its runtime shape.
+
+  Declaration-time defaults apply: `schedule_to_start_ms` defaults to nil
+  (unbounded queue wait), `on_deadline` to `:reschedule`. `start_to_close_ms`
+  stays nil when undeclared - the instance default fills it when the deadline
+  is computed at claim time, not at planning time. An absent block resolves
+  entirely from defaults.
+  """
+  @spec detach_node_policies(term()) ::
+          {:ok, detach_policies()} | {:error, [{String.t(), String.t()}]}
+  def detach_node_policies(policies) when is_map(policies) and not is_struct(policies) do
+    detach = Map.get(policies, @detach_key) || %{}
+
+    with :ok <- detach_policies(policies) do
+      {:ok,
+       %{
+         schedule_to_start_ms: Map.get(detach, "schedule_to_start_ms"),
+         start_to_close_ms: Map.get(detach, "start_to_close_ms"),
+         on_deadline:
+           case Map.get(detach, "on_deadline") do
+             nil -> :reschedule
+             "reschedule" -> :reschedule
+             "fail" -> :fail
+           end
+       }}
+    end
+  end
+
+  def detach_node_policies(other) do
+    {:error, [{@detach_key, "node policies must be a map, got #{inspect(other)}"}]}
+  end
+
   defp detach_errors(detach) do
     ms_errors =
       for key <- @detach_ms_keys,

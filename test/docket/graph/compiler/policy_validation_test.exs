@@ -104,6 +104,45 @@ defmodule Docket.Graph.Compiler.PolicyValidationTest do
     end
   end
 
+  describe "detach policy resolution" do
+    alias Docket.Graph.Compiler.Policies
+
+    test "resolves defaults for an absent or empty block" do
+      for policies <- [%{}, %{"detach" => %{}}] do
+        assert {:ok,
+                %{schedule_to_start_ms: nil, start_to_close_ms: nil, on_deadline: :reschedule}} =
+                 Policies.detach_node_policies(policies)
+      end
+    end
+
+    test "resolves every declared value, including explicit nils" do
+      assert {:ok,
+              %{schedule_to_start_ms: 60_000, start_to_close_ms: 600_000, on_deadline: :fail}} =
+               Policies.detach_node_policies(%{
+                 "detach" => %{
+                   "start_to_close_ms" => 600_000,
+                   "schedule_to_start_ms" => 60_000,
+                   "on_deadline" => "fail"
+                 }
+               })
+
+      # A declared-nil value is legal-unset, exactly as validation admits it.
+      assert {:ok, %{schedule_to_start_ms: nil, start_to_close_ms: nil, on_deadline: :reschedule}} =
+               Policies.detach_node_policies(%{
+                 "detach" => %{
+                   "start_to_close_ms" => nil,
+                   "schedule_to_start_ms" => nil,
+                   "on_deadline" => nil
+                 }
+               })
+    end
+
+    test "rejects what validation rejects" do
+      assert {:error, [{_key, _message} | _]} =
+               Policies.detach_node_policies(%{"detach" => %{"on_deadline" => "explode"}})
+    end
+  end
+
   describe "detach policies" do
     defp with_detach_policies(policies) do
       Graph.update_node!(Graphs.detached_linear(), "summarize", policies: policies)

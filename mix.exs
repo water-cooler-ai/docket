@@ -83,6 +83,8 @@ defmodule Docket.MixProject do
          filename: "architecture-migration-0.1.1-to-0.1.2"},
         {"docs/architecture/migration-0.1.2-to-0.2.0.md",
          filename: "architecture-migration-0.1.2-to-0.2.0"},
+        {"docs/architecture/migration-0.3.0-to-0.4.0.md",
+         filename: "architecture-migration-0.3.0-to-0.4.0"},
         {"examples/parent-app-integration.md", filename: "example-parent-app-integration"},
         {"examples/llm-node.md", filename: "example-llm-node"}
       ],

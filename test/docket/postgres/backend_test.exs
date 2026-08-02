@@ -357,7 +357,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       context = Docket.Postgres.context(opts)
 
-      assert_raise ArgumentError, ~r/requires schema version 2, found 0/, fn ->
+      assert_raise ArgumentError, ~r/requires schema version 3, found 0/, fn ->
         Docket.Postgres.init({opts, context})
       end
     end
@@ -1022,7 +1022,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       context = Docket.Postgres.context(opts)
 
-      assert_raise ArgumentError, ~r/requires schema version 2, found 1/, fn ->
+      assert_raise ArgumentError, ~r/requires schema version 3, found 1/, fn ->
         Docket.Postgres.init({opts, context})
       end
     end
@@ -1035,7 +1035,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         )
 
       TestRepo.query!(
-        ~s(COMMENT ON TABLE "docket_wrong_shape"."docket_runs" IS '2'),
+        ~s(COMMENT ON TABLE "docket_wrong_shape"."docket_runs" IS '3'),
         [],
         log: false
       )
@@ -1108,6 +1108,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                  docket_claim_partitions
                  docket_claim_policy
                  docket_claim_schedule
+                 docket_detached_tasks
                  docket_events
                  docket_graph_versions
                  docket_runs

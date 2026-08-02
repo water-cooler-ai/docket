@@ -12,7 +12,7 @@ defmodule Docket.Runtime.RunMutation do
   """
 
   alias Docket.{Error, Run, Schema, Wire}
-  alias Docket.Run.{InterruptState, TimerState}
+  alias Docket.Run.{InterruptState, TaskState, TimerState}
   alias Docket.Runtime.{Algorithm, Graph, Moment}
 
   @type mutation_result :: {:ok, Moment.t()} | {:error, Error.t()}
@@ -27,10 +27,11 @@ defmodule Docket.Runtime.RunMutation do
   distinguished from an unknown interrupt, and the stored schema plus graph
   field contract both validate the resolution value.
 
-  Resolution proposes an immediate wake unless every active attempt is
-  parked behind a future retry deadline; then it parks at the earliest
-  deadline, so the committed wake never precedes the first dispatchable
-  attempt.
+  Resolution proposes an immediate wake unless no active attempt is
+  dispatchable; then it parks at the earliest future deadline, or
+  externally when none exists (every outstanding task is a pending detached
+  task with no live deadline). The committed wake never precedes the first
+  dispatchable attempt.
   """
   @spec resolve_interrupt(Graph.t(), Run.t(), String.t(), term(), DateTime.t()) ::
           mutation_result()
@@ -131,25 +132,45 @@ defmodule Docket.Runtime.RunMutation do
 
   def cancel_run(%Run{} = run, %DateTime{}), do: non_durable_run(run)
 
-  # An active attempt without a timer is dispatchable now; committed retry
-  # parks always write one timer per active task.
+  # A retry-scheduled attempt without a timer or with a due timer is
+  # dispatchable now. Parked detached tasks are never dispatchable and
+  # their schedule-to-start timers never wake the run; a run whose only
+  # outstanding work is such tasks parks externally.
   defp resolution_disposition(%Run{active_tasks: tasks} = run, now) when map_size(tasks) > 0 do
-    deadlines =
-      Enum.map(tasks, fn {task_id, _task} ->
-        case Map.fetch(run.timers, task_id) do
-          {:ok, %TimerState{fires_at: fires_at}} -> fires_at
-          :error -> nil
-        end
-      end)
+    cond do
+      Enum.any?(tasks, fn {task_id, task} -> dispatchable_now?(run, task_id, task, now) end) ->
+        {:park, :immediate, :interrupt_resolved}
 
-    if Enum.any?(deadlines, &(is_nil(&1) or DateTime.compare(&1, now) != :gt)) do
-      {:park, :immediate, :interrupt_resolved}
-    else
-      {:park, {:at, Enum.min(deadlines, DateTime)}, :interrupt_resolved}
+      wake = next_wake(run.timers) ->
+        {:park, {:at, wake}, :interrupt_resolved}
+
+      true ->
+        {:park, :external, :interrupt_resolved}
     end
   end
 
   defp resolution_disposition(%Run{}, _now), do: {:park, :immediate, :interrupt_resolved}
+
+  defp dispatchable_now?(_run, _task_id, %TaskState{status: status}, _now)
+       when status in [:detached_pending, :detached_claimed],
+       do: false
+
+  defp dispatchable_now?(run, task_id, %TaskState{}, now) do
+    case Map.fetch(run.timers, task_id) do
+      {:ok, %TimerState{fires_at: fires_at}} -> DateTime.compare(fires_at, now) != :gt
+      :error -> true
+    end
+  end
+
+  defp next_wake(timers) do
+    fires =
+      for {_task_id, %TimerState{kind: :retry, fires_at: fires_at}} <- timers, do: fires_at
+
+    case fires do
+      [] -> nil
+      fires -> Enum.min(fires, DateTime)
+    end
+  end
 
   defp durable_resolution(value) do
     case Wire.dump_value(value) do

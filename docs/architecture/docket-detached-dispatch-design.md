@@ -479,9 +479,11 @@ not the run.
   table and its indexes) and bumps `@current_version` to 3.
   `mix docket.gen.migration` stays fresh-install-only with no upgrade
   flags; the release's migration guide documents the hand-pinned
-  `Migration.up(version: 3)` / `down(version: 2)` snippet, per the
-  established doctrine and doc pattern (schema impact stated in the lede,
-  removed APIs, mandatory declarations, upgrade steps).
+  `Migration.up(version: 3)` / `down(version: 3)` snippet — both directions
+  pin the version the release adds, since `down/1` tears down from the
+  installed version through the given one — per the established doctrine
+  and doc pattern (schema impact stated in the lede, removed APIs,
+  mandatory declarations, upgrade steps).
 - **Pruning needs no change.** The pruner deletes terminal runs only, and a
   terminal run has no live index rows (cancel/completion removed them); the
   FK cascade covers crash-window stragglers. A run parked on an unbounded

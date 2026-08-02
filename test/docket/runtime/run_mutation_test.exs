@@ -124,6 +124,55 @@ defmodule Docket.Runtime.RunMutationTest do
       assert moment.checkpoint_metadata["wake_disposition"] == "immediate"
     end
 
+    test "parks externally when only unbounded pending detached tasks remain" do
+      {rtg, run} = waiting_run()
+      [interrupt_id] = Map.keys(run.interrupts)
+
+      pending = %TaskState{
+        task_id: "detached",
+        node_id: "detached",
+        step: run.step,
+        attempt: 1,
+        status: :detached_pending,
+        scheduled_at: @now
+      }
+
+      parked = %{run | active_tasks: %{"detached" => pending}}
+
+      assert {:ok, %Moment{} = moment} =
+               RunMutation.resolve_interrupt(rtg, parked, interrupt_id, "approved", @now)
+
+      assert moment.disposition == {:park, :external, :interrupt_resolved}
+      assert moment.checkpoint_metadata["wake_disposition"] == "external"
+    end
+
+    test "a bounded pending detached deadline never contributes a wake" do
+      {rtg, run} = waiting_run()
+      [interrupt_id] = Map.keys(run.interrupts)
+      deadline = DateTime.add(@now, 45, :second)
+
+      pending = %TaskState{
+        task_id: "detached",
+        node_id: "detached",
+        step: run.step,
+        attempt: 1,
+        status: :detached_pending,
+        scheduled_at: @now,
+        deadline_at: deadline
+      }
+
+      parked = %{
+        run
+        | active_tasks: %{"detached" => pending},
+          timers: %{"detached" => %TimerState{kind: :schedule_to_start, fires_at: deadline}}
+      }
+
+      assert {:ok, %Moment{} = moment} =
+               RunMutation.resolve_interrupt(rtg, parked, interrupt_id, "approved", @now)
+
+      assert moment.disposition == {:park, :external, :interrupt_resolved}
+    end
+
     test "proposes an immediate wake when an active attempt has no timer" do
       {rtg, run} = waiting_run()
       [interrupt_id] = Map.keys(run.interrupts)

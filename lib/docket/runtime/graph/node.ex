@@ -32,4 +32,11 @@ defmodule Docket.Runtime.Graph.Node do
           policies: map(),
           metadata: map()
         }
+
+  @doc false
+  # A lowered node without a module is a detached node: compile validation
+  # rejects a module node with a missing implementation, so lowering's
+  # `{nil, nil}` target is produced for `%{type: :detached}` only.
+  @spec detached?(t()) :: boolean()
+  def detached?(%__MODULE__{module: module}), do: is_nil(module)
 end

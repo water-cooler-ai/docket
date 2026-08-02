@@ -4,9 +4,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     PostgreSQL-native one-statement commitment for a claimed runtime moment.
 
     The checkpoint fence, immutable run binding, scoped run update, assigned
-    event insert, and optional wake notification execute as one PostgreSQL
-    statement. PostgreSQL statement atomicity makes the run update and event
-    insert indivisible without an explicit transaction.
+    event insert, detached claim-index sync, and optional wake notification
+    execute as one PostgreSQL statement. PostgreSQL statement atomicity makes
+    the run update, event insert, and index sync indivisible without an
+    explicit transaction.
 
     A zero-row update pays one diagnostic read to preserve the public
     `:not_found` / `:invalid_commit` / `:stale_fence` distinction. The
@@ -49,11 +50,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp execute(repo, prefix, ctx, scope, proposal, event_attrs, params) do
       case Ecto.Adapters.SQL.query!(repo, statement(prefix), params, log: false).rows do
-        [[1, inserted, admitted_at, _guards]] when inserted == length(event_attrs) ->
+        [[1, inserted, admitted_at, _guards, _detached]] when inserted == length(event_attrs) ->
           maybe_emit_admission_release(admitted_at, proposal.schedule)
           {:ok, proposal.run}
 
-        [[0, 0, nil, _guards]] ->
+        [[0, 0, nil, _guards, 0]] ->
           RunStore.classify_commit_miss(ctx, scope, proposal)
 
         rows ->
@@ -70,6 +71,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp statement_params(attrs, proposal, events, scope_system?, scope_key, prefix) do
       {schedule_code, schedule_at} = schedule_values(proposal.schedule)
+      detached = Docket.Run.detached_tasks(proposal.run)
 
       [
         attrs.run_id,
@@ -99,13 +101,21 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         Enum.map(events, & &1.task_id),
         Enum.map(events, & &1.payload),
         Enum.map(events, & &1.metadata),
-        Enum.map(events, & &1.occurred_at)
+        Enum.map(events, & &1.occurred_at),
+        Enum.map(detached, & &1.task_id),
+        Enum.map(detached, & &1.node_id),
+        Enum.map(detached, & &1.attempt),
+        Enum.map(detached, &Docket.Run.TaskState.index_state/1),
+        Enum.map(detached, &normalize_database_datetime(&1.scheduled_at)),
+        Enum.map(detached, &normalize_optional_datetime(&1.started_at)),
+        Enum.map(detached, &normalize_optional_datetime(&1.deadline_at))
       ]
     end
 
     defp statement(prefix) do
       runs = Storage.qualified_table(prefix, "docket_runs")
       events = Storage.qualified_table(prefix, "docket_events")
+      detached = Storage.qualified_table(prefix, "docket_detached_tasks")
 
       """
       WITH target AS MATERIALIZED (
@@ -161,7 +171,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           AND run.started_at = $6::timestamptz
           AND run.checkpoint_seq = $7::bigint
           AND run.claim_token = $8::uuid
-        RETURNING run.run_id, target.tenant_admitted_at
+        RETURNING run.run_id, run.tenant_id, target.tenant_admitted_at
       ),
       proposed_events AS MATERIALIZED (
         SELECT *
@@ -265,6 +275,70 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
               (SELECT count(*) FROM proposed_events)
         RETURNING seq
       ),
+      proposed_detached AS MATERIALIZED (
+        SELECT *
+        FROM unnest(
+          $29::text[],
+          $30::text[],
+          $31::integer[],
+          $32::text[],
+          $33::timestamptz[],
+          $34::timestamptz[],
+          $35::timestamptz[]
+        ) AS task(
+          task_id,
+          node_id,
+          attempt,
+          state,
+          scheduled_at,
+          claimed_at,
+          deadline_at
+        )
+      ),
+      -- The claim index is a projection of the committed run's detached
+      -- tasks: rows outside the proposed set are stale and deleted, rows in
+      -- it are upserted in place. The two row sets are disjoint, and an
+      -- empty proposed set clears every row of the run. Both CTEs join
+      -- updated_run, so a failed fence syncs nothing.
+      deleted_detached AS (
+        DELETE FROM #{detached} AS task
+        USING updated_run
+        WHERE task.run_id = updated_run.run_id
+          AND task.task_id <> ALL ($29::text[])
+        RETURNING task.id
+      ),
+      upserted_detached AS (
+        INSERT INTO #{detached} AS stored_task (
+          run_id,
+          tenant_id,
+          task_id,
+          node_id,
+          attempt,
+          state,
+          scheduled_at,
+          claimed_at,
+          deadline_at
+        )
+        SELECT
+          updated_run.run_id,
+          updated_run.tenant_id,
+          task.task_id,
+          task.node_id,
+          task.attempt,
+          task.state,
+          task.scheduled_at,
+          task.claimed_at,
+          task.deadline_at
+        FROM updated_run
+        CROSS JOIN proposed_detached AS task
+        ON CONFLICT (run_id, task_id) DO UPDATE
+        SET attempt = EXCLUDED.attempt,
+            state = EXCLUDED.state,
+            scheduled_at = EXCLUDED.scheduled_at,
+            claimed_at = EXCLUDED.claimed_at,
+            deadline_at = EXCLUDED.deadline_at
+        RETURNING stored_task.id
+      ),
       notification AS (
         SELECT pg_notify($18::text, $19::text)
         FROM updated_run
@@ -279,7 +353,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
         (SELECT count(*)::bigint FROM inserted_events),
         (SELECT tenant_admitted_at FROM updated_run LIMIT 1),
         (SELECT count(*)::bigint FROM notification) +
-          (SELECT count(*)::bigint FROM event_conflict_guard)
+          (SELECT count(*)::bigint FROM event_conflict_guard),
+        (SELECT count(*)::bigint FROM deleted_detached) +
+          (SELECT count(*)::bigint FROM upserted_detached)
       """
     end
 

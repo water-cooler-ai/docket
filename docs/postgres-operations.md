@@ -396,17 +396,37 @@ end
 ```
 
 Stop dispatchers and all Docket run writers before the upgrade, deploy one
-homogeneous binary version, migrate, and restart. The migration locks the runs
-table against inserts while it backfills owner partitions and schedule rows.
-The current binary requires schema version 2 and checks it before starting
-backend children. Rolling back this schema-V1 upgrade removes the version 2
-admission schema, returning to schema version 1. Online migrations, readiness
-ledgers, fleet attestations, and audited activation are intentionally outside
-the v0.1.0 contract.
+homogeneous binary version, migrate, and restart. The V2 migration locks the
+runs table against inserts while it backfills owner partitions and schedule
+rows; rolling it back removes the version 2 admission schema, returning to
+schema version 1. Online migrations, readiness ledgers, fleet attestations,
+and audited activation are intentionally outside the v0.1.0 contract.
 
-Fresh installations use `mix docket.gen.migration`, which installs V01 and
-V02 in one host migration whose rollback removes the Docket schema. Use the
-same explicit prefix in both migration directions and runtime configuration.
+### Existing schema V2 installations
+
+Schema version 3 adds the `docket_detached_tasks` claim index and relaxes
+the runs-table running-schedule constraint so a running run may hold neither
+a wake nor a claim (parked on detached work with no live deadline). The
+upgrade pins both directions to the version it adds:
+
+```elixir
+defmodule MyApp.Repo.Migrations.UpgradeDocketToV3 do
+  use Ecto.Migration
+
+  def up, do: Docket.Postgres.Migration.up(version: 3)
+  def down, do: Docket.Postgres.Migration.down(version: 3)
+end
+```
+
+The current binary requires schema version 3 and checks it before starting
+backend children. The rollback refuses while any detached task is parked
+(the version-2 binary cannot decode a run holding one); cancel those runs
+or let them finish first.
+
+Fresh installations use `mix docket.gen.migration`, which installs V01
+through V03 in one host migration whose rollback removes the Docket schema.
+Use the same explicit prefix in both migration directions and runtime
+configuration.
 
 Claim-policy correctness is covered by the checked-in windowed engine suite
 and the shared run-store contract matrix. Timing and large benchmarks are
