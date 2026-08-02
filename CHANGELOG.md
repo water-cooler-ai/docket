@@ -52,8 +52,10 @@ project follows [Semantic Versioning](https://semver.org/).
 - **Breaking:** the PostgreSQL schema version is now 3. V03 adds
   `docket_detached_tasks` and relaxes the `docket_runs` running-schedule
   constraint from exactly-one to at-most-one of `wake_at`/`claim_token`.
-  See `docs/architecture/migration-0.3.0-to-0.4.0.md` for the hand-pinned
-  `up(version: 3)` / `down(version: 3)` snippet.
+  The rollback refuses while any detached task is parked - a parked task
+  lives in its run's encoded state, which the version-2 binary cannot
+  decode. See `docs/architecture/migration-0.3.0-to-0.4.0.md` for the
+  hand-pinned `up(version: 3)` / `down(version: 3)` snippet.
 - **Breaking:** `Docket.Run.TaskState` gained the `scheduled_at` field,
   changing the durable run encoding for runs parked inside an active
   superstep; such runs persisted by earlier releases fail to decode. The

@@ -103,18 +103,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     end
 
     def down(%{prefix: prefix}) do
+      refuse_down_with_parked_tasks!(prefix)
+
       drop_if_exists(table(:docket_detached_tasks, prefix: prefix))
 
       drop_if_exists(constraint(:docket_runs, @schedule_check_name, prefix: prefix))
-
-      # Runs in the V03-only shape (running, unpoisoned, neither wake nor
-      # claim) violate the exact-one form the recreated constraint validates
-      # against; they become immediately due instead.
-      execute(
-        "UPDATE #{Docket.Postgres.Storage.qualified_table(prefix, "docket_runs")} " <>
-          "SET wake_at = clock_timestamp() WHERE status = 'running' " <>
-          "AND poisoned_at IS NULL AND wake_at IS NULL AND claim_token IS NULL"
-      )
 
       create(
         constraint(:docket_runs, @schedule_check_name,
@@ -122,6 +115,32 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           prefix: prefix
         )
       )
+    end
+
+    # A parked detached task lives in its run's encoded state, which the
+    # version-2 binary cannot decode (TaskState gained scheduled_at), so a
+    # downgrade with parked tasks would strand runs no worker can execute or
+    # cancel. Index rows exist exactly when a non-terminal run holds parked
+    # detached tasks - the sync clears them in every terminal commit and the
+    # run FK cascades - so an empty index is the drained state the rollback
+    # requires.
+    defp refuse_down_with_parked_tasks!(prefix) do
+      table = Docket.Postgres.Storage.qualified_table(prefix, "docket_detached_tasks")
+
+      %{rows: [[table_exists]]} =
+        repo().query!("SELECT to_regclass($1) IS NOT NULL", [table], log: false)
+
+      parked? =
+        table_exists and
+          repo().query!("SELECT EXISTS (SELECT 1 FROM #{table})", [], log: false).rows == [
+            [true]
+          ]
+
+      if parked? do
+        raise "cannot downgrade the Docket schema to version 2 while detached tasks " <>
+                "are parked in prefix #{inspect(prefix)}; let their runs finish or " <>
+                "cancel them, then rerun the rollback"
+      end
     end
   end
 end

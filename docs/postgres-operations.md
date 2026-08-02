@@ -419,7 +419,9 @@ end
 ```
 
 The current binary requires schema version 3 and checks it before starting
-backend children.
+backend children. The rollback refuses while any detached task is parked
+(the version-2 binary cannot decode a run holding one); cancel those runs
+or let them finish first.
 
 Fresh installations use `mix docket.gen.migration`, which installs V01
 through V03 in one host migration whose rollback removes the Docket schema.

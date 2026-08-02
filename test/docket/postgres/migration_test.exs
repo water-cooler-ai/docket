@@ -403,9 +403,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                [["run-a", "tenant-a"], ["run-system", nil]]
     end
 
-    test "V3 down drops the claim index and restores the exact-schedule check" do
+    test "V3 down refuses while tasks are parked, then restores the exact-schedule check" do
       :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
-      insert_v1_graph_and_run("tenant-a", "run-external")
+      insert_v1_graph_and_run("tenant-a", "run-parked")
       :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
       :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
 
@@ -415,12 +415,38 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       # exact-one form has no boolean NOT.
       assert schedule_check_def() =~ "NOT ("
 
-      # A run in the V03-only shape (running, no wake, no claim) must not
-      # abort the rollback: down normalizes it to immediately due before
-      # recreating the exact-one constraint.
+      # A parked detached task lives in its run's encoded state, which the
+      # version-2 binary cannot decode: the rollback must refuse until the
+      # run finishes or is cancelled.
       TestRepo.query!(
         "UPDATE docket_runs SET wake_at = NULL, claim_token = NULL WHERE run_id = $1",
-        ["run-external"]
+        ["run-parked"]
+      )
+
+      TestRepo.query!(
+        """
+        INSERT INTO docket_detached_tasks
+          (run_id, tenant_id, task_id, node_id, attempt, state, scheduled_at)
+        VALUES ($1, 'tenant-a', $2, 'summarize', 1, 'pending', CURRENT_TIMESTAMP)
+        """,
+        ["run-parked", "run-parked:0:summarize"]
+      )
+
+      assert_raise RuntimeError, ~r/while detached tasks are parked/, fn ->
+        Ecto.Migrator.down(TestRepo, @v3, UpgradeV3, log: false)
+      end
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 3
+
+      # Draining (here: the cancel path's effect - the terminal commit
+      # clears the index row and the run's V03-only schedule shape) unblocks
+      # the rollback.
+      TestRepo.query!("DELETE FROM docket_detached_tasks WHERE run_id = $1", ["run-parked"])
+
+      TestRepo.query!(
+        "UPDATE docket_runs SET status = 'cancelled', finished_at = CURRENT_TIMESTAMP " <>
+          "WHERE run_id = $1",
+        ["run-parked"]
       )
 
       :ok = Ecto.Migrator.down(TestRepo, @v3, UpgradeV3, log: false)
@@ -433,11 +459,6 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
              ).rows == [[false]]
 
       refute schedule_check_def() =~ "NOT ("
-
-      assert TestRepo.query!(
-               "SELECT wake_at IS NOT NULL FROM docket_runs WHERE run_id = $1",
-               ["run-external"]
-             ).rows == [[true]]
     end
 
     defp schedule_check_def do

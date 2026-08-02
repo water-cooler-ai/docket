@@ -29,9 +29,12 @@ Stop dispatchers and all Docket run writers before the upgrade, deploy one
 homogeneous binary version, migrate, and restart; the binary requires schema
 version 3 and checks it before starting backend children. Rolling back
 returns the host to schema version 2, dropping the claim index and restoring
-the exact-one running-schedule constraint. `mix docket.gen.migration`
-remains fresh-install-only and now installs V01 through V03 in one host
-migration.
+the exact-one running-schedule constraint — and **refuses while any detached
+task is parked**: a parked task lives in its run's encoded state, which the
+0.3 binary cannot decode, so the rollback aborts until those runs finish or
+are cancelled rather than strand work no worker can execute or cancel.
+`mix docket.gen.migration` remains fresh-install-only and now installs V01
+through V03 in one host migration.
 
 ## New runtime behavior
 
