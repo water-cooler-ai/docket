@@ -68,10 +68,11 @@ defmodule Docket do
   @doc """
   Saves one effective, content-addressed graph version.
 
-  Publication snapshots each node implementation's configuration schema once
-  and materializes its defaults into the durable graph before hashing.
-  Storage keeps that effective graph; execution loads and compiles it on
-  the node that performs the work.
+  Publication snapshots each node's configuration schema once - a module
+  node's `config_schema/0` or a detached node's inline `config_schema`
+  attribute - and materializes its defaults into the durable graph before
+  hashing. Storage keeps that effective graph; execution loads and compiles
+  it on the node that performs the work.
   """
   def save_graph(runtime, graph, opts \\ [])
 

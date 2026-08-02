@@ -132,12 +132,21 @@ validated by the runtime rather than by graph compilation.
 
 ### Nodes
 
-- Every runnable node has a module implementation using `call/3`.
-- The module must export `config_schema/0` and `call/3`.
-- `config_schema/0` must return a valid `Docket.Schema`.
-- Configuration is validated against that schema.
+- Every node has an implementation: a module implementation using `call/3`,
+  or `%{type: :detached}` for work executed outside the runtime.
+- A module implementation must export `config_schema/0` and `call/3`, and
+  `config_schema/0` must return a valid `Docket.Schema`.
+- A detached node has no module and no export checks. It may declare an
+  inline `config_schema` attribute; the attribute is rejected on non-detached
+  nodes.
+- Configuration is validated against the node's schema when one exists
+  (module callback or inline attribute); a detached node without a schema
+  passes its config through opaquely.
 - Node policies validate the implemented `"timeout_ms"` and `"retry"` shapes.
-  `"on_error"` remains reserved and is rejected.
+  `"on_error"` remains reserved and is rejected. Detached nodes additionally
+  validate the `"detach"` block (`"start_to_close_ms"`,
+  `"schedule_to_start_ms"`, `"on_deadline"`); the block is rejected on
+  non-detached nodes.
 
 Exceptions, exits, and malformed returns from `config_schema/0` become
 node-scoped diagnostics rather than compiler crashes.

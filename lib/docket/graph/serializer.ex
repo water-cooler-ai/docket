@@ -22,7 +22,10 @@ defmodule Docket.Graph.Serializer do
   # `%{type: :module, module: M, function: F}` implementation in the reverse
   # registry and emits only the identifier; `load!/2` maps an identifier back to
   # the registered implementation. No module, function, or type name is ever
-  # converted to an atom on load.
+  # converted to an atom on load. Detached implementations carry no module and
+  # round-trip as the reserved `{"type": "detached"}` tag with no registry
+  # involvement; "module" and "detached" are both rejected as passthrough
+  # `"type"` values.
   #
   # dump/2 canonicalizes open content with Jason-style coercion: atoms become
   # strings (both map keys and values), silently. Terms with no JSON
@@ -40,7 +43,7 @@ defmodule Docket.Graph.Serializer do
   alias Docket.Graph.{Edge, Error, Field, Node, Output}
   alias Docket.{Guard, Reducer, Schema}
 
-  @schema_version 1
+  @schema_version 2
 
   @start_id "$start"
   @finish_id "$finish"
@@ -86,7 +89,7 @@ defmodule Docket.Graph.Serializer do
 
   @graph_keys ~w(schema_version id name description inputs fields outputs nodes edges policies metadata)
   @field_keys ~w(kind label description schema reducer required default metadata)
-  @node_keys ~w(label description implementation branches config policies metadata)
+  @node_keys ~w(label description implementation config_schema branches config policies metadata)
   @edge_keys ~w(from to label description source_handle target_handle guard metadata)
   @output_keys ~w(source label description schema metadata)
   @schema_keys ~w(type fields item values required default constraints metadata)
@@ -94,6 +97,7 @@ defmodule Docket.Graph.Serializer do
   @guard_keys ~w(op args)
 
   @module_impl_keys ~w(type implementation)
+  @detached_impl_keys ~w(type)
 
   # ---------------------------------------------------------------------------
   # Wire format (dump / load) - exposed as Docket.Graph.to_map/from_map
@@ -128,13 +132,17 @@ defmodule Docket.Graph.Serializer do
     assert_string_keys!(map, "graph document")
     assert_known_keys!(map, @graph_keys, "graph")
 
-    version = load_schema_version!(map)
+    load_schema_version!(map)
     id = fetch_required!(map, "id", "graph")
     assert_public_id!(id, :graph_id)
 
+    # Documents at any accepted wire version load as the current in-memory
+    # version: there is exactly one struct shape, and letting a superseded
+    # version number survive the load would give the same graph two content
+    # addresses.
     %Graph{
       id: id,
-      schema_version: version,
+      schema_version: @schema_version,
       name: load_optional_string!(map, "name", "graph"),
       description: load_optional_string!(map, "description", "graph"),
       inputs: load_collection!(map, "inputs", :input_id, &load_field(&1, &2, :input)),
@@ -281,6 +289,7 @@ defmodule Docket.Graph.Serializer do
     |> put_present_string("label", node.label)
     |> put_present_string("description", node.description)
     |> put_present("implementation", dump_implementation(node.implementation, registry))
+    |> put_present("config_schema", dump_schema(node.config_schema))
     |> put_open_map("branches", dump_branches(node.branches))
     |> put_open_map("config", node.config)
     |> put_open_map("policies", node.policies)
@@ -415,15 +424,35 @@ defmodule Docket.Graph.Serializer do
     end
   end
 
-  defp dump_implementation(%{"type" => "module"} = impl, _registry) when not is_struct(impl) do
-    invalid!(
-      :invalid_implementation,
-      "passthrough implementation #{inspect(impl)} uses the reserved \"type\" => \"module\" " <>
-        "tag; the module tag is reserved for registered module implementations"
-    )
+  defp dump_implementation(%{type: :detached} = impl, _registry) do
+    case Map.keys(impl) -- [:type] do
+      [] ->
+        %{"type" => "detached"}
+
+      extra ->
+        invalid!(
+          :invalid_implementation,
+          "detached implementations support only :type, got extra keys #{inspect(extra)}"
+        )
+    end
   end
 
-  defp dump_implementation(%{} = impl, _registry) when not is_struct(impl), do: durable!(impl)
+  # The reserved-tag check runs on the durable form so no spelling of the
+  # tag (atom or string keys and values) can dump as a passthrough map that
+  # would reload as a structural implementation.
+  defp dump_implementation(%{} = impl, _registry) when not is_struct(impl) do
+    case durable!(impl) do
+      %{"type" => tag} when tag in ["module", "detached"] ->
+        invalid!(
+          :invalid_implementation,
+          "passthrough implementation #{inspect(impl)} uses the reserved \"type\" => #{inspect(tag)} " <>
+            "tag; #{tag} is reserved for structural implementations"
+        )
+
+      dumped ->
+        dumped
+    end
+  end
 
   defp dump_implementation(other, _registry) do
     invalid!(
@@ -523,6 +552,8 @@ defmodule Docket.Graph.Serializer do
       label: load_optional_string!(map, "label", "node #{inspect(id)}"),
       description: load_optional_string!(map, "description", "node #{inspect(id)}"),
       implementation: load_implementation!(Map.get(map, "implementation"), id, registry),
+      config_schema:
+        load_schema!(Map.get(map, "config_schema"), "node #{inspect(id)} config_schema"),
       branches: load_branches!(Map.get(map, "branches"), id),
       config: load_open_map!(map, "config", "node #{inspect(id)}"),
       policies: load_open_map!(map, "policies", "node #{inspect(id)}"),
@@ -670,6 +701,7 @@ defmodule Docket.Graph.Serializer do
 
     case Map.get(map, "type") do
       "module" -> load_module_implementation!(map, id, registry)
+      "detached" -> load_detached_implementation!(map, id)
       _other -> load_durable_value!(map, "node #{inspect(id)} implementation")
     end
   end
@@ -704,6 +736,11 @@ defmodule Docket.Graph.Serializer do
           %{node_id: id, identifier: identifier}
         )
     end
+  end
+
+  defp load_detached_implementation!(map, id) do
+    assert_known_keys!(map, @detached_impl_keys, "node #{inspect(id)} implementation")
+    %{type: :detached}
   end
 
   defp load_branches!(nil, _id), do: %{}

@@ -4,6 +4,38 @@ All notable changes to `docket` are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- Detached node declarations: `implementation: :detached` in
+  `Docket.Graph.put_node!` declares a node whose work executes outside the
+  runtime. Detached nodes may declare an optional inline `config_schema`
+  attribute (validated and default-materialized exactly like module
+  `config_schema/0` callbacks; absent means opaque config passthrough) and an
+  optional `"detach"` policy block (`"start_to_close_ms"`,
+  `"schedule_to_start_ms"`, `"on_deadline"`). Detached graphs are authorable
+  from JSON via `Docket.Graph.from_map!` with no implementations registry.
+  Declaration only: parking, claiming, and completion land in subsequent
+  releases, and a detached node must not be run until they do.
+- The graph document wire format reserves `{"type": "detached"}` as a
+  structural implementation tag alongside `{"type": "module"}`. Passthrough
+  implementation maps using the `"detached"` tag are now rejected, as
+  `"module"` already was, and both rejections now catch every spelling of
+  the tag (atom or string keys and values), not only the string-keyed form.
+
+### Changed
+
+- **Breaking:** the graph document `schema_version` is now 2 and
+  `Docket.Graph.Node` gained the `config_schema` field, which changes the
+  durable encoding of every graph. Every graph hash changes - republishing
+  an unchanged graph mints a new version - and graph versions persisted by
+  earlier releases fail to decode (`:corrupt_graph`), so runs pinned to them
+  cannot resume. The supported adopter path remains drain-and-cut-over.
+  Version-1 JSON documents still load; a loaded document is always upgraded
+  to version 2 in memory, so it compiles, hashes, and re-dumps identically
+  to its version-2 equivalent.
+
 ## 0.3.0 — 2026-07-29
 
 ### Added

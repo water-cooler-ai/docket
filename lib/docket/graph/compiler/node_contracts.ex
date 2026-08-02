@@ -5,6 +5,9 @@ defmodule Docket.Graph.Compiler.NodeContracts do
   # this map after ingest and hands it to both validation and lowering, so
   # every pass sees the same result even when a config_schema/0 callback is
   # stateful or nondeterministic, and lowering never re-invokes user code.
+  # Detached nodes contribute their inline config_schema attribute through the
+  # same map; ingest has already durable-normalized it, so collection only
+  # checks validity.
   #
   # Config keys and atom values normalize for the public Node callback
   # contract, independently of graph persistence.
@@ -31,17 +34,35 @@ defmodule Docket.Graph.Compiler.NodeContracts do
       |> Enum.sort_by(&Atom.to_string/1)
       |> Map.new(&{&1, fetch_config_schema(&1)})
 
-    for {id, node} <- graph.nodes,
-        is_struct(node, Graph.Node),
-        match?(
-          %{type: :module, module: module, function: :call} when is_atom(module),
-          node.implementation
-        ),
-        Map.has_key?(schemas_by_module, node.implementation.module),
-        into: %{} do
-      {id, Map.fetch!(schemas_by_module, node.implementation.module)}
-    end
+    module_schemas =
+      for {id, node} <- graph.nodes,
+          is_struct(node, Graph.Node),
+          match?(
+            %{type: :module, module: module, function: :call} when is_atom(module),
+            node.implementation
+          ),
+          Map.has_key?(schemas_by_module, node.implementation.module),
+          into: %{} do
+        {id, Map.fetch!(schemas_by_module, node.implementation.module)}
+      end
+
+    inline_schemas =
+      for {id, node} <- graph.nodes,
+          is_struct(node, Graph.Node),
+          node.implementation == %{type: :detached},
+          node.config_schema != nil,
+          into: %{} do
+        {id, inline_config_schema(node.config_schema)}
+      end
+
+    Map.merge(module_schemas, inline_schemas)
   end
+
+  defp inline_config_schema(%Schema{} = schema) do
+    if Schema.valid?(schema), do: {:ok, schema}, else: {:error, %{returned: inspect(schema)}}
+  end
+
+  defp inline_config_schema(other), do: {:error, %{returned: inspect(other)}}
 
   @spec materialize_defaults(Graph.t(), %{optional(String.t()) => fetch_result()}) :: Graph.t()
   def materialize_defaults(%Graph{} = graph, config_schemas) do

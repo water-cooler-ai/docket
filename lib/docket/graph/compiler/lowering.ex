@@ -83,7 +83,7 @@ defmodule Docket.Graph.Compiler.Lowering do
 
   defp nodes(graph) do
     for {id, node} <- graph.nodes, into: %{} do
-      %{module: module, function: function} = node.implementation
+      {module, function} = implementation_target(node.implementation)
 
       {node_runtime_id(id),
        %Runtime.Graph.Node{
@@ -99,6 +99,9 @@ defmodule Docket.Graph.Compiler.Lowering do
        }}
     end
   end
+
+  defp implementation_target(%{type: :detached}), do: {nil, nil}
+  defp implementation_target(%{module: module, function: function}), do: {module, function}
 
   defp subscriptions(graph, node_id) do
     for {edge_id, %Edge{to: ^node_id}} <- graph.edges do
