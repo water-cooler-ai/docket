@@ -3,8 +3,9 @@ defmodule Docket.Graph.Node do
   Editable public graph node.
 
   This struct is part of the canonical graph document. It names implementation
-  references, branch group metadata, config, and application metadata. It is
-  not the runtime node representation.
+  references, branch group metadata, config, an optional inline config schema
+  (detached nodes only), and application metadata. It is not the runtime node
+  representation.
   """
 
   defstruct [
@@ -12,6 +13,7 @@ defmodule Docket.Graph.Node do
     :label,
     :description,
     :implementation,
+    :config_schema,
     branches: %{},
     config: %{},
     policies: %{},
@@ -24,6 +26,7 @@ defmodule Docket.Graph.Node do
             required(:module) => module(),
             optional(:function) => atom()
           }
+          | %{required(:type) => :detached}
           | %{required(:type) => atom(), optional(String.t()) => term()}
           | nil
   @type branch_group :: [String.t()] | %{optional(String.t()) => term()}
@@ -33,6 +36,7 @@ defmodule Docket.Graph.Node do
           label: String.t() | nil,
           description: String.t() | nil,
           implementation: implementation(),
+          config_schema: Docket.Schema.t() | nil,
           branches: %{optional(String.t()) => branch_group()},
           config: map(),
           policies: map(),

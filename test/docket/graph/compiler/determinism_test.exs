@@ -48,4 +48,39 @@ defmodule Docket.Graph.Compiler.DeterminismTest do
 
     assert compile!(verified).graph_hash == compile!(graph).graph_hash
   end
+
+  test "detached graphs compile to identical runtime graphs and hashes" do
+    graph = Graphs.detached_linear()
+
+    assert compile!(graph) == compile!(graph)
+  end
+
+  test "inline schema defaults materialize into the hash like module schema defaults" do
+    implicit = Graphs.detached_linear()
+
+    explicit =
+      Graph.update_node!(implicit, "summarize",
+        config: %{"endpoint" => "summarize", "style" => "terse"}
+      )
+
+    assert compile!(implicit).graph_hash == compile!(explicit).graph_hash
+  end
+
+  test "changing a detach policy changes the graph hash" do
+    base = Graphs.detached_linear()
+
+    changed =
+      Graph.update_node!(base, "summarize",
+        policies: %{"detach" => %{"start_to_close_ms" => 120_000}}
+      )
+
+    refute compile!(base).graph_hash == compile!(changed).graph_hash
+  end
+
+  test "changing a detached node's config changes the graph hash" do
+    base = Graphs.detached_linear()
+    changed = Graph.update_node!(base, "summarize", config: %{"endpoint" => "translate"})
+
+    refute compile!(base).graph_hash == compile!(changed).graph_hash
+  end
 end

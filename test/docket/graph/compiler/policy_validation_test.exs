@@ -103,4 +103,107 @@ defmodule Docket.Graph.Compiler.PolicyValidationTest do
       assert_diagnostic(failed, :invalid_policy, path: [:nodes, "flaky", :policies, "on_error"])
     end
   end
+
+  describe "detach policies" do
+    defp with_detach_policies(policies) do
+      Graph.update_node!(Graphs.detached_linear(), "summarize", policies: policies)
+    end
+
+    test "the full detach surface compiles on a detached node" do
+      graph =
+        with_detach_policies(%{
+          "retry" => %{"max_attempts" => 3, "backoff_ms" => 10},
+          "timeout_ms" => 5_000,
+          "detach" => %{
+            "start_to_close_ms" => 600_000,
+            "schedule_to_start_ms" => 60_000,
+            "on_deadline" => "fail"
+          }
+        })
+
+      assert {:ok, _rtg} = Compiler.compile(graph)
+    end
+
+    test "absent, empty, and explicit-nil detach values compile" do
+      assert {:ok, _rtg} = Compiler.compile(with_detach_policies(%{}))
+      assert {:ok, _rtg} = Compiler.compile(with_detach_policies(%{"detach" => nil}))
+      assert {:ok, _rtg} = Compiler.compile(with_detach_policies(%{"detach" => %{}}))
+
+      assert {:ok, _rtg} =
+               Compiler.compile(
+                 with_detach_policies(%{
+                   "detach" => %{
+                     "start_to_close_ms" => nil,
+                     "schedule_to_start_ms" => nil,
+                     "on_deadline" => nil
+                   }
+                 })
+               )
+    end
+
+    test "unknown open policy keys are ignored on detached nodes" do
+      assert {:ok, _rtg} = Compiler.compile(with_detach_policies(%{"custom" => "host-owned"}))
+    end
+
+    test "detach policies on a module node are rejected" do
+      Graph.update_node!(Graphs.retry_then_continue(), "flaky",
+        policies: %{"detach" => %{"start_to_close_ms" => 600_000}}
+      )
+      |> verify_error!()
+      |> assert_diagnostic(:invalid_policy,
+        path: [:nodes, "flaky", :policies, "detach"],
+        public_id: "flaky"
+      )
+    end
+
+    test "an explicit-nil detach block means unset on module nodes too" do
+      graph =
+        Graph.update_node!(Graphs.retry_then_continue(), "flaky", policies: %{"detach" => nil})
+
+      assert {:ok, _rtg} = Compiler.compile(graph)
+    end
+
+    test "deadline budgets must be positive integers or nil" do
+      for key <- ["start_to_close_ms", "schedule_to_start_ms"],
+          bad <- [0, -5, "fast", false, true] do
+        with_detach_policies(%{"detach" => %{key => bad}})
+        |> verify_error!()
+        |> assert_diagnostic(:invalid_policy,
+          path: [:nodes, "summarize", :policies, "detach"],
+          public_id: "summarize"
+        )
+      end
+    end
+
+    test "on_deadline accepts only reschedule and fail" do
+      for bad <- ["retry", 5, true] do
+        with_detach_policies(%{"detach" => %{"on_deadline" => bad}})
+        |> verify_error!()
+        |> assert_diagnostic(:invalid_policy,
+          path: [:nodes, "summarize", :policies, "detach"],
+          public_id: "summarize"
+        )
+      end
+    end
+
+    test "unknown detach keys are rejected" do
+      diagnostic =
+        with_detach_policies(%{"detach" => %{"deadline_ms" => 1_000}})
+        |> verify_error!()
+        |> assert_diagnostic(:invalid_policy,
+          path: [:nodes, "summarize", :policies, "detach"]
+        )
+
+      assert diagnostic.message =~ "deadline_ms"
+    end
+
+    test "detach must be a map" do
+      with_detach_policies(%{"detach" => 600_000})
+      |> verify_error!()
+      |> assert_diagnostic(:invalid_policy,
+        path: [:nodes, "summarize", :policies, "detach"],
+        public_id: "summarize"
+      )
+    end
+  end
 end

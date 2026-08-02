@@ -23,7 +23,7 @@ defmodule Docket.Graph do
   @id_pattern ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
   @start_id "$start"
   @finish_id "$finish"
-  @schema_version 1
+  @schema_version 2
 
   defstruct [
     :id,
@@ -306,8 +306,11 @@ defmodule Docket.Graph do
   tuple, or a `%{type: :module, module: MyNode, function: :call}` map. The
   registry must be unambiguous - two identifiers may not resolve to the same
   `{module, function}` pair. A module implementation that is absent from the
-  registry raises. Passthrough (non-module) implementation maps round-trip as
-  plain durable values.
+  registry raises. Detached implementations serialize as the reserved
+  `{"type": "detached"}` tag and need no registry. Passthrough implementation
+  maps (any other map) round-trip as plain durable values; the `"type"` values
+  `"module"` and `"detached"` are reserved and rejected in passthrough
+  positions.
 
   ## Options
 
@@ -388,7 +391,27 @@ defmodule Docket.Graph do
 
   - `MyNode` becomes `%{type: :module, module: MyNode, function: :call}`
   - `{MyNode, :run}` becomes `%{type: :module, module: MyNode, function: :run}`
+  - `:detached` becomes `%{type: :detached}` - a detached node executes outside
+    the runtime and has no module
   - maps are preserved for compiler/runtime validation
+
+  A detached node may declare an inline `:config_schema` (a `Docket.Schema` or
+  schema shorthand). When present, the node's config is validated against it
+  and schema defaults are materialized into the config at publication; when
+  absent, config passes through opaquely. Detached nodes also accept a
+  `"detach"` policy block:
+
+  - `"start_to_close_ms"` - positive integer or nil (treated as unset); time
+    allowed between claim and completion. When unset, the runtime's default
+    applies at claim time.
+  - `"schedule_to_start_ms"` - positive integer or nil (default); time allowed
+    to wait unclaimed. Nil waits unbounded.
+  - `"on_deadline"` - `"reschedule"` (default) or `"fail"`; disposition when
+    start-to-close expires.
+
+  The block is optional; a bare `implementation: :detached` is fully
+  specified. `"detach"` policies and `:config_schema` are rejected on
+  non-detached nodes.
 
   `:inputs` and `:fields` declare graph fields inline: each entry maps a
   field ID to either field attrs (everything `put_input!`/`put_field!`
@@ -882,7 +905,9 @@ defmodule Docket.Graph do
   defp existing_kind(_field), do: "state"
 
   defp node_from_attrs(%Node{} = node, _id) do
-    Map.update!(node, :implementation, &normalize_implementation/1)
+    node
+    |> Map.update!(:implementation, &normalize_implementation/1)
+    |> Map.update!(:config_schema, &normalize_config_schema/1)
   end
 
   defp node_from_attrs(attrs, id) do
@@ -891,9 +916,15 @@ defmodule Docket.Graph do
     |> Map.put_new(:id, id)
     |> then(&struct(Node, &1))
     |> Map.update!(:implementation, &normalize_implementation/1)
+    |> Map.update!(:config_schema, &normalize_config_schema/1)
   end
 
+  defp normalize_config_schema(nil), do: nil
+  defp normalize_config_schema(schema), do: Docket.Schema.normalize(schema)
+
   defp normalize_implementation(nil), do: nil
+
+  defp normalize_implementation(:detached), do: %{type: :detached}
 
   defp normalize_implementation(module) when is_atom(module) do
     %{type: :module, module: module, function: :call}

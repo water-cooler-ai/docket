@@ -19,7 +19,7 @@ defmodule Docket.Graph.Compiler.Validation do
   @id_pattern ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
   @start_id "$start"
   @finish_id "$finish"
-  @supported_schema_version 1
+  @supported_schema_version 2
   @supported_guard_ops [:all, :any, :changed, :equals, :exists, :not, :path, :version_at_least]
   @reducer_types Docket.Reducer.types()
 
@@ -500,24 +500,58 @@ defmodule Docket.Graph.Compiler.Validation do
   end
 
   # 9.5: the v0.1 node policy surface defined by the runtime ("timeout_ms",
-  # "retry", reserved "on_error"). The rules live in Policies so the compiler
-  # and plan-time validation cannot drift apart.
-  defp validate_node_policies(id, %Graph.Node{policies: policies}) do
-    case Policies.node_policies(NodeContracts.normalize_open(policies)) do
-      {:ok, _resolved} ->
-        []
+  # "retry", reserved "on_error") plus the "detach" block on detached nodes.
+  # The rules live in Policies so the compiler and plan-time validation cannot
+  # drift apart.
+  defp validate_node_policies(id, %Graph.Node{} = node) do
+    policies = NodeContracts.normalize_open(node.policies)
 
-      {:error, errors} ->
-        for {key, message} <- errors do
-          error(:invalid_policy, "node #{inspect(id)}: #{message}",
-            path: [:nodes, id, :policies] ++ List.wrap(key),
-            public_id: id
-          )
-        end
-    end
+    shared =
+      case Policies.node_policies(policies) do
+        {:ok, _resolved} -> []
+        {:error, errors} -> policy_errors(id, errors)
+      end
+
+    shared ++ validate_detach_policies(id, node, policies)
   end
 
   defp validate_node_policies(_id, _other), do: []
+
+  defp validate_detach_policies(id, node, policies) do
+    cond do
+      detached_node?(node) ->
+        case Policies.detach_policies(policies) do
+          :ok -> []
+          {:error, errors} -> policy_errors(id, errors)
+        end
+
+      is_map(policies) and Map.get(policies, Policies.detach_key()) != nil ->
+        [
+          error(
+            :invalid_policy,
+            "node #{inspect(id)}: node policy \"detach\" is only supported on detached nodes",
+            path: [:nodes, id, :policies, Policies.detach_key()],
+            public_id: id
+          )
+        ]
+
+      true ->
+        []
+    end
+  end
+
+  defp policy_errors(id, errors) do
+    for {key, message} <- errors do
+      error(:invalid_policy, "node #{inspect(id)}: #{message}",
+        path: [:nodes, id, :policies] ++ List.wrap(key),
+        public_id: id
+      )
+    end
+  end
+
+  defp detached_node?(%Graph.Node{implementation: implementation}) do
+    implementation == %{type: :detached}
+  end
 
   defp validate_node(id, %Graph.Node{} = node, config_schemas) do
     attrs =
@@ -538,6 +572,9 @@ defmodule Docket.Graph.Compiler.Validation do
               public_id: id
             )
           ]
+
+        detached when detached == %{type: :detached} ->
+          validate_detached_node(id, node, config_schemas)
 
         %{type: :module, module: module, function: :call} when is_atom(module) ->
           validate_node_module(id, node, module, config_schemas)
@@ -563,7 +600,7 @@ defmodule Docket.Graph.Compiler.Validation do
           ]
       end
 
-    attrs ++ implementation
+    attrs ++ implementation ++ check_config_schema_placement(id, node)
   end
 
   defp validate_node(id, other, _config_schemas) do
@@ -575,6 +612,61 @@ defmodule Docket.Graph.Compiler.Validation do
         public_id: id
       )
     ]
+  end
+
+  # A detached node with no inline schema is opaque config passthrough; the
+  # nil entry cannot be confused with an invalid schema because collection
+  # only produces entries for non-nil attributes.
+  defp validate_detached_node(id, node, config_schemas) do
+    case Map.get(config_schemas, id) do
+      {:ok, schema} ->
+        case Schema.validate(schema, NodeContracts.normalize_open(node.config)) do
+          :ok ->
+            []
+
+          {:error, reasons} ->
+            [
+              error(
+                :invalid_node_config,
+                "node #{inspect(id)} config does not match its config_schema",
+                path: [:nodes, id, :config],
+                public_id: id,
+                metadata: %{reasons: reasons}
+              )
+            ]
+        end
+
+      {:error, metadata} ->
+        [
+          error(
+            :invalid_node_config_schema,
+            "node #{inspect(id)} config_schema is not a valid Docket.Schema",
+            path: [:nodes, id, :config_schema],
+            public_id: id,
+            metadata: metadata
+          )
+        ]
+
+      nil ->
+        []
+    end
+  end
+
+  defp check_config_schema_placement(_id, %Graph.Node{config_schema: nil}), do: []
+
+  defp check_config_schema_placement(id, %Graph.Node{} = node) do
+    if detached_node?(node) do
+      []
+    else
+      [
+        error(
+          :invalid_node_config_schema,
+          "node #{inspect(id)} config_schema is only supported on detached nodes",
+          path: [:nodes, id, :config_schema],
+          public_id: id
+        )
+      ]
+    end
   end
 
   defp validate_node_module(id, node, module, config_schemas) do

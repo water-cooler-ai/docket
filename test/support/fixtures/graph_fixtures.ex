@@ -238,6 +238,31 @@ defmodule Docket.Test.Fixtures.Graphs do
   end
 
   @doc """
+  input: document -> summarize (detached) -> output: summary
+
+  The smallest complete detached-node graph: inline config schema with a
+  default, a detach policy block, and an output projection.
+  """
+  def detached_linear do
+    Graph.new!(id: "detached-linear")
+    |> Graph.put_input!("document", schema: Schema.string(), required: true)
+    |> Graph.put_field!("summary", schema: Schema.string())
+    |> Graph.put_node!("summarize",
+      implementation: :detached,
+      config: %{"endpoint" => "summarize"},
+      config_schema:
+        Schema.object(%{
+          "endpoint" => Schema.string(required: true),
+          "style" => Schema.string(default: "terse")
+        }),
+      policies: %{"detach" => %{"start_to_close_ms" => 600_000}}
+    )
+    |> Graph.put_edge!("edge_start_summarize", from: "$start", to: "summarize")
+    |> Graph.put_edge!("edge_summarize_finish", from: "summarize", to: "$finish")
+    |> Graph.put_output!("summary", [])
+  end
+
+  @doc """
   start -> flaky -> finish; flaky fails twice and succeeds on attempt three.
 
   Proves retry attempts and continuation after success.

@@ -149,4 +149,75 @@ defmodule Docket.Graph.Compiler.Policies do
         {nil, [{"retry", "node retry policy has unknown keys #{inspect(Enum.sort(extra))}"}]}
     end
   end
+
+  @detach_key "detach"
+  @detach_ms_keys ["start_to_close_ms", "schedule_to_start_ms"]
+  @detach_keys @detach_ms_keys ++ ["on_deadline"]
+  @on_deadline_values ["reschedule", "fail"]
+
+  @spec detach_key() :: String.t()
+  def detach_key, do: @detach_key
+
+  @doc """
+  Validates the `"detach"` node policy block: `"start_to_close_ms"` and
+  `"schedule_to_start_ms"` must be positive integers or nil (unset),
+  `"on_deadline"` must be `"reschedule"` or `"fail"`, and unknown keys are
+  rejected. An absent block is valid; every value has a resolution-time
+  default. Only detached nodes accept the block - placement is checked by the
+  caller, which knows the node's implementation.
+  """
+  @spec detach_policies(term()) :: :ok | {:error, [{String.t(), String.t()}]}
+  def detach_policies(policies) when is_map(policies) and not is_struct(policies) do
+    case Map.get(policies, @detach_key) do
+      nil ->
+        :ok
+
+      %{} = detach ->
+        case detach_errors(detach) do
+          [] -> :ok
+          errors -> {:error, errors}
+        end
+
+      other ->
+        {:error, [{@detach_key, "node policy \"detach\" must be a map, got #{inspect(other)}"}]}
+    end
+  end
+
+  def detach_policies(_other), do: :ok
+
+  defp detach_errors(detach) do
+    ms_errors =
+      for key <- @detach_ms_keys,
+          {:ok, value} <- [Map.fetch(detach, key)],
+          not (is_nil(value) or (is_integer(value) and value > 0)) do
+        {@detach_key,
+         "node detach policy #{inspect(key)} must be a positive integer or nil, got #{inspect(value)}"}
+      end
+
+    on_deadline_errors =
+      case Map.get(detach, "on_deadline") do
+        nil ->
+          []
+
+        value when value in @on_deadline_values ->
+          []
+
+        other ->
+          [
+            {@detach_key,
+             "node detach policy \"on_deadline\" must be one of #{inspect(@on_deadline_values)}, got #{inspect(other)}"}
+          ]
+      end
+
+    unknown_key_errors =
+      case Map.keys(detach) -- @detach_keys do
+        [] ->
+          []
+
+        extra ->
+          [{@detach_key, "node detach policy has unknown keys #{inspect(Enum.sort(extra))}"}]
+      end
+
+    ms_errors ++ on_deadline_errors ++ unknown_key_errors
+  end
 end

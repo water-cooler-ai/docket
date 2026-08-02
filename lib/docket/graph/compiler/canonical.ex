@@ -75,6 +75,7 @@ defmodule Docket.Graph.Compiler.Canonical do
     %{
       node
       | implementation: implementation(node.implementation, node.id),
+        config_schema: schema(node.config_schema, "node #{inspect(node.id)} config_schema"),
         branches: Wire.dump_value!(node.branches, "node #{inspect(node.id)} branches"),
         config: open_map!(node.config, "node config"),
         policies: open_map!(node.policies, "node policies"),
@@ -95,6 +96,8 @@ defmodule Docket.Graph.Compiler.Canonical do
   defp implementation(%{type: :module, module: module, function: :call} = value, _id)
        when is_atom(module) and map_size(value) == 3,
        do: value
+
+  defp implementation(%{type: :detached} = value, _id) when map_size(value) == 1, do: value
 
   defp implementation(value, id),
     do: Wire.dump_value!(value, "node #{inspect(id)} implementation")

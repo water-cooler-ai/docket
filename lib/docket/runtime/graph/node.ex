@@ -5,7 +5,8 @@ defmodule Docket.Runtime.Graph.Node do
   `id` is the namespaced runtime ID (`node:<public_id>`); `public_id` is what
   node callbacks receive in their runtime context. `subscribe` lists runtime
   channel IDs that activate this node; `outgoing_edges` lists public edge IDs
-  evaluated after this node completes.
+  evaluated after this node completes. Detached nodes lower with no module or
+  function.
   """
 
   defstruct [
@@ -23,8 +24,8 @@ defmodule Docket.Runtime.Graph.Node do
   @type t :: %__MODULE__{
           id: String.t(),
           public_id: String.t(),
-          module: module(),
-          function: atom(),
+          module: module() | nil,
+          function: atom() | nil,
           config: map(),
           subscribe: [String.t()],
           outgoing_edges: [String.t()],

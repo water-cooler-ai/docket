@@ -111,6 +111,37 @@ defmodule Docket.Graph.Compiler.LoweringTest do
              }
     end
 
+    test "detached nodes lower with no module or function" do
+      runtime_graph = compile!(Graphs.detached_linear())
+      node = runtime_graph.nodes["node:summarize"]
+
+      assert %Runtime.Graph.Node{
+               id: "node:summarize",
+               public_id: "summarize",
+               module: nil,
+               function: nil,
+               subscribe: ["edge:edge_start_summarize"],
+               outgoing_edges: ["edge_summarize_finish"]
+             } = node
+    end
+
+    test "detached node config is normalized with inline schema defaults applied" do
+      runtime_graph = compile!(Graphs.detached_linear())
+
+      assert runtime_graph.nodes["node:summarize"].config == %{
+               "endpoint" => "summarize",
+               "style" => "terse"
+             }
+    end
+
+    test "detached node policies are carried verbatim" do
+      runtime_graph = compile!(Graphs.detached_linear())
+
+      assert runtime_graph.nodes["node:summarize"].policies == %{
+               "detach" => %{"start_to_close_ms" => 600_000}
+             }
+    end
+
     test "atom-keyed config schemas apply defaults under canonical string keys" do
       graph =
         Graphs.minimal_linear()

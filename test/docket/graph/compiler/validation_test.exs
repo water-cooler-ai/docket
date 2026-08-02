@@ -19,6 +19,12 @@ defmodule Docket.Graph.Compiler.ValidationTest do
       assert {:error, _graph} = Compiler.compile(graph)
     end
 
+    test "rejects the superseded schema version 1 on in-memory graphs" do
+      %{Graphs.minimal_linear() | schema_version: 1}
+      |> verify_error!()
+      |> assert_diagnostic(:unsupported_schema_version, path: [:schema_version])
+    end
+
     test "rejects non-binary graph IDs" do
       %{Graphs.minimal_linear() | id: nil}
       |> verify_error!()
@@ -481,6 +487,109 @@ defmodule Docket.Graph.Compiler.ValidationTest do
 
       assert {:error, failed} = Compiler.compile_for_publication(graph)
       assert_diagnostic(failed, :invalid_node_config_schema, public_id: "nil-schema")
+    end
+  end
+
+  describe "detached node validation (9.5)" do
+    test "a detached graph with an inline config_schema compiles" do
+      assert {:ok, _rtg} = Compiler.compile(Graphs.detached_linear())
+    end
+
+    test "a bare detached implementation with no detach block is legal" do
+      graph =
+        Graphs.detached_linear()
+        |> Graph.update_node!("summarize", config_schema: nil, config: %{}, policies: %{})
+
+      assert {:ok, verified} = Graph.verify(graph)
+      refute_error_diagnostics(verified.diagnostics)
+    end
+
+    test "config passes through opaquely without an inline schema" do
+      graph =
+        Graphs.detached_linear()
+        |> Graph.update_node!("summarize",
+          config_schema: nil,
+          config: %{"anything" => %{"goes" => [1, 2, 3]}}
+        )
+
+      assert {:ok, _rtg} = Compiler.compile(graph)
+    end
+
+    test "rejects config that fails the inline config_schema" do
+      Graphs.detached_linear()
+      |> Graph.update_node!("summarize", config: %{"style" => "terse"})
+      |> verify_error!()
+      |> assert_diagnostic(:invalid_node_config,
+        path: [:nodes, "summarize", :config],
+        public_id: "summarize"
+      )
+    end
+
+    test "rejects a malformed inline config_schema" do
+      Graphs.detached_linear()
+      |> Graph.update_node!("summarize", config_schema: "not-a-schema")
+      |> verify_error!()
+      |> assert_diagnostic(:invalid_node_config_schema,
+        path: [:nodes, "summarize", :config_schema],
+        public_id: "summarize"
+      )
+    end
+
+    test "rejects config_schema on a module node" do
+      Graphs.minimal_linear()
+      |> Graph.update_node!("copy", config_schema: Docket.Schema.object(%{}))
+      |> verify_error!()
+      |> assert_diagnostic(:invalid_node_config_schema,
+        path: [:nodes, "copy", :config_schema],
+        public_id: "copy"
+      )
+    end
+
+    test "an explicitly nil implementation stays a compile error" do
+      Graphs.detached_linear()
+      |> Graph.update_node!("summarize", implementation: nil)
+      |> verify_error!()
+      |> assert_diagnostic(:missing_node_implementation,
+        path: [:nodes, "summarize", :implementation],
+        public_id: "summarize"
+      )
+    end
+
+    test "branch groups on detached nodes validate like module nodes" do
+      Graphs.detached_linear()
+      |> Graph.update_node!("summarize", branches: %{"route" => ["edge_missing"]})
+      |> verify_error!()
+      |> assert_diagnostic(:unknown_branch_edge,
+        path: [:nodes, "summarize", :branches, "route"],
+        public_id: "summarize"
+      )
+    end
+
+    test "edges and outputs on detached nodes validate like module nodes" do
+      Graphs.detached_linear()
+      |> Graph.put_edge!("edge_summarize_ghost", from: "summarize", to: "ghost")
+      |> verify_error!()
+      |> assert_diagnostic(:unknown_edge_target,
+        path: [:edges, "edge_summarize_ghost", :to]
+      )
+
+      Graphs.detached_linear()
+      |> Graph.put_output!("summary", schema: Docket.Schema.integer())
+      |> verify_error!()
+      |> assert_diagnostic(:incompatible_output_schema,
+        path: [:outputs, "summary", :schema],
+        public_id: "summary"
+      )
+    end
+
+    test "a detached implementation with extra keys is unsupported" do
+      Graphs.detached_linear()
+      |> Graph.update_node!("summarize", implementation: %{type: :detached, extra: 1})
+      |> verify_error!()
+      |> assert_diagnostic(:unsupported_node_implementation,
+        path: [:nodes, "summarize", :implementation],
+        public_id: "summarize"
+      )
     end
   end
 
