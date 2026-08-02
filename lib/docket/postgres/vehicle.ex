@@ -607,6 +607,15 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       end
     end
 
+    # A park with no resume instant has no dispatchable attempt and no
+    # future deadline - the run waits on an external event. The claim is
+    # handed back with no retry wake so the dispatcher does not reclaim a
+    # run nothing can advance; the abandon is non-poisoning because the
+    # host did nothing wrong.
+    defp defer(state, %{resume_at: nil}) do
+      {:ok, {:deferred, hand_back(state, state.clock.(), nil, non_poisoning: true)}}
+    end
+
     defp defer(state, park) do
       now = state.clock.()
 
@@ -616,14 +625,20 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       {:ok, {:deferred, hand_back(state, now, retry_at)}}
     end
 
-    defp hand_back(%{lease: lease} = state, now, retry_at) do
+    defp hand_back(%{lease: lease} = state, now, retry_at, extra \\ []) do
+      policy =
+        Map.merge(
+          %{
+            expected_checkpoint_seq: lease.checkpoint_seq,
+            now: now,
+            retry_at: retry_at,
+            max_claim_abandons: state.max_claim_abandons
+          },
+          Map.new(extra)
+        )
+
       {:ok, disposition} =
-        state.runs.abandon_claim(state.context, :system, lease.run_id, lease.claim_token, %{
-          expected_checkpoint_seq: lease.checkpoint_seq,
-          now: now,
-          retry_at: retry_at,
-          max_claim_abandons: state.max_claim_abandons
-        })
+        state.runs.abandon_claim(state.context, :system, lease.run_id, lease.claim_token, policy)
 
       disposition
     end

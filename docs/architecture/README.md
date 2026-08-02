@@ -37,6 +37,9 @@ upgrading from older lines.
   and the 0.1.x compatibility window (closed in 0.2.0).
 - [0.1.2 to 0.2.0](migration-0.1.2-to-0.2.0.md) — mandatory transition
   stores, the removed composition APIs, and the lifecycle telemetry rename.
+- [0.3.0 to 0.4.0](migration-0.3.0-to-0.4.0.md) — the schema V03 detached
+  claim index, the relaxed running-schedule constraint, and the
+  `TaskState.scheduled_at` durable-encoding change.
 
 ## Future planning
 

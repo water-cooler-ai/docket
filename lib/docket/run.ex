@@ -15,9 +15,9 @@ defmodule Docket.Run do
   The durable/public status vocabulary is exactly five values:
 
   - `:running` - autonomous graph execution can proceed. This one value
-    covers ready, claimed, timer-scheduled, budget-yielded, and retry-backoff
-    positions; queue position is derived from schedule, claim, and
-    active-superstep facts, never stored as extra statuses.
+    covers ready, claimed, timer-scheduled, budget-yielded, retry-backoff,
+    and detached-parked positions; queue position is derived from schedule,
+    claim, and active-superstep facts, never stored as extra statuses.
   - `:waiting` - open interrupts and nothing else can proceed; only an
     external graph mutation resumes the run.
   - `:done` / `:failed` / `:cancelled` - terminal and absorbing.
@@ -45,10 +45,13 @@ defmodule Docket.Run do
   Between a retryable node failure and the superstep's update barrier, the
   run durably encodes the superstep in flight: `active_tasks` holds the
   parked next attempt of each still-executing task (stable identity,
-  snapshot, accumulated failures), `pending_writes` holds completed sibling
-  results that stay invisible to channels until the barrier, and `timers`
-  holds each parked task's retry deadline. These fields are non-empty only
-  on a `:running` run and are cleared by the barrier or a terminal commit.
+  snapshot, accumulated failures) and each parked detached task awaiting
+  external completion, `pending_writes` holds completed sibling results that
+  stay invisible to channels until the barrier, and `timers` holds each
+  parked task's live deadline — a retry backoff or a bounded
+  schedule-to-start wait; an unbounded pending detached task carries no
+  timer. These fields are non-empty only on a `:running` run and are
+  cleared by the barrier or a terminal commit.
 
   ## Failure
 
@@ -195,6 +198,18 @@ defmodule Docket.Run do
   end
 
   @doc false
+  # The run's parked detached tasks, sorted by task ID. Backends project
+  # exactly this list into their claim index inside the run's own commit,
+  # so the index can never disagree with `active_tasks`.
+  @spec detached_tasks(t()) :: [TaskState.t()]
+  def detached_tasks(%__MODULE__{active_tasks: tasks}) do
+    tasks
+    |> Map.values()
+    |> Enum.filter(&(&1.status in [:detached_pending, :detached_claimed]))
+    |> Enum.sort_by(& &1.task_id)
+  end
+
+  @doc false
   @spec validate_durable(t()) :: :ok | {:error, Docket.Error.t()}
   def validate_durable(%__MODULE__{} = run) do
     cond do
@@ -270,8 +285,8 @@ defmodule Docket.Run do
       has_superstep and run.status != :running ->
         invalid_durable("active superstep state is only valid on a running run")
 
-      active_ids != timer_ids ->
-        invalid_durable("active task IDs must match retry timer IDs")
+      not MapSet.subset?(timer_ids, active_ids) ->
+        invalid_durable("every timer must belong to an active task")
 
       run.pending_writes != [] and map_size(run.active_tasks) == 0 ->
         invalid_durable("pending writes require active tasks")
@@ -340,14 +355,47 @@ defmodule Docket.Run do
     exact_struct?(task, TaskState) and valid_id?(task_id) and valid_id?(task.node_id) and
       task.task_id == task_id and
       task_id == TaskState.task_id(run.id, run.step, task.node_id) and task.step == run.step and
-      task.status == :retry_scheduled and pos_integer?(task.attempt) and
+      pos_integer?(task.attempt) and
       task.idempotency_key == TaskState.idempotency_key(task_id, task.attempt) and
       valid_id?(task.input_hash) and portable_map?(task.snapshot) and
       valid_source_versions?(task.source_versions) and valid_failures?(failures) and
       task.attempt == length(failures) + 1 and
-      task.input_hash == TaskState.snapshot_hash(task.snapshot) and is_nil(task.started_at) and
-      is_nil(task.deadline_at) and portable_map?(task.metadata)
+      task.input_hash == TaskState.snapshot_hash(task.snapshot) and
+      portable_map?(task.metadata) and valid_task_status?(run, task_id, task)
   end
+
+  # Each durable task status pins its own schedule shape: a retry-scheduled
+  # attempt has no lifetimes, at least one recorded failure, and a retry
+  # timer; a pending detached attempt records its park instant and carries a
+  # schedule-to-start deadline exactly when its schedule-to-start timer
+  # exists; a claimed detached attempt records its claim instant and always
+  # carries a start-to-close deadline.
+  defp valid_task_status?(run, task_id, %TaskState{status: :retry_scheduled} = task) do
+    is_nil(task.scheduled_at) and is_nil(task.started_at) and is_nil(task.deadline_at) and
+      task.failures != [] and
+      match?({:ok, %TimerState{kind: :retry}}, Map.fetch(run.timers, task_id))
+  end
+
+  defp valid_task_status?(run, task_id, %TaskState{status: :detached_pending} = task) do
+    valid_datetime?(task.scheduled_at) and is_nil(task.started_at) and
+      case Map.fetch(run.timers, task_id) do
+        {:ok, %TimerState{kind: :schedule_to_start, fires_at: fires_at}} ->
+          fires_at == task.deadline_at
+
+        :error ->
+          is_nil(task.deadline_at)
+
+        _other ->
+          false
+      end
+  end
+
+  defp valid_task_status?(run, task_id, %TaskState{status: :detached_claimed} = task) do
+    valid_datetime?(task.scheduled_at) and valid_datetime?(task.started_at) and
+      valid_datetime?(task.deadline_at) and not Map.has_key?(run.timers, task_id)
+  end
+
+  defp valid_task_status?(_run, _task_id, _task), do: false
 
   defp valid_source_versions?(versions) when is_map(versions) and not is_struct(versions) do
     Enum.all?(versions, fn {id, version} -> valid_id?(id) and non_neg_integer?(version) end)
@@ -355,7 +403,9 @@ defmodule Docket.Run do
 
   defp valid_source_versions?(_versions), do: false
 
-  defp valid_failures?(failures) when is_list(failures) and failures != [] do
+  defp valid_failures?([]), do: true
+
+  defp valid_failures?(failures) when is_list(failures) do
     if not proper_list?(failures) do
       false
     else
@@ -432,7 +482,8 @@ defmodule Docket.Run do
 
   defp valid_timers?(timers) when is_map(timers) and not is_struct(timers) do
     Enum.all?(timers, fn
-      {id, %TimerState{kind: :retry, fires_at: fires_at} = timer} ->
+      {id, %TimerState{kind: kind, fires_at: fires_at} = timer}
+      when kind in [:retry, :schedule_to_start] ->
         exact_struct?(timer, TimerState) and valid_id?(id) and valid_datetime?(fires_at)
 
       _other ->

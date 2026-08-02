@@ -8,6 +8,29 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Plan-time parking for declared detached nodes: the superstep partitions a
+  detached node's activation directly into the parked set — the dispatcher
+  never spawns a worker for it — and the park commit records a pending
+  `Docket.Run.TaskState` (status `:detached_pending`, park instant in the
+  new `scheduled_at` field, schedule-to-start deadline when the node bounds
+  its queue wait). The run stays `:running` and parks externally with no
+  wake; retry siblings still contribute their backoff wakes.
+  Schedule-to-start deadlines are durable but wake nothing yet — deadline
+  wakes ship together with the expiry dispositions that consume them. New
+  checkpoint type `:detach_scheduled` and event type `:node_detached`.
+- The `docket_detached_tasks` claim-index projection table
+  (`Docket.Postgres.Migrations.V03`): one row per pending or claimed
+  detached task, maintained inside the same commit as every run mutation on
+  both the fused claimed statement and the signal transaction, so the index
+  can never disagree with `active_tasks`. Cancel and terminal commits clear
+  a run's rows; the pruner is unchanged (`run_id` FK cascades for
+  crash-window stragglers). No token material is stored. The
+  `Docket.Test.MemoryBackend` maintains an equivalent in-VM index with
+  identical semantics.
+- `validate_durable` now encodes the detached structural invariants: a
+  claimed task without a start-to-close deadline is unrepresentable;
+  pending tasks may be timerless (unbounded schedule-to-start); a bounded
+  pending task's deadline and its `:schedule_to_start` timer must agree.
 - Detached node declarations: `implementation: :detached` in
   `Docket.Graph.put_node!` declares a node whose work executes outside the
   runtime. Detached nodes may declare an optional inline `config_schema`
@@ -26,6 +49,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** the PostgreSQL schema version is now 3. V03 adds
+  `docket_detached_tasks` and relaxes the `docket_runs` running-schedule
+  constraint from exactly-one to at-most-one of `wake_at`/`claim_token`.
+  See `docs/architecture/migration-0.3.0-to-0.4.0.md` for the hand-pinned
+  `up(version: 3)` / `down(version: 3)` snippet.
+- **Breaking:** `Docket.Run.TaskState` gained the `scheduled_at` field,
+  changing the durable run encoding for runs parked inside an active
+  superstep; such runs persisted by earlier releases fail to decode. The
+  supported adopter path remains drain-and-cut-over.
+- The backend contract admits `{:release_claim, :external}` for `:running`
+  runs (previously `:waiting` only), and
+  `Docket.Backend.RunStore.abandon_claim/5` accepts a nil `retry_at`,
+  recording no wake — both are the shape of a run parked on detached work
+  with no live deadline.
 - **Breaking:** the graph document `schema_version` is now 2 and
   `Docket.Graph.Node` gained the `config_schema` field, which changes the
   durable encoding of every graph. Every graph hash changes - republishing

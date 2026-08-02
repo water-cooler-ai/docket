@@ -6,7 +6,9 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     Schema version 1 contains durable graphs, runs, and events. Version 2 adds
     the admission-mode policy row, claim partitions, the authoritative
     unfinished-scope schedule, sticky logical-run admission, and supporting
-    indexes. Every step is an ordinary transactional migration.
+    indexes. Version 3 adds the detached-task claim index and admits running
+    runs with no wake and no claim (parked on external detached work). Every
+    step is an ordinary transactional migration.
     """
 
     use Ecto.Migration
@@ -14,7 +16,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     alias Docket.Postgres.Storage
 
     @initial_version 1
-    @current_version 2
+    @current_version 3
     @default_prefix "public"
 
     @spec up(keyword()) :: :ok
@@ -88,6 +90,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
           FROM information_schema.tables
           WHERE table_schema = $1
             AND table_name = 'docket_claim_schedule'
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM information_schema.tables
+          WHERE table_schema = $1
+            AND table_name = 'docket_detached_tasks'
         )
       """
     end

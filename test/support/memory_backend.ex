@@ -16,6 +16,7 @@ defmodule Docket.Test.MemoryBackend do
 
   defstruct runs: %{},
             graphs: %{},
+            detached_tasks: %{},
             clock: nil,
             token_generator: nil
 
@@ -121,7 +122,8 @@ defmodule Docket.Test.MemoryBackend do
             |> reset_operational_health()
             |> apply_schedule(proposal.schedule, now)
 
-          {{:ok, proposal.run}, put_in(state.runs[proposal.run.id], record)}
+          committed = put_in(state.runs[proposal.run.id], record)
+          {{:ok, proposal.run}, sync_detached_index(committed, record, proposal.run)}
         else
           {:error, reason} -> {{:error, normalize_transition_error(reason)}, state}
         end
@@ -154,7 +156,8 @@ defmodule Docket.Test.MemoryBackend do
             |> reset_operational_health()
             |> apply_schedule(proposal.schedule, current_time(state))
 
-          {{:ok, proposal.run}, put_in(state.runs[proposal.run.id], record)}
+          committed = put_in(state.runs[proposal.run.id], record)
+          {{:ok, proposal.run}, sync_detached_index(committed, record, proposal.run)}
         else
           {:error, reason} -> {{:error, normalize_transition_error(reason)}, state}
           false -> {{:error, :stale_checkpoint}, state}
@@ -704,11 +707,12 @@ defmodule Docket.Test.MemoryBackend do
   defp validate_abandon_policy!(%{
          expected_checkpoint_seq: seq,
          now: %DateTime{} = now,
-         retry_at: %DateTime{} = retry_at,
+         retry_at: retry_at,
          max_claim_abandons: max
        })
-       when is_integer(seq) and seq >= 0 and is_integer(max) and max > 0 do
-    if DateTime.compare(retry_at, now) == :lt do
+       when is_integer(seq) and seq >= 0 and is_integer(max) and max > 0 and
+              (is_nil(retry_at) or is_struct(retry_at, DateTime)) do
+    if not is_nil(retry_at) and DateTime.compare(retry_at, now) == :lt do
       raise ArgumentError, "abandon policy retry_at must not precede now"
     end
 
@@ -1008,6 +1012,46 @@ defmodule Docket.Test.MemoryBackend do
     18
     |> :crypto.strong_rand_bytes()
     |> Base.url_encode64(padding: false)
+  end
+
+  @doc false
+  # Test read over the in-VM claim index: the rows for one run, or all rows,
+  # sorted by scheduled_at then task_id (the pending pop-next order).
+  def detached_index(backend, run_id \\ nil) do
+    state_get(backend, fn state ->
+      state.detached_tasks
+      |> Map.values()
+      |> Enum.filter(fn row -> is_nil(run_id) or row.run_id == run_id end)
+      |> Enum.sort_by(fn row ->
+        {DateTime.to_unix(row.scheduled_at, :microsecond), row.task_id}
+      end)
+    end)
+  end
+
+  # Syncs the in-VM claim index to the committed run's detached tasks inside
+  # the same locked state update as the run write: every entry of this run
+  # is replaced by a projection of the run's current detached tasks, so an
+  # empty set (barrier, cancel, terminal failure) clears the run's rows.
+  defp sync_detached_index(state, record, run) do
+    cleared =
+      Map.reject(state.detached_tasks, fn {{run_id, _task_id}, _row} -> run_id == run.id end)
+
+    index =
+      Enum.reduce(Docket.Run.detached_tasks(run), cleared, fn task, index ->
+        Map.put(index, {run.id, task.task_id}, %{
+          run_id: run.id,
+          tenant_id: record.tenant_id,
+          task_id: task.task_id,
+          node_id: task.node_id,
+          attempt: task.attempt,
+          state: Docket.Run.TaskState.index_state(task),
+          scheduled_at: task.scheduled_at,
+          claimed_at: task.started_at,
+          deadline_at: task.deadline_at
+        })
+      end)
+
+    %{state | detached_tasks: index}
   end
 
   defp state_get(backend, fun), do: Agent.get(backend, fun)

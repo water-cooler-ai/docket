@@ -5,10 +5,12 @@ defmodule Docket.Runtime.Superstep do
   # dispatcher returning task results and the loop proposing the attempt's
   # commit boundary.
   #
-  # `new/5` partitions the dispatch's results and runs every write and
+  # `new/6` partitions the dispatch's results and runs every write and
   # interrupt validator exactly once; the loop pattern matches the struct's
   # fields to pick the boundary (fail, park, or barrier) instead of
-  # re-deriving lists. `absorb_pending/1` folds the run's durable pending
+  # re-deriving lists. `detached` carries the plan-partitioned detached
+  # activations - never dispatched, parked pending at the boundary.
+  # `absorb_pending/1` folds the run's durable pending
   # sibling writes through the same validators at the barrier, so each result
   # batch is validated once per proposal no matter which boundary it reaches.
   #
@@ -57,6 +59,7 @@ defmodule Docket.Runtime.Superstep do
     writes: [],
     interrupts: [],
     retries: [],
+    detached: [],
     failures: [],
     remaining_active?: false
   ]
@@ -70,12 +73,13 @@ defmodule Docket.Runtime.Superstep do
           writes: [PendingWrite.t()],
           interrupts: [PendingWrite.t()],
           retries: [TaskResult.t()],
+          detached: [Activation.t()],
           failures: [Failure.t()],
           remaining_active?: boolean()
         }
 
   @doc false
-  def new(rtg, run, config, activations, results) do
+  def new(rtg, run, config, activations, results, detached \\ []) do
     results = Enum.sort_by(results, & &1.node_id)
     {oks, interrupt_results, retries, failures} = partition(results)
     {writes, write_failures} = validate_writes(rtg, oks)
@@ -90,6 +94,7 @@ defmodule Docket.Runtime.Superstep do
       writes: writes,
       interrupts: interrupts,
       retries: retries,
+      detached: detached,
       failures: failures ++ write_failures ++ interrupt_failures,
       remaining_active?: remaining_active?(run, results)
     }

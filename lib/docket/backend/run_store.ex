@@ -90,8 +90,9 @@ defmodule Docket.Backend.RunStore do
 
   `expected_checkpoint_seq` is the lease's committed sequence, `now` is the
   caller's clock reading, `retry_at` is the future wake the abandoned run
-  receives, and `max_claim_abandons` bounds consecutive abandons before the
-  run is poisoned instead of rescheduled.
+  receives — nil when the run waits on an external event and must receive
+  no wake at all — and `max_claim_abandons` bounds consecutive abandons
+  before the run is poisoned instead of rescheduled.
 
   A `:non_poisoning` abandon reverses the claim-attempt increment, counts
   one claim abandon, and never poisons regardless of the count. When
@@ -102,7 +103,7 @@ defmodule Docket.Backend.RunStore do
   @type abandon_policy :: %{
           required(:expected_checkpoint_seq) => non_neg_integer(),
           required(:now) => DateTime.t(),
-          required(:retry_at) => DateTime.t(),
+          required(:retry_at) => DateTime.t() | nil,
           required(:max_claim_abandons) => pos_integer(),
           optional(:non_poisoning) => boolean(),
           optional(:backoff) => %{base_ms: pos_integer(), cap_ms: pos_integer()}
@@ -271,7 +272,10 @@ defmodule Docket.Backend.RunStore do
   poison recovery.
 
   `policy.retry_at` must not precede `policy.now`: the future wake is what
-  keeps an incompatible node from immediately re-claiming the same run.
+  keeps an incompatible node from immediately re-claiming the same run. A
+  nil `retry_at` records no wake — the abandoned run waits on an external
+  event (a pending detached task with no live deadline) and is reclaimed
+  only when a committed mutation schedules it again.
   Callers should add jitter to their retry backoff so runs abandoned together
   do not become due together. A rolling deployment therefore self-heals — a
   compatible node claims the run at or after `retry_at` — while a fleet that

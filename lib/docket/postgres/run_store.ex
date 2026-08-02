@@ -40,7 +40,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @behaviour Docket.Backend.RunStore
 
     alias Docket.Postgres.{ClaimPolicy, RunCodec, Storage}
-    alias Docket.Postgres.Schemas.{ClaimPartition, Run}
+    alias Docket.Postgres.Schemas.{ClaimPartition, DetachedTask, Run}
 
     @type ctx :: module() | %{required(:repo) => module(), optional(:prefix) => String.t() | nil}
 
@@ -384,10 +384,11 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp non_poisoning_abandon(ctx, run_id, claim_token, seq, retry_at, policy, started) do
       {repo, prefix} = Storage.context!(ctx)
 
+      predicate =
+        dynamic([run], ^current_claim(run_id, claim_token) and run.checkpoint_seq == ^seq)
+
       {matched, _} =
-        run_id
-        |> current_claim(claim_token)
-        |> where([run], run.checkpoint_seq == ^seq)
+        predicate
         |> claim_query(prefix)
         |> repo.update_all(
           [
@@ -736,6 +737,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
                log: false
              ) do
           {1, _} ->
+            sync_detached_index(repo, prefix, row, stored_run, proposed_run)
             notify_wake(repo, prefix, schedule)
             maybe_emit_admission_release(row.tenant_admitted_at, schedule)
             {:ok, {:committed, opaque}}
@@ -756,6 +758,57 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
     defp apply_mutation(_repo, _prefix, _scope, _row, _run, _decision),
       do: {:error, :invalid_mutation}
+
+    # Syncs the claim index to the committed run's detached tasks inside the
+    # caller's transaction: rows outside the proposed set are stale and
+    # deleted, rows in it are upserted in place. An empty proposed set
+    # clears every row of the run - that is how cancel and terminal commits
+    # remove index rows with no path-specific code. Skipped entirely when
+    # neither the pre-image nor the proposal holds detached tasks.
+    defp sync_detached_index(repo, prefix, row, stored_run, proposed_run) do
+      detached = Docket.Run.detached_tasks(proposed_run)
+
+      if detached != [] or Docket.Run.detached_tasks(stored_run) != [] do
+        task_ids = Enum.map(detached, & &1.task_id)
+
+        {_deleted, nil} =
+          repo.delete_all(
+            from(task in DetachedTask,
+              where: task.run_id == ^row.run_id and task.task_id not in ^task_ids
+            ),
+            prefix: prefix,
+            log: false
+          )
+
+        if detached != [] do
+          rows =
+            Enum.map(detached, fn task ->
+              %{
+                run_id: row.run_id,
+                tenant_id: row.tenant_id,
+                task_id: task.task_id,
+                node_id: task.node_id,
+                attempt: task.attempt,
+                state: Docket.Run.TaskState.index_state(task),
+                scheduled_at: task.scheduled_at,
+                claimed_at: task.started_at,
+                deadline_at: task.deadline_at
+              }
+            end)
+
+          {_upserted, nil} =
+            repo.insert_all(DetachedTask, rows,
+              on_conflict:
+                {:replace, [:attempt, :state, :scheduled_at, :claimed_at, :deadline_at]},
+              conflict_target: [:run_id, :task_id],
+              prefix: prefix,
+              log: false
+            )
+        end
+      end
+
+      :ok
+    end
 
     defp validate_mutation(stored, proposed, checkpoint_type, schedule) do
       cond do
@@ -792,7 +845,10 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     defp schedule_matches_status?(:retain_claim, :running), do: true
     defp schedule_matches_status?({:release_claim, :immediate}, :running), do: true
     defp schedule_matches_status?({:release_claim, {:at, %DateTime{}}}, :running), do: true
-    defp schedule_matches_status?({:release_claim, :external}, :waiting), do: true
+
+    defp schedule_matches_status?({:release_claim, :external}, status)
+         when status in [:running, :waiting],
+         do: true
 
     defp schedule_matches_status?({:release_claim, :terminal}, status),
       do: status in [:done, :failed, :cancelled]
@@ -1092,12 +1148,13 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
            %{
              expected_checkpoint_seq: seq,
              now: %DateTime{} = now,
-             retry_at: %DateTime{} = retry_at,
+             retry_at: retry_at,
              max_claim_abandons: max
            } = policy
          )
-         when is_integer(seq) and seq >= 0 and is_integer(max) and max > 0 do
-      if DateTime.compare(retry_at, now) == :lt do
+         when is_integer(seq) and seq >= 0 and is_integer(max) and max > 0 and
+                (is_nil(retry_at) or is_struct(retry_at, DateTime)) do
+      if not is_nil(retry_at) and DateTime.compare(retry_at, now) == :lt do
         raise ArgumentError,
               "abandon policy retry_at must not precede now, got: #{inspect(policy)}"
       end
@@ -1107,7 +1164,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       %{
         policy
         | now: normalize_database_datetime(now),
-          retry_at: normalize_database_datetime(retry_at)
+          retry_at: retry_at && normalize_database_datetime(retry_at)
       }
     end
 

@@ -15,6 +15,7 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
     @failed_v2 20_260_716_000_106
     @host_v1_to_current 20_260_716_000_107
     @fresh_current 20_260_719_000_111
+    @v3 20_260_802_000_112
 
     defmodule InstallV1 do
       use Ecto.Migration
@@ -26,6 +27,12 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
       use Ecto.Migration
       def up, do: Docket.Postgres.Migration.up(version: 2)
       def down, do: Docket.Postgres.Migration.down(version: 2)
+    end
+
+    defmodule UpgradeV3 do
+      use Ecto.Migration
+      def up, do: Docket.Postgres.Migration.up(version: 3)
+      def down, do: Docket.Postgres.Migration.down(version: 3)
     end
 
     defmodule InstallPrivate do
@@ -394,6 +401,54 @@ if Code.ensure_loaded?(Ecto.Adapters.SQL) and Code.ensure_loaded?(Postgrex) do
 
       assert v1_runs("docket_private") ==
                [["run-a", "tenant-a"], ["run-system", nil]]
+    end
+
+    test "V3 down drops the claim index and restores the exact-schedule check" do
+      :ok = Ecto.Migrator.up(TestRepo, @schema_v1, InstallV1, log: false)
+      insert_v1_graph_and_run("tenant-a", "run-external")
+      :ok = Ecto.Migrator.up(TestRepo, @v2, UpgradeV2, log: false)
+      :ok = Ecto.Migrator.up(TestRepo, @v3, UpgradeV3, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 3
+
+      # The relaxed check renders as a boolean NOT over the pair; the V01
+      # exact-one form has no boolean NOT.
+      assert schedule_check_def() =~ "NOT ("
+
+      # A run in the V03-only shape (running, no wake, no claim) must not
+      # abort the rollback: down normalizes it to immediately due before
+      # recreating the exact-one constraint.
+      TestRepo.query!(
+        "UPDATE docket_runs SET wake_at = NULL, claim_token = NULL WHERE run_id = $1",
+        ["run-external"]
+      )
+
+      :ok = Ecto.Migrator.down(TestRepo, @v3, UpgradeV3, log: false)
+
+      assert Docket.Postgres.Migration.migrated_version(repo: TestRepo) == 2
+
+      assert TestRepo.query!(
+               "SELECT EXISTS (SELECT 1 FROM information_schema.tables " <>
+                 "WHERE table_schema = 'public' AND table_name = 'docket_detached_tasks')"
+             ).rows == [[false]]
+
+      refute schedule_check_def() =~ "NOT ("
+
+      assert TestRepo.query!(
+               "SELECT wake_at IS NOT NULL FROM docket_runs WHERE run_id = $1",
+               ["run-external"]
+             ).rows == [[true]]
+    end
+
+    defp schedule_check_def do
+      TestRepo.query!(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint " <>
+          "WHERE conname = 'docket_runs_running_schedule_check'",
+        [],
+        log: false
+      ).rows
+      |> List.first()
+      |> List.first()
     end
 
     test "V2 down removes current authority while preserving schema V1 data" do

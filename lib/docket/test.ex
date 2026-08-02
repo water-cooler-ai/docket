@@ -221,6 +221,12 @@ defmodule Docket.Test do
             {:stop, run, checkpoints}
         end
 
+      # An uncommitted park with no wake: the active superstep has no
+      # dispatchable attempt and no future deadline, so inline driving
+      # stops with the run parked on external work.
+      {:park, run, %{resume_at: nil}} ->
+        {:stop, run, []}
+
       # An uncommitted retry wait: nothing durable changed, the sleeper just
       # served the remaining time to the earliest parked deadline.
       {:park, run, park} ->

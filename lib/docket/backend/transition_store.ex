@@ -264,7 +264,13 @@ defmodule Docket.Backend.TransitionStore do
   defp valid_schedule?(:retain_claim, :running, true), do: true
   defp valid_schedule?({:release_claim, :immediate}, :running, _claimed), do: true
   defp valid_schedule?({:release_claim, {:at, %DateTime{}}}, :running, _claimed), do: true
-  defp valid_schedule?({:release_claim, :external}, :waiting, _claimed), do: true
+
+  # A waiting run parks on its open interrupts; a running run may park
+  # externally (the shape of a run parked on detached work with no live
+  # deadline).
+  defp valid_schedule?({:release_claim, :external}, status, _claimed)
+       when status in [:running, :waiting],
+       do: true
 
   defp valid_schedule?({:release_claim, :terminal}, status, _claimed),
     do: status in [:done, :failed, :cancelled]
