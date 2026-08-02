@@ -94,7 +94,7 @@ defmodule Docket.Graph.SerializerTest do
                implementations: registry()
              ) == map
 
-      assert map["schema_version"] == 1
+      assert map["schema_version"] == 2
       refute Map.has_key?(map, "diagnostics")
     end
   end
@@ -372,9 +372,11 @@ defmodule Docket.Graph.SerializerTest do
     end
 
     test "rejects a passthrough map that reuses the reserved module tag" do
-      for extra <- [%{"handler" => "x"}, %{"implementation" => "foo"}] do
-        impl = Map.merge(%{"type" => "module"}, extra)
-
+      for impl <- [
+            Map.merge(%{"type" => "module"}, %{"handler" => "x"}),
+            Map.merge(%{"type" => "module"}, %{"implementation" => "foo"}),
+            %{type: "module"}
+          ] do
         graph =
           Graph.new!(id: "reserved")
           |> Graph.put_node!("n", implementation: impl)
@@ -483,6 +485,115 @@ defmodule Docket.Graph.SerializerTest do
 
       error = assert_raise Graph.Error, fn -> Graph.to_map(graph, implementations: [:nope]) end
       assert error.code == :invalid_registry
+    end
+  end
+
+  describe "detached implementations and inline config_schema" do
+    defp detached_graph do
+      Graph.new!(id: "detached")
+      |> Graph.put_input!("document", schema: Schema.string(), required: true)
+      |> Graph.put_field!("summary", schema: Schema.string())
+      |> Graph.put_node!("summarize",
+        implementation: :detached,
+        config: %{"endpoint" => "summarize"},
+        config_schema:
+          Schema.object(%{
+            "endpoint" => Schema.string(required: true),
+            "style" => Schema.string(default: "terse")
+          }),
+        policies: %{"detach" => %{"start_to_close_ms" => 600_000}}
+      )
+      |> Graph.put_edge!("edge_start_summarize", from: "$start", to: "summarize")
+      |> Graph.put_edge!("edge_summarize_finish", from: "summarize", to: "$finish")
+      |> Graph.put_output!("summary", [])
+    end
+
+    test "round-trips a detached graph with no implementations registry" do
+      graph = detached_graph()
+      map = Graph.to_map(graph)
+
+      assert map["nodes"]["summarize"]["implementation"] == %{"type" => "detached"}
+      assert map["nodes"]["summarize"]["config_schema"]["type"] == "object"
+
+      assert Graph.from_map!(map) == graph
+      assert Graph.to_map(Graph.from_map!(map)) == map
+    end
+
+    test "a detached document authored as plain JSON loads and verifies without a registry" do
+      document = %{
+        "schema_version" => 2,
+        "id" => "external-work",
+        "inputs" => %{"document" => %{"kind" => "input", "schema" => %{"type" => "string"}}},
+        "fields" => %{"summary" => %{"kind" => "state", "schema" => %{"type" => "string"}}},
+        "nodes" => %{
+          "summarize" => %{
+            "implementation" => %{"type" => "detached"},
+            "config" => %{"endpoint" => "summarize"},
+            "config_schema" => %{
+              "type" => "object",
+              "fields" => %{"endpoint" => %{"type" => "string"}}
+            },
+            "policies" => %{
+              "detach" => %{"schedule_to_start_ms" => nil, "on_deadline" => "reschedule"}
+            }
+          }
+        },
+        "edges" => %{
+          "edge_start_summarize" => %{"from" => "$start", "to" => "summarize"},
+          "edge_summarize_finish" => %{"from" => "summarize", "to" => "$finish"}
+        },
+        "outputs" => %{"summary" => %{"source" => "summary"}}
+      }
+
+      graph = Graph.from_map!(document)
+      assert graph.nodes["summarize"].implementation == %{type: :detached}
+      assert {:ok, _verified} = Graph.verify(graph)
+    end
+
+    test "rejects a passthrough map that reuses the reserved detached tag in any spelling" do
+      for impl <- [
+            %{"type" => "detached"},
+            %{"type" => "detached", "handler" => "x"},
+            %{type: "detached"},
+            %{"type" => :detached}
+          ] do
+        graph =
+          Graph.new!(id: "reserved")
+          |> Graph.put_node!("n", implementation: impl)
+
+        error = assert_raise Graph.Error, fn -> Graph.to_map(graph) end
+        assert error.code == :invalid_implementation
+      end
+    end
+
+    test "dump rejects a detached implementation with extra keys" do
+      graph =
+        Graph.new!(id: "extra")
+        |> Graph.put_node!("n", implementation: %{type: :detached, extra: 1})
+
+      error = assert_raise Graph.Error, fn -> Graph.to_map(graph) end
+      assert error.code == :invalid_implementation
+    end
+
+    test "load rejects a detached implementation with extra keys" do
+      document = %{
+        "schema_version" => 2,
+        "id" => "extra",
+        "nodes" => %{
+          "n" => %{"implementation" => %{"type" => "detached", "extra" => 1}}
+        }
+      }
+
+      assert {:error, %Graph.Error{code: :invalid_document}} = Graph.from_map(document)
+    end
+
+    test "version-1 documents load as version 2 and re-dump as version 2" do
+      v1 = Map.put(Graph.to_map(Graph.new!(id: "old")), "schema_version", 1)
+
+      graph = Graph.from_map!(v1)
+      assert graph.schema_version == 2
+      assert Graph.to_map(graph)["schema_version"] == 2
+      assert graph == Graph.from_map!(Graph.to_map(graph))
     end
   end
 

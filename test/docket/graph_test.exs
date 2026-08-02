@@ -47,6 +47,53 @@ defmodule Docket.GraphTest do
     assert Docket.Graph.diagnostics(graph) == []
   end
 
+  describe "detached node declaration" do
+    test "implementation: :detached normalizes to %{type: :detached}" do
+      graph =
+        Docket.Graph.new!(id: "detached")
+        |> Docket.Graph.put_node!("wait", implementation: :detached)
+
+      assert graph.nodes["wait"].implementation == %{type: :detached}
+    end
+
+    test "implementation: nil stays nil" do
+      graph =
+        Docket.Graph.new!(id: "detached")
+        |> Docket.Graph.put_node!("wait", implementation: nil)
+
+      assert graph.nodes["wait"].implementation == nil
+    end
+
+    test "config_schema accepts schema shorthand" do
+      graph =
+        Docket.Graph.new!(id: "detached")
+        |> Docket.Graph.put_node!("wait",
+          implementation: :detached,
+          config_schema: {:object, %{"endpoint" => :string}}
+        )
+
+      assert %Docket.Schema{type: :object, fields: %{"endpoint" => %Docket.Schema{type: :string}}} =
+               graph.nodes["wait"].config_schema
+    end
+
+    test "config_schema normalizes through node struct patches" do
+      graph =
+        Docket.Graph.new!(id: "detached")
+        |> Docket.Graph.put_node!("wait", implementation: :detached)
+        |> Docket.Graph.update_node!("wait", config_schema: :string)
+
+      assert %Docket.Schema{type: :string} = graph.nodes["wait"].config_schema
+    end
+
+    test "config_schema defaults to nil" do
+      graph =
+        Docket.Graph.new!(id: "detached")
+        |> Docket.Graph.put_node!("wait", implementation: :detached)
+
+      assert graph.nodes["wait"].config_schema == nil
+    end
+  end
+
   test "supports realtime-style node, edge, and field edits" do
     {:ok, graph} = Docket.Graph.new(id: "support-reply")
     {:ok, graph} = Docket.Graph.put_input(graph, "message", schema: Docket.Schema.string())

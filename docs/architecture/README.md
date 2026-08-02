@@ -17,6 +17,9 @@ individual function boundary.
   configuration, migration, recovery, and inspection.
 - [ClaimPolicy boundary](docket-claim-policy.md) — the one-statement internal
   seam, engine selection, and the admission-mode interlock.
+- [Detached task dispatch](docket-detached-dispatch-design.md) — declared
+  detached nodes, leased pull claims, token-authenticated completion, and
+  the split-deadline lifecycle (contract locked under DCKT-86/87).
 
 Graph and compiler internals are documented in
 [graph construction](docket-graph-construction-design.md),

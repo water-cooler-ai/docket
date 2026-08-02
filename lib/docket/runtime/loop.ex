@@ -513,13 +513,14 @@ defmodule Docket.Runtime.Loop do
 
     committed = %{committed | status: eager_status(rtg, committed, config)}
 
+    # A committing superstep has no retry results, so unlike the retry park
+    # and superstep failure paths, the barrier emits no attempt-failure
+    # entries of its own.
     entries =
-      commit_entries(rtg, run.step, superstep.writes, changed_fields, writers,
-        triggered: triggered,
-        finish: finish,
-        interrupts: interrupts,
-        interrupt_writes: interrupt_writes
-      )
+      node_completed_entries(run.step, superstep.writes) ++
+        channel_updated_entries(run.step, changed_fields, writers) ++
+        edge_triggered_entries(rtg, run.step, triggered ++ finish) ++
+        interrupt_requested_entries(run.step, interrupts, interrupt_writes)
 
     type = if map_size(interrupts) == 0, do: :step_committed, else: :interrupt_requested
     propose(committed, type, entries, run_disposition(committed), config)
@@ -581,42 +582,50 @@ defmodule Docket.Runtime.Loop do
     end)
   end
 
-  # A committing superstep has no retry results, so unlike the retry park
-  # and superstep failure paths, the barrier emits no attempt-failure
-  # entries of its own.
-  defp commit_entries(rtg, step, validated_writes, changed_fields, writers, extra) do
-    Enum.map(validated_writes, fn write ->
+  defp node_completed_entries(step, writes) do
+    Enum.map(writes, fn write ->
       entry(:node_completed, step,
         node_id: write.node_id,
         task_id: write.task_id,
         payload: %{"attempt" => write.attempt}
       )
-    end) ++
-      Enum.map(Enum.sort(changed_fields), fn field_id ->
-        entry(:channel_updated, step,
-          channel_id: "state:" <> field_id,
-          payload: %{"writers" => Map.fetch!(writers, field_id)}
-        )
-      end) ++
-      Enum.map(Keyword.fetch!(extra, :triggered) ++ Keyword.fetch!(extra, :finish), fn edge_id ->
-        entry(:edge_triggered, step,
-          channel_id: Map.fetch!(rtg.edges, edge_id).channel_id,
-          payload: %{"edge_id" => edge_id, "to" => Map.fetch!(rtg.edges, edge_id).to}
-        )
-      end) ++
-      Enum.map(Enum.sort(Keyword.fetch!(extra, :interrupts)), fn {id, state} ->
-        write = Map.fetch!(Keyword.fetch!(extra, :interrupt_writes), id)
+    end)
+  end
 
-        entry(:interrupt_requested, step,
-          node_id: state.node_id,
-          task_id: write.task_id,
-          payload: %{
-            "attempt" => write.attempt,
-            "interrupt_id" => id,
-            "resume_channel" => state.resume_channel
-          }
-        )
-      end)
+  defp channel_updated_entries(step, changed_fields, writers) do
+    Enum.map(Enum.sort(changed_fields), fn field_id ->
+      entry(:channel_updated, step,
+        channel_id: "state:" <> field_id,
+        payload: %{"writers" => Map.fetch!(writers, field_id)}
+      )
+    end)
+  end
+
+  defp edge_triggered_entries(rtg, step, edge_ids) do
+    Enum.map(edge_ids, fn edge_id ->
+      edge = Map.fetch!(rtg.edges, edge_id)
+
+      entry(:edge_triggered, step,
+        channel_id: edge.channel_id,
+        payload: %{"edge_id" => edge_id, "to" => edge.to}
+      )
+    end)
+  end
+
+  defp interrupt_requested_entries(step, interrupts, interrupt_writes) do
+    Enum.map(Enum.sort(interrupts), fn {id, state} ->
+      write = Map.fetch!(interrupt_writes, id)
+
+      entry(:interrupt_requested, step,
+        node_id: state.node_id,
+        task_id: write.task_id,
+        payload: %{
+          "attempt" => write.attempt,
+          "interrupt_id" => id,
+          "resume_channel" => state.resume_channel
+        }
+      )
+    end)
   end
 
   # One dispatch executes at most one attempt per task, so the only
