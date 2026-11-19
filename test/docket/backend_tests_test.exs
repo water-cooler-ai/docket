@@ -10,6 +10,13 @@ backends =
     backends
   end
 
+backends =
+  if Code.ensure_loaded?(Exqlite.Sqlite3) do
+    backends ++ [{Docket.SQLite, Docket.Test.BackendTestSetup.SQLite, true, []}]
+  else
+    backends
+  end
+
 for {backend, setup_module, async?, tags} <- backends do
   defmodule Module.concat(backend, SharedBackendTest) do
     use ExUnit.Case, async: async?

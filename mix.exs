@@ -39,7 +39,7 @@ defmodule Docket.MixProject do
     [
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false, warn_if_outdated: true}
-    ] ++ postgres_deps()
+    ] ++ postgres_deps() ++ sqlite_deps()
   end
 
   # The Postgres backend (`Docket.Postgres.*`) compiles only when the host
@@ -54,6 +54,12 @@ defmodule Docket.MixProject do
         {:postgrex, "~> 0.17", optional: true}
       ]
     end
+  end
+
+  # The SQLite backend (`Docket.SQLite.*`) compiles only when the host
+  # application already depends on exqlite.
+  defp sqlite_deps do
+    if @core_only?, do: [], else: [{:exqlite, "~> 0.27", optional: true}]
   end
 
   defp package do
