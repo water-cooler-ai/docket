@@ -229,8 +229,12 @@ defmodule Docket.Bench.Backends do
       commits
     )
 
+    # The clock starts before the runtime does: the runner can claim work
+    # while its supervisor is still starting. That startup (a few ms) is
+    # counted, so throughput errs low rather than high.
+    started = System.monotonic_time(:microsecond)
+
     with_runtime(storage, :production, fn ->
-      started = System.monotonic_time(:microsecond)
       done = collect(MapSet.new(ids), :run_completed, config.timeout_ms)
       elapsed_s = (Enum.max(Map.values(done)) - started) / 1_000_000
       committed = :counters.get(commits, 1)
@@ -307,8 +311,10 @@ defmodule Docket.Bench.Backends do
       Map.new(ids, fn id ->
         {:ok, run} = Docket.fetch_run(@runtime, id)
         [{interrupt_id, _}] = Map.to_list(run.interrupts)
+        # Stamped before the call: the run can finish before it returns.
+        at = System.monotonic_time(:microsecond)
         {:ok, _} = Docket.resolve_interrupt(@runtime, id, interrupt_id, "ok")
-        {id, System.monotonic_time(:microsecond)}
+        {id, at}
       end)
 
     resolve_elapsed = System.monotonic_time(:microsecond) - resolve_started
