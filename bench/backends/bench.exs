@@ -382,7 +382,7 @@ defmodule Docket.Bench.Backends do
   end
 
   defp count_done(before, acc) do
-    opts = [limit: 1_000, statuses: [:done]] ++ if(before, do: [before: before], else: [])
+    opts = [limit: 1_000, status: :done] ++ if(before, do: [before: before], else: [])
     {:ok, page} = Docket.list_runs(@runtime, opts)
     acc = acc + length(page.runs)
     if page.has_more?, do: count_done(page.next_before, acc), else: acc
