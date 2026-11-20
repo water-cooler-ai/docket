@@ -74,7 +74,7 @@ if Code.ensure_loaded?(Exqlite.Sqlite3) do
         assert {:ok, %Docket.Run{status: :done}} = Host.await_run(id, timeout: 5_000)
       end
 
-      assert {:ok, %Docket.RunPage{runs: runs}} = Host.list_runs(limit: 500, statuses: [:done])
+      assert {:ok, %Docket.RunPage{runs: runs}} = Host.list_runs(limit: 500, status: :done)
       assert length(runs) == 200
     end
 
